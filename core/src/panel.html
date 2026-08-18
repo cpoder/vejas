@@ -5,34 +5,108 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vejas — business surface</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; } h2 { font-size: 1rem; margin: 1.6rem 0 .4rem; font-weight: 600; }
-  p.hint { color: #777; font-size: .9rem; }
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --ink: #191918; --ink2: #5c5b57; --muted: #8a897f;
+    --line: #e6e5e0; --accent: #0b7285; --accent-ink: #ffffff; --wash: rgba(11,114,133,.07);
+    --ok: #2b8a3e; --err: #c92a2a; --chip: #eef3f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141414; --card: #1d1d1c; --ink: #f0efec; --ink2: #b9b8b2; --muted: #85847c;
+      --line: #2e2e2c; --accent: #3bc9db; --accent-ink: #0c2b31; --wash: rgba(59,201,219,.09);
+      --ok: #51cf66; --err: #ff6b6b; --chip: #24302f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 28px 20px 60px; }
+
+  header { display: flex; align-items: center; gap: 14px; padding-bottom: 18px; }
+  .mark { width: 34px; height: 34px; flex: none; }
+  .mark path { stroke: var(--accent); stroke-width: 2.6; fill: none; stroke-linecap: round; }
+  .brand { font-size: 21px; font-weight: 700; letter-spacing: .01em; }
+  .brand small { display: block; font-size: 12px; font-weight: 500; color: var(--muted);
+                 letter-spacing: .08em; text-transform: uppercase; margin-top: 1px; }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 8px;
+            font-size: 13px; color: var(--ink2); background: var(--card);
+            border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+
+  .lede { color: var(--ink2); font-size: 14px; margin: 4px 0 26px; max-width: 62ch; }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 20px 22px; margin-bottom: 18px; }
+  .card h2 { display: flex; align-items: center; gap: 9px; margin: 0 0 4px;
+             font-size: 15.5px; font-weight: 650; }
+  .card h2 .dot { width: 7px; height: 7px; }
+  .card .sub { font-size: 12.5px; color: var(--muted); margin: 0 0 14px; }
+
+  .sect { font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
+          color: var(--muted); margin: 16px 0 8px; }
   table { border-collapse: collapse; width: 100%; }
-  td, th { padding: .45rem .6rem; border-bottom: 1px solid #8883; text-align: left; vertical-align: middle; }
-  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; color: #888; }
-  input { width: 100%; box-sizing: border-box; font: inherit; padding: .35rem .5rem; border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; }
-  button { font: inherit; padding: .35rem .9rem; border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
-  button:hover { border-color: #888; }
-  #toast { position: fixed; bottom: 1rem; right: 1rem; padding: .6rem 1rem; border-radius: 8px; background: #2a7d2a; color: #fff; opacity: 0; transition: opacity .3s; }
-  #toast.err { background: #b03030; }
-  code { font-size: .85em; }
+  td, th { padding: 9px 10px; text-align: left; vertical-align: middle; }
+  tr + tr td { border-top: 1px solid var(--line); }
+  th { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
+       color: var(--muted); border-bottom: 1px solid var(--line); }
+  td.field { width: 24%; }
+  td.field code { font: 600 13px/1.3 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  td.action { width: 92px; text-align: right; }
+  .arrow { color: var(--muted); padding: 0 2px; }
+
+  input { width: 100%; font: 13.5px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+          padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+          background: transparent; color: var(--ink); transition: border-color .15s; }
+  input:focus { outline: none; border-color: var(--accent); background: var(--wash); }
+
+  button { font: 600 13px system-ui, sans-serif; padding: 7px 14px; border-radius: 8px;
+           border: 1px solid var(--line); background: transparent; color: var(--muted);
+           cursor: pointer; transition: all .15s; }
+  tr.dirty button, .const.dirty button { background: var(--accent); border-color: var(--accent);
+           color: var(--accent-ink); }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .consts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .const { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .const label { display: block; font: 600 11px/1 ui-monospace, Menlo, monospace;
+                 letter-spacing: .04em; color: var(--ink2); margin-bottom: 8px; }
+  .const .row { display: flex; gap: 8px; }
+
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 26px; max-width: 64ch; }
+
+  #toast { position: fixed; bottom: 18px; right: 18px; padding: 11px 18px; border-radius: 10px;
+           background: var(--ok); color: #fff; font-size: 14px; opacity: 0; transform: translateY(6px);
+           transition: all .25s; pointer-events: none; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+  #toast.show { opacity: 1; transform: none; }
+  #toast.err { background: var(--err); }
 </style>
 </head>
 <body>
-<h1>Vejas — business surface</h1>
-<p class="hint">These values come straight from the flow files. Correct a source path, a transform chain
-(<code>path | transform | transform</code>) or a constant, then Apply: the literal is rewritten in the code
-and the flow reloads. Nothing else in the code is touched.</p>
-<div id="root">loading…</div>
+<div class="wrap">
+  <header>
+    <svg class="mark" viewBox="0 0 34 34" aria-hidden="true">
+      <path d="M3 11 h17 a4.5 4.5 0 1 0 -4.5 -4.5"/>
+      <path d="M3 18 h24 a4.5 4.5 0 1 1 -4.5 4.5"/>
+      <path d="M3 25 h13"/>
+    </svg>
+    <div class="brand">Vejas<small>business surface</small></div>
+    <div class="status" id="status"><span class="dot"></span><span>loading…</span></div>
+  </header>
+  <p class="lede">Every value on this page lives in a flow file. Correct a source path, a transform
+  chain (<b>path&nbsp;|&nbsp;transform</b>) or a constant, then Apply: only that literal is rewritten
+  and the flow reloads. The code around it stays untouched.</p>
+  <div id="root">loading…</div>
+  <footer>Vejas panel v0 — corrections are applied live. Next: sample values from traces,
+  shadow-replay of recent events, and approval before promote.</footer>
+</div>
 <div id="toast"></div>
 <script>
 const root = document.getElementById('root');
+const statusEl = document.getElementById('status');
 const toast = (msg, err) => {
   const t = document.getElementById('toast');
-  t.textContent = msg; t.className = err ? 'err' : ''; t.style.opacity = 1;
-  setTimeout(() => t.style.opacity = 0, 2600);
+  t.textContent = msg; t.className = err ? 'show err' : 'show';
+  setTimeout(() => t.className = t.className.replace('show', ''), 2800);
 };
 const ruleToText = r => Array.isArray(r) ? r.join(' | ') : String(r);
 const textToRule = t => {
@@ -50,59 +124,84 @@ async function setLiteral(file, name, key, value) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({file, name, key, value})
   });
-  const body = await res.text();
-  if (!res.ok) throw new Error(body);
+  if (!res.ok) throw new Error(await res.text());
   await fetch('/reload', {method: 'POST'});
 }
+function applyButton(getDirtyRoot, doApply) {
+  const btn = document.createElement('button');
+  btn.textContent = 'Apply';
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = '…';
+    try { await doApply(); toast('Updated — flow reloaded'); getDirtyRoot().classList.remove('dirty'); }
+    catch (e) { toast(e.message.slice(0, 120), true); }
+    btn.disabled = false; btn.textContent = 'Apply';
+  };
+  return btn;
+}
 async function load() {
-  const res = await fetch('/surface');
-  const entries = await res.json();
-  if (!entries.length) { root.textContent = 'No business surface declared yet.'; return; }
+  const [surface, topo] = await Promise.all([
+    fetch('/surface').then(r => r.json()),
+    fetch('/topology').then(r => r.json()).catch(() => ({flows: []})),
+  ]);
+  const running = (topo.flows || []).filter(f => f.status === 'running').length;
+  statusEl.innerHTML = `<span class="dot"></span><span>${running} flow${running === 1 ? '' : 's'} running</span>`;
+  if (!surface.length) { root.textContent = 'No business surface declared yet.'; return; }
   root.innerHTML = '';
   const byFile = {};
-  for (const e of entries) (byFile[e.file] ??= []).push(e);
+  for (const e of surface) (byFile[e.file] ??= []).push(e);
   for (const [file, list] of Object.entries(byFile)) {
-    const h2 = document.createElement('h2');
-    h2.textContent = file.split('/').pop();
-    root.appendChild(h2);
-    for (const entry of list) {
-      if (entry.kind === 'mapping') {
-        const table = document.createElement('table');
-        table.innerHTML = '<tr><th>field</th><th>comes from</th><th></th></tr>';
-        for (const [target, rule] of Object.entries(entry.value)) {
-          const tr = document.createElement('tr');
-          const input = document.createElement('input');
-          input.value = ruleToText(rule);
-          const btn = document.createElement('button');
-          btn.textContent = 'Apply';
-          btn.onclick = () => setLiteral(file, entry.name, target, textToRule(input.value))
-            .then(() => toast(`${target} updated, flow reloaded`))
-            .catch(e => toast(e.message, true));
-          const tds = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
-          tds[0].innerHTML = `<code>${target}</code>`;
-          tds[1].appendChild(input); tds[2].appendChild(btn);
-          tds.forEach(td => tr.appendChild(td));
-          table.appendChild(tr);
-        }
-        root.appendChild(table);
-      } else {
-        const table = document.createElement('table');
+    const short = file.split('/').pop();
+    const flowInfo = (topo.flows || []).find(f => f.file.endsWith(short));
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<h2><span class="dot" style="background:${flowInfo && flowInfo.status === 'running' ? 'var(--ok)' : 'var(--muted)'}"></span>${short.replace('.py','')}</h2>
+      <p class="sub">${file}${flowInfo ? ' · ' + flowInfo.status + (flowInfo.restarts ? ' · ' + flowInfo.restarts + ' reload' + (flowInfo.restarts > 1 ? 's' : '') : '') : ''}</p>`;
+    const mappings = list.filter(e => e.kind === 'mapping');
+    const consts = list.filter(e => e.kind === 'constant');
+    for (const entry of mappings) {
+      const sect = document.createElement('div');
+      sect.className = 'sect'; sect.textContent = entry.name.toLowerCase();
+      card.appendChild(sect);
+      const table = document.createElement('table');
+      table.innerHTML = '<tr><th>field</th><th></th><th>comes from</th><th></th></tr>';
+      for (const [target, rule] of Object.entries(entry.value)) {
         const tr = document.createElement('tr');
         const input = document.createElement('input');
-        input.value = String(entry.value);
-        const btn = document.createElement('button');
-        btn.textContent = 'Apply';
-        btn.onclick = () => setLiteral(file, entry.name, '-', parseConst(input.value))
-          .then(() => toast(`${entry.name} updated, flow reloaded`))
-          .catch(e => toast(e.message, true));
-        const tds = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
-        tds[0].innerHTML = `<code>${entry.name}</code>`;
-        tds[1].appendChild(input); tds[2].appendChild(btn);
-        tds.forEach(td => tr.appendChild(td));
+        input.value = ruleToText(rule);
+        input.oninput = () => tr.classList.add('dirty');
+        const btn = applyButton(() => tr,
+          () => setLiteral(file, entry.name, target, textToRule(input.value)));
+        tr.innerHTML = `<td class="field"><code>${target}</code></td><td class="arrow">←</td>`;
+        const tdIn = document.createElement('td'); tdIn.appendChild(input);
+        const tdBtn = document.createElement('td'); tdBtn.className = 'action'; tdBtn.appendChild(btn);
+        tr.appendChild(tdIn); tr.appendChild(tdBtn);
         table.appendChild(tr);
-        root.appendChild(table);
       }
+      card.appendChild(table);
     }
+    if (consts.length) {
+      const sect = document.createElement('div');
+      sect.className = 'sect'; sect.textContent = 'constants';
+      card.appendChild(sect);
+      const grid = document.createElement('div');
+      grid.className = 'consts';
+      for (const entry of consts) {
+        const box = document.createElement('div');
+        box.className = 'const';
+        const label = document.createElement('label'); label.textContent = entry.name;
+        const row = document.createElement('div'); row.className = 'row';
+        const input = document.createElement('input');
+        input.value = String(entry.value);
+        input.oninput = () => box.classList.add('dirty');
+        const btn = applyButton(() => box,
+          () => setLiteral(file, entry.name, '-', parseConst(input.value)));
+        row.appendChild(input); row.appendChild(btn);
+        box.appendChild(label); box.appendChild(row);
+        grid.appendChild(box);
+      }
+      card.appendChild(grid);
+    }
+    root.appendChild(card);
   }
 }
 load().catch(e => { root.textContent = 'cannot load /surface: ' + e.message; });

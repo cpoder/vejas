@@ -6,6 +6,8 @@ Vėjas is the old Baltic god of the wind. Wind moves things without anyone drawi
 
 **Status: design & demo stage.** The manifesto explains the bet: [MANIFESTO.md](MANIFESTO.md).
 
+![The business panel — mappings and constants extracted from plain code, correctable by a domain expert](docs/screenshots/panel-light.png)
+
 ## How it works
 
 - **Runtime**: one Rust binary. Supervises flows, wires them to the bus, handles retries and backpressure, exports OpenTelemetry traces.
