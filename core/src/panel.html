@@ -20,7 +20,7 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
          font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  .wrap { max-width: 920px; margin: 0 auto; padding: 26px 20px 60px; }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 26px 20px 60px; }
 
   header { display: flex; align-items: center; gap: 14px; padding-bottom: 16px; }
   .mark { width: 34px; height: 34px; flex: none; }
@@ -36,11 +36,13 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
           padding: 20px 22px; margin-bottom: 16px; }
   .card h2 { display: flex; align-items: center; gap: 9px; margin: 0 0 4px;
-             font-size: 15.5px; font-weight: 650; }
+             font-size: 15.5px; font-weight: 650; flex-wrap: wrap; }
   .card h2 .dot { width: 7px; height: 7px; }
   .card .sub { font-size: 12.5px; color: var(--muted); margin: 0 0 12px; }
+  .badge { font: 600 10px var(--mono); letter-spacing: .05em; padding: 2px 7px;
+           border-radius: 5px; background: var(--wash); color: var(--accent); }
+  .badge.pkg { background: var(--chip); color: var(--ink2); }
 
-  /* new flow */
   .newflow { display: flex; gap: 10px; }
   .newflow input { flex: 1; font: 14px system-ui, sans-serif; padding: 10px 14px;
                    border: 1px solid var(--line); border-radius: 9px; background: transparent; color: var(--ink); }
@@ -51,15 +53,17 @@
   .newflow button:disabled { opacity: .6; cursor: wait; }
   .hint { font-size: 12.5px; color: var(--muted); margin: 10px 0 0; }
 
-  /* pipeline */
   #pipe { width: 100%; height: auto; display: block; }
   .pill { fill: var(--wash); stroke: var(--line); }
   .pill-t { font: 600 11.5px var(--mono); fill: var(--ink2); }
   .fnode { fill: var(--card); stroke: var(--line); }
   .fnode-t { font: 650 12.5px system-ui, sans-serif; fill: var(--ink); }
+  .snode { fill: var(--chip); stroke: var(--line); }
+  .snode-t { font: 600 11px var(--mono); fill: var(--ink2); }
   .chip-t { font: 600 11px system-ui, sans-serif; fill: var(--muted); }
   .edge { stroke: var(--accent); stroke-width: 1.6; fill: none; opacity: .55; }
   .edge.dashed { stroke-dasharray: 4 4; opacity: .3; stroke: var(--muted); }
+  .edge.svc { stroke-dasharray: 2 3; opacity: .5; }
   .colh { font: 600 10px system-ui, sans-serif; fill: var(--muted); letter-spacing: .08em; }
 
   .sect { font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
@@ -69,22 +73,21 @@
   tr + tr td { border-top: 1px solid var(--line); }
   th { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
        color: var(--muted); border-bottom: 1px solid var(--line); }
-  td.field { width: 20%; } td.field code { font: 600 13px var(--mono); }
+  td.field { width: 22%; } td.field code { font: 600 13px var(--mono); }
   td.action { width: 84px; text-align: right; }
-  td.sample { width: 26%; font: 11.5px var(--mono); color: var(--muted); overflow: hidden; }
+  td.sample { width: 25%; font: 11.5px var(--mono); color: var(--muted); }
   td.sample b { color: var(--ink2); font-weight: 600; }
   .arrow { color: var(--muted); padding: 0 2px; }
-  tr.subrow td.field { padding-left: 28px; }
-  .each-tag { font: 600 11px var(--mono); color: var(--accent); background: var(--wash);
-              border-radius: 6px; padding: 3px 8px; }
 
   input.rule { width: 100%; font: 13px var(--mono); padding: 6px 9px; border: 1px solid var(--line);
                border-radius: 8px; background: transparent; color: var(--ink); }
   input.rule:focus { outline: none; border-color: var(--accent); background: var(--wash); }
-  button.apply { font: 600 12.5px system-ui, sans-serif; padding: 6px 12px; border-radius: 8px;
+  button.apply, button.tool { font: 600 12.5px system-ui, sans-serif; padding: 6px 12px; border-radius: 8px;
                  border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
   tr.dirty button.apply, .const.dirty button.apply { background: var(--accent);
                  border-color: var(--accent); color: var(--accent-ink); }
+  button.tool:hover { border-color: var(--accent); color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; margin: 10px 0 2px; }
 
   .consts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 11px; }
   .const { border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
@@ -99,6 +102,15 @@
              padding: 10px 12px; margin: 8px 0 2px; overflow-x: auto; color: var(--ink2); }
   .run details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 4px; }
   .run .err { color: var(--err); }
+
+  textarea.editor { width: 100%; min-height: 220px; font: 13px/1.55 var(--mono);
+    border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+    color: var(--ink); padding: 12px 14px; resize: vertical; }
+  textarea.editor:focus { outline: none; border-color: var(--accent); }
+  .editor-row { display: none; margin-top: 10px; }
+  .editor-row.open { display: block; }
+  .editor-row .bar { display: flex; justify-content: space-between; align-items: center; margin: 6px 0; }
+  .editor-row .bar span { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
 
   footer { color: var(--muted); font-size: 12.5px; margin-top: 24px; max-width: 66ch; }
   #toast { position: fixed; bottom: 18px; right: 18px; padding: 11px 18px; border-radius: 10px;
@@ -123,23 +135,23 @@
   <div class="card">
     <h2>New flow</h2>
     <div class="newflow">
-      <input id="prompt" placeholder="Describe the integration — e.g. “when a Stripe payment fails, alert Slack with the amount in euros and the customer email”">
+      <input id="prompt" placeholder="Describe the integration — your agent writes it in VejasScript, one screen of readable code">
       <button id="gen">Generate</button>
     </div>
-    <p class="hint">Your agent writes the flow as plain Python against the SDK contract. It lands below,
-    running, with its mappings, tables and constants ready for review. You never see the code unless you want to.</p>
+    <p class="hint">The flow lands below, running, with its tables and constants ready for review.
+    Open the script to read or edit the whole treatment; open the input to change the sample event.</p>
   </div>
 
   <div class="card">
     <h2>Pipeline</h2>
-    <p class="sub">Derived from the code itself — sources, flows, destinations and connectors. Nothing to keep in sync.</p>
+    <p class="sub">Derived from the code itself — sources, flows, composed services, destinations, connectors.</p>
     <svg id="pipe"></svg>
   </div>
 
   <div id="root">loading…</div>
-  <footer>Vejas panel v0.2 — corrections rewrite one literal and reload one flow. Sample values come from
-  each flow's fixture; the sample run goes through the real handler, custom code included.
-  Next: live samples from traces, shadow-replay, approvals.</footer>
+  <footer>Vejas panel v0.3 — VejasScript flows run natively in the runtime; corrections rewrite one
+  literal and reload one flow; the whole script and its sample input are editable here. Packages under
+  packages/ are hot-addable. Next: shadow-replay, approvals, package exports &amp; rights.</footer>
 </div>
 <div id="toast"></div>
 <script>
@@ -150,19 +162,21 @@ const toast = (msg, err) => {
   t.textContent = msg; t.className = err ? 'show err' : 'show';
   setTimeout(() => t.className = t.className.replace('show',''), 3200);
 };
-const trunc = (v, n=42) => { const s = typeof v === 'string' ? v : JSON.stringify(v); return s == null ? '∅' : (s.length > n ? s.slice(0, n-1) + '…' : s); };
+const trunc = (v, n=40) => { const s = typeof v === 'string' ? v : JSON.stringify(v); return s == null ? '∅' : (s.length > n ? s.slice(0, n-1) + '…' : s); };
 const ruleToText = r => Array.isArray(r) ? r.join(' | ') : String(r);
 const textToRule = t => { const p = t.split('|').map(s => s.trim()).filter(Boolean); return p.length > 1 ? p : p[0] ?? ''; };
 const parseConst = t => { const s = t.trim();
   if (s === 'true') return true; if (s === 'false') return false;
   if (s !== '' && !isNaN(Number(s))) return Number(s); return s; };
 
-async function setLiteral(file, name, key, value) {
-  const res = await fetch('/surface/set', { method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({file, name, key, value}) });
+async function post(url, payload) {
+  const res = await fetch(url, { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
   if (!res.ok) throw new Error(await res.text());
-  await fetch('/reload', {method: 'POST'});
+  return res;
+}
+async function setLiteral(file, name, key, value) {
+  await post('/surface/set', {file, name, key, value});
 }
 function applyBtn(dirtyEl, doApply) {
   const btn = document.createElement('button');
@@ -175,14 +189,12 @@ function applyBtn(dirtyEl, doApply) {
   };
   return btn;
 }
-function row(table, {label, sub, tag, input, sample, btn}) {
+function row(table, {label, input, sample, btn, arrow}) {
   const tr = document.createElement('tr');
-  if (sub) tr.className = 'subrow';
   const tdF = document.createElement('td'); tdF.className = 'field';
   tdF.innerHTML = `<code>${esc(label)}</code>`;
-  const tdA = document.createElement('td'); tdA.className = 'arrow'; tdA.textContent = '←';
+  const tdA = document.createElement('td'); tdA.className = 'arrow'; tdA.textContent = arrow || '←';
   const tdI = document.createElement('td');
-  if (tag) { const t = document.createElement('span'); t.className = 'each-tag'; t.textContent = tag; tdI.appendChild(t); }
   if (input) tdI.appendChild(input);
   const tdS = document.createElement('td'); tdS.className = 'sample';
   if (sample) { tdS.title = `${sample.rawFull} → ${sample.outFull}`;
@@ -194,44 +206,54 @@ function row(table, {label, sub, tag, input, sample, btn}) {
   return tr;
 }
 
-/* ---------- pipeline graph ---------- */
+/* ---------- pipeline ---------- */
 function drawPipe(graph, topo) {
   const svg = $('#pipe');
-  const flows = graph.flows, cons = graph.connectors;
-  const srcs = [...new Set(flows.flatMap(f => f.sources))];
-  const sinks = [...new Set(flows.flatMap(f => f.emits))];
+  const flows = graph.flows || [], services = graph.services || [], cons = graph.connectors || [];
+  const srcs = [...new Set(flows.flatMap(f => f.sources || []))];
+  const sinks = [...new Set(flows.flatMap(f => f.emits || []))];
   const consOut = cons.filter(c => (c.subjects_out || []).length);
   const consIn = cons.filter(c => (c.subjects_in || []).length);
-  const rows = Math.max(srcs.length, flows.length, sinks.length, 1);
-  const W = 880, rowH = 58, top = 34, H = top + rows * rowH + 26;
+  const rows = Math.max(srcs.length, flows.length + services.length, sinks.length, 1);
+  const W = 900, rowH = 54, top = 34, H = top + rows * rowH + 30;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  const X = { con: 10, src: 150, flow: 400, sink: 620, conIn: 800 };
+  const X = { con: 8, src: 148, flow: 402, sink: 636, conIn: 818 };
   const y = (i, n) => top + (i + .5) * rowH + (rows - n) * rowH / 2;
   let out = '';
   const colh = (x, t) => out += `<text class="colh" x="${x}" y="${top - 14}">${t}</text>`;
-  colh(X.src, 'SOURCES'); colh(X.flow, 'FLOWS'); colh(X.sink, 'DESTINATIONS');
+  colh(X.src, 'SOURCES'); colh(X.flow, 'FLOWS & SERVICES'); colh(X.sink, 'DESTINATIONS');
   const pos = {};
   const pill = (x, yy, text, w) => out += `<rect class="pill" x="${x}" y="${yy - 14}" rx="14" width="${w}" height="28"/>
     <text class="pill-t" x="${x + w/2}" y="${yy + 4}" text-anchor="middle">${esc(text)}</text>`;
   srcs.forEach((s, i) => { const yy = y(i, srcs.length); pos['s:' + s] = yy; pill(X.src, yy, s, 190); });
   sinks.forEach((s, i) => { const yy = y(i, sinks.length); pos['k:' + s] = yy; pill(X.sink, yy, s, 165); });
-  const statusOf = f => (topo.flows || []).find(t => t.file.endsWith('/' + f.name + '.py')) || {};
+  const nAll = flows.length + services.length;
+  const statusOf = f => (topo.flows || []).find(t => t.file === f.file) || {};
   flows.forEach((f, i) => {
-    const yy = y(i, flows.length); pos['f:' + f.name] = yy;
+    const yy = y(i, nAll); pos['f:' + f.name] = yy;
     const st = statusOf(f); const c = st.status === 'running' ? 'var(--ok)' : 'var(--muted)';
-    out += `<rect class="fnode" x="${X.flow}" y="${yy - 17}" rx="9" width="170" height="34"/>
-      <circle cx="${X.flow + 16}" cy="${yy}" r="4" fill="${c}"/>
-      <text class="fnode-t" x="${X.flow + 28}" y="${yy + 4}">${esc(f.name)}</text>`;
+    out += `<rect class="fnode" x="${X.flow}" y="${yy - 17}" rx="9" width="176" height="34"/>
+      <circle cx="${X.flow + 15}" cy="${yy}" r="4" fill="${c}"/>
+      <text class="fnode-t" x="${X.flow + 26}" y="${yy + 4}">${esc(trunc(f.name, 18))}</text>`;
   });
-  const curve = (x1, y1, x2, y2, cls) => out += `<path class="edge ${cls || ''}" d="M${x1} ${y1} C ${x1 + 60} ${y1}, ${x2 - 60} ${y2}, ${x2} ${y2}"/>`;
+  services.forEach((s, i) => {
+    const yy = y(flows.length + i, nAll); pos['v:' + (s.name.split(':').pop())] = yy;
+    out += `<rect class="snode" x="${X.flow + 14}" y="${yy - 13}" rx="7" width="148" height="26"/>
+      <text class="snode-t" x="${X.flow + 26}" y="${yy + 4}">⚙ ${esc(trunc(s.name, 16))}</text>`;
+  });
+  const curve = (x1, y1, x2, y2, cls) => out += `<path class="edge ${cls || ''}" d="M${x1} ${y1} C ${x1 + 55} ${y1}, ${x2 - 55} ${y2}, ${x2} ${y2}"/>`;
   flows.forEach(f => {
-    f.sources.forEach(s => curve(X.src + 190, pos['s:' + s], X.flow, pos['f:' + f.name]));
-    f.emits.forEach(e => curve(X.flow + 170, pos['f:' + f.name], X.sink, pos['k:' + e]));
+    (f.sources || []).forEach(s => { if (pos['s:' + s] != null) curve(X.src + 190, pos['s:' + s], X.flow, pos['f:' + f.name]); });
+    (f.emits || []).forEach(e => { if (pos['k:' + e] != null) curve(X.flow + 176, pos['f:' + f.name], X.sink, pos['k:' + e]); });
+    (f.invokes || []).forEach(v => {
+      const key = 'v:' + v.split(':').pop();
+      if (pos[key] != null) curve(X.flow + 88, pos['f:' + f.name] + 17, X.flow + 80, pos[key] - 13, 'svc');
+    });
   });
   consOut.forEach((c, i) => {
-    const yy = top + 6 + i * 26;
+    const yy = top + 6 + i * 24;
     out += `<text class="chip-t" x="${X.con}" y="${yy}">▸ ${esc(c.name)} (${esc((c.subjects_out||[]).join(','))})</text>`;
-    srcs.forEach(s => curve(X.con + 110, yy - 4, X.src, pos['s:' + s], 'dashed'));
+    srcs.forEach(s => curve(X.con + 108, yy - 4, X.src, pos['s:' + s], 'dashed'));
   });
   consIn.forEach(c => {
     (c.subjects_in || []).forEach(s => {
@@ -244,7 +266,7 @@ function drawPipe(graph, topo) {
   svg.innerHTML = out;
 }
 
-/* ---------- cards ---------- */
+/* ---------- sections ---------- */
 function mappingSection(card, file, entry, previewEntries) {
   const sect = document.createElement('div');
   sect.className = 'sect'; sect.textContent = entry.name.toLowerCase();
@@ -253,14 +275,16 @@ function mappingSection(card, file, entry, previewEntries) {
   table.innerHTML = '<tr><th>field</th><th></th><th>comes from</th><th>sample</th><th></th></tr>';
   const pv = (previewEntries || {})[entry.name] || {};
   for (const [target, rule] of Object.entries(entry.value)) {
-    const sampleFor = t => pv[t] ? { raw: trunc(pv[t].raw, 20), out: trunc(pv[t].out, 26),
+    const sampleFor = t => pv[t] ? { raw: trunc(pv[t].raw, 20), out: trunc(pv[t].out, 24),
       rawFull: JSON.stringify(pv[t].raw), outFull: JSON.stringify(pv[t].out) } : null;
     if (rule && typeof rule === 'object' && !Array.isArray(rule)) {
-      row(table, { label: target, tag: `for each ${rule.each}`, sample: sampleFor(target) });
+      row(table, { label: target, input: (() => { const s = document.createElement('span');
+        s.className = 'badge'; s.textContent = `for each ${rule.each}`; return s; })(),
+        sample: sampleFor(target) });
       for (const [sub, subRule] of Object.entries(rule.map || {})) {
         const input = document.createElement('input');
         input.className = 'rule'; input.value = ruleToText(subRule);
-        const tr = row(table, { label: sub, sub: true, input,
+        const tr = row(table, { label: '· ' + sub, input,
           btn: applyBtn(() => tr, () => setLiteral(file, entry.name, `${target}/map/${sub}`, textToRule(input.value))) });
         input.oninput = () => tr.classList.add('dirty');
       }
@@ -283,9 +307,8 @@ function tableSection(card, file, entry) {
   for (const [k, v] of Object.entries(entry.value)) {
     const input = document.createElement('input');
     input.className = 'rule'; input.value = String(v);
-    const tr = row(table, { label: k, input,
+    const tr = row(table, { label: k, input, arrow: '→',
       btn: applyBtn(() => tr, () => setLiteral(file, entry.name, k, parseConst(input.value))) });
-    tr.querySelector('td.arrow').textContent = '→';
     input.oninput = () => tr.classList.add('dirty');
   }
   card.appendChild(table);
@@ -317,27 +340,65 @@ function constsSection(card, file, entries) {
 function runStrip(card, preview) {
   const run = document.createElement('div'); run.className = 'run';
   if (!preview || !preview.fixture) {
-    run.innerHTML = `<span style="color:var(--muted)">No fixture yet — add one under flows/fixtures/ to see the sample run.</span>`;
+    run.innerHTML = `<span style="color:var(--muted)">No fixture yet — open “Edit input” to create the sample event.</span>`;
     card.appendChild(run); return;
   }
   const n = (preview.emits || []).length;
   const subjects = [...new Set((preview.emits || []).map(e => e.subject))];
-  run.innerHTML = `<b>Sample run</b> — fixture event → ${n} emit${n === 1 ? '' : 's'}` +
+  run.innerHTML = `<b>Sample run</b> — input event → ${n} emit${n === 1 ? '' : 's'}` +
     (subjects.length ? ` → ${subjects.map(s => `<code>${esc(s)}</code>`).join(' ')}` : '') +
-    (preview.error ? ` <span class="err">· ${esc(preview.error)}</span>` : '');
+    ((preview.invokes || []).length ? ` · composes ${preview.invokes.map(s => `<code>${esc(s)}</code>`).join(' ')}` : '') +
+    (preview.error ? ` <span class="err">· ${esc(String(preview.error))}</span>` : '');
+  if (preview.input) {
+    const det = document.createElement('details');
+    det.innerHTML = `<summary>input</summary><pre>${esc(JSON.stringify(preview.input, null, 2))}</pre>`;
+    run.appendChild(det);
+  }
   if (n) {
     const det = document.createElement('details');
-    det.innerHTML = `<summary>payload</summary><pre>${esc(JSON.stringify(preview.emits.map(e => e.payload), null, 2))}</pre>`;
+    det.innerHTML = `<summary>output</summary><pre>${esc(JSON.stringify(preview.emits.map(e => ({[e.subject]: e.payload})), null, 2))}</pre>`;
     run.appendChild(det);
   }
   card.appendChild(run);
+}
+function editorRow(kind, file) {
+  const wrap = document.createElement('div');
+  wrap.className = 'editor-row';
+  const bar = document.createElement('div'); bar.className = 'bar';
+  const label = document.createElement('span');
+  const save = document.createElement('button'); save.className = 'tool'; save.textContent = 'Save';
+  bar.appendChild(label); bar.appendChild(save);
+  const ta = document.createElement('textarea'); ta.className = 'editor'; ta.spellcheck = false;
+  wrap.appendChild(bar); wrap.appendChild(ta);
+  let loaded = false;
+  wrap.load = async () => {
+    const url = kind === 'script' ? '/file?path=' + encodeURIComponent(file)
+                                  : '/fixture?file=' + encodeURIComponent(file);
+    const d = await fetch(url).then(r => r.json());
+    label.textContent = d.path; ta.value = d.content; loaded = true;
+  };
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      if (kind === 'script') await post('/file/set', {path: file, content: ta.value});
+      else await post('/fixture/set', {file, content: ta.value});
+      toast(kind === 'script' ? 'Script saved — reloaded' : 'Input saved');
+      await load();
+    } catch (e) { toast(e.message.slice(0, 160), true); }
+    save.disabled = false;
+  };
+  wrap.toggle = async () => {
+    wrap.classList.toggle('open');
+    if (wrap.classList.contains('open') && !loaded) await wrap.load();
+  };
+  return wrap;
 }
 
 async function load() {
   const [surface, topo, graph] = await Promise.all([
     fetch('/surface').then(r => r.json()),
     fetch('/topology').then(r => r.json()).catch(() => ({flows: []})),
-    fetch('/graph').then(r => r.json()).catch(() => ({flows: [], connectors: []})),
+    fetch('/graph').then(r => r.json()).catch(() => ({flows: [], services: [], connectors: []})),
   ]);
   const running = (topo.flows || []).filter(f => f.status === 'running').length;
   $('#status').innerHTML = `<span class="dot"></span><span>${running} flow${running === 1 ? '' : 's'} running</span>`;
@@ -346,22 +407,47 @@ async function load() {
   const byFile = {};
   for (const e of surface) (byFile[e.file] ??= []).push(e);
   const previews = {};
-  await Promise.all(Object.keys(byFile).map(f =>
+  await Promise.all(Object.keys(byFile).filter(f => !byFile[f][0].service).map(f =>
     fetch('/preview?file=' + encodeURIComponent(f)).then(r => r.json())
       .then(p => previews[f] = p).catch(() => {})));
 
   const root = $('#root'); root.innerHTML = '';
-  for (const [file, list] of Object.entries(byFile)) {
+  const ordered = Object.entries(byFile).sort(([a], [b]) =>
+    (byFile[a][0].service ? 1 : 0) - (byFile[b][0].service ? 1 : 0) || a.localeCompare(b));
+  for (const [file, list] of ordered) {
+    const meta = list[0];
     const short = file.split('/').pop();
-    const info = (topo.flows || []).find(f => f.file.endsWith('/' + short)) || {};
+    const info = (topo.flows || []).find(f => f.file === file || f.file.endsWith('/' + short)) || {};
+    const isService = !!meta.service;
+    const lang = meta.lang || (file.endsWith('.vjs') ? 'vjs' : 'py');
     const card = document.createElement('div'); card.className = 'card';
-    card.innerHTML = `<h2><span class="dot" style="background:${info.status === 'running' ? 'var(--ok)' : 'var(--muted)'}"></span>${esc(short.replace('.py',''))}</h2>
+    const badges = `<span class="badge">${lang === 'vjs' ? 'VejasScript' : 'Python'}</span>` +
+      (meta.pkg && meta.pkg !== 'default' ? `<span class="badge pkg">pkg: ${esc(meta.pkg)}</span>` : '') +
+      (isService ? `<span class="badge pkg">service</span>` : '');
+    card.innerHTML = `<h2>${isService ? '' : `<span class="dot" style="background:${info.status === 'running' ? 'var(--ok)' : 'var(--muted)'}"></span>`}${esc(short.replace(/\.(py|vjs)$/,''))} ${badges}</h2>
       <p class="sub">${esc(file)}${info.status ? ' · ' + info.status : ''}${info.restarts ? ' · ' + info.restarts + ' reload' + (info.restarts > 1 ? 's' : '') : ''}</p>`;
-    runStrip(card, previews[file]);
+    if (!isService) runStrip(card, previews[file]);
     for (const e of list.filter(x => x.kind === 'mapping')) mappingSection(card, file, e, (previews[file] || {}).entries);
     for (const e of list.filter(x => x.kind === 'table')) tableSection(card, file, e);
     const consts = list.filter(x => x.kind === 'constant');
     if (consts.length) constsSection(card, file, consts);
+    const toolbar = document.createElement('div'); toolbar.className = 'toolbar';
+    const scriptEd = editorRow('script', file);
+    const btnScript = document.createElement('button'); btnScript.className = 'tool';
+    btnScript.textContent = 'Edit script';
+    btnScript.onclick = () => scriptEd.toggle();
+    toolbar.appendChild(btnScript);
+    let inputEd = null;
+    if (!isService) {
+      inputEd = editorRow('input', file);
+      const btnInput = document.createElement('button'); btnInput.className = 'tool';
+      btnInput.textContent = 'Edit input';
+      btnInput.onclick = () => inputEd.toggle();
+      toolbar.appendChild(btnInput);
+    }
+    card.appendChild(toolbar);
+    card.appendChild(scriptEd);
+    if (inputEd) card.appendChild(inputEd);
     root.appendChild(card);
   }
 }
@@ -372,10 +458,8 @@ $('#gen').onclick = async () => {
   const btn = $('#gen');
   btn.disabled = true; btn.textContent = 'Asking the agent…';
   try {
-    const res = await fetch('/flows/new', { method: 'POST',
-      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompt}) });
-    const body = await res.json().catch(async () => ({ok: false, error: await res.text()}));
-    if (!res.ok || !body.ok) throw new Error(body.error || 'generation failed');
+    const res = await post('/flows/new', {prompt});
+    const body = await res.json();
     toast(`Flow ${body.flow} created and running`);
     $('#prompt').value = '';
     await load();

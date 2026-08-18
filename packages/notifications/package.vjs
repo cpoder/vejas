@@ -1,0 +1,2 @@
+# package: notifications — hot-addable unit (drop the directory, POST /reload)
+ENABLED = true

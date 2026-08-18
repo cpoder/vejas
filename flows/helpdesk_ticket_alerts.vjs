@@ -1,0 +1,13 @@
+# flow: helpdesk_ticket_alerts
+source "vx.helpdesk.tickets"
+
+# French priority label -> severity code. The business expert edits this table.
+SEVERITY_CODES = {"critique": "P1", "haute": "P2", "normale": "P3", "basse": "P4"}
+ALERT_SEVERITIES = ["P1", "P2"]
+
+severity = SEVERITY_CODES[priority] ?? "P3"
+
+if severity in ALERT_SEVERITIES:
+    invoke format_alert(sev: severity, subj: subject, email: requester?.email)
+    emit "vx.slack.out", {text: alert_text}
+end

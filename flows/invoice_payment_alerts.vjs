@@ -1,0 +1,16 @@
+# flow: invoice_payment_alerts
+source "vx.billing.payments"
+
+# Payment method code -> human-readable label. The business expert edits this table.
+PAYMENT_METHOD_LABELS = {"card": "Carte bancaire", "sepa": "Prélèvement SEPA", "transfer": "Virement bancaire"}
+UNKNOWN_METHOD_LABEL = "Moyen de paiement inconnu"
+
+# Only payments strictly above this amount (in euros) raise a Slack alert.
+ALERT_THRESHOLD_EUR = 250
+
+amount_eur = round(amount_cents / 100, 2)
+method_label = PAYMENT_METHOD_LABELS[payment_method] ?? UNKNOWN_METHOD_LABEL
+
+if amount_eur > ALERT_THRESHOLD_EUR:
+    emit "vx.slack.out", {text: f"Paiement reçu — facture {invoice_id} : {amount_eur} € ({method_label})"}
+end

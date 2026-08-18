@@ -1,0 +1,3 @@
+# service: format_alert
+# Inputs: sev, subj, email. Output pipeline: alert_text (merged into caller).
+alert_text = f"[{sev}] {subj} - {lower(email)}"

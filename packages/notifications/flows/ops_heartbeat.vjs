@@ -1,0 +1,6 @@
+# flow: ops_heartbeat — proves the package model: lives in packages/notifications
+source "vx.ops.ping"
+
+HEARTBEAT_TEXT = "ops heartbeat received"
+
+emit "vx.slack.out", {text: f"{HEARTBEAT_TEXT} from {origin ?? "unknown"}"}
