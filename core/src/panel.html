@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vejas — business surface</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1rem; margin: 1.6rem 0 .4rem; font-weight: 600; }
+  p.hint { color: #777; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: .45rem .6rem; border-bottom: 1px solid #8883; text-align: left; vertical-align: middle; }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; color: #888; }
+  input { width: 100%; box-sizing: border-box; font: inherit; padding: .35rem .5rem; border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .35rem .9rem; border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+  button:hover { border-color: #888; }
+  #toast { position: fixed; bottom: 1rem; right: 1rem; padding: .6rem 1rem; border-radius: 8px; background: #2a7d2a; color: #fff; opacity: 0; transition: opacity .3s; }
+  #toast.err { background: #b03030; }
+  code { font-size: .85em; }
+</style>
+</head>
+<body>
+<h1>Vejas — business surface</h1>
+<p class="hint">These values come straight from the flow files. Correct a source path, a transform chain
+(<code>path | transform | transform</code>) or a constant, then Apply: the literal is rewritten in the code
+and the flow reloads. Nothing else in the code is touched.</p>
+<div id="root">loading…</div>
+<div id="toast"></div>
+<script>
+const root = document.getElementById('root');
+const toast = (msg, err) => {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = err ? 'err' : ''; t.style.opacity = 1;
+  setTimeout(() => t.style.opacity = 0, 2600);
+};
+const ruleToText = r => Array.isArray(r) ? r.join(' | ') : String(r);
+const textToRule = t => {
+  const parts = t.split('|').map(s => s.trim()).filter(Boolean);
+  return parts.length > 1 ? parts : parts[0] ?? '';
+};
+const parseConst = t => {
+  const s = t.trim();
+  if (s === 'true') return true; if (s === 'false') return false;
+  if (s !== '' && !isNaN(Number(s))) return Number(s);
+  return s;
+};
+async function setLiteral(file, name, key, value) {
+  const res = await fetch('/surface/set', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({file, name, key, value})
+  });
+  const body = await res.text();
+  if (!res.ok) throw new Error(body);
+  await fetch('/reload', {method: 'POST'});
+}
+async function load() {
+  const res = await fetch('/surface');
+  const entries = await res.json();
+  if (!entries.length) { root.textContent = 'No business surface declared yet.'; return; }
+  root.innerHTML = '';
+  const byFile = {};
+  for (const e of entries) (byFile[e.file] ??= []).push(e);
+  for (const [file, list] of Object.entries(byFile)) {
+    const h2 = document.createElement('h2');
+    h2.textContent = file.split('/').pop();
+    root.appendChild(h2);
+    for (const entry of list) {
+      if (entry.kind === 'mapping') {
+        const table = document.createElement('table');
+        table.innerHTML = '<tr><th>field</th><th>comes from</th><th></th></tr>';
+        for (const [target, rule] of Object.entries(entry.value)) {
+          const tr = document.createElement('tr');
+          const input = document.createElement('input');
+          input.value = ruleToText(rule);
+          const btn = document.createElement('button');
+          btn.textContent = 'Apply';
+          btn.onclick = () => setLiteral(file, entry.name, target, textToRule(input.value))
+            .then(() => toast(`${target} updated, flow reloaded`))
+            .catch(e => toast(e.message, true));
+          const tds = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
+          tds[0].innerHTML = `<code>${target}</code>`;
+          tds[1].appendChild(input); tds[2].appendChild(btn);
+          tds.forEach(td => tr.appendChild(td));
+          table.appendChild(tr);
+        }
+        root.appendChild(table);
+      } else {
+        const table = document.createElement('table');
+        const tr = document.createElement('tr');
+        const input = document.createElement('input');
+        input.value = String(entry.value);
+        const btn = document.createElement('button');
+        btn.textContent = 'Apply';
+        btn.onclick = () => setLiteral(file, entry.name, '-', parseConst(input.value))
+          .then(() => toast(`${entry.name} updated, flow reloaded`))
+          .catch(e => toast(e.message, true));
+        const tds = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
+        tds[0].innerHTML = `<code>${entry.name}</code>`;
+        tds[1].appendChild(input); tds[2].appendChild(btn);
+        tds.forEach(td => tr.appendChild(td));
+        table.appendChild(tr);
+        root.appendChild(table);
+      }
+    }
+  }
+}
+load().catch(e => { root.textContent = 'cannot load /surface: ' + e.message; });
+</script>
+</body>
+</html>

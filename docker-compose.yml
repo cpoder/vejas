@@ -1,0 +1,18 @@
+# The whole deployment story: a bus and a runtime.
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+
+  vejas:
+    build: .
+    environment:
+      NATS_URL: nats://nats:4222
+      # SLACK_WEBHOOK_URL: https://hooks.slack.com/services/...   # optional; DRY-RUN without it
+    ports:
+      - "8686:8686"   # monitoring: /healthz /topology /reload
+      - "8787:8787"   # http-in connector: POST /ingest/<subject-suffix>
+    depends_on:
+      - nats
