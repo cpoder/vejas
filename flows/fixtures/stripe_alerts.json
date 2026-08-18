@@ -1,0 +1,10 @@
+{
+  "type": "payment_intent.succeeded",
+  "data": {
+    "object": {
+      "amount": 123400,
+      "currency": "eur",
+      "customer": "cus_9XKL2m"
+    }
+  }
+}

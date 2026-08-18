@@ -1,0 +1,14 @@
+{
+  "id": "#1042",
+  "email": "John.Doe@ACME.com",
+  "total_price": "189.90",
+  "currency": "eur",
+  "shipping_address": {
+    "country": "France"
+  },
+  "line_items": [
+    { "sku": "TSH-BLK-M", "quantity": "2", "unit_price_cents": 2950 },
+    { "sku": "MUG-LOGO", "quantity": "1", "unit_price_cents": 1490 },
+    { "sku": "STK-PACK", "quantity": "3", "unit_price_cents": 350 }
+  ]
+}

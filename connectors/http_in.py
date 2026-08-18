@@ -18,6 +18,10 @@ from vejas import ensure_stream, SUBJECT_ROOT, NATS_URL
 
 PORT = int(os.environ.get("HTTP_IN_PORT", "8787"))
 
+# Declared surface for the pipeline graph: this connector publishes anywhere
+# under the root (the ingest path decides the exact subject).
+SUBJECTS_OUT = ["vx.*"]
+
 loop = asyncio.new_event_loop()
 _js = None
 

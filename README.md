@@ -6,7 +6,11 @@ Vėjas is the old Baltic god of the wind. Wind moves things without anyone drawi
 
 **Status: design & demo stage.** The manifesto explains the bet: [MANIFESTO.md](MANIFESTO.md).
 
-![The business panel — mappings and constants extracted from plain code, correctable by a domain expert](docs/screenshots/panel-light.png)
+![Prompt-to-flow and the pipeline, derived from the code itself](docs/screenshots/panel-top.png)
+
+The card below belongs to a flow an agent wrote from one sentence: transcoding table seeded, samples from the fixture, the real emitted payload on top. A domain expert corrects any of it without touching code:
+
+![An agent-written flow — sample run, mappings with live samples, transcoding table, constants](docs/screenshots/panel-agent-flow.png)
 
 ## How it works
 

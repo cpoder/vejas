@@ -9,13 +9,20 @@
 // consumers, ack/nak) live in the SDK, so this binary stays a boring,
 // dependency-light supervisor: spawn, watch, restart with backoff, report.
 //
-// HTTP surface (the only UI is monitoring):
-//   GET  /healthz   -> "ok"
-//   GET  /topology  -> JSON: every supervised process, status, pid, restarts
-//   POST /reload    -> rescan flows/ and connectors/, start new, stop removed
+// HTTP surface (one request = one thread; /flows/new can take minutes):
+//   GET  /            -> the panel (also /panel)
+//   GET  /healthz     -> "ok"
+//   GET  /topology    -> JSON: every supervised process, status, pid, restarts
+//   GET  /graph       -> JSON: static pipeline graph (AST-derived)
+//   GET  /surface     -> JSON: business surface (mappings, tables, constants)
+//   GET  /preview?file=<flow.py> -> mapping preview + sample run on the fixture
+//   POST /surface/set -> rewrite one literal in place, JSON {file,name,key,value}
+//   POST /flows/new   -> ask the agent CLI for a new flow, JSON {prompt}
+//   POST /reload      -> rescan; start new, stop removed, restart changed files
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -116,7 +123,6 @@ fn build_command(spec: &Spec, root: &Path) -> Command {
             c
         }
     };
-    // The SDK is importable without installation; PYTHONPATH is enough.
     let sdk = root.join("sdk").join("python");
     let py_path = match env::var("PYTHONPATH") {
         Ok(existing) if !existing.is_empty() => format!("{}:{}", sdk.display(), existing),
@@ -156,7 +162,6 @@ fn supervise(handle: Arc<Handle>, root: PathBuf) {
         }
         eprintln!("[vejas] {} started (pid {})", handle.spec.name, child.id());
 
-        // Poll so a stop request can interrupt the wait.
         let exit = loop {
             if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                 let _ = child.kill();
@@ -186,7 +191,6 @@ fn supervise(handle: Arc<Handle>, root: PathBuf) {
                     handle.spec.name,
                     exit.and_then(|s| s.code())
                 );
-                // A process that lived a while earns a fresh backoff.
                 if started.elapsed() > Duration::from_secs(30) {
                     delay = Duration::from_secs(1);
                 }
@@ -231,7 +235,6 @@ fn reload(registry: &Registry, root: &Path) -> (usize, usize, usize) {
     }
     let mut started = 0;
     let mut stopped = 0;
-    // (stopped?, mtime) per currently registered process
     let current: HashMap<String, (bool, u64)> = {
         let reg = registry.lock().unwrap();
         for (name, handle) in reg.iter() {
@@ -246,10 +249,9 @@ fn reload(registry: &Registry, root: &Path) -> (usize, usize, usize) {
     };
     for (name, spec) in &wanted {
         let restart = match current.get(name) {
-            None => true,                        // brand new
-            Some((true, _)) => true,             // previously stopped
+            None => true,
+            Some((true, _)) => true,
             Some((false, old_mtime)) if *old_mtime != spec.mtime => {
-                // file changed (e.g. a business-surface edit): replace the process
                 if let Some(handle) = registry.lock().unwrap().get(name) {
                     handle.stop.store(true, Ordering::SeqCst);
                 }
@@ -307,6 +309,104 @@ fn vejas_py(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+fn respond(request: tiny_http::Request, code: u16, body: String, ctype: &str) {
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
+    let _ = request.respond(
+        tiny_http::Response::from_string(body)
+            .with_status_code(code)
+            .with_header(header),
+    );
+}
+
+fn handle_request(mut request: tiny_http::Request, registry: Registry, root: PathBuf) {
+    let method = request.method().clone();
+    let url = request.url().to_string();
+    match (method, url.as_str()) {
+        (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
+            request,
+            200,
+            include_str!("panel.html").to_string(),
+            "text/html; charset=utf-8",
+        ),
+        (tiny_http::Method::Get, "/healthz") => respond(request, 200, "ok".into(), "text/plain"),
+        (tiny_http::Method::Get, "/topology") => respond(
+            request,
+            200,
+            topology_json(&registry).to_string(),
+            "application/json",
+        ),
+        (tiny_http::Method::Get, "/graph") => {
+            let root_s = root.display().to_string();
+            match vejas_py(&root, &["graph", &root_s]) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, "/surface") => {
+            let flows = root.join("flows").display().to_string();
+            match vejas_py(&root, &["surface", &flows]) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, u) if u.starts_with("/preview?file=") => {
+            let file = u.trim_start_matches("/preview?file=").replace("%2F", "/");
+            match vejas_py(&root, &["preview", &file]) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/surface/set") => {
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => {
+                    let file = v["file"].as_str().unwrap_or("").to_string();
+                    let name = v["name"].as_str().unwrap_or("").to_string();
+                    let key = v["key"].as_str().unwrap_or("-").to_string();
+                    let value = v["value"].to_string();
+                    match vejas_py(&root, &["set", &file, &name, &key, &value]) {
+                        Ok(json) => respond(request, 200, json, "application/json"),
+                        Err(err) => respond(request, 422, err, "text/plain"),
+                    }
+                }
+                Err(err) => respond(request, 400, format!("bad json: {err}"), "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/flows/new") => {
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            let prompt = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["prompt"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            if prompt.trim().is_empty() {
+                return respond(request, 400, "missing prompt".into(), "text/plain");
+            }
+            eprintln!("[vejas] asking the agent for a new flow…");
+            let root_s = root.display().to_string();
+            match vejas_py(&root, &["new", &prompt, &root_s]) {
+                Ok(json) => {
+                    let (_, started, _) = reload(&registry, &root);
+                    eprintln!("[vejas] agent flow landed ({started} started)");
+                    respond(request, 200, json, "application/json")
+                }
+                Err(err) => respond(request, 422, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/reload") => {
+            let (total, started, stopped) = reload(&registry, &root);
+            respond(
+                request,
+                200,
+                json!({"total": total, "started": started, "stopped": stopped}).to_string(),
+                "application/json",
+            )
+        }
+        _ => respond(request, 404, "not found".into(), "text/plain"),
+    }
+}
+
 fn serve_http(registry: Registry, root: PathBuf, addr: String) {
     let server = match tiny_http::Server::http(&addr) {
         Ok(server) => server,
@@ -315,72 +415,11 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
             return;
         }
     };
-    eprintln!("[vejas] monitoring on http://{addr} (/healthz /topology /reload)");
+    eprintln!("[vejas] panel + monitoring on http://{addr}");
     for request in server.incoming_requests() {
-        let method = request.method().clone();
-        let url = request.url().to_string();
-        let respond = |req: tiny_http::Request, code: u16, body: String, ctype: &str| {
-            let header =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
-            let _ = req.respond(
-                tiny_http::Response::from_string(body)
-                    .with_status_code(code)
-                    .with_header(header),
-            );
-        };
-        match (method, url.as_str()) {
-            (tiny_http::Method::Get, "/healthz") => {
-                respond(request, 200, "ok".into(), "text/plain")
-            }
-            (tiny_http::Method::Get, "/topology") => respond(
-                request,
-                200,
-                topology_json(&registry).to_string(),
-                "application/json",
-            ),
-            (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
-                request,
-                200,
-                include_str!("panel.html").to_string(),
-                "text/html; charset=utf-8",
-            ),
-            (tiny_http::Method::Get, "/surface") => {
-                let flows = root.join("flows").display().to_string();
-                match vejas_py(&root, &["surface", &flows]) {
-                    Ok(json) => respond(request, 200, json, "application/json"),
-                    Err(err) => respond(request, 500, err, "text/plain"),
-                }
-            }
-            (tiny_http::Method::Post, "/surface/set") => {
-                let mut request = request;
-                let mut body = String::new();
-                use std::io::Read;
-                let _ = request.as_reader().read_to_string(&mut body);
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(v) => {
-                        let file = v["file"].as_str().unwrap_or("").to_string();
-                        let name = v["name"].as_str().unwrap_or("").to_string();
-                        let key = v["key"].as_str().unwrap_or("-").to_string();
-                        let value = v["value"].to_string();
-                        match vejas_py(&root, &["set", &file, &name, &key, &value]) {
-                            Ok(json) => respond(request, 200, json, "application/json"),
-                            Err(err) => respond(request, 422, err, "text/plain"),
-                        }
-                    }
-                    Err(err) => respond(request, 400, format!("bad json: {err}"), "text/plain"),
-                }
-            }
-            (tiny_http::Method::Post, "/reload") => {
-                let (total, started, stopped) = reload(&registry, &root);
-                respond(
-                    request,
-                    200,
-                    json!({"total": total, "started": started, "stopped": stopped}).to_string(),
-                    "application/json",
-                )
-            }
-            _ => respond(request, 404, "not found".into(), "text/plain"),
-        }
+        let registry = registry.clone();
+        let root = root.clone();
+        thread::spawn(move || handle_request(request, registry, root));
         if !RUNNING.load(Ordering::SeqCst) {
             break;
         }
@@ -410,7 +449,6 @@ fn main() {
     while RUNNING.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(300));
     }
-    // Give supervisors a moment to kill children.
     let reg = registry.lock().unwrap();
     for handle in reg.values() {
         handle.stop.store(true, Ordering::SeqCst);

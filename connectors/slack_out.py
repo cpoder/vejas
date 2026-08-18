@@ -16,6 +16,9 @@ from vejas import ensure_stream, SUBJECT_ROOT, NATS_URL
 SUBJECT = f"{SUBJECT_ROOT}.slack.out"
 WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
 
+# Declared surface for the pipeline graph.
+SUBJECTS_IN = ["vx.slack.out"]
+
 
 def _post(text):
     req = urllib.request.Request(
