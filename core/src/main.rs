@@ -225,8 +225,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     return Ok(());
                 }
                 engine.invalidate(); // pick up live service edits
-                let batch = sub.fetch(10).map_err(|e| e.to_string())?;
-                for msg in batch {
+                for msg in connectors::fetch_round(&sub)? {
+                    if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                        // stopped mid-batch: leave the message un-acked, it
+                        // redelivers to whoever holds the durable next
+                        return Ok(());
+                    }
                     let event: Value = match serde_json::from_slice(&msg.data) {
                         Ok(v) => v,
                         Err(e) => {
@@ -259,7 +263,6 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(150));
             }
         })();
         match attempt {

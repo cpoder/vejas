@@ -291,6 +291,31 @@ impl Driver for HttpPoll {
     }
 }
 
+// ───────────────────────── pull rounds ─────────────────────────
+
+/// One bounded pull round: up to 10 messages, and the server resolves the
+/// request within PULL_EXPIRES_NS (messages or a 408 timeout status), so the
+/// calling loop gets control back and can re-check its stop flag. A plain
+/// `fetch()` parks forever on an idle subject: a stopped flow's thread stayed
+/// wedged in `recv()`, reported "running", and processed one more message
+/// before dying (the zombie-consumer trap caught while rehearsing the demo).
+pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
+    // server-side expiry (ns) strictly below the client-side wait, so every
+    // pull is resolved by the server and none accumulates in max_waiting
+    const PULL_EXPIRES_NS: usize = 700_000_000;
+    let iter = sub
+        .timeout_fetch(
+            nats::jetstream::BatchOptions {
+                batch: 10,
+                expires: Some(PULL_EXPIRES_NS),
+                no_wait: false,
+            },
+            Duration::from_millis(1000),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(iter.map_while(|m| m.ok()).collect())
+}
+
 // ───────────────────────── sinks ─────────────────────────
 
 /// Shared sink loop: durable pull consumer -> handler; ack on Ok, nak on Err.
@@ -320,8 +345,11 @@ fn run_sink(
         if !ctx.alive() {
             return Ok(());
         }
-        let batch = sub.fetch(10).map_err(|e| e.to_string())?;
-        for msg in batch {
+        for msg in fetch_round(&sub)? {
+            if !ctx.alive() {
+                // stopped mid-batch: leave the message un-acked, it redelivers
+                return Ok(());
+            }
             match handler(&msg.data) {
                 Ok(()) => {
                     let _ = msg.ack();
@@ -332,7 +360,6 @@ fn run_sink(
                 }
             }
         }
-        thread::sleep(Duration::from_millis(150));
     }
 }
 
