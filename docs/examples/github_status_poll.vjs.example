@@ -1,0 +1,5 @@
+# connector: github_status_poll
+driver "http-poll"
+URL = "https://www.githubstatus.com/api/v2/status.json"
+SUBJECT = "vx.github.status"
+INTERVAL_SECS = 60

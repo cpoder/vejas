@@ -703,15 +703,12 @@ Rules:
 
 Task: {task}"#;
 
-fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
-    let existing: Vec<String> = scan_all(root).iter().map(|s| s.name.clone()).collect();
-    let full = CONTRACT_VJS
-        .replace("{existing}", &existing.join(", "))
-        .replace("{task}", prompt);
+/// Ask the agent CLI for a file and return its content (markdown fences stripped).
+fn ask_agent(prompt: String) -> Result<String, String> {
     let agent = env::var("VEJAS_AGENT_CMD").unwrap_or_else(|_| "claude".into());
     let out = Command::new(agent)
         .arg("-p")
-        .arg(full)
+        .arg(prompt)
         .output()
         .map_err(|e| format!("agent spawn: {e}"))?;
     if !out.status.success() {
@@ -727,25 +724,94 @@ fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
             .to_string();
     }
     code.push('\n');
+    Ok(code)
+}
+
+fn unique_target(dir: &Path, name: &str) -> PathBuf {
+    let mut target = dir.join(format!("{name}.vjs"));
+    let mut n = 2;
+    while target.exists() {
+        target = dir.join(format!("{name}_{n}.vjs"));
+        n += 1;
+    }
+    target
+}
+
+fn first_line_name(code: &str, prefix: &str, fallback: &str) -> String {
+    code.lines()
+        .next()
+        .and_then(|l| l.strip_prefix(prefix))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or_else(|| format!("{fallback}_{}", now_secs() % 100000))
+}
+
+fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
+    let existing: Vec<String> = scan_all(root).iter().map(|s| s.name.clone()).collect();
+    let full = CONTRACT_VJS
+        .replace("{existing}", &existing.join(", "))
+        .replace("{task}", prompt);
+    let code = ask_agent(full)?;
     let prog = vjs::parse(&code)?;
     if prog.source.is_none() {
         return Err("generated flow has no `source` declaration".into());
     }
-    let name = code
-        .lines()
-        .next()
-        .and_then(|l| l.strip_prefix("# flow:"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or_else(|| format!("flow_{}", now_secs() % 100000));
-    let mut target = root.join("flows").join(format!("{name}.vjs"));
-    let mut n = 2;
-    while target.exists() {
-        target = root.join("flows").join(format!("{name}_{n}.vjs"));
-        n += 1;
-    }
+    let name = first_line_name(&code, "# flow:", "flow");
+    let target = unique_target(&root.join("flows"), &name);
     fs::write(&target, &code).map_err(|e| e.to_string())?;
     Ok(json!({"ok": true, "file": target.display().to_string(), "flow": name, "lang": "vjs"})
+        .to_string())
+}
+
+const CONTRACT_CONNECTOR: &str = r#"You write ONE Vejas connector manifest (.vjs). Reply with ONLY the file content (no markdown fences, no commentary).
+
+A connector manifest binds a driver to config. Structure:
+  # connector: <snake_case_name>       <- REQUIRED first line
+  driver "<driver-name>"               <- REQUIRED, exactly one of the catalog below
+  UPPERCASE_KEY = <literal>            <- config values (strings, numbers, {docs})
+  SOME_SECRET = secret("path/key")     <- credentials: NEVER a literal, ALWAYS secret("...")
+
+Available drivers (pick ONE; its description lists the config keys it needs):
+{drivers}
+
+Rules:
+- Every bus subject starts with "vx.". A sink reads a SUBJECT; a source publishes to a SUBJECT.
+- Any credential (token, password, a webhook URL that is secret) MUST use secret("path/key"), never a literal.
+- If no built-in driver fits, use `exec-source` (CMD prints one JSON object per line on stdout, any language) or `exec-sink` (CMD reads a JSON body on stdin). Keep CMD to a single shell command.
+- First line MUST be: # connector: <snake_case_name>
+- Existing connectors (do not reuse names): {existing}
+
+Task: {task}"#;
+
+fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
+    let drivers = connectors::catalog()
+        .into_iter()
+        .map(|(n, k, a)| format!("- {n} ({k}): {a}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing: Vec<String> = connector_graph(root)
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    let full = CONTRACT_CONNECTOR
+        .replace("{drivers}", &drivers)
+        .replace("{existing}", &existing.join(", "))
+        .replace("{task}", prompt);
+    let code = ask_agent(full)?;
+    let prog = vjs::parse(&code)?;
+    let driver = prog
+        .driver
+        .clone()
+        .ok_or("generated connector has no `driver` declaration")?;
+    if connectors::driver_for(&driver).is_none() {
+        return Err(format!("generated connector uses unknown driver {driver:?}"));
+    }
+    let name = first_line_name(&code, "# connector:", "connector");
+    let dir = root.join("connectors");
+    let _ = fs::create_dir_all(&dir);
+    let target = unique_target(&dir, &name);
+    fs::write(&target, &code).map_err(|e| e.to_string())?;
+    Ok(json!({"ok": true, "file": target.display().to_string(), "connector": name, "driver": driver})
         .to_string())
 }
 
@@ -804,6 +870,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
+        json!({"name": "vejas_new_connector", "description": "Ask the agent to write a new connector manifest from a natural-language request (picks a driver, writes config, uses secret() for credentials); it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
         json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_drivers", "description": "List the available connector drivers (name, kind, description) for writing connector manifests.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_secrets", "description": "List the secret references (var, path) declared by flows and connectors — references only, never values.", "inputSchema": obj(json!({}), vec![])}),
@@ -865,6 +932,12 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         "vejas_new_flow" => {
             let prompt = args["prompt"].as_str().ok_or("prompt required")?;
             let res = generate_flow(root, prompt)?;
+            let _ = reload(registry, root);
+            text(res)
+        }
+        "vejas_new_connector" => {
+            let prompt = args["prompt"].as_str().ok_or("prompt required")?;
+            let res = generate_connector(root, prompt)?;
             let _ = reload(registry, root);
             text(res)
         }
@@ -1124,6 +1197,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(json) => {
                     let (_, started, _) = reload(&registry, &root);
                     eprintln!("[vejas] agent flow landed ({started} started)");
+                    respond(request, 200, json, "application/json")
+                }
+                Err(err) => respond(request, 422, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/connectors/new") => {
+            let body = read_body(&mut request);
+            let prompt = body["prompt"].as_str().unwrap_or("").to_string();
+            if prompt.trim().is_empty() {
+                return respond(request, 400, "missing prompt".into(), "text/plain");
+            }
+            eprintln!("[vejas] asking the agent for a new connector…");
+            match generate_connector(&root, &prompt) {
+                Ok(json) => {
+                    let (_, started, _) = reload(&registry, &root);
+                    eprintln!("[vejas] agent connector landed ({started} started)");
                     respond(request, 200, json, "application/json")
                 }
                 Err(err) => respond(request, 422, err, "text/plain"),

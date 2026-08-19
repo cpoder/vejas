@@ -53,6 +53,12 @@ Write one with `vejas_write_flow` (any `.vjs` path), tune its config with
 today: `http-in` (webhook), `timer` (interval), `http-poll` (poll), `slack-out`
 and `http-out` (sinks). See ADR-0007.
 
+Or describe it: `vejas_new_connector` asks the agent to pick a driver, write the
+config, and use `secret("…")` for any credential — it lands running (like
+`vejas_new_flow` for flows). Drivers today: `http-in` (webhook), `timer`
+(interval), `http-poll` (poll), `slack-out` / `http-out` (sinks), `exec-source` /
+`exec-sink` (any-language over stdio). See ADR-0007, ADR-0011.
+
 ## Secrets over MCP
 
 `vejas_secrets` lists every `NAME = secret("path/key")` reference declared by

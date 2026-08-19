@@ -127,8 +127,7 @@ straight from the manifest's surface literals into the driver's `Config`.
 
 The **subject convention** (`SUBJECTS.md`) remains the whole interface, so an
 **external connector in any language** is a first-class citizen over the bus.
-Secret references in manifests (ADR-0008) and connector-by-prompt are _(planned,
-this phase)_.
+Secret references in manifests use secret() (ADR-0008). Connector-by-prompt is built (vejas_new_connector / POST /connectors/new).
 
 ## Secrets (ADR-0008)
 

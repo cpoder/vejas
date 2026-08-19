@@ -31,8 +31,10 @@ real secret, a real sink). Do this before anything else.
    manifest. Port `http-in`/`slack-out` onto the trait as the first two.
 2. **Secrets/Vault** (ADR-0008): `SecretStore` trait (Vault default, dev
    backend), `secret("path")` builtin, panel shows references not values.
-3. **Connector-by-prompt**: `vejas_new_connector` MCP tool (generation loop of
-   ADR-0006 retargeted to the trait contract).
+3. **Connector-by-prompt** (built): `vejas_new_connector` MCP tool + POST
+   /connectors/new — the ADR-0006 generation loop retargeted to the driver
+   catalog; the agent picks a driver, writes config, and uses secret() for
+   credentials.
 
 Exit criterion: a Stripe webhook → a flow → a Slack post, with the signing key
 in Vault, deployed from `docker compose` — recordable for a Show HN.
