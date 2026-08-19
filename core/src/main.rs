@@ -15,6 +15,7 @@
 // HTTP surface (one request = one thread; /flows/new can take minutes):
 //   GET  /            panel        GET /healthz        GET /topology
 //   GET  /graph       pipeline     GET /surface        business surface
+//   GET  /events?flow=             last processed events (in-memory ring)
 //   GET  /preview?file=            fixture -> sample run
 //   GET  /file?path=               read a script        POST /file/set
 //   GET  /fixture?file=            read a fixture       POST /fixture/set
@@ -26,11 +27,11 @@ mod connectors;
 mod secrets;
 mod vjs;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
@@ -67,6 +68,58 @@ struct Handle {
 type Registry = Arc<Mutex<HashMap<String, Arc<Handle>>>>;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+// ───────────────────────── event trace ─────────────────────────
+//
+// The last events each flow processed, in memory (ring of 50 per flow) — the
+// minimal honest answer to "what just went through, and did it work?". Served
+// by GET /events, the vejas_events MCP tool, and the panel's live strip.
+
+static TRACES: OnceLock<Mutex<HashMap<String, VecDeque<Value>>>> = OnceLock::new();
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn record_trace(
+    flow: &str,
+    subject: &str,
+    ok: bool,
+    error: Option<String>,
+    emits: Vec<String>,
+    preview: String,
+) {
+    let seq = TRACE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let mut map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let ring = map.entry(flow.to_string()).or_default();
+    ring.push_back(json!({
+        "seq": seq, "ts": now_secs(), "flow": flow, "subject": subject,
+        "ok": ok, "error": error, "emits": emits, "preview": preview,
+    }));
+    while ring.len() > 50 {
+        ring.pop_front();
+    }
+}
+
+/// Newest-first flat list of trace entries, optionally for one flow, capped.
+fn events_json(flow: Option<&str>) -> String {
+    let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let mut all: Vec<Value> = map
+        .iter()
+        .filter(|(name, _)| flow.map(|f| f == name.as_str()).unwrap_or(true))
+        .flat_map(|(_, ring)| ring.iter().cloned())
+        .collect();
+    all.sort_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)));
+    all.truncate(100);
+    json!({ "events": all }).to_string()
+}
+
+fn preview_of(v: &Value) -> String {
+    let s = v.to_string();
+    if s.chars().count() > 160 {
+        let cut: String = s.chars().take(159).collect();
+        format!("{cut}…")
+    } else {
+        s
+    }
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -235,6 +288,14 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         Ok(v) => v,
                         Err(e) => {
                             eprintln!("[vejas] {}: bad json: {e}", handle.spec.name);
+                            record_trace(
+                                &handle.spec.name,
+                                &msg.subject,
+                                false,
+                                Some(format!("bad json: {e}")),
+                                vec![],
+                                String::from_utf8_lossy(&msg.data).chars().take(160).collect(),
+                            );
                             let _ = msg.ack();
                             continue;
                         }
@@ -252,12 +313,28 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     ok = false;
                                 }
                             }
+                            record_trace(
+                                &handle.spec.name,
+                                &msg.subject,
+                                ok,
+                                (!ok).then(|| "publish failed (will redeliver)".to_string()),
+                                ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+                                preview_of(&event),
+                            );
                             if ok {
                                 let _ = msg.ack();
                             }
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
+                            record_trace(
+                                &handle.spec.name,
+                                &msg.subject,
+                                false,
+                                Some(e.clone()),
+                                vec![],
+                                preview_of(&event),
+                            );
                             set_state(&handle, |st| st.last_error = Some(e));
                             // no ack -> redelivery after ack_wait
                         }
@@ -679,9 +756,9 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
 
 // ───────────────────────── agent generation ─────────────────────────
 
-const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
-
-VejasScript in 20 lines:
+/// The single-source VejasScript reference: served to agents over MCP
+/// (`vejas_language`) and embedded in the generation prompts below.
+const LANGUAGE_VJS: &str = r#"VejasScript in 20 lines:
   # comment
   source "vx.domain.name"            <- the flow's input subject, REQUIRED, line 1
   SEVERITY_CODES = {"critique": "P1", "haute": "P2"}   <- UPPERCASE literal dicts are transcoding tables the business expert edits
@@ -691,9 +768,11 @@ VejasScript in 20 lines:
   email = lower(requester?.email)    <- builtins: upper lower trim len str num split join replace round abs; ?. is null-safe
   ids = orders[].id                  <- array projection
   big = orders[total > 100]          <- array filtering
+  out = out + [{sku: l.sku}]         <- array concatenation builds lists inside a for
   invoke format_alert(sev: code)     <- compose a service from services/<name>.vjs; its outputs MERGE into this pipeline
   d = invoke format_alert(sev: code) <- or capture its whole pipeline as a document
   invoke pkg:svc(k: v)               <- cross-package composition (the target package must list svc in its EXPORTS)
+  key = secret("slack/webhook")      <- credentials resolve from the Vault at run time; NEVER a literal
   if code in ALERT_LEVELS:
       emit "vx.slack.out", {text: f"[{code}] {subject}"}
   end                                <- every if/for closes with `end`
@@ -701,10 +780,35 @@ VejasScript in 20 lines:
 Rules:
 - Known sinks: vx.slack.out (payload {text: "..."}). All subjects start with "vx.".
 - Put every business-meaningful value (thresholds, tables, queue names) in UPPERCASE literals.
+- A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
+- Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
+- A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
+
+const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
+
+{language}
+
+Task rules:
 - First line must be: # flow: <snake_case_name>
 - Existing flows (do not reuse names): {existing}
 
 Task: {task}"#;
+
+/// Is the agent CLI reachable in THIS deployment? The stock container ships
+/// no CLI, so the generation tools must not be advertised there — an external
+/// agent writes the .vjs itself (vejas_language + vejas_write_flow).
+fn agent_available() -> bool {
+    let agent = env::var("VEJAS_AGENT_CMD").unwrap_or_else(|_| "claude".into());
+    if agent.contains('/') {
+        return Path::new(&agent).exists();
+    }
+    env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|dir| !dir.is_empty() && Path::new(dir).join(&agent).exists())
+}
+
+const NO_AGENT_CLI: &str = "this deployment has no agent CLI (VEJAS_AGENT_CMD): write the file yourself — vejas_language gives the syntax, vejas_write_flow deploys it";
 
 /// Ask the agent CLI for a file and return its content (markdown fences stripped).
 fn ask_agent(prompt: String) -> Result<String, String> {
@@ -750,8 +854,12 @@ fn first_line_name(code: &str, prefix: &str, fallback: &str) -> String {
 }
 
 fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
+    if !agent_available() {
+        return Err(NO_AGENT_CLI.into());
+    }
     let existing: Vec<String> = scan_all(root).iter().map(|s| s.name.clone()).collect();
     let full = CONTRACT_VJS
+        .replace("{language}", LANGUAGE_VJS)
         .replace("{existing}", &existing.join(", "))
         .replace("{task}", prompt);
     let code = ask_agent(full)?;
@@ -787,6 +895,9 @@ Rules:
 Task: {task}"#;
 
 fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
+    if !agent_available() {
+        return Err(NO_AGENT_CLI.into());
+    }
     let drivers = connectors::catalog()
         .into_iter()
         .map(|(n, k, a)| format!("- {n} ({k}): {a}"))
@@ -867,17 +978,23 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_topology", "description": "List running flows and connectors with their status.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_graph", "description": "The pipeline graph: sources, flows, composed services, destinations, connectors.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_surface", "description": "The business surface of every flow: mappings, transcoding tables, constants.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_language", "description": "The VejasScript reference: grammar, builtins, and the rules for flow files and connector manifests. Read this before writing any .vjs.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
-        json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs file (parse-validated, hot-reloaded). path under flows/ or packages/<pkg>/flows|services.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
+        json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
-        json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
-        json!({"name": "vejas_new_connector", "description": "Ask the agent to write a new connector manifest from a natural-language request (picks a driver, writes config, uses secret() for credentials); it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
+        json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_drivers", "description": "List the available connector drivers (name, kind, description) for writing connector manifests.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_secrets", "description": "List the secret references (var, path) declared by flows and connectors — references only, never values.", "inputSchema": obj(json!({}), vec![])}),
     ];
+    // generation-by-prompt shells out to the agent CLI: only advertised where
+    // one exists (the stock container has none — external agents write .vjs)
+    if agent_available() {
+        tools.push(json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}));
+        tools.push(json!({"name": "vejas_new_connector", "description": "Ask the agent to write a new connector manifest from a natural-language request (picks a driver, writes config, uses secret() for credentials); it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}));
+    }
     // flow-as-tool: dynamic tools declared by `tool "..."` in a flow/service
     for (name, _file, desc) in tool_flows(root) {
         tools.push(json!({
@@ -900,14 +1017,21 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let path = guard_path(root, p).ok_or("path not allowed")?;
             text(fs::read_to_string(&path).map_err(|e| e.to_string())?)
         }
+        "vejas_language" => text(LANGUAGE_VJS.to_string()),
+        "vejas_events" => text(events_json(args["flow"].as_str())),
         "vejas_write_flow" => {
             let p = args["path"].as_str().ok_or("path required")?;
             let content = args["content"].as_str().ok_or("content required")?;
-            if !p.ends_with(".vjs") {
-                return Err("only .vjs files".into());
-            }
             let path = guard_path(root, p).ok_or("path not allowed")?;
-            vjs::parse(content)?; // validate before writing
+            // validate before writing: .vjs must parse, .json (fixtures) must be JSON
+            if p.ends_with(".vjs") {
+                vjs::parse(content)?;
+            } else if p.ends_with(".json") {
+                serde_json::from_str::<Value>(content)
+                    .map_err(|e| format!("fixture must be valid JSON: {e}"))?;
+            } else {
+                return Err("only .vjs or .json files".into());
+            }
             fs::write(&path, content).map_err(|e| e.to_string())?;
             let (_, started, stopped) = reload(registry, root);
             text(json!({"ok": true, "started": started, "stopped": stopped}).to_string())
@@ -1047,6 +1171,31 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     let method = request.method().clone();
     let url = request.url().to_string();
     let path_only = url.split('?').next().unwrap_or("").to_string();
+    // Optional write protection: when VEJAS_TOKEN is set, every POST (the
+    // whole mutating surface, /mcp included) requires `Authorization: Bearer
+    // <token>`. Reads stay open — they expose no secret values by design.
+    if method == tiny_http::Method::Post {
+        if let Ok(token) = env::var("VEJAS_TOKEN") {
+            if !token.is_empty() {
+                let authorized = request.headers().iter().any(|h| {
+                    h.field.equiv("authorization")
+                        && h.value
+                            .as_str()
+                            .strip_prefix("Bearer ")
+                            .map(|t| t == token)
+                            .unwrap_or(false)
+                });
+                if !authorized {
+                    return respond(
+                        request,
+                        401,
+                        "unauthorized: set Authorization: Bearer <VEJAS_TOKEN>".into(),
+                        "text/plain",
+                    );
+                }
+            }
+        }
+    }
     match (method, path_only.as_str()) {
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
             request,
@@ -1073,6 +1222,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             surface_json(&root).to_string(),
             "application/json",
         ),
+        (tiny_http::Method::Get, "/events") => {
+            let flow = qparam(&url, "flow");
+            respond(request, 200, events_json(flow.as_deref()), "application/json")
+        }
         (tiny_http::Method::Get, "/preview") => {
             let Some(file) = qparam(&url, "file") else {
                 return respond(request, 400, "missing file".into(), "text/plain");

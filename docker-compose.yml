@@ -11,9 +11,12 @@ services:
     environment:
       NATS_URL: nats://nats:4222
       # SLACK_WEBHOOK_URL: https://hooks.slack.com/services/...   # optional; DRY-RUN without it
+      # VEJAS_TOKEN: change-me   # when set, every write (POST, /mcp included) needs Authorization: Bearer
     ports:
-      - "8686:8686"   # panel + monitoring
-      - "8787:8787"   # http-in connector: POST /ingest/<subject-suffix>
+      # panel + MCP: local-only by default — this surface can write flows and
+      # run commands (exec connectors). Expose it deliberately, with VEJAS_TOKEN.
+      - "127.0.0.1:8686:8686"
+      - "8787:8787"   # http-in connector: POST /ingest/<subject-suffix> (webhook entry, publish-only)
     volumes:
       # your flows live in YOUR repo, not in the container: what an agent
       # writes over MCP lands here, in git, and survives a rebuild

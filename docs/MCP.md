@@ -11,13 +11,25 @@ inspect, edit, generate, run — with no side channel.
 | `vejas_topology` | running flows + connectors and their status |
 | `vejas_graph` | the pipeline graph (sources, flows, services, destinations) |
 | `vejas_surface` | every flow's business surface (mappings, tables, constants) |
+| `vejas_language` | the VejasScript reference — read it before writing any `.vjs` |
 | `vejas_read` | read a `.vjs` script or a `.json` fixture |
-| `vejas_write_flow` | create/overwrite a `.vjs` (parse-validated, hot-reloaded) |
+| `vejas_write_flow` | create/overwrite a `.vjs` (parse-validated, hot-reloaded) or a `.json` fixture |
 | `vejas_set_literal` | rewrite one business-surface literal in place |
 | `vejas_preview` | run a flow on its fixture, return emits + final pipeline |
 | `vejas_run_flow` | run any flow on a supplied input, return emits (bus untouched) |
+| `vejas_events` | the last events the flows processed (subject, ok/error, emits, preview) |
 | `vejas_new_flow` | agent writes a new VejasScript flow from a prompt; it lands running |
 | `vejas_reload` | rescan flows/packages |
+
+`vejas_new_flow` and `vejas_new_connector` shell out to an agent CLI
+(`VEJAS_AGENT_CMD`, default `claude`) and are advertised **only where one
+exists** — the stock container ships none. The normal path for an external
+agent is to write the file itself: `vejas_language` for the syntax, then
+`vejas_write_flow`.
+
+When the runtime is started with `VEJAS_TOKEN` set, every write (POST,
+`/mcp` included) requires `Authorization: Bearer <token>` — e.g.
+`claude mcp add --transport http vejas <url> --header "Authorization: Bearer <token>"`.
 
 ## Flow-as-tool
 

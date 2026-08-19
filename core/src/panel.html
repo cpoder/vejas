@@ -148,6 +148,12 @@
     <svg id="pipe"></svg>
   </div>
 
+  <div class="card">
+    <h2>Recent events</h2>
+    <p class="sub">The last events the flows processed — live from the runtime, newest first.</p>
+    <div id="events"><span style="color:var(--muted)">No events yet — send one to a source subject.</span></div>
+  </div>
+
   <div id="root">loading…</div>
   <footer>Vejas panel v0.3 — VejasScript flows run natively in the runtime; corrections rewrite one
   literal and reload one flow; the whole script and its sample input are editable here. Packages under
@@ -451,6 +457,34 @@ async function load() {
     root.appendChild(card);
   }
 }
+
+/* ---------- recent events (live) ---------- */
+async function loadEvents() {
+  try {
+    const d = await fetch('/events').then(r => r.json());
+    const evs = (d.events || []).slice(0, 12);
+    if (!evs.length) return;
+    const rows = evs.map(e => {
+      const t = new Date((e.ts || 0) * 1000).toLocaleTimeString();
+      const outcome = e.ok
+        ? ((e.emits || []).length
+            ? e.emits.map(s => `<code>${esc(s)}</code>`).join(' ')
+            : '<span style="color:var(--muted)">no emit</span>')
+        : `<span style="color:var(--err)">${esc(trunc(e.error || 'error', 60))}</span>`;
+      return `<tr>
+        <td class="sample">${t}</td>
+        <td class="field"><code>${esc(String(e.flow || '').replace(/^flow:/, ''))}</code></td>
+        <td class="sample">${esc(e.subject || '')}</td>
+        <td>${outcome}</td>
+        <td class="sample" title="${esc(e.preview || '')}">${esc(trunc(e.preview || '', 42))}</td>
+      </tr>`;
+    }).join('');
+    $('#events').innerHTML =
+      `<table><tr><th>time</th><th>flow</th><th>event on</th><th>emitted</th><th>payload</th></tr>${rows}</table>`;
+  } catch {}
+}
+loadEvents();
+setInterval(loadEvents, 4000);
 
 $('#gen').onclick = async () => {
   const prompt = $('#prompt').value.trim();

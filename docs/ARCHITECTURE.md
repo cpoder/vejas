@@ -27,10 +27,12 @@ docker-compose.yml        two containers: nats + vejas
 The runtime is a single OS process. Inside it:
 
 - **one supervisor thread per flow** — connects to NATS, creates a durable pull
-  consumer on the flow's `source`, and loops: fetch a batch, run each event
-  through the interpreter, publish the emits **before** acking (at-least-once;
-  a crash means redelivery, never a lost emit). Restarts with backoff on error;
-  restarts on file change (mtime).
+  consumer on the flow's `source`, and loops: fetch a bounded batch (the pull
+  carries a server-side expiry so a stopped flow actually stops), run each
+  event through the interpreter, publish the emits **before** acking
+  (at-least-once; a crash means redelivery, never a lost emit), and record the
+  event in the in-memory trace ring (last 50 per flow, `/events`). Restarts
+  with backoff on error; restarts on file change (mtime).
 - **native connector threads** — `http-in` (a threaded HTTP server; `POST
   /ingest/<suffix>` → publish `vx.<suffix>`) and `slack-out` (durable pull
   consumer on `vx.slack.out` → webhook or DRY-RUN).
@@ -92,6 +94,7 @@ emitted payloads — how a non-developer validates behavior without reading code
 | `GET /topology` | flows (status) + connectors |
 | `GET /graph` | pipeline graph (sources, flows, services, destinations) |
 | `GET /surface` | business surface of every flow |
+| `GET /events?flow=` | the last events processed (in-memory ring, 50 per flow) |
 | `GET /preview?file=` | run a flow on its fixture → emits + pipeline |
 | `GET /file?path=` · `POST /file/set` | read / write a script (parse-validated) |
 | `GET /fixture?file=` · `POST /fixture/set` | read / write a sample input |
@@ -100,8 +103,15 @@ emitted payloads — how a non-developer validates behavior without reading code
 | `POST /reload` | rescan; start new, stop removed, restart changed |
 | `POST /mcp` | JSON-RPC 2.0 MCP server (see `MCP.md`) |
 
-MCP tools include `vejas_drivers` (connector driver catalog) and `vejas_secrets`
-(declared secret references, values never returned).
+MCP tools include `vejas_drivers` (connector driver catalog), `vejas_secrets`
+(declared secret references, values never returned), `vejas_language` (the
+VejasScript reference for agents) and `vejas_events` (the trace ring).
+
+When `VEJAS_TOKEN` is set, every POST (the whole mutating surface, `/mcp`
+included) requires `Authorization: Bearer <token>`; reads stay open. The
+bundled compose binds 8686 (panel/MCP) to localhost only — that surface can
+write flows and run commands (exec connectors) — while 8787 (webhook ingest,
+publish-only) stays exposed.
 
 ## MCP server (ADR-0006)
 
