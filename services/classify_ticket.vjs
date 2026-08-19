@@ -1,0 +1,10 @@
+# service: classify_ticket
+# Exposed as an MCP tool AND callable as a composed service.
+tool "Classify a support ticket: map a French priority label to a severity code (P1-P4) and say whether it should page on-call."
+
+SEVERITY_CODES = {"critique": "P1", "haute": "P2", "normale": "P3", "basse": "P4"}
+PAGING = ["P1", "P2"]
+
+severity = SEVERITY_CODES[priority] ?? "P3"
+should_page = severity in PAGING
+emit "vx.classify.result", {severity: severity, should_page: should_page}

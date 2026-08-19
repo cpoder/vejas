@@ -607,6 +607,168 @@ fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
 
 // ───────────────────────── http ─────────────────────────
 
+// ───────────────────────── MCP server ─────────────────────────
+//
+// The runtime IS the MCP server: JSON-RPC 2.0 over POST /mcp. The whole
+// platform is drivable by any agent — inspect, edit, generate, run — and a
+// flow/service that declares `tool "..."` is exposed as a first-class MCP tool
+// (call it, it runs on the arguments and returns its emits). New tools are
+// added by writing new flows; the MCP surface grows with the platform.
+
+fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value>, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let prog = vjs::parse(&src)?;
+    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let ctx = vjs::run(&prog, input, &mut engine)?;
+    Ok(ctx
+        .emits
+        .iter()
+        .map(|(s, p)| json!({"subject": s, "payload": p}))
+        .collect())
+}
+
+/// Flows/services that declare `tool "..."`, as (mcp_tool_name, file, description).
+fn tool_flows(root: &Path) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (path, pkg) in vjs_files(root) {
+        let Ok(src) = fs::read_to_string(&path) else { continue };
+        let Ok(prog) = vjs::parse(&src) else { continue };
+        let Some(desc) = prog.tool else { continue };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let name = if pkg == "default" {
+            format!("flow_{stem}")
+        } else {
+            format!("flow_{pkg}_{stem}")
+        };
+        out.push((name, path.display().to_string(), desc));
+    }
+    out
+}
+
+fn mcp_tools(root: &Path) -> Value {
+    let obj = |props: Value, req: Vec<&str>| {
+        json!({"type": "object", "properties": props, "required": req})
+    };
+    let mut tools = vec![
+        json!({"name": "vejas_topology", "description": "List running flows and connectors with their status.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_graph", "description": "The pipeline graph: sources, flows, composed services, destinations, connectors.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_surface", "description": "The business surface of every flow: mappings, transcoding tables, constants.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
+        json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs file (parse-validated, hot-reloaded). path under flows/ or packages/<pkg>/flows|services.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
+        json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
+        json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
+        json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
+    ];
+    // flow-as-tool: dynamic tools declared by `tool "..."` in a flow/service
+    for (name, _file, desc) in tool_flows(root) {
+        tools.push(json!({
+            "name": name,
+            "description": desc,
+            "inputSchema": {"type": "object", "description": "the input event for this flow"},
+        }));
+    }
+    Value::Array(tools)
+}
+
+fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Result<Value, String> {
+    let text = |v: String| Ok(json!({"content": [{"type": "text", "text": v}]}));
+    match name {
+        "vejas_topology" => text(topology_json(registry).to_string()),
+        "vejas_graph" => text(graph_json(root).to_string()),
+        "vejas_surface" => text(surface_json(root).to_string()),
+        "vejas_read" => {
+            let p = args["path"].as_str().ok_or("path required")?;
+            let path = guard_path(root, p).ok_or("path not allowed")?;
+            text(fs::read_to_string(&path).map_err(|e| e.to_string())?)
+        }
+        "vejas_write_flow" => {
+            let p = args["path"].as_str().ok_or("path required")?;
+            let content = args["content"].as_str().ok_or("content required")?;
+            if !p.ends_with(".vjs") {
+                return Err("only .vjs files".into());
+            }
+            let path = guard_path(root, p).ok_or("path not allowed")?;
+            vjs::parse(content)?; // validate before writing
+            fs::write(&path, content).map_err(|e| e.to_string())?;
+            let (_, started, stopped) = reload(registry, root);
+            text(json!({"ok": true, "started": started, "stopped": stopped}).to_string())
+        }
+        "vejas_set_literal" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let lname = args["name"].as_str().ok_or("name required")?;
+            let key = args["key"].as_str().unwrap_or("-");
+            let path = guard_path(root, file).ok_or("path not allowed")?;
+            let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            let new_src = vjs::set_literal(&src, lname, key, &args["value"])?;
+            fs::write(&path, new_src).map_err(|e| e.to_string())?;
+            let _ = reload(registry, root);
+            text(json!({"ok": true}).to_string())
+        }
+        "vejas_preview" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            text(preview_json(root, file)?)
+        }
+        "vejas_run_flow" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let emits = run_flow_on_input(root, file, &args["input"])?;
+            text(json!({"emits": emits}).to_string())
+        }
+        "vejas_new_flow" => {
+            let prompt = args["prompt"].as_str().ok_or("prompt required")?;
+            let res = generate_flow(root, prompt)?;
+            let _ = reload(registry, root);
+            text(res)
+        }
+        "vejas_reload" => {
+            let (total, started, stopped) = reload(registry, root);
+            text(json!({"total": total, "started": started, "stopped": stopped}).to_string())
+        }
+        other => {
+            // flow-as-tool: run the declaring flow on the arguments
+            if let Some((_, file, _)) = tool_flows(root).into_iter().find(|(n, _, _)| n == other) {
+                let emits = run_flow_on_input(root, &file, args)?;
+                text(json!({"emits": emits}).to_string())
+            } else {
+                Err(format!("unknown tool {other:?}"))
+            }
+        }
+    }
+}
+
+fn mcp_dispatch(root: &Path, registry: &Registry, req: &Value) -> Option<Value> {
+    let id = req.get("id").cloned();
+    let method = req["method"].as_str().unwrap_or("");
+    let ok = |result: Value| {
+        Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    };
+    let err = |code: i64, msg: String| {
+        Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}))
+    };
+    match method {
+        "initialize" => ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": true}},
+            "serverInfo": {"name": "vejas", "version": env!("CARGO_PKG_VERSION")},
+        })),
+        "notifications/initialized" | "notifications/cancelled" => None, // notifications: no reply
+        "ping" => ok(json!({})),
+        "tools/list" => ok(json!({"tools": mcp_tools(root)})),
+        "tools/call" => {
+            let params = &req["params"];
+            let name = params["name"].as_str().unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            match mcp_call(root, registry, name, &args) {
+                Ok(result) => ok(result),
+                Err(e) => ok(json!({"content": [{"type": "text", "text": format!("error: {e}")}], "isError": true})),
+            }
+        }
+        _ => err(-32601, format!("method not found: {method}")),
+    }
+}
+
 fn respond(request: tiny_http::Request, code: u16, body: String, ctype: &str) {
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
     let _ = request.respond(
@@ -804,6 +966,26 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 json!({"total": total, "started": started, "stopped": stopped}).to_string(),
                 "application/json",
             )
+        }
+        (tiny_http::Method::Post, "/mcp") => {
+            let body = read_body(&mut request);
+            // support a JSON-RPC batch or a single request
+            let out = if let Some(arr) = body.as_array() {
+                let replies: Vec<Value> = arr
+                    .iter()
+                    .filter_map(|r| mcp_dispatch(&root, &registry, r))
+                    .collect();
+                if replies.is_empty() {
+                    return respond(request, 202, String::new(), "application/json");
+                }
+                Value::Array(replies)
+            } else {
+                match mcp_dispatch(&root, &registry, &body) {
+                    Some(reply) => reply,
+                    None => return respond(request, 202, String::new(), "application/json"),
+                }
+            };
+            respond(request, 200, out.to_string(), "application/json")
         }
         _ => respond(request, 404, "not found".into(), "text/plain"),
     }

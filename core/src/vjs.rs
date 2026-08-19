@@ -55,6 +55,7 @@ pub enum Tok {
     Emit,
     Invoke,
     Source,
+    Tool,
     Newline,
     Colon,
     Comma,
@@ -153,6 +154,7 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     "emit" => Tok::Emit,
                     "invoke" => Tok::Invoke,
                     "source" => Tok::Source,
+                    "tool" => Tok::Tool,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "null" => Tok::Null,
@@ -351,6 +353,9 @@ pub struct SurfaceEntry {
 
 pub struct Program {
     pub source: Option<String>,
+    /// When set, this flow/service is exposed as an MCP tool (and as an API):
+    /// `tool "one-line description of what calling it does"`.
+    pub tool: Option<String>,
     pub stmts: Vec<Stmt>,
     pub surface: Vec<SurfaceEntry>,
     pub emit_subjects: Vec<String>,
@@ -409,6 +414,7 @@ impl<'a> Parser<'a> {
 
     fn program(&mut self) -> Result<Program, String> {
         let mut source = None;
+        let mut tool = None;
         let mut stmts = Vec::new();
         let mut surface = Vec::new();
         loop {
@@ -421,6 +427,14 @@ impl<'a> Parser<'a> {
                 match self.next() {
                     Tok::Str(s) => source = Some(s),
                     _ => return Err(self.err("source expects a string subject")),
+                }
+                continue;
+            }
+            if *self.peek() == Tok::Tool {
+                self.next();
+                match self.next() {
+                    Tok::Str(s) => tool = Some(s),
+                    _ => return Err(self.err("tool expects a string description")),
                 }
                 continue;
             }
@@ -450,6 +464,7 @@ impl<'a> Parser<'a> {
         }
         let mut prog = Program {
             source,
+            tool,
             stmts,
             surface,
             emit_subjects: Vec::new(),
