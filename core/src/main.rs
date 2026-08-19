@@ -35,11 +35,18 @@ use std::{env, fs, thread};
 
 use serde_json::{json, Value};
 
+#[derive(Clone, PartialEq)]
+enum Kind {
+    Flow,
+    Connector,
+}
+
 #[derive(Clone)]
 struct Spec {
     name: String,
     path: PathBuf,
     pkg: String,
+    kind: Kind,
     mtime: u64,
 }
 
@@ -90,8 +97,12 @@ fn package_enabled(pkg_dir: &Path) -> bool {
     true
 }
 
-fn scan_flows(dir: &Path, pkg: &str, out: &mut Vec<Spec>) {
+fn scan_units(dir: &Path, pkg: &str, kind: Kind, out: &mut Vec<Spec>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
+    let prefix = match kind {
+        Kind::Flow => "flow",
+        Kind::Connector => "connector",
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
@@ -102,22 +113,24 @@ fn scan_flows(dir: &Path, pkg: &str, out: &mut Vec<Spec>) {
         }
         let stem = fname.trim_end_matches(".vjs").to_string();
         let name = if pkg == "default" {
-            format!("flow:{stem}")
+            format!("{prefix}:{stem}")
         } else {
-            format!("flow:{pkg}:{stem}")
+            format!("{prefix}:{pkg}:{stem}")
         };
         out.push(Spec {
             name,
             mtime: mtime_of(&path),
             path,
             pkg: pkg.to_string(),
+            kind: kind.clone(),
         });
     }
 }
 
 fn scan_all(root: &Path) -> Vec<Spec> {
     let mut out = Vec::new();
-    scan_flows(&root.join("flows"), "default", &mut out);
+    scan_units(&root.join("flows"), "default", Kind::Flow, &mut out);
+    scan_units(&root.join("connectors"), "default", Kind::Connector, &mut out);
     if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
         for p in pkgs.flatten() {
             let dir = p.path();
@@ -128,7 +141,8 @@ fn scan_all(root: &Path) -> Vec<Spec> {
             if !package_enabled(&dir) {
                 continue;
             }
-            scan_flows(&dir.join("flows"), &pkg, &mut out);
+            scan_units(&dir.join("flows"), &pkg, Kind::Flow, &mut out);
+            scan_units(&dir.join("connectors"), &pkg, Kind::Connector, &mut out);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -289,7 +303,84 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();
-    thread::spawn(move || supervise_vjs(handle, root));
+    match spec.kind {
+        Kind::Flow => {
+            thread::spawn(move || supervise_vjs(handle, root));
+        }
+        Kind::Connector => {
+            thread::spawn(move || supervise_connector(handle));
+        }
+    }
+}
+
+/// Native connector instance: a manifest (`driver "..."` + literal config) run
+/// by a compiled-in driver, restarted with backoff on error / file change.
+fn supervise_connector(handle: Arc<Handle>) {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    let mut delay = Duration::from_secs(1);
+    let stop = Arc::new(AtomicBool::new(true));
+    loop {
+        if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let attempt = (|| -> Result<(), String> {
+            let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
+            let prog = vjs::parse(&src)?;
+            let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
+            let driver = connectors::driver_for(&driver_name)
+                .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+            let mut config = serde_json::Map::new();
+            for e in &prog.surface {
+                config.insert(e.name.clone(), e.value.clone());
+            }
+            set_state(&handle, |st| {
+                st.status = format!("running ({})", driver.kind());
+                st.started_at = Some(now_secs());
+                st.last_error = None;
+            });
+            // wire this connector's stop flag to the shared running signal
+            let running = stop.clone();
+            running.store(true, Ordering::SeqCst);
+            let ctx = connectors::Ctx {
+                name: handle.spec.name.clone(),
+                nats_url: url.clone(),
+                stream: stream.clone(),
+                subj_root: subj_root.clone(),
+                config: connectors::Config(config),
+                running: running.clone(),
+            };
+            // watch the handle's stop flag in a sidecar thread → clears ctx.running
+            let h2 = handle.clone();
+            let r2 = running.clone();
+            thread::spawn(move || {
+                while RUNNING.load(Ordering::SeqCst) && !h2.stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                r2.store(false, Ordering::SeqCst);
+            });
+            driver.run(&ctx)
+        })();
+        stop.store(false, Ordering::SeqCst);
+        match attempt {
+            Ok(()) => break,
+            Err(e) => {
+                eprintln!("[vejas] connector {}: {e}", handle.spec.name);
+                set_state(&handle, |st| {
+                    st.status = "restarting".into();
+                    st.restarts += 1;
+                    st.last_error = Some(e);
+                });
+                if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+    set_state(&handle, |st| st.status = "stopped".into());
 }
 
 fn reload(registry: &Registry, root: &Path) -> (usize, usize, usize) {
@@ -340,7 +431,7 @@ fn topology_json(registry: &Registry) -> Value {
     let mut connectors = Vec::new();
     for handle in reg.values() {
         let st = handle.state.lock().unwrap();
-        flows.push(json!({
+        let entry = json!({
             "name": handle.spec.name,
             "file": handle.spec.path.display().to_string(),
             "pkg": handle.spec.pkg,
@@ -349,12 +440,49 @@ fn topology_json(registry: &Registry) -> Value {
             "restarts": st.restarts,
             "started_at": st.started_at,
             "last_error": st.last_error,
-        }));
+        });
+        match handle.spec.kind {
+            Kind::Flow => flows.push(entry),
+            Kind::Connector => connectors.push(entry),
+        }
     }
-    // native connectors are runtime threads, reported for the graph
-    connectors.push(json!({"name": "http-in", "status": "running", "subjects_out": ["vx.*"]}));
-    connectors.push(json!({"name": "slack-out", "status": "running", "subjects_in": ["vx.slack.out"]}));
     json!({ "flows": flows, "connectors": connectors })
+}
+
+/// Connector instances (manifests), for the graph: name, driver, kind, in/out.
+fn connector_graph(root: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let scan = |dir: PathBuf, list: &mut Vec<Value>| {
+        let Ok(entries) = fs::read_dir(&dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.extension().map(|x| x == "vjs").unwrap_or(false) {
+                continue;
+            }
+            let Ok(prog) = fs::read_to_string(&p).ok().map(|s| vjs::parse(&s)).unwrap_or(Err("".into()))
+            else { continue };
+            let Some(driver) = prog.driver else { continue };
+            let cfg: std::collections::HashMap<String, Value> =
+                prog.surface.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
+            let kind = connectors::driver_for(&driver).map(|d| d.kind()).unwrap_or("unknown");
+            let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let mut entry = json!({"name": name, "driver": driver, "kind": kind});
+            if kind.starts_with("source") {
+                let subj = cfg.get("SUBJECT").and_then(|v| v.as_str()).unwrap_or("vx.*");
+                entry["subjects_out"] = json!([subj]);
+            } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
+                entry["subjects_in"] = json!([s]);
+            }
+            list.push(entry);
+        }
+    };
+    scan(root.join("connectors"), &mut out);
+    if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
+        for p in pkgs.flatten() {
+            scan(p.path().join("connectors"), &mut out);
+        }
+    }
+    out
 }
 
 fn vjs_kind_of(name: &str, value: &Value) -> &'static str {
@@ -438,10 +566,7 @@ fn surface_json(root: &Path) -> Value {
 fn graph_json(root: &Path) -> Value {
     let mut flows: Vec<Value> = Vec::new();
     let mut services: Vec<Value> = Vec::new();
-    let connectors: Vec<Value> = vec![
-        json!({"name": "http-in", "subjects_out": ["vx.*"]}),
-        json!({"name": "slack-out", "subjects_in": ["vx.slack.out"]}),
-    ];
+    let connectors: Vec<Value> = connector_graph(root);
     for (path, pkg) in vjs_files(root) {
         let Ok(src) = fs::read_to_string(&path) else { continue };
         let Ok(prog) = vjs::parse(&src) else { continue };
@@ -519,7 +644,7 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
     }
     let rel = rel.trim_start_matches("./");
     let p = root.join(rel);
-    let ok_dir = ["flows", "services", "packages"]
+    let ok_dir = ["flows", "services", "connectors", "packages"]
         .iter()
         .any(|d| rel.starts_with(d));
     let ok_ext = rel.ends_with(".vjs") || rel.ends_with(".json");
@@ -661,6 +786,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
         json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_drivers", "description": "List the available connector drivers (name, kind, description) for writing connector manifests.", "inputSchema": obj(json!({}), vec![])}),
     ];
     // flow-as-tool: dynamic tools declared by `tool "..."` in a flow/service
     for (name, _file, desc) in tool_flows(root) {
@@ -725,6 +851,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         "vejas_reload" => {
             let (total, started, stopped) = reload(registry, root);
             text(json!({"total": total, "started": started, "stopped": stopped}).to_string())
+        }
+        "vejas_drivers" => {
+            let list: Vec<Value> = connectors::catalog()
+                .into_iter()
+                .map(|(n, k, a)| json!({"driver": n, "kind": k, "about": a}))
+                .collect();
+            text(Value::Array(list).to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -1133,28 +1266,9 @@ fn main() {
     })
     .expect("signal handler");
 
+    // flows AND declared connector instances start here (reload supervises both)
     let (total, started, _) = reload(&registry, &root);
-    eprintln!("[vejas] supervising {total} flows ({started} started)");
-
-    // native bundled connectors (Rust threads; no Python, no subprocess)
-    {
-        let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-        let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
-        let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
-        let http_port: u16 = env::var("HTTP_IN_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(8787);
-        let running = Arc::new(AtomicBool::new(true));
-        {
-            let (r, u, s, sr) = (running.clone(), url.clone(), stream.clone(), subj_root.clone());
-            thread::spawn(move || connectors::run_http_in(r, u, s, sr, http_port));
-        }
-        {
-            let (r, u, s, sr) = (running.clone(), url, stream, subj_root);
-            thread::spawn(move || connectors::run_slack_out(r, u, s, sr));
-        }
-    }
+    eprintln!("[vejas] supervising {total} units ({started} started)");
 
     {
         let registry = registry.clone();

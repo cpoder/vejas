@@ -1,12 +1,18 @@
-// Native connectors, in-process.
+// Connector SDK (ADR-0007).
 //
-// Bundled connectors are Rust threads inside the runtime — no subprocess, no
-// Python. The subject convention (docs/SUBJECTS.md) is still the whole plugin
-// interface, so an external connector in any language can talk to the same bus;
-// these are just the batteries included.
+// A connector is a native Rust **driver** + a declarative **instance manifest**
+// (`connectors/<name>.vjs`: `driver "http-in"` plus UPPERCASE literal config).
+// Drivers are compiled in; instances are data — hot-addable, editable in the
+// panel like any other business surface. Two families:
 //
-//   http-in   : POST /ingest/<suffix>  -> publish vx.<suffix>
-//   slack-out : consume vx.slack.out   -> Slack webhook (or DRY-RUN log)
+//   Source  — pushes onto the bus. Trigger kinds: webhook, poll, interval,
+//             (queue/stream = future drivers). Publishes vx.<...>.
+//   Sink    — consumes from the bus (durable pull consumer) and does a side
+//             effect. Ack after success, else nak (redelivery = retry).
+//
+// The subject convention (SUBJECTS.md) remains the whole interface, so an
+// external connector in any language is still a first-class citizen over the
+// bus. These native drivers are the batteries included.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -15,65 +21,134 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-fn ensure_stream(js: &nats::jetstream::JetStream, stream: &str, subj_root: &str) {
-    let _ = js.add_stream(&nats::jetstream::StreamConfig {
-        name: stream.to_string(),
-        subjects: vec![format!("{subj_root}.>")],
-        ..Default::default()
-    });
+// ───────────────────────── config & context ─────────────────────────
+
+/// A connector instance's config: the UPPERCASE literals of its manifest.
+#[derive(Clone, Default)]
+pub struct Config(pub Map<String, Value>);
+
+impl Config {
+    pub fn str(&self, key: &str) -> Option<String> {
+        self.0.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+    }
+    pub fn str_or(&self, key: &str, default: &str) -> String {
+        self.str(key).unwrap_or_else(|| default.to_string())
+    }
+    pub fn u64_or(&self, key: &str, default: u64) -> u64 {
+        self.0.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
+    }
+    pub fn value(&self, key: &str) -> Option<Value> {
+        self.0.get(key).cloned()
+    }
 }
 
-/// http-in: a tiny threaded HTTP server that publishes JSON bodies to the bus.
-pub fn run_http_in(
-    running: Arc<AtomicBool>,
-    url: String,
-    stream: String,
-    subj_root: String,
-    port: u16,
-) {
-    let nc = match nats::connect(&url) {
-        Ok(nc) => nc,
-        Err(e) => {
-            eprintln!("[http-in] cannot connect NATS: {e}");
-            return;
-        }
-    };
-    let js = nats::jetstream::new(nc);
-    ensure_stream(&js, &stream, &subj_root);
-    let listener = match TcpListener::bind(("0.0.0.0", port)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[http-in] cannot bind :{port}: {e}");
-            return;
-        }
-    };
-    listener.set_nonblocking(true).ok();
-    eprintln!("[http-in] listening on :{port}, publishing under {subj_root}.*");
-    for stream_res in listener.incoming() {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        match stream_res {
-            Ok(mut sock) => {
-                let js = js.clone();
-                let subj_root = subj_root.clone();
-                thread::spawn(move || handle_http(&mut sock, &js, &subj_root));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => eprintln!("[http-in] accept: {e}"),
+pub struct Ctx {
+    pub name: String,
+    pub nats_url: String,
+    pub stream: String,
+    pub subj_root: String,
+    pub config: Config,
+    pub running: Arc<AtomicBool>,
+}
+
+impl Ctx {
+    fn alive(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+    fn jetstream(&self) -> Result<nats::jetstream::JetStream, String> {
+        let nc = nats::connect(&self.nats_url).map_err(|e| e.to_string())?;
+        let js = nats::jetstream::new(nc);
+        let _ = js.add_stream(&nats::jetstream::StreamConfig {
+            name: self.stream.clone(),
+            subjects: vec![format!("{}.>", self.subj_root)],
+            ..Default::default()
+        });
+        Ok(js)
+    }
+    /// Full subject from a config value that may be a bare suffix or a vx.* path.
+    fn subject(&self, raw: &str) -> String {
+        if raw.starts_with(&format!("{}.", self.subj_root)) {
+            raw.to_string()
+        } else {
+            format!("{}.{}", self.subj_root, raw)
         }
     }
 }
 
-fn handle_http(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
+// ───────────────────────── driver trait & registry ─────────────────────────
+
+pub trait Driver: Send + Sync {
+    /// e.g. "source:webhook", "source:poll", "source:interval", "sink".
+    fn kind(&self) -> &'static str;
+    /// One-line description for the panel / MCP.
+    fn about(&self) -> &'static str;
+    /// Blocking; loops until `ctx.running` clears. Returning Err triggers a
+    /// supervised restart.
+    fn run(&self, ctx: &Ctx) -> Result<(), String>;
+}
+
+/// The compiled-in driver catalog. New drivers are added here (and, later,
+/// generated onto this trait via `vejas_new_connector`).
+pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
+    match name {
+        "http-in" => Some(Box::new(HttpIn)),
+        "timer" => Some(Box::new(Timer)),
+        "http-poll" => Some(Box::new(HttpPoll)),
+        "slack-out" => Some(Box::new(SlackOut)),
+        "http-out" => Some(Box::new(HttpOut)),
+        _ => None,
+    }
+}
+
+pub fn catalog() -> Vec<(&'static str, &'static str, &'static str)> {
+    ["http-in", "timer", "http-poll", "slack-out", "http-out"]
+        .iter()
+        .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
+        .collect()
+}
+
+// ───────────────────────── source: webhook ─────────────────────────
+
+struct HttpIn;
+impl Driver for HttpIn {
+    fn kind(&self) -> &'static str {
+        "source:webhook"
+    }
+    fn about(&self) -> &'static str {
+        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let port = ctx.config.u64_or("PORT", 8787) as u16;
+        let js = ctx.jetstream()?;
+        let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).ok();
+        eprintln!("[{}] http-in on :{port}, publishing under {}.*", ctx.name, ctx.subj_root);
+        for s in listener.incoming() {
+            if !ctx.alive() {
+                break;
+            }
+            match s {
+                Ok(mut sock) => {
+                    let js = js.clone();
+                    let root = ctx.subj_root.clone();
+                    thread::spawn(move || handle_http_in(&mut sock, &js, &root));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => eprintln!("[{}] accept: {e}", ctx.name),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn handle_http_in(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
-    // read headers + body (small requests; read until we have Content-Length bytes)
     let mut header_end = None;
     loop {
         match sock.read(&mut tmp) {
@@ -81,13 +156,12 @@ fn handle_http(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, 
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
                 if header_end.is_none() {
-                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         header_end = Some(pos + 4);
                     }
                 }
                 if let Some(he) = header_end {
-                    let head = String::from_utf8_lossy(&buf[..he]);
-                    let clen = content_length(&head);
+                    let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
                     if buf.len() >= he + clen {
                         break;
                     }
@@ -101,14 +175,10 @@ fn handle_http(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, 
     }
     let text = String::from_utf8_lossy(&buf);
     let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split(' ');
+    let mut parts = lines.next().unwrap_or("").split(' ');
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
-    let body = header_end
-        .map(|he| &buf[he.min(buf.len())..])
-        .unwrap_or(&[]);
-
+    let body = header_end.map(|he| &buf[he.min(buf.len())..]).unwrap_or(&[]);
     let reply = |sock: &mut std::net::TcpStream, code: &str, json: &str| {
         let _ = write!(
             sock,
@@ -116,7 +186,6 @@ fn handle_http(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, 
             json.len()
         );
     };
-
     if method == "GET" && path == "/healthz" {
         return reply(sock, "200 OK", "{\"ok\":true}");
     }
@@ -132,17 +201,9 @@ fn handle_http(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, 
     }
     let subject = format!("{subj_root}.{suffix}");
     match js.publish(&subject, body) {
-        Ok(_) => reply(
-            sock,
-            "202 Accepted",
-            &format!("{{\"published\":\"{subject}\"}}"),
-        ),
+        Ok(_) => reply(sock, "202 Accepted", &format!("{{\"published\":\"{subject}\"}}")),
         Err(e) => reply(sock, "502 Bad Gateway", &format!("{{\"error\":\"{e}\"}}")),
     }
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 fn content_length(head: &str) -> usize {
@@ -154,80 +215,197 @@ fn content_length(head: &str) -> usize {
     0
 }
 
-/// slack-out: durable pull consumer on vx.slack.out -> webhook, or DRY-RUN log.
-pub fn run_slack_out(running: Arc<AtomicBool>, url: String, stream: String, subj_root: String) {
-    let subject = format!("{subj_root}.slack.out");
-    let webhook = std::env::var("SLACK_WEBHOOK_URL").unwrap_or_default();
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            return;
-        }
-        let attempt = (|| -> Result<(), String> {
-            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let js = nats::jetstream::new(nc);
-            ensure_stream(&js, &stream, &subj_root);
-            let _ = js.add_consumer(
-                &stream,
-                nats::jetstream::ConsumerConfig {
-                    durable_name: Some("slack_out".into()),
-                    filter_subject: subject.clone(),
-                    ..Default::default()
-                },
-            );
-            let sub = js
-                .pull_subscribe_with_options(
-                    &subject,
-                    &nats::jetstream::PullSubscribeOptions::new().durable_name("slack_out".into()),
-                )
-                .map_err(|e| e.to_string())?;
-            let mode = if webhook.is_empty() {
-                "DRY-RUN (set SLACK_WEBHOOK_URL to post)"
-            } else {
-                "webhook"
-            };
-            eprintln!("[slack-out] consuming {subject} -> {mode}");
-            loop {
-                if !running.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                let batch = sub.fetch(10).map_err(|e| e.to_string())?;
-                for msg in batch {
-                    let text = serde_json::from_slice::<Value>(&msg.data)
-                        .ok()
-                        .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| String::from_utf8_lossy(&msg.data).into_owned());
-                    if webhook.is_empty() {
-                        eprintln!("[slack-out] DRY-RUN would post: {text}");
-                        let _ = msg.ack();
-                    } else {
-                        match post_webhook(&webhook, &text) {
-                            Ok(()) => {
-                                eprintln!("[slack-out] posted: {text}");
-                                let _ = msg.ack();
-                            }
-                            Err(e) => eprintln!("[slack-out] post failed ({e}), will retry"),
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(150));
+// ───────────────────────── source: interval (timer) ─────────────────────────
+
+struct Timer;
+impl Driver for Timer {
+    fn kind(&self) -> &'static str {
+        "source:interval"
+    }
+    fn about(&self) -> &'static str {
+        "Emits a fixed payload on a subject every INTERVAL_SECS. Config: SUBJECT, INTERVAL_SECS, PAYLOAD."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let interval = ctx.config.u64_or("INTERVAL_SECS", 60).max(1);
+        let payload = ctx.config.value("PAYLOAD").unwrap_or(Value::Object(Map::new()));
+        let js = ctx.jetstream()?;
+        eprintln!("[{}] timer every {interval}s -> {subject}", ctx.name);
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let mut waited = 0;
+        loop {
+            if !ctx.alive() {
+                return Ok(());
             }
-        })();
-        if let Err(e) = attempt {
-            eprintln!("[slack-out] {e}; reconnecting");
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(250));
+            waited += 250;
+            if waited >= interval * 1000 {
+                waited = 0;
+                if let Err(e) = js.publish(&subject, &bytes) {
+                    return Err(format!("publish: {e}"));
+                }
+            }
         }
     }
 }
 
-/// Minimal HTTPS POST via the system curl (no TLS crate pulled in for v0).
-fn post_webhook(url: &str, text: &str) -> Result<(), String> {
-    let payload = serde_json::json!({ "text": text }).to_string();
+// ───────────────────────── source: poll ─────────────────────────
+
+struct HttpPoll;
+impl Driver for HttpPoll {
+    fn kind(&self) -> &'static str {
+        "source:poll"
+    }
+    fn about(&self) -> &'static str {
+        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let url = ctx.config.str("URL").ok_or("URL required")?;
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let interval = ctx.config.u64_or("INTERVAL_SECS", 60).max(1);
+        let js = ctx.jetstream()?;
+        eprintln!("[{}] polling {url} every {interval}s -> {subject}", ctx.name);
+        let mut waited = interval * 1000; // fire immediately on start
+        loop {
+            if !ctx.alive() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
+            waited += 250;
+            if waited >= interval * 1000 {
+                waited = 0;
+                match http_get(&url) {
+                    Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
+                        let _ = js.publish(&subject, &body);
+                    }
+                    Ok(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
+                    Err(e) => eprintln!("[{}] poll: {e}", ctx.name),
+                }
+            }
+        }
+    }
+}
+
+// ───────────────────────── sinks ─────────────────────────
+
+/// Shared sink loop: durable pull consumer -> handler; ack on Ok, nak on Err.
+fn run_sink(
+    ctx: &Ctx,
+    subject: &str,
+    handler: impl Fn(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let js = ctx.jetstream()?;
+    let durable = ctx.name.replace([':', '.', '-'], "_");
+    let _ = js.add_consumer(
+        &ctx.stream,
+        nats::jetstream::ConsumerConfig {
+            durable_name: Some(durable.clone()),
+            filter_subject: subject.to_string(),
+            ..Default::default()
+        },
+    );
+    let sub = js
+        .pull_subscribe_with_options(
+            subject,
+            &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
+        )
+        .map_err(|e| e.to_string())?;
+    eprintln!("[{}] consuming {subject}", ctx.name);
+    loop {
+        if !ctx.alive() {
+            return Ok(());
+        }
+        let batch = sub.fetch(10).map_err(|e| e.to_string())?;
+        for msg in batch {
+            match handler(&msg.data) {
+                Ok(()) => {
+                    let _ = msg.ack();
+                }
+                Err(e) => {
+                    eprintln!("[{}] {e} -> nak", ctx.name);
+                    let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
+struct SlackOut;
+impl Driver for SlackOut {
+    fn kind(&self) -> &'static str {
+        "sink"
+    }
+    fn about(&self) -> &'static str {
+        "Consumes vx.slack.out and posts {text} to a Slack webhook (DRY-RUN if unset). Config: SUBJECT, WEBHOOK_URL."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let subject = ctx.subject(&ctx.config.str_or("SUBJECT", "slack.out"));
+        let webhook = ctx
+            .config
+            .str("WEBHOOK_URL")
+            .or_else(|| std::env::var("SLACK_WEBHOOK_URL").ok())
+            .unwrap_or_default();
+        let name = ctx.name.clone();
+        run_sink(ctx, &subject, move |data| {
+            let text = serde_json::from_slice::<Value>(data)
+                .ok()
+                .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| String::from_utf8_lossy(data).into_owned());
+            if webhook.is_empty() {
+                eprintln!("[{name}] DRY-RUN would post: {text}");
+                Ok(())
+            } else {
+                let payload = serde_json::json!({ "text": text }).to_string();
+                http_post(&webhook, payload.as_bytes()).map(|_| ())
+            }
+        })
+    }
+}
+
+struct HttpOut;
+impl Driver for HttpOut {
+    fn kind(&self) -> &'static str {
+        "sink"
+    }
+    fn about(&self) -> &'static str {
+        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let url = ctx.config.str("URL").ok_or("URL required")?;
+        run_sink(ctx, &subject, move |data| http_post(&url, data).map(|_| ()))
+    }
+}
+
+// ───────────────────────── tiny HTTP client (curl) ─────────────────────────
+// v0 keeps the dependency graph light; a Rust HTTP client replaces this later.
+
+fn http_get(url: &str) -> Result<Vec<u8>, String> {
     let out = std::process::Command::new("curl")
-        .args(["-sS", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json", "-d", &payload, url])
+        .args(["-sS", "-m", "15", url])
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(())
+        Ok(out.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("curl")
+        .args(["-sS", "-m", "15", "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", url])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    child.stdin.take().unwrap().write_all(body).map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(out.stdout)
     } else {
         Err(String::from_utf8_lossy(&out.stderr).into_owned())
     }

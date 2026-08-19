@@ -36,3 +36,19 @@ emit "vx.classify.result", {severity: severity}
 the arguments and returns its emits. The MCP surface grows as you write flows —
 no server code to touch. The same declaration is what a future `/api/<name>`
 HTTP endpoint will expose.
+
+## Connectors over MCP
+
+`vejas_drivers` lists the available connector drivers (name, kind, description).
+A connector is a manifest file under `connectors/` (or `packages/<pkg>/connectors/`):
+
+```
+# connector: stripe_in
+driver "http-in"
+PORT = 8787
+```
+
+Write one with `vejas_write_flow` (any `.vjs` path), tune its config with
+`vejas_set_literal`, and it hot-starts on reload — same tools as flows. Drivers
+today: `http-in` (webhook), `timer` (interval), `http-poll` (poll), `slack-out`
+and `http-out` (sinks). See ADR-0007.

@@ -56,6 +56,7 @@ pub enum Tok {
     Invoke,
     Source,
     Tool,
+    Driver,
     Newline,
     Colon,
     Comma,
@@ -155,6 +156,7 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     "invoke" => Tok::Invoke,
                     "source" => Tok::Source,
                     "tool" => Tok::Tool,
+                    "driver" => Tok::Driver,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "null" => Tok::Null,
@@ -356,6 +358,9 @@ pub struct Program {
     /// When set, this flow/service is exposed as an MCP tool (and as an API):
     /// `tool "one-line description of what calling it does"`.
     pub tool: Option<String>,
+    /// When set, this file is a connector instance manifest: `driver "http-in"`
+    /// plus UPPERCASE literal config. It is run by a native driver, not as a flow.
+    pub driver: Option<String>,
     pub stmts: Vec<Stmt>,
     pub surface: Vec<SurfaceEntry>,
     pub emit_subjects: Vec<String>,
@@ -415,6 +420,7 @@ impl<'a> Parser<'a> {
     fn program(&mut self) -> Result<Program, String> {
         let mut source = None;
         let mut tool = None;
+        let mut driver = None;
         let mut stmts = Vec::new();
         let mut surface = Vec::new();
         loop {
@@ -435,6 +441,14 @@ impl<'a> Parser<'a> {
                 match self.next() {
                     Tok::Str(s) => tool = Some(s),
                     _ => return Err(self.err("tool expects a string description")),
+                }
+                continue;
+            }
+            if *self.peek() == Tok::Driver {
+                self.next();
+                match self.next() {
+                    Tok::Str(s) => driver = Some(s),
+                    _ => return Err(self.err("driver expects a string driver name")),
                 }
                 continue;
             }
@@ -465,6 +479,7 @@ impl<'a> Parser<'a> {
         let mut prog = Program {
             source,
             tool,
+            driver,
             stmts,
             surface,
             emit_subjects: Vec::new(),

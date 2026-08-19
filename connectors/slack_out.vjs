@@ -1,0 +1,4 @@
+# connector: slack_out — Slack sink (consumes vx.slack.out; DRY-RUN without a webhook)
+driver "slack-out"
+SUBJECT = "vx.slack.out"
+# WEBHOOK_URL = "https://hooks.slack.com/services/..."   # or set SLACK_WEBHOOK_URL

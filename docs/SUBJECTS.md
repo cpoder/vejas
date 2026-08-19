@@ -3,14 +3,15 @@
 Everything on the bus lives under one subject root: `vx.` (configurable via
 `VEJAS_SUBJECT_ROOT`). One JetStream stream named `VEJAS` binds `vx.>`.
 
-The bundled connectors run as **native Rust threads inside the runtime** — no
-subprocess, no Python:
+Bundled connectors are **native Rust drivers** run from a declarative manifest
+(`connectors/<name>.vjs`: `driver "..."` + literal config, editable in the panel,
+hot-addable). No subprocess, no Python. Drivers today:
 
-- **http-in** — `POST /ingest/<suffix>` publishes the JSON body on `vx.<suffix>`
-  (e.g. `POST /ingest/stripe.events` → `vx.stripe.events`). Port `HTTP_IN_PORT`
-  (default 8787).
-- **slack-out** — durable pull consumer on `vx.slack.out`, posts `{text: ...}`
-  to `SLACK_WEBHOOK_URL` (or logs a DRY-RUN line when unset).
+- **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT.
+- **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS.
+- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT.
+- **slack-out** (sink) — consumes vx.slack.out → Slack webhook / DRY-RUN.
+- **http-out** (sink) — consumes SUBJECT → POST to URL.
 
 An **external connector** in any language is still a first-class citizen: it is
 just a process that follows these rules on the same bus. Language, host and

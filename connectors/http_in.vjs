@@ -1,0 +1,3 @@
+# connector: http_in — webhook source (POST /ingest/<suffix> -> vx.<suffix>)
+driver "http-in"
+PORT = 8787

@@ -1,0 +1,5 @@
+# connector: ops_heartbeat_timer — interval source, proves a new Source kind
+driver "timer"
+SUBJECT = "vx.ops.ping"
+INTERVAL_SECS = 30
+PAYLOAD = {origin: "timer"}

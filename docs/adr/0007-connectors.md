@@ -1,6 +1,6 @@
 # 0007 — Connectors: native bundled + bus contract + SDK
 
-- Status: Accepted (partial)
+- Status: Accepted
 - Date: 2026-08-19
 
 ## Context
@@ -20,17 +20,30 @@ integration into one language.
   ack only after the side effect succeeds, else `nak`. Any process that follows
   this — **in any language** — is a first-class external connector over the bus.
 
-## Decision (planned, Phase 2)
+## Decision (built, Phase 2)
 
-- A typed **connector SDK**: a Rust `Connector` trait with two families,
-  **Source** (pushes onto the bus) and **Sink** (consumes from it). The four
-  input modes are patterns of one Source trait, modeled as trigger kinds:
-  **webhook**, **poll** (tick + cursor), **queue/stream** (long-lived
-  subscription: Kafka/AMQP/MQTT), **push/real-time**. A connector is a package
-  (ADR-0003) with a manifest declaring its kind and its secret references
-  (ADR-0008), hot-addable.
-- **Connector-by-prompt**: the ADR-0006 generation loop, retargeted — a
-  `vejas_new_connector` MCP tool whose grammar is the trait contract.
+- A typed **connector SDK**: a Rust `Driver` trait (`core/src/connectors.rs`)
+  with two families, **Source** (pushes onto the bus) and **Sink** (consumes
+  from it). Input modes are `kind`s of Source: `source:webhook`,
+  `source:interval`, `source:poll` (queue/stream drivers for Kafka/AMQP/MQTT are
+  future additions on the same trait). Shipped drivers: `http-in`, `timer`,
+  `http-poll`, `slack-out`, `http-out`. The `Driver::kind()` string surfaces in
+  the topology and graph.
+- A connector is a **declarative instance manifest**: a `.vjs` file under
+  `connectors/` (or `packages/<pkg>/connectors/`) with a `driver "name"`
+  directive and UPPERCASE literal config. It is parsed and configured by the
+  same machinery as flows — so its config is **editable in the panel /
+  `set_literal`** and it is **hot-addable via reload**. The bundled `http-in`,
+  `slack-out`, and a demo `timer` ship as such manifests.
+- `vejas_drivers` (MCP) lists the driver catalog for writing manifests.
+
+## Planned (later this phase)
+
+- **Secret references** in a manifest resolved via the Vault (ADR-0008); today
+  config values (incl. `WEBHOOK_URL`) are literals/env.
+- **Connector-by-prompt**: a `vejas_new_connector` MCP tool — the ADR-0006
+  generation loop retargeted to the `Driver` trait contract.
+- **Queue/stream Source drivers** (Kafka/AMQP/MQTT) on the same trait.
 
 ## Consequences
 

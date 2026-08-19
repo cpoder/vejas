@@ -109,10 +109,23 @@ the arguments and returns its emits. Details and the tool table: `MCP.md`.
 
 ## Connectors (ADR-0007)
 
-Bundled connectors are native Rust threads. The **subject convention**
-(`SUBJECTS.md`) is the whole connector interface, so an **external connector in
-any language** is a first-class citizen over the bus. A typed connector **SDK**
-(source patterns: webhook/poll/queue/push; sinks) is _(planned, Phase 2)_.
+A connector is a native Rust **driver** + a declarative **instance manifest**.
+Drivers implement `connectors::Driver` (`kind()`, `about()`, `run(ctx)`) in two
+families — Source (pushes onto the bus) and Sink (consumes it); Source kinds are
+`webhook` / `interval` / `poll` (queue/stream drivers are future). Shipped:
+`http-in`, `timer`, `http-poll`, `slack-out`, `http-out`.
+
+An instance is a `.vjs` manifest under `connectors/` (or
+`packages/<pkg>/connectors/`): a `driver "name"` directive plus UPPERCASE literal
+config. It is scanned, supervised (restart/backoff, restart on mtime change),
+and reported in `/topology` and `/graph` like a flow — and its config is
+editable via `set_literal` / the panel, hot-addable via `/reload`. Config maps
+straight from the manifest's surface literals into the driver's `Config`.
+
+The **subject convention** (`SUBJECTS.md`) remains the whole interface, so an
+**external connector in any language** is a first-class citizen over the bus.
+Secret references in manifests (ADR-0008) and connector-by-prompt are _(planned,
+this phase)_.
 
 ## Secrets _(planned, ADR-0008)_
 
