@@ -1,3 +1,10 @@
+> **Superseded (2026-08-19).** This was the original v0 demo spec and
+> planning scratchpad; parts reference the removed Python SDK. The
+> current, maintained docs are [VISION](docs/VISION.md),
+> [ARCHITECTURE](docs/ARCHITECTURE.md), [ROADMAP](docs/ROADMAP.md) and
+> the [ADRs](docs/adr/). Kept for history (traction thresholds, the
+> A/B/C amendments).
+
 # Vejas — spec de la démo minimale (v0)
 
 **But unique : tester la traction avant de construire.** Budget dur : 2 week-ends (lane FEU — la lane revenu, relances IT + 31/10, reste intouchée). Tout ce qui n'est pas nécessaire à la démo enregistrée est hors périmètre.

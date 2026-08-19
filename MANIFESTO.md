@@ -22,10 +22,10 @@ Vejas is my attempt at that reduced platform. Vėjas is the old Baltic god of th
 
 The architecture is deliberately boring:
 
-- One Rust binary for the runtime. It supervises flows, wires them to the bus, enforces retries and backpressure, and exports traces. No embedded DSL, no workflow language of mine.
+- One Rust binary for the runtime. It runs the flows in-process, wires them to the bus, enforces retries and backpressure, and exports traces. No subprocess, no Python.
 - NATS as the only infrastructure dependency. JetStream covers persistence, key-value and object storage, so there is no Redis and no Postgres to start with. Two processes, one docker-compose. That is the deployment story.
-- Connectors are just services on the bus. The "plugin interface" is a subject convention, not a linker trick. A connector can therefore be written in any language, is isolated by construction, and can be replaced live.
-- Flows are plain Python or Rust files in your own git repository. An agent writes them, a human reviews the pull request, CI runs the tests, GitOps deploys. If you leave, you take your code with you. There is nothing to export because nothing was captured.
+- Connectors are just services on the bus. The bundled ones ship in the binary; the "plugin interface" is a subject convention, not a linker trick, so a connector can be written in any language, is isolated by construction, and can be replaced live.
+- Flows are VejasScript files in your own git repository — a small, readable language (I reimplemented my old WmScript in Rust for it). An agent writes them, a human reviews the pull request, the tests run, GitOps deploys. If you leave, you take your code with you. There is nothing to export because nothing was captured.
 - No builder UI. Two screens survive: monitoring (OpenTelemetry-native: live topology, per-flow traces, replay) for whoever operates, and a business panel where a domain user reviews and corrects the business surface of a flow (mappings, thresholds). Neither screen can draw a flow.
 - An MCP server exposes the platform to whatever agent you already use: list connectors, scaffold a flow, run it against fixtures, deploy, read traces. Bring your own agent. Claude Code, Codex, a cron job with an API key, I don't care.
 
