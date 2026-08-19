@@ -12,6 +12,7 @@ hot-addable). No subprocess, no Python. Drivers today:
 - **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT.
 - **slack-out** (sink) — consumes vx.slack.out → Slack webhook / DRY-RUN.
 - **http-out** (sink) — consumes SUBJECT → POST to URL.
+- **exec-source** / **exec-sink** — bridge an external program in ANY language over stdio (source prints JSON on stdout; sink reads JSON on stdin). The hot-add path for new connector types without recompiling the core or loading native libs (ADR-0011).
 
 An **external connector** in any language is still a first-class citizen: it is
 just a process that follows these rules on the same bus. Language, host and

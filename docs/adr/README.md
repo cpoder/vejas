@@ -21,6 +21,7 @@ the old one.
 | [0008](0008-secrets-vault.md) | Secrets via a Vault, never in literals | Proposed |
 | [0009](0009-all-rust-no-python.md) | All-Rust runtime, no Python | Accepted |
 | [0010](0010-transformation-doctrine.md) | Transformation doctrine: small registry + code-by-example | Accepted |
+| [0011](0011-connector-extensibility.md) | Connector extensibility: external process, not native libs; WASM later | Accepted |
 
 ## Template
 

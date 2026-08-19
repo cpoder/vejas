@@ -1,0 +1,6 @@
+# connector: shell_clock — a source connector in PURE SHELL, hot-addable
+# It prints one JSON line; the runtime bridges stdout -> the bus. Any language works this way.
+driver "exec-source"
+CMD = "printf '{\"text\": \"shell connector tick at %s\"}' \"$(date +%H:%M:%S)\""
+SUBJECT = "vx.slack.out"
+INTERVAL_SECS = 5

@@ -98,15 +98,20 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
         "http-poll" => Some(Box::new(HttpPoll)),
         "slack-out" => Some(Box::new(SlackOut)),
         "http-out" => Some(Box::new(HttpOut)),
+        "exec-source" => Some(Box::new(ExecSource)),
+        "exec-sink" => Some(Box::new(ExecSink)),
         _ => None,
     }
 }
 
 pub fn catalog() -> Vec<(&'static str, &'static str, &'static str)> {
-    ["http-in", "timer", "http-poll", "slack-out", "http-out"]
-        .iter()
-        .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
-        .collect()
+    [
+        "http-in", "timer", "http-poll", "slack-out", "http-out", "exec-source",
+        "exec-sink",
+    ]
+    .iter()
+    .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
+    .collect()
 }
 
 // ───────────────────────── source: webhook ─────────────────────────
@@ -375,6 +380,97 @@ impl Driver for HttpOut {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let url = ctx.config.str("URL").ok_or("URL required")?;
         run_sink(ctx, &subject, move |data| http_post(&url, data).map(|_| ()))
+    }
+}
+
+// ───────────────────────── external process connectors ─────────────────────
+//
+// The hot-add extension path for NEW connector types without recompiling the
+// core and without loading native libraries (no .so/.dll, no unstable ABI, no
+// in-process arbitrary code). A connector is an external program in ANY
+// language; the runtime bridges it to the bus over stdio, so the program needs
+// no NATS client. Isolation is by process. See ADR-0011.
+
+struct ExecSource;
+impl Driver for ExecSource {
+    fn kind(&self) -> &'static str {
+        "source:exec"
+    }
+    fn about(&self) -> &'static str {
+        "Runs CMD every INTERVAL_SECS; each JSON line it prints on stdout is published to SUBJECT. Any language, no NATS client. Config: CMD, SUBJECT, INTERVAL_SECS."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let interval = ctx.config.u64_or("INTERVAL_SECS", 10).max(1);
+        let js = ctx.jetstream()?;
+        eprintln!("[{}] exec-source: `{cmd}` every {interval}s -> {subject}", ctx.name);
+        let mut waited = interval * 1000; // fire immediately on start
+        loop {
+            if !ctx.alive() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
+            waited += 250;
+            if waited >= interval * 1000 {
+                waited = 0;
+                let out = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    eprintln!("[{}] exec: {}", ctx.name, String::from_utf8_lossy(&out.stderr).trim());
+                }
+                for line in out.stdout.split(|&b| b == b'\n') {
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if serde_json::from_slice::<Value>(line).is_ok() {
+                        let _ = js.publish(&subject, line);
+                    } else {
+                        eprintln!("[{}] exec: non-JSON line skipped", ctx.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ExecSink;
+impl Driver for ExecSink {
+    fn kind(&self) -> &'static str {
+        "sink:exec"
+    }
+    fn about(&self) -> &'static str {
+        "Consumes SUBJECT; pipes each message body to CMD's stdin. Any language, no NATS client. Config: CMD, SUBJECT."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let name = ctx.name.clone();
+        run_sink(ctx, &subject, move |data| {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            child
+                .stdin
+                .take()
+                .ok_or("no stdin")?
+                .write_all(data)
+                .map_err(|e| e.to_string())?;
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(format!("{name}: exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        })
     }
 }
 
