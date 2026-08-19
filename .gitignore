@@ -1,4 +1,6 @@
 /core/target/
+/e2e/node_modules/
+/e2e/out/
 .env
 *.log
 .DS_Store
