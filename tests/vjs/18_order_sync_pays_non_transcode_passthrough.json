@@ -1,0 +1,5 @@
+{
+  "flow": "flows/order_sync.vjs",
+  "input": {"id": "#9", "email": "x@y.z", "total_price": "10", "shipping_address": {"country": "Andorra"}, "line_items": []},
+  "expect_emits": [{"subject": "vx.erp.orders.upsert", "payload": {"order_ref": "9", "customer_email": "x@y.z", "total_eur": 10, "country": "Andorra", "positions": []}}]
+}

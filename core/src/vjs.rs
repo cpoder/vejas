@@ -1320,6 +1320,12 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                     (Value::Number(a), Value::Number(b)) => {
                         num(a.as_f64().unwrap_or(0.0) + b.as_f64().unwrap_or(0.0))
                     }
+                    (Value::Array(a), Value::Array(b)) => {
+                        // array concatenation: how lists are built in a loop
+                        let mut out = a.clone();
+                        out.extend(b.clone());
+                        Value::Array(out)
+                    }
                     _ => Value::String(format!("{}{}", to_display(&lv), to_display(&rv))),
                 },
                 BinOp::Sub | BinOp::Mul | BinOp::Div => match (lv.as_f64(), rv.as_f64()) {
@@ -1445,4 +1451,211 @@ pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Resul
     out.push_str(&src[end..]);
     parse(&out)?;
     Ok(out)
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn eval_flow(src: &str, event: Value) -> Result<Vec<(String, Value)>, String> {
+        let prog = parse(src)?;
+        let mut engine = Engine::new(std::env::temp_dir(), "default".into());
+        run(&prog, &event, &mut engine).map(|c| c.emits)
+    }
+    fn one_emit(src: &str, event: Value) -> Value {
+        let emits = eval_flow(src, event).expect("run");
+        assert_eq!(emits.len(), 1, "expected exactly one emit");
+        emits[0].1.clone()
+    }
+
+    #[test]
+    fn fstring_utf8_and_escapes() {
+        let p = one_emit(
+            "emit \"vx.t\", {r: f\"héllo {upper(name)} — 100 % {{brace}}\"}",
+            json!({"name": "josé"}),
+        );
+        assert_eq!(p["r"], "héllo JOSÉ — 100 % {brace}");
+    }
+
+    #[test]
+    fn null_safe_and_coalesce() {
+        let p = one_emit(
+            "emit \"vx.t\", {a: user?.email, b: user?.email ?? \"none\", c: missing ?? 0}",
+            json!({}),
+        );
+        assert_eq!(p["a"], Value::Null);
+        assert_eq!(p["b"], "none");
+        assert_eq!(p["c"], 0);
+    }
+
+    #[test]
+    fn projection_and_filter_with_outer_scope() {
+        let p = one_emit(
+            "MIN = 10\nemit \"vx.t\", {ids: orders[].id, big: orders[total > MIN][].id}",
+            json!({"orders": [{"id": "a", "total": 5}, {"id": "b", "total": 50}]}),
+        );
+        assert_eq!(p["ids"], json!(["a", "b"]));
+        assert_eq!(p["big"], json!(["b"]));
+    }
+
+    #[test]
+    fn index_by_expression_and_table() {
+        let p = one_emit(
+            "T = {\"fr\": \"France\"}\nemit \"vx.t\", {c: T[code] ?? \"?\", n: xs[1]}",
+            json!({"code": "fr", "xs": [10, 20, 30]}),
+        );
+        assert_eq!(p["c"], "France");
+        assert_eq!(p["n"], 20);
+    }
+
+    #[test]
+    fn arithmetic_division_by_zero_is_null() {
+        let p = one_emit(
+            "emit \"vx.t\", {a: 7 / 2, b: 1 / 0, c: round(10 / 3, 2)}",
+            json!({}),
+        );
+        assert_eq!(p["a"], 3.5);
+        assert_eq!(p["b"], Value::Null);
+        assert_eq!(p["c"], 3.33);
+    }
+
+    #[test]
+    fn array_concat_builds_lists_in_for() {
+        let p = one_emit(
+            "out = []\nfor l in lines:\n  out = out + [{s: l.sku, q: num(l.q)}]\nend\nemit \"vx.t\", {out: out}",
+            json!({"lines": [{"sku": "A", "q": "2"}, {"sku": "B", "q": "3"}]}),
+        );
+        assert_eq!(p["out"], json!([{"s": "A", "q": 2}, {"s": "B", "q": 3}]));
+    }
+
+    #[test]
+    fn nested_assignment_builds_documents() {
+        let p = one_emit(
+            "doc.head.id = 1\ndoc.head.kind = \"x\"\nemit \"vx.t\", doc",
+            json!({}),
+        );
+        assert_eq!(p, json!({"head": {"id": 1, "kind": "x"}}));
+    }
+
+    #[test]
+    fn in_operator_array_string_object() {
+        let p = one_emit(
+            "emit \"vx.t\", {a: \"P1\" in codes, b: \"P9\" in codes, c: \"ell\" in \"hello\", d: \"k\" in {\"k\": 1}}",
+            json!({"codes": ["P1", "P2"]}),
+        );
+        assert_eq!(p["a"], true);
+        assert_eq!(p["b"], false);
+        assert_eq!(p["c"], true);
+        assert_eq!(p["d"], true);
+    }
+
+    #[test]
+    fn builtins_split_join_replace_trim_len() {
+        let p = one_emit(
+            "parts = split(ref, \"-\")\nemit \"vx.t\", {p1: parts[1], j: join(parts, \"/\"), r: replace(ref, \"-\", \".\"), t: trim(pad), l: len(parts)}",
+            json!({"ref": "FA-2026-77", "pad": "  x  "}),
+        );
+        assert_eq!(p["p1"], "2026");
+        assert_eq!(p["j"], "FA/2026/77");
+        assert_eq!(p["r"], "FA.2026.77");
+        assert_eq!(p["t"], "x");
+        assert_eq!(p["l"], 3);
+    }
+
+    #[test]
+    fn unknown_function_and_parse_errors() {
+        assert!(eval_flow("x = nope(1)\nemit \"vx.t\", {x: x}", json!({}))
+            .unwrap_err()
+            .contains("unknown function"));
+        match parse("if x:\n  y = 1\n") {
+            Err(e) => assert!(e.contains("missing `end`")),
+            Ok(_) => panic!("expected parse error"),
+        }
+        assert!(parse("x = ").is_err());
+    }
+
+    #[test]
+    fn emit_subject_via_constant_is_collected() {
+        let prog = parse("Q = \"vx.out.q\"\nemit Q, {a: 1}").unwrap();
+        assert_eq!(prog.emit_subjects, vec!["vx.out.q"]);
+    }
+
+    #[test]
+    fn surface_extraction_kinds() {
+        let prog =
+            parse("T = {\"a\": \"b\"}\nN = 5\nL = [1, 2]\nS = \"x\"\nlower_ignored = 1\n").unwrap();
+        let names: Vec<&str> = prog.surface.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["T", "N", "L", "S"]);
+    }
+
+    #[test]
+    fn set_literal_constant_and_table_entry_and_list() {
+        let src = "T = {\"haute\": \"P2\", \"basse\": \"P4\"}\nN = 250\nL = [\"P1\", \"P2\"]\nemit \"vx.t\", {n: N}\n";
+        let s1 = set_literal(src, "N", "-", &json!(999)).unwrap();
+        assert!(s1.contains("N = 999"));
+        let s2 = set_literal(&s1, "T", "haute", &json!("P9")).unwrap();
+        assert!(s2.contains("\"haute\": \"P9\""));
+        assert!(s2.contains("\"basse\": \"P4\""));
+        let s3 = set_literal(&s2, "L", "-", &json!(["P1"])).unwrap();
+        assert!(s3.contains("L = [\"P1\"]"));
+        // and the result still runs
+        let emits = eval_flow(&s3, json!({})).unwrap();
+        assert_eq!(emits[0].1["n"], 999);
+        assert!(set_literal(src, "T", "absent", &json!("x")).is_err());
+        assert!(set_literal(src, "NOPE", "-", &json!(1)).is_err());
+    }
+
+    #[test]
+    fn invoke_capture_and_merge_and_exports() {
+        let root = std::env::temp_dir().join(format!("vejas-test-{}", std::process::id()));
+        let svc_default = root.join("services");
+        let pkg = root.join("packages").join("billing");
+        std::fs::create_dir_all(&svc_default).unwrap();
+        std::fs::create_dir_all(pkg.join("services")).unwrap();
+        std::fs::write(svc_default.join("double.vjs"), "twice = n * 2\n").unwrap();
+        std::fs::write(pkg.join("services").join("fmt.vjs"), "label = f\"<{x}>\"\n").unwrap();
+        std::fs::write(pkg.join("services").join("secret.vjs"), "y = 1\n").unwrap();
+        std::fs::write(pkg.join("package.vjs"), "ENABLED = true\nEXPORTS = [\"fmt\"]\n").unwrap();
+
+        let mut engine = Engine::new(root.clone(), "default".into());
+        // merge form
+        let prog = parse("invoke double(n: 21)\nemit \"vx.t\", {t: twice}").unwrap();
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1["t"], 42);
+        // capture form + cross-package exported
+        let prog2 = parse("d = invoke billing:fmt(x: \"ok\")\nemit \"vx.t\", {l: d.label}").unwrap();
+        let ctx2 = run(&prog2, &json!({}), &mut engine).unwrap();
+        assert_eq!(ctx2.emits[0].1["l"], "<ok>");
+        // cross-package private -> denied
+        let prog3 = parse("invoke billing:secret(a: 1)\n").unwrap();
+        let err = match run(&prog3, &json!({}), &mut engine) {
+            Err(e) => e,
+            Ok(_) => panic!("expected exports denial"),
+        };
+        assert!(err.contains("not exported"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn service_emits_propagate_and_pkg_context_switches() {
+        let root = std::env::temp_dir().join(format!("vejas-test2-{}", std::process::id()));
+        let pkg = root.join("packages").join("n");
+        std::fs::create_dir_all(pkg.join("services")).unwrap();
+        std::fs::write(pkg.join("services").join("inner.vjs"), "r = a + 1\n").unwrap();
+        std::fs::write(
+            pkg.join("services").join("outer.vjs"),
+            "invoke inner(a: v)\nemit \"vx.deep\", {r: r}\n",
+        )
+        .unwrap();
+        std::fs::write(pkg.join("package.vjs"), "EXPORTS = [\"outer\"]\n").unwrap();
+        let mut engine = Engine::new(root.clone(), "default".into());
+        // outer is exported; inner is private but called FROM WITHIN pkg n -> allowed
+        let prog = parse("invoke n:outer(v: 9)\n").unwrap();
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(ctx.emits, vec![("vx.deep".to_string(), json!({"r": 10}))]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

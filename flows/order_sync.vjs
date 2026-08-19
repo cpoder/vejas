@@ -1,0 +1,23 @@
+# flow: order_sync
+source "vx.shop.orders"
+
+# The shop sends country names ("France"); the ERP wants ISO codes ("FR").
+COUNTRY_CODES = {"France": "FR", "Germany": "DE", "Italy": "IT", "Portugal": "PT", "Netherlands": "NL"}
+
+MIN_TOTAL_EUR = 0
+ERP_QUEUE = "vx.erp.orders.upsert"
+
+order_ref = split(id, "#")[1]
+customer_email = lower(email)
+total_eur = num(total_price)
+country = COUNTRY_CODES[shipping_address.country] ?? shipping_address.country
+
+# project order lines into ERP positions, element by element
+positions = []
+for line in line_items:
+    positions = positions + [{sku: line.sku, qty: num(line.quantity), unit_eur: round(line.unit_price_cents / 100, 2)}]
+end
+
+if total_eur >= MIN_TOTAL_EUR:
+    emit ERP_QUEUE, {order_ref: order_ref, customer_email: customer_email, total_eur: total_eur, country: country, positions: positions}
+end

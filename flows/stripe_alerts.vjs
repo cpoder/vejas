@@ -1,0 +1,13 @@
+# flow: stripe_alerts
+source "vx.stripe.events"
+
+# Alert Slack when a Stripe payment exceeds this amount (in euros).
+THRESHOLD_EUR = 500
+
+amount_eur = round(data.object.amount / 100, 2)
+currency = upper(data.object.currency)
+customer = data.object.customer
+
+if amount_eur > THRESHOLD_EUR:
+    emit "vx.slack.out", {text: f"payment {amount_eur} {currency} from {customer}"}
+end

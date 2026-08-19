@@ -1,16 +1,16 @@
-# Stage 1: build the runtime
+# One stage, one binary. No Python anywhere.
 FROM rust:1-slim AS build
 WORKDIR /build
 COPY core/ .
 RUN cargo build --release
 
-# Stage 2: runtime + Python for the bundled SDK/connectors/flows
-FROM python:3.12-slim
-RUN pip install --no-cache-dir "nats-py>=2.6"
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY sdk/ sdk/
-COPY connectors/ connectors/
 COPY flows/ flows/
+COPY services/ services/
+COPY packages/ packages/
 COPY docs/ docs/
 COPY --from=build /build/target/release/vejas-runtime /usr/local/bin/vejas-runtime
 ENV VEJAS_ROOT=/app

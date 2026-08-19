@@ -1,0 +1,5 @@
+{
+  "flow": "tests/vjs/flows/projection_filter_probe.vjs",
+  "input": {"orders": [{"id": "a", "total": 50}, {"id": "b", "total": 150}, {"id": "c", "total": 100}]},
+  "expect_emits": [{"subject": "vx.report.big", "payload": {"ids": ["b", "c"], "count": 2}}]
+}

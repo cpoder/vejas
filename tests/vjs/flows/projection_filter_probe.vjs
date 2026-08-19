@@ -1,0 +1,5 @@
+# probe: array projection + filtering + outer-scope constant in the predicate
+source "vx.orders.batch"
+MIN_TOTAL = 100
+big_ids = orders[total >= MIN_TOTAL][].id
+emit "vx.report.big", {ids: big_ids, count: len(big_ids)}

@@ -1,68 +1,52 @@
-// Vejas runtime.
+// Vejas runtime — all Rust, no Python.
 //
-// Supervises flows and connectors, executes VejasScript natively, and serves
-// the panel. Layout (webMethods-style packages, hot-addable):
+// Executes VejasScript flows natively, runs the bundled connectors as threads,
+// and serves the panel. Layout (webMethods-style packages, hot-addable):
 //
-//   flows/*.vjs|*.py          the "default" package
-//   services/*.vjs            composable services (invoke name(...))
-//   connectors/*.py           bus adapters (any language; Python bundled)
-//   packages/<pkg>/flows|services|connectors|fixtures
-//   packages/<pkg>/package.vjs   literal manifest: ENABLED = true/false
+//   flows/*.vjs                  the "default" package
+//   services/*.vjs               composable services (invoke name(...))
+//   packages/<pkg>/flows|services
+//   packages/<pkg>/package.vjs   literal manifest: ENABLED, EXPORTS = [...]
 //
-// VejasScript flows run IN-PROCESS (interpreter thread + NATS pull consumer);
-// Python flows/connectors run as supervised subprocesses via the SDK.
+// A flow is a NATS pull-consumer thread + the in-process interpreter. The
+// bundled connectors (http-in, slack-out) are Rust threads. External
+// connectors in any language remain possible over the bus (docs/SUBJECTS.md).
 //
 // HTTP surface (one request = one thread; /flows/new can take minutes):
 //   GET  /            panel        GET /healthz        GET /topology
 //   GET  /graph       pipeline     GET /surface        business surface
-//   GET  /preview?file=            fixture -> sample run (+ per-rule for .py)
+//   GET  /preview?file=            fixture -> sample run
 //   GET  /file?path=               read a script        POST /file/set
 //   GET  /fixture?file=            read a fixture       POST /fixture/set
 //   POST /surface/set              rewrite one literal in place
 //   POST /flows/new                agent CLI writes a VejasScript flow
 //   POST /reload                   rescan; restart changed files (mtime)
 
+mod connectors;
 mod vjs;
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use serde_json::{json, Value};
-
-#[derive(Clone, PartialEq)]
-enum Kind {
-    Flow,
-    Connector,
-}
-
-#[derive(Clone, PartialEq)]
-enum Lang {
-    Py,
-    Vjs,
-}
 
 #[derive(Clone)]
 struct Spec {
     name: String,
     path: PathBuf,
-    kind: Kind,
-    lang: Lang,
     pkg: String,
     mtime: u64,
 }
 
 struct ProcState {
     status: String,
-    pid: Option<u32>,
     restarts: u64,
     started_at: Option<u64>,
-    last_exit: Option<i32>,
     last_error: Option<String>,
 }
 
@@ -106,42 +90,26 @@ fn package_enabled(pkg_dir: &Path) -> bool {
     true
 }
 
-fn scan_unit(dir: &Path, kind: Kind, pkg: &str, out: &mut Vec<Spec>) {
+fn scan_flows(dir: &Path, pkg: &str, out: &mut Vec<Spec>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if fname.starts_with('_') {
+        if fname.starts_with('_') || !fname.ends_with(".vjs") {
             continue;
         }
-        let lang = if fname.ends_with(".py") {
-            Lang::Py
-        } else if fname.ends_with(".vjs") {
-            Lang::Vjs
-        } else {
-            continue;
-        };
-        if kind == Kind::Connector && lang == Lang::Vjs {
-            continue; // connectors are external processes; vjs is for flows/services
-        }
-        let stem = fname.trim_end_matches(".py").trim_end_matches(".vjs").to_string();
-        let kind_s = match kind {
-            Kind::Flow => "flow",
-            Kind::Connector => "connector",
-        };
+        let stem = fname.trim_end_matches(".vjs").to_string();
         let name = if pkg == "default" {
-            format!("{kind_s}:{stem}")
+            format!("flow:{stem}")
         } else {
-            format!("{kind_s}:{pkg}:{stem}")
+            format!("flow:{pkg}:{stem}")
         };
         out.push(Spec {
             name,
             mtime: mtime_of(&path),
             path,
-            kind: kind.clone(),
-            lang,
             pkg: pkg.to_string(),
         });
     }
@@ -149,8 +117,7 @@ fn scan_unit(dir: &Path, kind: Kind, pkg: &str, out: &mut Vec<Spec>) {
 
 fn scan_all(root: &Path) -> Vec<Spec> {
     let mut out = Vec::new();
-    scan_unit(&root.join("flows"), Kind::Flow, "default", &mut out);
-    scan_unit(&root.join("connectors"), Kind::Connector, "default", &mut out);
+    scan_flows(&root.join("flows"), "default", &mut out);
     if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
         for p in pkgs.flatten() {
             let dir = p.path();
@@ -161,8 +128,7 @@ fn scan_all(root: &Path) -> Vec<Spec> {
             if !package_enabled(&dir) {
                 continue;
             }
-            scan_unit(&dir.join("flows"), Kind::Flow, &pkg, &mut out);
-            scan_unit(&dir.join("connectors"), Kind::Connector, &pkg, &mut out);
+            scan_flows(&dir.join("flows"), &pkg, &mut out);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -183,90 +149,9 @@ fn fixture_path_for(flow_path: &Path) -> PathBuf {
 
 // ───────────────────────── supervision ─────────────────────────
 
-fn build_py_command(spec: &Spec, root: &Path) -> Command {
-    let mut cmd = Command::new("python3");
-    match spec.kind {
-        Kind::Flow => {
-            cmd.arg("-m").arg("vejas").arg("run").arg(&spec.path);
-        }
-        Kind::Connector => {
-            cmd.arg(&spec.path);
-        }
-    }
-    let sdk = root.join("sdk").join("python");
-    let py_path = match env::var("PYTHONPATH") {
-        Ok(existing) if !existing.is_empty() => format!("{}:{}", sdk.display(), existing),
-        _ => sdk.display().to_string(),
-    };
-    cmd.env("PYTHONPATH", py_path);
-    cmd.env("VEJAS_PROC", &spec.name);
-    cmd
-}
-
 fn set_state(handle: &Handle, f: impl FnOnce(&mut ProcState)) {
     let mut st = handle.state.lock().unwrap();
     f(&mut st);
-}
-
-fn supervise_py(handle: Arc<Handle>, root: PathBuf) {
-    let mut delay = Duration::from_secs(1);
-    loop {
-        if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let started = Instant::now();
-        let mut child = match build_py_command(&handle.spec, &root).spawn() {
-            Ok(c) => c,
-            Err(err) => {
-                set_state(&handle, |st| {
-                    st.status = "spawn-error".into();
-                    st.last_error = Some(err.to_string());
-                });
-                thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(30));
-                continue;
-            }
-        };
-        set_state(&handle, |st| {
-            st.status = "running".into();
-            st.pid = Some(child.id());
-            st.started_at = Some(now_secs());
-        });
-        eprintln!("[vejas] {} started (pid {})", handle.spec.name, child.id());
-        let exit = loop {
-            if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => thread::sleep(Duration::from_millis(200)),
-                Err(_) => break None,
-            }
-        };
-        set_state(&handle, |st| st.pid = None);
-        match exit {
-            Some(status) => {
-                set_state(&handle, |st| {
-                    st.last_exit = status.code();
-                    st.restarts += 1;
-                    st.status = "restarting".into();
-                });
-                eprintln!("[vejas] {} exited, restarting", handle.spec.name);
-                if started.elapsed() > Duration::from_secs(30) {
-                    delay = Duration::from_secs(1);
-                }
-                thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(30));
-            }
-            None => break,
-        }
-    }
-    set_state(&handle, |st| {
-        st.status = "stopped".into();
-        st.pid = None;
-    });
 }
 
 /// Native VejasScript flow: NATS pull consumer + in-process interpreter.
@@ -396,24 +281,15 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
         spec: spec.clone(),
         state: Mutex::new(ProcState {
             status: "starting".into(),
-            pid: None,
             restarts: 0,
             started_at: None,
-            last_exit: None,
             last_error: None,
         }),
         stop: AtomicBool::new(false),
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();
-    match spec.lang {
-        Lang::Py => {
-            thread::spawn(move || supervise_py(handle, root));
-        }
-        Lang::Vjs => {
-            thread::spawn(move || supervise_vjs(handle, root));
-        }
-    }
+    thread::spawn(move || supervise_vjs(handle, root));
 }
 
 fn reload(registry: &Registry, root: &Path) -> (usize, usize, usize) {
@@ -464,42 +340,21 @@ fn topology_json(registry: &Registry) -> Value {
     let mut connectors = Vec::new();
     for handle in reg.values() {
         let st = handle.state.lock().unwrap();
-        let entry = json!({
+        flows.push(json!({
             "name": handle.spec.name,
             "file": handle.spec.path.display().to_string(),
             "pkg": handle.spec.pkg,
-            "lang": if handle.spec.lang == Lang::Vjs { "vjs" } else { "py" },
+            "lang": "vjs",
             "status": st.status,
-            "pid": st.pid,
             "restarts": st.restarts,
             "started_at": st.started_at,
-            "last_exit": st.last_exit,
             "last_error": st.last_error,
-        });
-        match handle.spec.kind {
-            Kind::Flow => flows.push(entry),
-            Kind::Connector => connectors.push(entry),
-        }
+        }));
     }
+    // native connectors are runtime threads, reported for the graph
+    connectors.push(json!({"name": "http-in", "status": "running", "subjects_out": ["vx.*"]}));
+    connectors.push(json!({"name": "slack-out", "status": "running", "subjects_in": ["vx.slack.out"]}));
     json!({ "flows": flows, "connectors": connectors })
-}
-
-fn vejas_py(root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("python3");
-    cmd.arg("-m").arg("vejas");
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.env("PYTHONPATH", root.join("sdk").join("python"));
-    match cmd.output() {
-        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(o) => Err(format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        )),
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 fn vjs_kind_of(name: &str, value: &Value) -> &'static str {
@@ -541,11 +396,6 @@ fn vjs_files(root: &Path) -> Vec<(PathBuf, String)> {
 
 fn surface_json(root: &Path) -> Value {
     let mut entries: Vec<Value> = Vec::new();
-    if let Ok(py) = vejas_py(root, &["surface", &root.join("flows").display().to_string()]) {
-        if let Ok(Value::Array(a)) = serde_json::from_str(&py) {
-            entries.extend(a);
-        }
-    }
     for (path, pkg) in vjs_files(root) {
         let Ok(src) = fs::read_to_string(&path) else { continue };
         let Ok(prog) = vjs::parse(&src) else { continue };
@@ -588,17 +438,10 @@ fn surface_json(root: &Path) -> Value {
 fn graph_json(root: &Path) -> Value {
     let mut flows: Vec<Value> = Vec::new();
     let mut services: Vec<Value> = Vec::new();
-    let mut connectors: Vec<Value> = Vec::new();
-    if let Ok(py) = vejas_py(root, &["graph", &root.display().to_string()]) {
-        if let Ok(v) = serde_json::from_str::<Value>(&py) {
-            if let Some(a) = v["flows"].as_array() {
-                flows.extend(a.clone());
-            }
-            if let Some(a) = v["connectors"].as_array() {
-                connectors.extend(a.clone());
-            }
-        }
-    }
+    let connectors: Vec<Value> = vec![
+        json!({"name": "http-in", "subjects_out": ["vx.*"]}),
+        json!({"name": "slack-out", "subjects_in": ["vx.slack.out"]}),
+    ];
     for (path, pkg) in vjs_files(root) {
         let Ok(src) = fs::read_to_string(&path) else { continue };
         let Ok(prog) = vjs::parse(&src) else { continue };
@@ -630,9 +473,6 @@ fn graph_json(root: &Path) -> Value {
 }
 
 fn preview_json(root: &Path, file: &str) -> Result<String, String> {
-    if file.ends_with(".py") {
-        return vejas_py(root, &["preview", file]);
-    }
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
@@ -679,10 +519,10 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
     }
     let rel = rel.trim_start_matches("./");
     let p = root.join(rel);
-    let ok_dir = ["flows", "services", "connectors", "packages"]
+    let ok_dir = ["flows", "services", "packages"]
         .iter()
         .any(|d| rel.starts_with(d));
-    let ok_ext = rel.ends_with(".py") || rel.ends_with(".vjs") || rel.ends_with(".json");
+    let ok_ext = rel.ends_with(".vjs") || rel.ends_with(".json");
     if ok_dir && ok_ext {
         Some(p)
     } else {
@@ -720,11 +560,7 @@ Rules:
 Task: {task}"#;
 
 fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
-    let existing: Vec<String> = scan_all(root)
-        .iter()
-        .filter(|s| s.kind == Kind::Flow)
-        .map(|s| s.name.clone())
-        .collect();
+    let existing: Vec<String> = scan_all(root).iter().map(|s| s.name.clone()).collect();
     let full = CONTRACT_VJS
         .replace("{existing}", &existing.join(", "))
         .replace("{task}", prompt);
@@ -861,34 +697,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let Some(p) = guard_path(&root, pstr) else {
                 return respond(request, 400, "path not allowed".into(), "text/plain");
             };
-            // validate before writing
+            // validate (parse) before writing
             if pstr.ends_with(".vjs") {
                 if let Err(e) = vjs::parse(content) {
                     return respond(request, 422, e, "text/plain");
-                }
-            } else if pstr.ends_with(".py") {
-                let check = Command::new("python3")
-                    .arg("-c")
-                    .arg("import ast,sys; ast.parse(sys.stdin.read())")
-                    .stdin(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .and_then(|mut ch| {
-                        use std::io::Write;
-                        ch.stdin.take().unwrap().write_all(content.as_bytes())?;
-                        ch.wait_with_output()
-                    });
-                match check {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        return respond(
-                            request,
-                            422,
-                            String::from_utf8_lossy(&o.stderr).into_owned(),
-                            "text/plain",
-                        )
-                    }
-                    Err(e) => return respond(request, 500, e.to_string(), "text/plain"),
                 }
             }
             if let Err(e) = fs::write(&p, content) {
@@ -945,38 +757,27 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let name = body["name"].as_str().unwrap_or("").to_string();
             let key = body["key"].as_str().unwrap_or("-").to_string();
             let value = body["value"].clone();
-            if file.ends_with(".vjs") {
-                let Some(p) = guard_path(&root, &file) else {
-                    return respond(request, 400, "path not allowed".into(), "text/plain");
-                };
-                let src = match fs::read_to_string(&p) {
-                    Ok(s) => s,
-                    Err(e) => return respond(request, 500, e.to_string(), "text/plain"),
-                };
-                match vjs::set_literal(&src, &name, &key, &value) {
-                    Ok(new_src) => {
-                        if let Err(e) = fs::write(&p, new_src) {
-                            return respond(request, 500, e.to_string(), "text/plain");
-                        }
-                        let _ = reload(&registry, &root);
-                        respond(
-                            request,
-                            200,
-                            json!({"ok": true, "file": file, "name": name, "key": key})
-                                .to_string(),
-                            "application/json",
-                        )
+            let Some(p) = guard_path(&root, &file) else {
+                return respond(request, 400, "path not allowed".into(), "text/plain");
+            };
+            let src = match fs::read_to_string(&p) {
+                Ok(s) => s,
+                Err(e) => return respond(request, 500, e.to_string(), "text/plain"),
+            };
+            match vjs::set_literal(&src, &name, &key, &value) {
+                Ok(new_src) => {
+                    if let Err(e) = fs::write(&p, new_src) {
+                        return respond(request, 500, e.to_string(), "text/plain");
                     }
-                    Err(e) => respond(request, 422, e, "text/plain"),
+                    let _ = reload(&registry, &root);
+                    respond(
+                        request,
+                        200,
+                        json!({"ok": true, "file": file, "name": name, "key": key}).to_string(),
+                        "application/json",
+                    )
                 }
-            } else {
-                match vejas_py(&root, &["set", &file, &name, &key, &value.to_string()]) {
-                    Ok(json) => {
-                        let _ = reload(&registry, &root);
-                        respond(request, 200, json, "application/json")
-                    }
-                    Err(err) => respond(request, 422, err, "text/plain"),
-                }
+                Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
         (tiny_http::Method::Post, "/flows/new") => {
@@ -1151,7 +952,27 @@ fn main() {
     .expect("signal handler");
 
     let (total, started, _) = reload(&registry, &root);
-    eprintln!("[vejas] supervising {total} processes ({started} started)");
+    eprintln!("[vejas] supervising {total} flows ({started} started)");
+
+    // native bundled connectors (Rust threads; no Python, no subprocess)
+    {
+        let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+        let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+        let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+        let http_port: u16 = env::var("HTTP_IN_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8787);
+        let running = Arc::new(AtomicBool::new(true));
+        {
+            let (r, u, s, sr) = (running.clone(), url.clone(), stream.clone(), subj_root.clone());
+            thread::spawn(move || connectors::run_http_in(r, u, s, sr, http_port));
+        }
+        {
+            let (r, u, s, sr) = (running.clone(), url, stream, subj_root);
+            thread::spawn(move || connectors::run_slack_out(r, u, s, sr));
+        }
+    }
 
     {
         let registry = registry.clone();

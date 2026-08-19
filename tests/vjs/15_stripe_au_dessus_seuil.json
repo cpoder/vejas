@@ -1,0 +1,5 @@
+{
+  "flow": "flows/stripe_alerts.vjs",
+  "input": {"data": {"object": {"amount": 123400, "currency": "eur", "customer": "cus_9XKL2m"}}},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "payment 1234 EUR from cus_9XKL2m"}}]
+}

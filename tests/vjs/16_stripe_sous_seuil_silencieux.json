@@ -1,0 +1,5 @@
+{
+  "flow": "flows/stripe_alerts.vjs",
+  "input": {"data": {"object": {"amount": 4990, "currency": "usd", "customer": "cus_x"}}},
+  "expect_emits": []
+}
