@@ -18,7 +18,7 @@ the old one.
 | [0005](0005-business-surface.md) | Business surface: literals, corrected in place | Accepted |
 | [0006](0006-runtime-is-mcp-server.md) | The runtime is its own MCP server; flow-as-tool | Accepted |
 | [0007](0007-connectors.md) | Connectors: native drivers + declarative manifests + bus contract | Accepted |
-| [0008](0008-secrets-vault.md) | Secrets via a Vault, never in literals | Proposed |
+| [0008](0008-secrets-vault.md) | Secrets via a Vault, never in literals | Accepted |
 | [0009](0009-all-rust-no-python.md) | All-Rust runtime, no Python | Accepted |
 | [0010](0010-transformation-doctrine.md) | Transformation doctrine: small registry + code-by-example | Accepted |
 | [0011](0011-connector-extensibility.md) | Connector extensibility: external process, not native libs; WASM later | Accepted |

@@ -1,6 +1,6 @@
 # 0008 — Secrets via a Vault, never in literals
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-19
 
 ## Context
@@ -12,17 +12,22 @@ git (ADR-0005) — so a secret must **never** be a literal — and the runtime i
 all-Rust, single-process (ADR-0009), so the secret path must be in-process, not
 a sidecar.
 
-## Decision (proposed)
+## Decision (built)
 
-- A **`SecretStore` trait**, **HashiCorp Vault by default**, with alternate
-  backends (encrypted-file for dev, cloud KMS later). The backend is
-  configuration, not a code dependency.
-- Secrets are referenced, never inlined: a `secret("path/to/key")` builtin in
-  VejasScript resolves at run time; the value is used by the flow and **never
-  written to the file or shown in the panel**. A connector manifest declares its
-  secret references the same way.
-- The panel shows *which* secrets a flow/connector references and whether they
-  resolve — never their values.
+- A **`SecretStore` trait** (`core/src/secrets.rs`): **VaultStore** (HashiCorp
+  Vault KV v2, when `VAULT_ADDR` is set) and **EnvStore** (dev default:
+  `secret("a/b")` → env `VEJAS_SECRET_A_B`). The backend is chosen at startup,
+  not a code dependency; cloud KMS is a future backend.
+- Secrets are referenced, never inlined: the `secret("path/key")` builtin
+  resolves at run time (fail-closed: a missing secret aborts the run). The
+  value is used by the flow/connector but is **never a literal**, so it never
+  enters the business surface, the file, or the panel. A connector manifest
+  resolves the same way: its config is produced by **evaluating** the manifest,
+  so `WEBHOOK_URL = secret("slack/webhook")` yields the real value into the
+  driver's config while the manifest file holds only the reference.
+- Static `NAME = secret("…")` references are captured (`Program.secret_refs`)
+  and surfaced via `/graph` and the `vejas_secrets` MCP tool — references only,
+  never values.
 
 ## Consequences
 

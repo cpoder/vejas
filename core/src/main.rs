@@ -23,6 +23,7 @@
 //   POST /reload                   rescan; restart changed files (mtime)
 
 mod connectors;
+mod secrets;
 mod vjs;
 
 use std::collections::HashMap;
@@ -308,14 +309,14 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
             thread::spawn(move || supervise_vjs(handle, root));
         }
         Kind::Connector => {
-            thread::spawn(move || supervise_connector(handle));
+            thread::spawn(move || supervise_connector(handle, root));
         }
     }
 }
 
 /// Native connector instance: a manifest (`driver "..."` + literal config) run
 /// by a compiled-in driver, restarted with backoff on error / file change.
-fn supervise_connector(handle: Arc<Handle>) {
+fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
     let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
@@ -331,9 +332,20 @@ fn supervise_connector(handle: Arc<Handle>) {
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
             let driver = connectors::driver_for(&driver_name)
                 .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+            // Resolve config by EVALUATING the manifest (so secret("…") in a
+            // config value resolves to the real value, fail-closed). The
+            // manifest's UPPERCASE variables are the driver's config.
+            let mut cfg_engine =
+                vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+            let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut cfg_engine)?;
             let mut config = serde_json::Map::new();
-            for e in &prog.surface {
-                config.insert(e.name.clone(), e.value.clone());
+            for (k, v) in cfg_ctx.vars {
+                if k != "event"
+                    && k.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                    && k.chars().any(|c| c.is_ascii_uppercase())
+                {
+                    config.insert(k, v);
+                }
             }
             set_state(&handle, |st| {
                 st.status = format!("running ({})", driver.kind());
@@ -461,7 +473,7 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             }
             let Ok(prog) = fs::read_to_string(&p).ok().map(|s| vjs::parse(&s)).unwrap_or(Err("".into()))
             else { continue };
-            let Some(driver) = prog.driver else { continue };
+            let Some(driver) = prog.driver.clone() else { continue };
             let cfg: std::collections::HashMap<String, Value> =
                 prog.surface.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
             let kind = connectors::driver_for(&driver).map(|d| d.kind()).unwrap_or("unknown");
@@ -472,6 +484,13 @@ fn connector_graph(root: &Path) -> Vec<Value> {
                 entry["subjects_out"] = json!([subj]);
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                 entry["subjects_in"] = json!([s]);
+            }
+            if !prog.secret_refs.is_empty() {
+                entry["secret_refs"] = json!(prog
+                    .secret_refs
+                    .iter()
+                    .map(|(n, r)| json!({"var": n, "ref": r}))
+                    .collect::<Vec<_>>());
             }
             list.push(entry);
         }
@@ -787,6 +806,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_new_flow", "description": "Ask the agent to write a new VejasScript flow from a natural-language request; it lands running.", "inputSchema": obj(json!({"prompt": {"type": "string"}}), vec!["prompt"])}),
         json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_drivers", "description": "List the available connector drivers (name, kind, description) for writing connector manifests.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_secrets", "description": "List the secret references (var, path) declared by flows and connectors — references only, never values.", "inputSchema": obj(json!({}), vec![])}),
     ];
     // flow-as-tool: dynamic tools declared by `tool "..."` in a flow/service
     for (name, _file, desc) in tool_flows(root) {
@@ -858,6 +878,24 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
                 .map(|(n, k, a)| json!({"driver": n, "kind": k, "about": a}))
                 .collect();
             text(Value::Array(list).to_string())
+        }
+        "vejas_secrets" => {
+            let mut refs = Vec::new();
+            for (path, _pkg) in vjs_files(root) {
+                if let Ok(prog) = fs::read_to_string(&path).ok().map(|s| vjs::parse(&s)).unwrap_or(Err(String::new())) {
+                    for (var, r) in prog.secret_refs {
+                        refs.push(json!({"file": path.display().to_string(), "var": var, "ref": r}));
+                    }
+                }
+            }
+            for c in connector_graph(root) {
+                if let Some(sr) = c.get("secret_refs").and_then(|v| v.as_array()) {
+                    for s in sr {
+                        refs.push(json!({"connector": c["name"], "var": s["var"], "ref": s["ref"]}));
+                    }
+                }
+            }
+            text(Value::Array(refs).to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments

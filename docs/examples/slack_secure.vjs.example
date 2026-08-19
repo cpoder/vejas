@@ -1,0 +1,4 @@
+# connector: slack_secure — Slack sink whose webhook comes from the Vault, not a literal
+driver "slack-out"
+SUBJECT = "vx.secure.out"
+WEBHOOK_URL = secret("slack/webhook")

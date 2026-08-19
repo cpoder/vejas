@@ -52,3 +52,11 @@ Write one with `vejas_write_flow` (any `.vjs` path), tune its config with
 `vejas_set_literal`, and it hot-starts on reload — same tools as flows. Drivers
 today: `http-in` (webhook), `timer` (interval), `http-poll` (poll), `slack-out`
 and `http-out` (sinks). See ADR-0007.
+
+## Secrets over MCP
+
+`vejas_secrets` lists every `NAME = secret("path/key")` reference declared by
+flows and connectors — **references only, never values**. Secrets resolve at run
+time via the `secret()` builtin against the configured `SecretStore` (Vault by
+default, env for dev); a missing secret fails the run closed. A secret is never a
+literal, so it never appears in `/surface`, the file, or the panel. See ADR-0008.

@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{Map, Number, Value};
 
@@ -365,6 +366,9 @@ pub struct Program {
     pub surface: Vec<SurfaceEntry>,
     pub emit_subjects: Vec<String>,
     pub invokes: Vec<String>,
+    /// Top-level `NAME = secret("path/key")` references (name, reference).
+    /// Lets the panel show which secrets a flow/connector uses, never values.
+    pub secret_refs: Vec<(String, String)>,
 }
 
 // ───────────────────────────── parser ─────────────────────────────
@@ -484,6 +488,7 @@ impl<'a> Parser<'a> {
             surface,
             emit_subjects: Vec::new(),
             invokes: Vec::new(),
+            secret_refs: Vec::new(),
         };
         let consts: Vec<(String, String)> = prog
             .surface
@@ -494,6 +499,16 @@ impl<'a> Parser<'a> {
         collect_static(&prog.stmts, &consts, &mut emits, &mut invokes);
         prog.emit_subjects = emits;
         prog.invokes = invokes;
+        // static secret references: NAME = secret("path/key")
+        for s in &prog.stmts {
+            if let Stmt::Assign(path, Expr::Call(fname, args)) = s {
+                if path.len() == 1 && fname == "secret" {
+                    if let Some(Expr::Lit(Value::String(r))) = args.first() {
+                        prog.secret_refs.push((path[0].clone(), r.clone()));
+                    }
+                }
+            }
+        }
         Ok(prog)
     }
 
@@ -959,16 +974,25 @@ pub struct Engine {
     pub caller_pkg: String,
     cache: HashMap<String, Program>,
     exports: HashMap<String, Vec<String>>,
+    secrets: Arc<dyn crate::secrets::SecretStore>,
     depth: usize,
 }
 
 impl Engine {
     pub fn new(project_root: PathBuf, caller_pkg: String) -> Self {
+        Self::with_secrets(project_root, caller_pkg, crate::secrets::default_store())
+    }
+    pub fn with_secrets(
+        project_root: PathBuf,
+        caller_pkg: String,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+    ) -> Self {
         Engine {
             project_root,
             caller_pkg,
             cache: HashMap::new(),
             exports: HashMap::new(),
+            secrets,
             depth: 0,
         }
     }
@@ -1283,7 +1307,17 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                 .iter()
                 .map(|a| eval(a, ctx, engine))
                 .collect::<Result<Vec<_>, _>>()?;
-            builtin(name, &vals)?
+            if name == "secret" {
+                // resolve a secret at run time; never a literal, never exposed.
+                // fail closed: a missing secret aborts the run.
+                let reference = vals
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or("secret() needs a string reference, e.g. secret(\"slack/webhook\")")?;
+                Value::String(engine.secrets.get(reference)?)
+            } else {
+                builtin(name, &vals)?
+            }
         }
         Expr::Unary(op, e) => {
             let v = eval(e, ctx, engine)?;
@@ -1636,6 +1670,34 @@ mod tests {
         assert_eq!(emits[0].1["n"], 999);
         assert!(set_literal(src, "T", "absent", &json!("x")).is_err());
         assert!(set_literal(src, "NOPE", "-", &json!(1)).is_err());
+    }
+
+    struct MapStore(std::collections::HashMap<String, String>);
+    impl crate::secrets::SecretStore for MapStore {
+        fn kind(&self) -> &'static str { "map" }
+        fn get(&self, r: &str) -> Result<String, String> {
+            self.0.get(r).cloned().ok_or_else(|| format!("secret {r:?} not found"))
+        }
+    }
+
+    #[test]
+    fn secret_resolves_and_fails_closed() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("api/key".to_string(), "TOP-SECRET".to_string());
+        let store = std::sync::Arc::new(MapStore(m));
+        let prog = parse("k = secret(\"api/key\")\nemit \"vx.t\", {len: len(k), auth: len(k) > 0}").unwrap();
+        // static reference is captured for the panel, value is not
+        assert_eq!(prog.secret_refs, vec![("k".to_string(), "api/key".to_string())]);
+        let mut eng = Engine::with_secrets(std::env::temp_dir(), "default".into(), store.clone());
+        let ctx = run(&prog, &json!({}), &mut eng).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"len": 10, "auth": true}));
+        // missing secret fails closed
+        let bad = parse("k = secret(\"nope/x\")\nemit \"vx.t\", {k: k}").unwrap();
+        let mut eng2 = Engine::with_secrets(std::env::temp_dir(), "default".into(), store);
+        match run(&bad, &json!({}), &mut eng2) {
+            Err(e) => assert!(e.contains("not found")),
+            Ok(_) => panic!("expected fail-closed on missing secret"),
+        }
     }
 
     #[test]

@@ -100,6 +100,9 @@ emitted payloads — how a non-developer validates behavior without reading code
 | `POST /reload` | rescan; start new, stop removed, restart changed |
 | `POST /mcp` | JSON-RPC 2.0 MCP server (see `MCP.md`) |
 
+MCP tools include `vejas_drivers` (connector driver catalog) and `vejas_secrets`
+(declared secret references, values never returned).
+
 ## MCP server (ADR-0006)
 
 `POST /mcp` speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`,
@@ -127,18 +130,23 @@ The **subject convention** (`SUBJECTS.md`) remains the whole interface, so an
 Secret references in manifests (ADR-0008) and connector-by-prompt are _(planned,
 this phase)_.
 
-## Secrets _(planned, ADR-0008)_
+## Secrets (ADR-0008)
 
-A `SecretStore` trait (HashiCorp Vault by default) resolved at run time via a
-`secret("path")` builtin. Secrets never appear in a VejasScript literal or the
-panel — that keeps "the whole script is editable and versionable" true without
-leaking credentials into git.
+A `SecretStore` trait (`core/src/secrets.rs`): `VaultStore` (HashiCorp Vault KV
+v2 when `VAULT_ADDR` is set) or `EnvStore` (dev: `secret("a/b")` → env
+`VEJAS_SECRET_A_B`). The `secret("path/key")` builtin resolves at run time,
+fail-closed. The value is never a literal, so it never enters the business
+surface, the file, or the panel; a connector's config is produced by evaluating
+its manifest, so `WEBHOOK_URL = secret("…")` yields the real value to the driver
+while the file holds only the reference. Static references are captured
+(`Program.secret_refs`) and exposed via `/graph` and the `vejas_secrets` MCP
+tool — references only.
 
 ## Build, run, test
 
 ```
 docker compose up                         # nats + vejas, nothing else
-cargo test --manifest-path core/Cargo.toml # 15 language unit tests
+cargo test --manifest-path core/Cargo.toml # 16 language unit tests
 vejas-runtime vjs-test tests/vjs           # 19 golden end-to-end cases
 vejas-runtime vjs-check <file.vjs>         # parse-check one script
 vejas-runtime vjs-run <file.vjs> <in.json> # run one script on an input
