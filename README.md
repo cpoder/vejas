@@ -37,10 +37,16 @@ it without touching code:
   as editable literals. Descended from [WmScript](https://github.com/cpoder/wmscript).
 - **Packages** — group flows and services, hot-addable; cross-package calls go
   through `EXPORTS` (private by default) or the bus. (ADR-0003, ADR-0004)
-- **Connectors** — bundled ones (`http-in`, `slack-out`) are native Rust
-  threads; the subject convention is the whole interface, so an external
-  connector in **any language** works over the bus. A typed connector SDK is
-  next. (ADR-0007)
+- **Connectors** — a typed Rust **driver SDK** (`Driver` trait, Source/Sink).
+  Bundled drivers: `http-in`, `timer`, `http-poll`, `slack-out`, `http-out`,
+  plus `exec-source`/`exec-sink`, which wrap a program in **any language** over
+  stdio (this is how a native vendor SDK like SAP JCo is bridged, never via
+  FFI). An instance is a declarative `.vjs` manifest, hot-addable, and an agent
+  can write one from a prompt. The subject convention stays the whole interface,
+  so an out-of-process connector is first-class. (ADR-0007, ADR-0011)
+- **Secrets** — `secret("path/key")` resolves from a Vault (HashiCorp KV v2; an
+  env backend for dev) at run time. A secret is never a literal, so it never
+  lands in git, the panel, or the business surface. (ADR-0008)
 - **UI** — no builder. Monitoring + a business panel where experts review and
   correct the business surface (rendered from literals in the code). You never
   click to draw a flow. (ADR-0005)

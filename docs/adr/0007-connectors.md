@@ -37,13 +37,23 @@ integration into one language.
   `slack-out`, and a demo `timer` ship as such manifests.
 - `vejas_drivers` (MCP) lists the driver catalog for writing manifests.
 
-## Planned (later this phase)
+## Also built (Phase 2)
 
-- **Secret references** in a manifest resolved via the Vault (ADR-0008); today
-  config values (incl. `WEBHOOK_URL`) are literals/env.
-- **Connector-by-prompt**: a `vejas_new_connector` MCP tool — the ADR-0006
-  generation loop retargeted to the `Driver` trait contract.
+- **Secret references** in a manifest resolve via the Vault (ADR-0008):
+  `WEBHOOK_URL = secret("slack/webhook")` yields the real value into the
+  driver's config while the file holds only the reference.
+- **Connector-by-prompt**: the `vejas_new_connector` MCP tool (and POST
+  `/connectors/new`) — the ADR-0006 generation loop retargeted to the `Driver`
+  trait contract; the agent picks a driver, writes config, and uses `secret()`
+  for credentials.
+- **External-process drivers** `exec-source`/`exec-sink` (ADR-0011): wrap a
+  program in any language over stdio — the hot-add / native-vendor-SDK path.
+
+## Still planned
+
 - **Queue/stream Source drivers** (Kafka/AMQP/MQTT) on the same trait.
+- **Resolved config as child-process env** for exec connectors (so a wrapped
+  SAP jar receives `SAP_PASSWORD` without reading the Vault itself).
 
 ## Consequences
 
@@ -53,9 +63,10 @@ integration into one language.
   publish/ack logic per connector.
 - Connector code is specification-shaped, so agents generate it well — the
   catalog can compound faster than hand-built catalogs did.
-- **Cost / open question:** catalog breadth still takes real work; the SDK,
-  manifest schema, and secret wiring are not built yet. Until the SDK lands,
-  new bundled connectors mean editing `core/src/connectors.rs`.
+- **Cost / open question:** catalog breadth still takes real work. A new
+  *bundled* driver still means editing `core/src/connectors.rs` and cutting a
+  release; the out-of-process (`exec`) and agent-written paths absorb the long
+  tail without a runtime change.
 
 ## Alternatives considered
 
