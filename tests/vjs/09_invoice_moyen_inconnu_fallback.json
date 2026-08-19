@@ -1,0 +1,5 @@
+{
+  "flow": "flows/invoice_payment_alerts.vjs",
+  "input": {"invoice_id": "FA-2026-0820", "amount_cents": 99000, "payment_method": "crypto"},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "Paiement reçu — facture FA-2026-0820 : 990 € (Moyen de paiement inconnu)"}}]
+}

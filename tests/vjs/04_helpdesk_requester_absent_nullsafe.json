@@ -1,0 +1,5 @@
+{
+  "flow": "flows/helpdesk_ticket_alerts.vjs",
+  "input": {"priority": "critique", "subject": "Panne totale"},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "[P1] Panne totale - "}}]
+}

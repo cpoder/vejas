@@ -1,0 +1,3 @@
+# probe: cross-package invoke of a PRIVATE service must be denied
+source "vx.test.probe"
+invoke notifications:internal_fmt(text: "should be denied")

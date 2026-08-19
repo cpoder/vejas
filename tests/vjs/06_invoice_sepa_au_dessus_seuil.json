@@ -1,0 +1,5 @@
+{
+  "flow": "flows/invoice_payment_alerts.vjs",
+  "input": {"invoice_id": "FA-2026-0817", "amount_cents": 129900, "payment_method": "sepa"},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "Paiement reçu — facture FA-2026-0817 : 1299 € (Prélèvement SEPA)"}}]
+}

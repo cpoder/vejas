@@ -1,0 +1,5 @@
+{
+  "flow": "packages/notifications/flows/ops_heartbeat.vjs",
+  "input": {},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "[notifications] ops heartbeat received from unknown"}}]
+}

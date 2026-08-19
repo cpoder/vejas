@@ -1,0 +1,5 @@
+{
+  "flow": "tests/vjs/flows/cross_export_probe.vjs",
+  "input": {"client": "ACME", "montant": 42},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "commande ACME : 42 €"}}]
+}

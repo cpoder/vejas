@@ -1,0 +1,5 @@
+{
+  "flow": "flows/helpdesk_ticket_alerts.vjs",
+  "input": {"priority": "urgentissime", "subject": "X", "requester": {"email": "a@b.fr"}},
+  "expect_emits": []
+}

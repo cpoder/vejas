@@ -1066,6 +1066,80 @@ fn main() {
         }
     }
 
+    // Golden-test runner: vejas-runtime vjs-test <dir>
+    // Each <dir>/*.json case: {"flow": path, "input": {...} | "input_file": path,
+    //   "expect_emits": [{"subject": s, "payload": {...}}]} or {"expect_error": "substring"}.
+    if args.len() >= 3 && args[1] == "vjs-test" {
+        let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
+        let dir = PathBuf::from(&args[2]);
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .expect("test dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+        let (mut pass, mut fail) = (0, 0);
+        for case_path in files {
+            let case: Value =
+                serde_json::from_str(&fs::read_to_string(&case_path).unwrap()).unwrap();
+            let name = case_path.file_stem().unwrap().to_string_lossy().to_string();
+            let flow = case["flow"].as_str().expect("case.flow");
+            let input: Value = if let Some(f) = case["input_file"].as_str() {
+                serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap()
+            } else {
+                case["input"].clone()
+            };
+            let run = fs::read_to_string(flow)
+                .map_err(|e| e.to_string())
+                .and_then(|src| vjs::parse(&src))
+                .and_then(|prog| {
+                    let mut engine =
+                        vjs::Engine::new(root.clone(), pkg_of_path(&PathBuf::from(flow)));
+                    vjs::run(&prog, &input, &mut engine)
+                        .map(|ctx| ctx.emits)
+                });
+            let verdict: Result<(), String> = match (&run, case["expect_error"].as_str()) {
+                (Err(e), Some(want)) => {
+                    if e.contains(want) {
+                        Ok(())
+                    } else {
+                        Err(format!("error mismatch: got {e:?}, want substring {want:?}"))
+                    }
+                }
+                (Err(e), None) => Err(format!("unexpected error: {e}")),
+                (Ok(_), Some(want)) => Err(format!("expected error {want:?}, flow succeeded")),
+                (Ok(emits), None) => {
+                    let got: Value = emits
+                        .iter()
+                        .map(|(s, p)| json!({"subject": s, "payload": p}))
+                        .collect::<Vec<_>>()
+                        .into();
+                    let want = case["expect_emits"].clone();
+                    if got == want {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "emits mismatch\n     got:  {got}\n     want: {want}"
+                        ))
+                    }
+                }
+            };
+            match verdict {
+                Ok(()) => {
+                    pass += 1;
+                    println!("  ✓ {name}");
+                }
+                Err(e) => {
+                    fail += 1;
+                    println!("  ✗ {name}: {e}");
+                }
+            }
+        }
+        println!("{pass} passed, {fail} failed");
+        std::process::exit(if fail > 0 { 1 } else { 0 });
+    }
+
     let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
     let addr = env::var("VEJAS_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8686".into());
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));

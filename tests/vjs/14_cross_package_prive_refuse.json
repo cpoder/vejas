@@ -1,0 +1,5 @@
+{
+  "flow": "tests/vjs/flows/cross_private_probe.vjs",
+  "input": {"any": "data"},
+  "expect_error": "not exported by package"
+}

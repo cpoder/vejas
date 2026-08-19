@@ -1,0 +1,5 @@
+{
+  "flow": "flows/helpdesk_ticket_alerts.vjs",
+  "input": {"priority": "haute", "subject": "Serveur de prod injoignable", "requester": {"email": "Marie.Curie@Client.FR"}},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "[P2] Serveur de prod injoignable - marie.curie@client.fr"}}]
+}

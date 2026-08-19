@@ -1,0 +1,5 @@
+{
+  "flow": "flows/helpdesk_ticket_alerts.vjs",
+  "input": {"priority": "critique", "subject": "Écran gelé — données perdues à 100 %", "requester": {"email": "José.Nuñez@Español.ES"}},
+  "expect_emits": [{"subject": "vx.slack.out", "payload": {"text": "[P1] Écran gelé — données perdues à 100 % - josé.nuñez@español.es"}}]
+}

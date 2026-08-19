@@ -1,0 +1,3 @@
+# probe: cross-package invoke of an EXPORTS-ed service, with event data in args
+source "vx.test.probe"
+invoke notifications:notify_slack(message: f"commande {client} : {montant} €")

@@ -1,0 +1,5 @@
+{
+  "flow": "flows/invoice_payment_alerts.vjs",
+  "input": {"invoice_id": "FA-2026-0819", "amount_cents": 25000, "payment_method": "card"},
+  "expect_emits": []
+}
