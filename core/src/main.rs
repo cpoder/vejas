@@ -319,7 +319,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 "[vejas] {} (vjs, native) consuming {source}",
                 handle.spec.name
             );
-            let mut engine = vjs::Engine::new(pkg_root(&root, &handle.spec.pkg));
+            let mut engine = vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -381,12 +381,14 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     });
 }
 
-fn pkg_root(root: &Path, pkg: &str) -> PathBuf {
-    if pkg == "default" {
-        root.to_path_buf()
-    } else {
-        root.join("packages").join(pkg)
+fn pkg_of_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    if let Some(rest) = s.split("packages/").nth(1) {
+        if let Some(pkg) = rest.split('/').next() {
+            return pkg.to_string();
+        }
     }
+    "default".to_string()
 }
 
 fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
@@ -643,12 +645,7 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     )
     .map_err(|e| format!("fixture: {e}"))?;
     // package context: services resolve relative to the file's package
-    let pkg_dir = path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| root.to_path_buf());
-    let mut engine = vjs::Engine::new(pkg_dir);
+    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
     let (emits, error, pipeline) = match vjs::run(&prog, &event, &mut engine) {
         Ok(ctx) => {
             let emits: Vec<Value> = ctx
@@ -709,6 +706,7 @@ VejasScript in 20 lines:
   big = orders[total > 100]          <- array filtering
   invoke format_alert(sev: code)     <- compose a service from services/<name>.vjs; its outputs MERGE into this pipeline
   d = invoke format_alert(sev: code) <- or capture its whole pipeline as a document
+  invoke pkg:svc(k: v)               <- cross-package composition (the target package must list svc in its EXPORTS)
   if code in ALERT_LEVELS:
       emit "vx.slack.out", {text: f"[{code}] {subject}"}
   end                                <- every if/for closes with `end`
@@ -1053,12 +1051,7 @@ fn main() {
             serde_json::from_str(&fs::read_to_string(&args[3]).expect("read fixture"))
                 .expect("fixture json");
         let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
-        let pkg_dir = PathBuf::from(&args[2])
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or(root);
-        let mut engine = vjs::Engine::new(pkg_dir);
+        let mut engine = vjs::Engine::new(root, pkg_of_path(&PathBuf::from(&args[2])));
         match vjs::run(&prog, &event, &mut engine) {
             Ok(ctx) => {
                 for (s, p) in &ctx.emits {

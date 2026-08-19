@@ -1,2 +1,6 @@
 # package: notifications — hot-addable unit (drop the directory, POST /reload)
 ENABLED = true
+
+# Services callable from OTHER packages. Everything else is package-private;
+# between packages, prefer the bus — EXPORTS is the deliberate exception.
+EXPORTS = ["notify_slack"]

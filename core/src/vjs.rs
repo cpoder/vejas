@@ -569,10 +569,19 @@ impl<'a> Parser<'a> {
     }
 
     fn invoke_args(&mut self) -> Result<(String, Vec<(String, Expr)>), String> {
-        let name = match self.next() {
+        let mut name = match self.next() {
             Tok::Ident(n) => n,
             _ => return Err(self.err("expected service name after invoke")),
         };
+        // qualified reference: invoke pkg:service(...)
+        if *self.peek() == Tok::Colon {
+            if let Some(Tok::Ident(_)) = self.peek2() {
+                self.next();
+                if let Tok::Ident(svc) = self.next() {
+                    name = format!("{name}:{svc}");
+                }
+            }
+        }
         self.eat(Tok::LParen, "(")?;
         let mut args = Vec::new();
         while *self.peek() != Tok::RParen {
@@ -905,32 +914,106 @@ fn to_display(v: &Value) -> String {
     }
 }
 
-/// Loads and caches composed services from <root>/services/<name>.vjs.
+/// Loads and caches composed services.
+///
+/// Resolution (webMethods packages, with a stricter coupling rule):
+///   - `invoke fmt(...)`          -> <caller package>/services/fmt.vjs
+///   - `invoke billing:fmt(...)`  -> packages/billing/services/fmt.vjs
+///     (or the project root when the package is "default")
+///   - a cross-package invoke is allowed ONLY if the target package's
+///     package.vjs manifest lists the service in EXPORTS = [...]. Private by
+///     default: no manifest, or not listed, means denied with a clear error.
+///     Between packages, prefer the bus; EXPORTS is the deliberate exception.
 pub struct Engine {
-    pub root: PathBuf,
+    pub project_root: PathBuf,
+    pub caller_pkg: String,
     cache: HashMap<String, Program>,
+    exports: HashMap<String, Vec<String>>,
     depth: usize,
 }
 
 impl Engine {
-    pub fn new(root: PathBuf) -> Self {
-        Engine { root, cache: HashMap::new(), depth: 0 }
+    pub fn new(project_root: PathBuf, caller_pkg: String) -> Self {
+        Engine {
+            project_root,
+            caller_pkg,
+            cache: HashMap::new(),
+            exports: HashMap::new(),
+            depth: 0,
+        }
     }
     pub fn invalidate(&mut self) {
         self.cache.clear();
+        self.exports.clear();
     }
-    fn service_stmts(&mut self, name: &str) -> Result<Vec<Stmt>, String> {
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(format!("invalid service name {name:?}"));
+    fn pkg_dir(&self, pkg: &str) -> PathBuf {
+        if pkg == "default" {
+            self.project_root.clone()
+        } else {
+            self.project_root.join("packages").join(pkg)
         }
-        if !self.cache.contains_key(name) {
-            let path = self.root.join("services").join(format!("{name}.vjs"));
+    }
+    fn exports_of(&mut self, pkg: &str) -> Result<Vec<String>, String> {
+        if let Some(e) = self.exports.get(pkg) {
+            return Ok(e.clone());
+        }
+        let manifest = self.pkg_dir(pkg).join("package.vjs");
+        let src = std::fs::read_to_string(&manifest).map_err(|_| {
+            format!(
+                "package {pkg:?} has no package.vjs manifest; cross-package invoke requires an EXPORTS list"
+            )
+        })?;
+        let prog = parse(&src).map_err(|e| format!("package {pkg} manifest: {e}"))?;
+        let list = prog
+            .surface
+            .iter()
+            .find(|e| e.name == "EXPORTS")
+            .map(|e| {
+                e.value
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        self.exports.insert(pkg.to_string(), list.clone());
+        Ok(list)
+    }
+    /// Resolve an invoke target to (package, service) and enforce EXPORTS.
+    fn resolve(&mut self, name: &str) -> Result<(String, String), String> {
+        let (pkg, svc) = match name.split_once(':') {
+            Some((p, s)) => (p.to_string(), s.to_string()),
+            None => (self.caller_pkg.clone(), name.to_string()),
+        };
+        let valid = |s: &str| {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if !valid(&pkg) || !valid(&svc) {
+            return Err(format!("invalid service reference {name:?}"));
+        }
+        if pkg != self.caller_pkg {
+            let exports = self.exports_of(&pkg)?;
+            if !exports.iter().any(|e| e == &svc) {
+                return Err(format!(
+                    "service {pkg}:{svc} is not exported by package {pkg:?} (add {svc:?} to EXPORTS in its package.vjs, or talk to it over the bus)"
+                ));
+            }
+        }
+        Ok((pkg, svc))
+    }
+    fn service_stmts(&mut self, pkg: &str, svc: &str) -> Result<Vec<Stmt>, String> {
+        let key = format!("{pkg}:{svc}");
+        if !self.cache.contains_key(&key) {
+            let path = self.pkg_dir(pkg).join("services").join(format!("{svc}.vjs"));
             let src = std::fs::read_to_string(&path)
-                .map_err(|_| format!("unknown service {name:?} (no {})", path.display()))?;
-            let prog = parse(&src).map_err(|e| format!("service {name}: {e}"))?;
-            self.cache.insert(name.to_string(), prog);
+                .map_err(|_| format!("unknown service {key:?} (no {})", path.display()))?;
+            let prog = parse(&src).map_err(|e| format!("service {key}: {e}"))?;
+            self.cache.insert(key.clone(), prog);
         }
-        Ok(self.cache.get(name).unwrap().stmts.clone())
+        Ok(self.cache.get(&key).unwrap().stmts.clone())
     }
 }
 
@@ -961,17 +1044,21 @@ fn run_service(
     if engine.depth >= 32 {
         return Err(format!("invoke depth exceeded at {name}"));
     }
+    let (pkg, svc) = engine.resolve(name)?;
     engine.depth += 1;
-    let stmts = match engine.service_stmts(name) {
+    let stmts = match engine.service_stmts(&pkg, &svc) {
         Ok(s) => s,
         Err(e) => {
             engine.depth -= 1;
             return Err(e);
         }
     };
+    // The invoked service's own invokes resolve within ITS package.
+    let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
     let mut ctx = Ctx { vars: args.clone(), emits: Vec::new() };
     ctx.vars.insert("event".into(), Value::Object(args));
     let result = exec_block(&stmts, &mut ctx, engine);
+    engine.caller_pkg = saved_pkg;
     engine.depth -= 1;
     result?;
     emits.append(&mut ctx.emits);

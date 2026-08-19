@@ -1,0 +1,3 @@
+# service: internal_fmt — deliberately NOT in EXPORTS: package-private.
+# Invoking notifications:internal_fmt from another package must be denied.
+formatted = f"[notifications] {text}"

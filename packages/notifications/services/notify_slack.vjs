@@ -1,0 +1,3 @@
+# service: notify_slack — the one exported door of this package.
+# Input: message. Emits the Slack payload; adds nothing to the caller pipeline.
+emit "vx.slack.out", {text: message}

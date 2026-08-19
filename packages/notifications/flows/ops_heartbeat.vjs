@@ -1,6 +1,8 @@
-# flow: ops_heartbeat — proves the package model: lives in packages/notifications
+# flow: ops_heartbeat — package-local composition: unqualified invoke resolves
+# inside THIS package (no EXPORTS needed within the same package).
 source "vx.ops.ping"
 
 HEARTBEAT_TEXT = "ops heartbeat received"
 
-emit "vx.slack.out", {text: f"{HEARTBEAT_TEXT} from {origin ?? "unknown"}"}
+invoke internal_fmt(text: f"{HEARTBEAT_TEXT} from {origin ?? "unknown"}")
+invoke notify_slack(message: formatted)
