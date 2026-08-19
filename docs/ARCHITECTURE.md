@@ -31,7 +31,10 @@ The runtime is a single OS process. Inside it:
   carries a server-side expiry so a stopped flow actually stops), run each
   event through the interpreter, publish the emits **before** acking
   (at-least-once; a crash means redelivery, never a lost emit), and record the
-  event in the in-memory trace ring (last 50 per flow, `/events`). Restarts
+  event in the in-memory trace ring (last 50 per flow, `/events`; the full
+  event is kept internally as shadow-replay fuel). A message that still fails
+  after 5 deliveries is dropped (acked) and the drop is traced — redelivery is
+  the retry mechanism, not an infinite loop for poison messages. Restarts
   with backoff on error; restarts on file change (mtime).
 - **native connector threads** — `http-in` (a threaded HTTP server; `POST
   /ingest/<suffix>` → publish `vx.<suffix>`) and `slack-out` (durable pull
@@ -85,6 +88,13 @@ AST; the panel renders them; corrections go through `set_literal` +
 targeted reload. Sample runs execute the real flow on the fixture and show the
 emitted payloads — how a non-developer validates behavior without reading code.
 
+A correction is **shadow-replayed before promotion**: `/surface/replay` (and
+the `vejas_replay_literal` MCP tool) applies the change in memory, reruns the
+flow's last real events (from the trace ring) against the current and the
+patched script, and returns the before/after emit diff — nothing written, bus
+untouched. The panel's Apply shows that diff with Promote / Discard; with no
+recent traffic the change applies directly.
+
 ## HTTP surface
 
 | Method / path | Purpose |
@@ -98,6 +108,7 @@ emitted payloads — how a non-developer validates behavior without reading code
 | `GET /preview?file=` | run a flow on its fixture → emits + pipeline |
 | `GET /file?path=` · `POST /file/set` | read / write a script (parse-validated) |
 | `GET /fixture?file=` · `POST /fixture/set` | read / write a sample input |
+| `POST /surface/replay` | shadow-replay a proposed literal change on the last real events (diff, no write) |
 | `POST /surface/set` | rewrite one literal in place |
 | `POST /flows/new` | agent writes a new flow from a prompt |
 | `POST /reload` | rescan; start new, stop removed, restart changed |

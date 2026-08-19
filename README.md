@@ -49,8 +49,9 @@ it without touching code:
   lands in git, the panel, or the business surface. (ADR-0008)
 - **UI** — no builder. Monitoring (pipeline graph, statuses, a live feed of the
   last processed events) + a business panel where experts review and correct
-  the business surface (rendered from literals in the code). You never click to
-  draw a flow. (ADR-0005)
+  the business surface (rendered from literals in the code). A correction is
+  **shadow-replayed on the flow's last real events** — before/after diff, then
+  promote or discard. You never click to draw a flow. (ADR-0005)
 - **MCP** — the runtime is its own MCP server; a flow that declares `tool "…"`
   becomes a first-class MCP tool. The platform grows its own tool surface as you
   write flows. (ADR-0006, [docs/MCP.md](docs/MCP.md))

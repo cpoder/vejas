@@ -355,8 +355,16 @@ fn run_sink(
                     let _ = msg.ack();
                 }
                 Err(e) => {
-                    eprintln!("[{}] {e} -> nak", ctx.name);
-                    let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                    // poison guard: give up after MAX_DELIVERIES attempts
+                    let delivered =
+                        msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                    if delivered >= crate::MAX_DELIVERIES {
+                        eprintln!("[{}] {e} -> dropped after {delivered} deliveries", ctx.name);
+                        let _ = msg.ack();
+                    } else {
+                        eprintln!("[{}] {e} -> nak", ctx.name);
+                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                    }
                 }
             }
         }

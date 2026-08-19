@@ -162,7 +162,7 @@
 <div id="toast"></div>
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const toast = (msg, err) => {
   const t = $('#toast');
   t.textContent = msg; t.className = err ? 'show err' : 'show';
@@ -184,13 +184,67 @@ async function post(url, payload) {
 async function setLiteral(file, name, key, value) {
   await post('/surface/set', {file, name, key, value});
 }
-function applyBtn(dirtyEl, doApply) {
+
+/* Apply = shadow-replay first (ADR-0005): rerun the flow's last real events
+   against the current and the patched script, show the before/after diff,
+   then Promote (write + reload) or Discard. No recent traffic: apply directly. */
+function emitSummary(side) {
+  if (side.error) return `<span style="color:var(--err)">error: ${esc(trunc(side.error, 40))}</span>`;
+  const es = side.emits || [];
+  if (!es.length) return '<span style="color:var(--muted)">no emit</span>';
+  return es.map(e => {
+    const t = e.payload && typeof e.payload.text === 'string' ? ` “${trunc(e.payload.text, 36)}”` : '';
+    return `<code>${esc(e.subject)}</code>${esc(t)}`;
+  }).join(' ');
+}
+function renderReplay(anchor, p, res) {
+  const card = anchor.closest('.card');
+  card.querySelectorAll('.replay').forEach(x => x.remove());
+  const strip = document.createElement('div');
+  strip.className = 'run replay';
+  const lines = (res.results || []).filter(r => r.changed).slice(0, 5).map(r =>
+    `<div>· ${new Date((r.ts || 0) * 1000).toLocaleTimeString()} <code>${esc(r.subject)}</code> — ` +
+    `${emitSummary(r.before)} <span class="arrow">→</span> ${emitSummary(r.after)}</div>`).join('');
+  strip.innerHTML =
+    `<b>Shadow-replay</b> — <code>${esc(p.name)}${p.key && p.key !== '-' ? '.' + esc(p.key) : ''}</code>` +
+    ` on the last <b>${res.events}</b> real event${res.events === 1 ? '' : 's'}: ` +
+    `<b>${res.changed}</b> would change` +
+    (res.changed ? lines : ' <span style="color:var(--muted)">(no behavior change)</span>');
+  const bar = document.createElement('div');
+  bar.className = 'toolbar';
+  const promote = document.createElement('button');
+  promote.className = 'apply'; promote.textContent = 'Promote';
+  promote.style.background = 'var(--accent)';
+  promote.style.borderColor = 'var(--accent)';
+  promote.style.color = 'var(--accent-ink)';
+  promote.onclick = async () => {
+    promote.disabled = true;
+    try { await setLiteral(p.file, p.name, p.key, p.value); toast('Promoted — flow reloaded'); await load(); }
+    catch (e) { toast(e.message.slice(0, 140), true); promote.disabled = false; }
+  };
+  const discard = document.createElement('button');
+  discard.className = 'tool'; discard.textContent = 'Discard';
+  discard.onclick = () => strip.remove();
+  bar.appendChild(promote); bar.appendChild(discard);
+  strip.appendChild(bar);
+  card.appendChild(strip);
+}
+function applyBtn(dirtyEl, params) {
   const btn = document.createElement('button');
   btn.className = 'apply'; btn.textContent = 'Apply';
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = '…';
-    try { await doApply(); toast('Updated — flow reloaded'); dirtyEl().classList.remove('dirty'); }
-    catch (e) { toast(e.message.slice(0, 140), true); }
+    const p = params();
+    try {
+      const res = await (await post('/surface/replay', {...p, n: 20})).json();
+      if (!res.events) {
+        await setLiteral(p.file, p.name, p.key, p.value);
+        toast('Updated — flow reloaded (no recent traffic to replay)');
+        await load();
+        return;
+      }
+      renderReplay(dirtyEl(), p, res);
+    } catch (e) { toast(e.message.slice(0, 140), true); }
     btn.disabled = false; btn.textContent = 'Apply';
   };
   return btn;
@@ -291,14 +345,14 @@ function mappingSection(card, file, entry, previewEntries) {
         const input = document.createElement('input');
         input.className = 'rule'; input.value = ruleToText(subRule);
         const tr = row(table, { label: '· ' + sub, input,
-          btn: applyBtn(() => tr, () => setLiteral(file, entry.name, `${target}/map/${sub}`, textToRule(input.value))) });
+          btn: applyBtn(() => tr, () => ({file, name: entry.name, key: `${target}/map/${sub}`, value: textToRule(input.value)})) });
         input.oninput = () => tr.classList.add('dirty');
       }
     } else {
       const input = document.createElement('input');
       input.className = 'rule'; input.value = ruleToText(rule);
       const tr = row(table, { label: target, input, sample: sampleFor(target),
-        btn: applyBtn(() => tr, () => setLiteral(file, entry.name, target, textToRule(input.value))) });
+        btn: applyBtn(() => tr, () => ({file, name: entry.name, key: target, value: textToRule(input.value)})) });
       input.oninput = () => tr.classList.add('dirty');
     }
   }
@@ -314,7 +368,7 @@ function tableSection(card, file, entry) {
     const input = document.createElement('input');
     input.className = 'rule'; input.value = String(v);
     const tr = row(table, { label: k, input, arrow: '→',
-      btn: applyBtn(() => tr, () => setLiteral(file, entry.name, k, parseConst(input.value))) });
+      btn: applyBtn(() => tr, () => ({file, name: entry.name, key: k, value: parseConst(input.value)})) });
     input.oninput = () => tr.classList.add('dirty');
   }
   card.appendChild(table);
@@ -338,7 +392,7 @@ function constsSection(card, file, entries) {
       ? input.value.split(',').map(s => parseConst(s)).filter(v => v !== '')
       : parseConst(input.value);
     rw.appendChild(input);
-    rw.appendChild(applyBtn(() => box, () => setLiteral(file, entry.name, '-', parse())));
+    rw.appendChild(applyBtn(() => box, () => ({file, name: entry.name, key: '-', value: parse()})));
     box.appendChild(label); box.appendChild(rw); grid.appendChild(box);
   }
   card.appendChild(grid);

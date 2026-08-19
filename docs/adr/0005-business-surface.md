@@ -45,8 +45,13 @@ The business user approves behavior; the artifact stays plain code.
 - **Cost:** literals only. Richer business logic must be expressed as code and
   validated by example — which is a feature (ADR-0010), but means the panel is
   not a universal editor.
-- **Planned:** live sample values from real traces (not just the fixture), and
-  shadow-replay + approval before a correction is promoted to production.
+- **Built since:** shadow-replay before promotion — a proposed literal change
+  is applied in memory and rerun against the flow's last real events (the
+  runtime's trace ring); the before/after emit diff is shown and the expert
+  promotes or discards (`/surface/replay`, `vejas_replay_literal`, panel
+  Apply → Promote/Discard). **Still planned:** replay hydrated from JetStream
+  (survives restarts, deeper history), approval audit trail, one-click
+  rollback (today: the one-line git diff).
 
 ## Alternatives considered
 

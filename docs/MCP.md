@@ -15,6 +15,7 @@ inspect, edit, generate, run — with no side channel.
 | `vejas_read` | read a `.vjs` script or a `.json` fixture |
 | `vejas_write_flow` | create/overwrite a `.vjs` (parse-validated, hot-reloaded) or a `.json` fixture |
 | `vejas_set_literal` | rewrite one business-surface literal in place |
+| `vejas_replay_literal` | shadow-replay a proposed literal change on the last real events — diff only, no write |
 | `vejas_preview` | run a flow on its fixture, return emits + final pipeline |
 | `vejas_run_flow` | run any flow on a supplied input, return emits (bus untouched) |
 | `vejas_events` | the last events the flows processed (subject, ok/error, emits, preview) |

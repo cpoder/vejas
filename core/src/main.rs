@@ -78,6 +78,11 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static TRACES: OnceLock<Mutex<HashMap<String, VecDeque<Value>>>> = OnceLock::new();
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// After this many failed deliveries of the same message, a unit stops
+/// retrying and drops it (acked, visible in the trace) — redelivery is the
+/// retry mechanism, not an infinite loop for poison messages.
+pub const MAX_DELIVERIES: i64 = 5;
+
 fn record_trace(
     flow: &str,
     subject: &str,
@@ -85,6 +90,7 @@ fn record_trace(
     error: Option<String>,
     emits: Vec<String>,
     preview: String,
+    event: Option<Value>,
 ) {
     let seq = TRACE_SEQ.fetch_add(1, Ordering::SeqCst);
     let mut map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -92,6 +98,8 @@ fn record_trace(
     ring.push_back(json!({
         "seq": seq, "ts": now_secs(), "flow": flow, "subject": subject,
         "ok": ok, "error": error, "emits": emits, "preview": preview,
+        // the full event, kept for shadow-replay; stripped from /events output
+        "event": event,
     }));
     while ring.len() > 50 {
         ring.pop_front();
@@ -99,16 +107,100 @@ fn record_trace(
 }
 
 /// Newest-first flat list of trace entries, optionally for one flow, capped.
+/// The stored full event stays internal (replay fuel), only the preview goes out.
 fn events_json(flow: Option<&str>) -> String {
     let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let mut all: Vec<Value> = map
         .iter()
         .filter(|(name, _)| flow.map(|f| f == name.as_str()).unwrap_or(true))
-        .flat_map(|(_, ring)| ring.iter().cloned())
+        .flat_map(|(_, ring)| {
+            ring.iter().map(|e| {
+                let mut e = e.clone();
+                if let Some(o) = e.as_object_mut() {
+                    o.remove("event");
+                }
+                e
+            })
+        })
         .collect();
     all.sort_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)));
     all.truncate(100);
     json!({ "events": all }).to_string()
+}
+
+/// The supervised process name of a flow file (how the trace ring is keyed).
+fn flow_proc_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let pkg = pkg_of_path(path);
+    if pkg == "default" {
+        format!("flow:{stem}")
+    } else {
+        format!("flow:{pkg}:{stem}")
+    }
+}
+
+/// Shadow-replay (ADR-0005): apply a literal change IN MEMORY, rerun the
+/// flow's last real events against the current and the patched script, and
+/// return the before/after emit diff. Nothing is written, nothing touches the
+/// bus — emits are collected, not published. Approval = the ordinary
+/// `set_literal` write afterwards.
+fn replay_literal(
+    root: &Path,
+    file: &str,
+    name: &str,
+    key: &str,
+    value: &Value,
+    n: usize,
+) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let patched = vjs::set_literal(&src, name, key, value)?;
+    let before = vjs::parse(&src)?;
+    let after = vjs::parse(&patched)?;
+    let proc = flow_proc_name(&path);
+    // snapshot the last n full events (newest first), then release the lock
+    let events: Vec<Value> = {
+        let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        map.get(&proc)
+            .map(|ring| ring.iter().rev().take(n.clamp(1, 50)).cloned().collect())
+            .unwrap_or_default()
+    };
+    let pkg = pkg_of_path(&path);
+    let mut run_one = |prog: &vjs::Program, ev: &Value| -> Value {
+        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        match vjs::run(prog, ev, &mut engine) {
+            Ok(ctx) => json!({
+                "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
+                "error": Value::Null,
+            }),
+            Err(e) => json!({ "emits": [], "error": e }),
+        }
+    };
+    let mut results = Vec::new();
+    let mut changed_count = 0;
+    for entry in &events {
+        let ev = entry.get("event").cloned().unwrap_or(Value::Null);
+        if ev.is_null() {
+            continue; // unparseable event of a bad-json trace: nothing to replay
+        }
+        let b = run_one(&before, &ev);
+        let a = run_one(&after, &ev);
+        let changed = b != a;
+        if changed {
+            changed_count += 1;
+        }
+        results.push(json!({
+            "ts": entry["ts"], "subject": entry["subject"], "preview": entry["preview"],
+            "before": b, "after": a, "changed": changed,
+        }));
+    }
+    Ok(json!({
+        "file": file, "name": name, "key": key, "value": value,
+        "events": results.len(), "changed": changed_count, "results": results,
+    }))
 }
 
 fn preview_of(v: &Value) -> String {
@@ -295,6 +387,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 Some(format!("bad json: {e}")),
                                 vec![],
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect(),
+                                None,
                             );
                             let _ = msg.ack();
                             continue;
@@ -320,6 +413,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 (!ok).then(|| "publish failed (will redeliver)".to_string()),
                                 ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
                                 preview_of(&event),
+                                Some(event.clone()),
                             );
                             if ok {
                                 let _ = msg.ack();
@@ -327,16 +421,29 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
+                            // poison guard: after MAX_DELIVERIES failed runs the
+                            // message is dropped (acked), not redelivered forever
+                            let delivered =
+                                msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                            let dropped = delivered >= MAX_DELIVERIES;
                             record_trace(
                                 &handle.spec.name,
                                 &msg.subject,
                                 false,
-                                Some(e.clone()),
+                                Some(if dropped {
+                                    format!("{e} — dropped after {delivered} deliveries")
+                                } else {
+                                    e.clone()
+                                }),
                                 vec![],
                                 preview_of(&event),
+                                Some(event.clone()),
                             );
                             set_state(&handle, |st| st.last_error = Some(e));
-                            // no ack -> redelivery after ack_wait
+                            if dropped {
+                                let _ = msg.ack();
+                            }
+                            // else: no ack -> redelivery after ack_wait
                         }
                     }
                 }
@@ -741,7 +848,13 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.contains("..") {
         return None;
     }
-    let rel = rel.trim_start_matches("./");
+    let mut rel = rel.trim_start_matches("./");
+    // The introspection endpoints emit paths as the runtime sees them, which
+    // are absolute when VEJAS_ROOT is (e.g. /app in the container). The panel
+    // round-trips those, so accept an absolute path IF it lives under root.
+    if let Ok(stripped) = Path::new(rel).strip_prefix(root) {
+        rel = stripped.to_str()?;
+    }
     let p = root.join(rel);
     let ok_dir = ["flows", "services", "connectors", "packages"]
         .iter()
@@ -982,6 +1095,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change: rerun the flow's last real events against the current AND the patched script, return the before/after emit diff. Nothing is written, the bus is untouched — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
@@ -1046,6 +1160,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             fs::write(&path, new_src).map_err(|e| e.to_string())?;
             let _ = reload(registry, root);
             text(json!({"ok": true}).to_string())
+        }
+        "vejas_replay_literal" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let lname = args["name"].as_str().ok_or("name required")?;
+            let key = args["key"].as_str().unwrap_or("-");
+            let n = args["n"].as_u64().unwrap_or(20) as usize;
+            text(replay_literal(root, file, lname, key, &args["value"], n)?.to_string())
         }
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
@@ -1313,6 +1434,17 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Err(e) => respond(request, 500, e.to_string(), "text/plain"),
             }
         }
+        (tiny_http::Method::Post, "/surface/replay") => {
+            let body = read_body(&mut request);
+            let file = body["file"].as_str().unwrap_or("").to_string();
+            let name = body["name"].as_str().unwrap_or("").to_string();
+            let key = body["key"].as_str().unwrap_or("-").to_string();
+            let n = body["n"].as_u64().unwrap_or(20) as usize;
+            match replay_literal(&root, &file, &name, &key, &body["value"], n) {
+                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
         (tiny_http::Method::Post, "/surface/set") => {
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
@@ -1568,4 +1700,66 @@ fn main() {
     }
     drop(reg);
     thread::sleep(Duration::from_millis(800));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // NOTE: TRACES is process-global and tests run in parallel — every test
+    // must use its own unique flow name.
+
+    #[test]
+    fn replay_literal_diffs_on_traced_events() {
+        let root = std::env::temp_dir().join(format!("vejas-replay-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("replay_probe.vjs"),
+            "source \"vx.rp.test\"\nTH = 500\nif amount > TH:\n  emit \"vx.out\", {a: amount}\nend\n",
+        )
+        .unwrap();
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec!["vx.out".into()], "{}".into(), Some(json!({"amount": 700})));
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec![], "{}".into(), Some(json!({"amount": 300})));
+        let diff = replay_literal(&root, "flows/replay_probe.vjs", "TH", "-", &json!(200), 20).unwrap();
+        assert_eq!(diff["events"], 2);
+        // 700 emitted before and after; 300 emits only after the change
+        assert_eq!(diff["changed"], 1);
+        let changed: Vec<&Value> = diff["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["changed"] == true)
+            .collect();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["before"]["emits"].as_array().unwrap().len(), 0);
+        assert_eq!(changed[0]["after"]["emits"].as_array().unwrap().len(), 1);
+        // nothing was written: the file still holds the original threshold
+        let src = std::fs::read_to_string(root.join("flows").join("replay_probe.vjs")).unwrap();
+        assert!(src.contains("TH = 500"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guard_path_accepts_absolute_only_under_root() {
+        let root = Path::new("/srv/vejas");
+        assert!(guard_path(root, "flows/x.vjs").is_some());
+        assert_eq!(
+            guard_path(root, "/srv/vejas/flows/x.vjs"),
+            guard_path(root, "flows/x.vjs"),
+        );
+        assert!(guard_path(root, "/etc/passwd").is_none());
+        assert!(guard_path(root, "/srv/vejas/core/x.vjs").is_none());
+        assert!(guard_path(root, "flows/../core/x.vjs").is_none());
+    }
+
+    #[test]
+    fn events_json_strips_the_full_event() {
+        record_trace("flow:strip_probe", "vx.sp.test", true, None, vec![], "{\"a\":1}".into(), Some(json!({"a": 1})));
+        let out: Value = serde_json::from_str(&events_json(Some("flow:strip_probe"))).unwrap();
+        let entry = &out["events"][0];
+        assert_eq!(entry["flow"], "flow:strip_probe");
+        assert!(entry.get("event").is_none(), "full event must not leave the runtime via /events");
+        assert_eq!(entry["preview"], "{\"a\":1}");
+    }
 }

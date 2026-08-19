@@ -46,8 +46,10 @@ in Vault, deployed from `docker compose` — recordable for a Show HN.
 - **Panel administration**: connectors (with secret references, never values),
   the live MCP tool list, and a real-time monitor — assembled on existing
   endpoints.
-- **Shadow-replay & approval** (ADR-0005): propose a correction → replay the
-  last N real events → diff before/after → approve → promote; rollback + audit.
+- **Shadow-replay & approval** (ADR-0005) — built (lite): propose a correction
+  → replay the last real events from the trace ring → before/after diff →
+  promote or discard (panel + MCP). Later: JetStream-hydrated history,
+  audit trail, one-click rollback.
 
 ## Phase 4 — Distribution & durability
 
