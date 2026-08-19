@@ -14,5 +14,12 @@ services:
     ports:
       - "8686:8686"   # panel + monitoring
       - "8787:8787"   # http-in connector: POST /ingest/<subject-suffix>
+    volumes:
+      # your flows live in YOUR repo, not in the container: what an agent
+      # writes over MCP lands here, in git, and survives a rebuild
+      - ./flows:/app/flows
+      - ./services:/app/services
+      - ./packages:/app/packages
+      - ./connectors:/app/connectors
     depends_on:
       - nats
