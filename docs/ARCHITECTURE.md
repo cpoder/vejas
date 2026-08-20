@@ -137,7 +137,12 @@ A connector is a native Rust **driver** + a declarative **instance manifest**.
 Drivers implement `connectors::Driver` (`kind()`, `about()`, `run(ctx)`) in two
 families — Source (pushes onto the bus) and Sink (consumes it); Source kinds are
 `webhook` / `interval` / `poll` (queue/stream drivers are future). Shipped:
-`http-in`, `timer`, `http-poll`, `slack-out`, `http-out`.
+`http-in`, `timer`, `http-poll`, `oauth-poll` (generic OAuth2 client-credentials
+REST poller: token cache, Bearer, cursor pagination, one `{endpoint, fetched_at,
+body}` message per page), `slack-out`, `http-out`. The HTTP-speaking drivers
+accept an optional `HEADERS` doc (values via `secret()`), and every HTTP call
+goes through an argv-safe curl wrapper: URL and headers travel in a 0600
+`--config` file, never in argv, because `/proc/<pid>/cmdline` is world-readable.
 
 An instance is a `.vjs` manifest under `connectors/` (or
 `packages/<pkg>/connectors/`): a `driver "name"` directive plus UPPERCASE literal

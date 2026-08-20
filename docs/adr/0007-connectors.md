@@ -27,8 +27,12 @@ integration into one language.
   from it). Input modes are `kind`s of Source: `source:webhook`,
   `source:interval`, `source:poll` (queue/stream drivers for Kafka/AMQP/MQTT are
   future additions on the same trait). Shipped drivers: `http-in`, `timer`,
-  `http-poll`, `slack-out`, `http-out`. The `Driver::kind()` string surfaces in
-  the topology and graph.
+  `http-poll`, `oauth-poll` (generic OAuth2 client-credentials + Bearer + cursor
+  pagination — one driver covers the bulk of "REST API" connectors), `slack-out`,
+  `http-out`. HTTP drivers take an optional `HEADERS` doc (values via `secret()`),
+  and all HTTP goes through an argv-safe curl wrapper (0600 `--config` file, no
+  credentials in argv). The `Driver::kind()` string surfaces in the topology and
+  graph.
 - A connector is a **declarative instance manifest**: a `.vjs` file under
   `connectors/` (or `packages/<pkg>/connectors/`) with a `driver "name"`
   directive and UPPERCASE literal config. It is parsed and configured by the

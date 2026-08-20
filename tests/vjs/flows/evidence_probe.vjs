@@ -1,0 +1,29 @@
+# flow: evidence_probe — {endpoint, fetched_at, body} envelope -> EvidenceFact batch
+# Pins the evidence-collection contract mechanics: composite idempotency key by
+# f-string (no clock, no hash in the language), collected_at copied from the
+# driver-stamped fetched_at, keyword field names (source), per-page batching.
+source "vx.evidence.raw.test"
+
+METRIC_CONTROLS = {"mfa_enabled": "ctl.auth.mfa"}
+PASS_THRESHOLD_PCT = 95
+
+if "users" in endpoint:
+    covered = len(body.value[mfa == true])
+    population = len(body.value)
+    pct = round(covered / population * 100, 0)
+    status = "partial"
+    if pct >= PASS_THRESHOLD_PCT:
+        status = "pass"
+    end
+    fact = {
+        idempotency_key: f"probe|ctl.auth.mfa|mfa_enabled|{fetched_at}|{covered}/{population}",
+        control_ref: METRIC_CONTROLS["mfa_enabled"],
+        framework_key: "test-transposition",
+        source: "probe",
+        metric: "mfa_enabled",
+        collected_at: fetched_at,
+        status: status,
+        scope: {population: population, covered: covered}
+    }
+    emit "vx.evidence.facts", {raw: event, facts: [fact]}
+end

@@ -1,0 +1,5 @@
+{
+  "flow": "tests/vjs/flows/evidence_probe.vjs",
+  "input": {"endpoint": "/users?page=2", "fetched_at": "2026-08-20T10:30:00Z", "body": {"value": [{"id": "u4", "mfa": true}, {"id": "u5", "mfa": false}]}},
+  "expect_emits": [{"subject": "vx.evidence.facts", "payload": {"raw": {"endpoint": "/users?page=2", "fetched_at": "2026-08-20T10:30:00Z", "body": {"value": [{"id": "u4", "mfa": true}, {"id": "u5", "mfa": false}]}}, "facts": [{"idempotency_key": "probe|ctl.auth.mfa|mfa_enabled|2026-08-20T10:30:00Z|1/2", "control_ref": "ctl.auth.mfa", "framework_key": "test-transposition", "source": "probe", "metric": "mfa_enabled", "collected_at": "2026-08-20T10:30:00Z", "status": "partial", "scope": {"population": 2, "covered": 1}}]}}]
+}

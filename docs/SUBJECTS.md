@@ -9,9 +9,17 @@ hot-addable). No subprocess, no Python. Drivers today:
 
 - **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT.
 - **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS.
-- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT.
+- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS.
+- **oauth-poll** (source:poll) — OAuth2 client-credentials REST poller: token from
+  TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
+  pagination via NEXT_LINK_FIELD (default `@odata.nextLink`, absolute links followed
+  as-is) capped by MAX_PAGES, publishes one `{endpoint, fetched_at, body}` message
+  per page on SUBJECT. One generic OAuth+REST driver stands in for most of a
+  connector catalog.
 - **slack-out** (sink) — consumes vx.slack.out → Slack webhook / DRY-RUN.
-- **http-out** (sink) — consumes SUBJECT → POST to URL.
+- **http-out** (sink) — consumes SUBJECT → POST to URL. Optional HEADERS doc for
+  authenticated pushes, values via `secret()`:
+  `HEADERS = {"Authorization": f"Bearer {secret("acme/api_token")}"}`.
 - **exec-source** / **exec-sink** — bridge an external program in ANY language over stdio (source prints JSON on stdout; sink reads JSON on stdin). The hot-add path for new connector types without recompiling the core or loading native libs (ADR-0011).
 
 An **external connector** in any language is still a first-class citizen: it is

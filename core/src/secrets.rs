@@ -81,15 +81,15 @@ impl SecretStore for VaultStore {
             .rsplit_once('/')
             .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
-        let out = std::process::Command::new("curl")
-            .args(["-sS", "-m", "10", "-H", &format!("X-Vault-Token: {}", self.token), &url])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("vault: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        // argv-safe: the token travels in the curl --config file, never argv
+        let headers = [("X-Vault-Token".to_string(), self.token.clone())];
+        let (code, body) = crate::connectors::http_request("GET", &url, &headers, None)
+            .map_err(|e| format!("vault: {e}"))?;
+        if !(200..300).contains(&code) {
+            return Err(format!("vault: HTTP {code} reading {path:?}"));
         }
-        let v: Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("vault: bad response: {e}"))?;
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|e| format!("vault: bad response: {e}"))?;
         v["data"]["data"][key]
             .as_str()
             .map(|s| s.to_string())

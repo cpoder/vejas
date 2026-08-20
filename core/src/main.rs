@@ -882,6 +882,7 @@ const LANGUAGE_VJS: &str = r#"VejasScript in 20 lines:
   ids = orders[].id                  <- array projection
   big = orders[total > 100]          <- array filtering
   out = out + [{sku: l.sku}]         <- array concatenation builds lists inside a for
+  fact = {source: "graph", in: 2}    <- doc keys and .field names may be ANY word, keywords included
   invoke format_alert(sev: code)     <- compose a service from services/<name>.vjs; its outputs MERGE into this pipeline
   d = invoke format_alert(sev: code) <- or capture its whole pipeline as a document
   invoke pkg:svc(k: v)               <- cross-package composition (the target package must list svc in its EXPORTS)

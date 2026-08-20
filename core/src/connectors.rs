@@ -16,10 +16,10 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -41,6 +41,20 @@ impl Config {
     }
     pub fn value(&self, key: &str) -> Option<Value> {
         self.0.get(key).cloned()
+    }
+    /// Optional HEADERS doc: `HEADERS = {"Authorization": f"Bearer {secret("…")}"}`.
+    /// Manifests are evaluated, so secret()/f-strings resolve before this runs —
+    /// and an expression is not a literal, so it never enters the business surface.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        self.0
+            .get("HEADERS")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -96,6 +110,7 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
         "http-in" => Some(Box::new(HttpIn)),
         "timer" => Some(Box::new(Timer)),
         "http-poll" => Some(Box::new(HttpPoll)),
+        "oauth-poll" => Some(Box::new(OAuthPoll)),
         "slack-out" => Some(Box::new(SlackOut)),
         "http-out" => Some(Box::new(HttpOut)),
         "exec-source" => Some(Box::new(ExecSource)),
@@ -106,8 +121,8 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
 
 pub fn catalog() -> Vec<(&'static str, &'static str, &'static str)> {
     [
-        "http-in", "timer", "http-poll", "slack-out", "http-out", "exec-source",
-        "exec-sink",
+        "http-in", "timer", "http-poll", "oauth-poll", "slack-out", "http-out",
+        "exec-source", "exec-sink",
     ]
     .iter()
     .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
@@ -262,12 +277,13 @@ impl Driver for HttpPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS."
+        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …})."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let url = ctx.config.str("URL").ok_or("URL required")?;
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let interval = ctx.config.u64_or("INTERVAL_SECS", 60).max(1);
+        let headers = ctx.config.headers();
         let js = ctx.jetstream()?;
         eprintln!("[{}] polling {url} every {interval}s -> {subject}", ctx.name);
         let mut waited = interval * 1000; // fire immediately on start
@@ -279,7 +295,7 @@ impl Driver for HttpPoll {
             waited += 250;
             if waited >= interval * 1000 {
                 waited = 0;
-                match http_get(&url) {
+                match http_get(&url, &headers) {
                     Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
                         let _ = js.publish(&subject, &body);
                     }
@@ -314,6 +330,171 @@ pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::
         )
         .map_err(|e| e.to_string())?;
     Ok(iter.map_while(|m| m.ok()).collect())
+}
+
+// ───────────────────────── source: oauth-poll ─────────────────────────
+//
+// The generic OAuth2 client-credentials REST poller — the driver that stands
+// in for the overwhelming majority of "400 connectors": one token endpoint,
+// a Bearer, N REST endpoints, cursor pagination. Publishes one message per
+// page, enveloped as {endpoint, fetched_at, body}: `endpoint` is the logical
+// route for the mapping flow, `fetched_at` (ISO 8601 UTC, stamped here — the
+// language has no clock) is what the flow copies into collected_at, so a
+// JetStream redelivery reproduces byte-identical facts and idempotency keys.
+
+struct OAuthPoll;
+
+impl OAuthPoll {
+    fn token(
+        token_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        scope: &str,
+    ) -> Result<(String, Duration), String> {
+        let form = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
+            urlencode(client_id),
+            urlencode(client_secret),
+            urlencode(scope)
+        );
+        let headers = [(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let (code, body) = http_request("POST", token_url, &headers, Some(form.as_bytes()))?;
+        if !(200..300).contains(&code) {
+            return Err(format!(
+                "token endpoint HTTP {code}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(300)]).trim()
+            ));
+        }
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|e| format!("token endpoint: bad JSON: {e}"))?;
+        let tok = v["access_token"]
+            .as_str()
+            .ok_or("token endpoint: no access_token in response")?
+            .to_string();
+        // refresh a minute early; floor for endpoints that answer tiny lifetimes
+        let ttl = v["expires_in"].as_u64().unwrap_or(300).saturating_sub(60).max(30);
+        Ok((tok, Duration::from_secs(ttl)))
+    }
+}
+
+impl Driver for OAuthPoll {
+    fn kind(&self) -> &'static str {
+        "source:poll"
+    }
+    fn about(&self) -> &'static str {
+        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE, BASE_URL, ENDPOINTS, SUBJECT, INTERVAL_SECS, MAX_PAGES."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
+        let client_id = ctx.config.str("CLIENT_ID").ok_or("CLIENT_ID required")?;
+        let client_secret = ctx.config.str("CLIENT_SECRET").ok_or("CLIENT_SECRET required")?;
+        let scope = ctx.config.str("SCOPE").ok_or(
+            "SCOPE required (e.g. \"https://graph.microsoft.com/.default\" — the API origin, not BASE_URL)",
+        )?;
+        let base = ctx.config.str("BASE_URL").ok_or("BASE_URL required")?;
+        let endpoints: Vec<String> = ctx
+            .config
+            .value("ENDPOINTS")
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .ok_or("ENDPOINTS required (a non-empty list of paths)")?;
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let interval = ctx.config.u64_or("INTERVAL_SECS", 300).max(1);
+        let max_pages = ctx.config.u64_or("MAX_PAGES", 10).max(1);
+        let next_field = ctx.config.str_or("NEXT_LINK_FIELD", "@odata.nextLink");
+        let js = ctx.jetstream()?;
+        eprintln!(
+            "[{}] oauth-poll {} endpoint(s) on {base} every {interval}s -> {subject}",
+            ctx.name,
+            endpoints.len()
+        );
+        let mut cached: Option<(String, Instant)> = None;
+        let mut waited = interval * 1000; // fire immediately on start
+        loop {
+            if !ctx.alive() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
+            waited += 250;
+            if waited < interval * 1000 {
+                continue;
+            }
+            waited = 0;
+            for ep in &endpoints {
+                let mut url = join_url(&base, ep);
+                let mut retried_401 = false;
+                let mut pages = 0;
+                while pages < max_pages {
+                    if !ctx.alive() {
+                        return Ok(());
+                    }
+                    let tok = match &cached {
+                        Some((t, deadline)) if Instant::now() < *deadline => t.clone(),
+                        _ => {
+                            // a broken token config never comes back on its own:
+                            // fail the run, let supervision back off and retry
+                            let (t, ttl) =
+                                Self::token(&token_url, &client_id, &client_secret, &scope)?;
+                            cached = Some((t.clone(), Instant::now() + ttl));
+                            t
+                        }
+                    };
+                    let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
+                    match http_request("GET", &url, &headers, None) {
+                        Ok((401, _)) if !retried_401 => {
+                            cached = None; // expired/revoked mid-flight: one fresh retry
+                            retried_401 = true;
+                        }
+                        Ok((code, body)) if (200..300).contains(&code) => {
+                            let parsed: Value = match serde_json::from_slice(&body) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("[{}] {ep}: non-JSON page skipped: {e}", ctx.name);
+                                    break;
+                                }
+                            };
+                            let envelope = serde_json::json!({
+                                "endpoint": ep,
+                                "fetched_at": iso8601_utc(crate::now_secs()),
+                                "body": parsed,
+                            });
+                            if let Err(e) =
+                                js.publish(&subject, serde_json::to_vec(&envelope).unwrap_or_default())
+                            {
+                                return Err(format!("publish: {e}"));
+                            }
+                            pages += 1;
+                            match next_url(&base, &parsed, &next_field) {
+                                Some(next) => url = next,
+                                None => break,
+                            }
+                        }
+                        Ok((code, body)) => {
+                            eprintln!(
+                                "[{}] {ep}: HTTP {code}, endpoint skipped this tick: {}",
+                                ctx.name,
+                                String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] {ep}: {e} — endpoint skipped this tick", ctx.name);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ───────────────────────── sinks ─────────────────────────
@@ -397,7 +578,8 @@ impl Driver for SlackOut {
                 Ok(())
             } else {
                 let payload = serde_json::json!({ "text": text }).to_string();
-                http_post(&webhook, payload.as_bytes()).map(|_| ())
+                let headers = [("Content-Type".to_string(), "application/json".to_string())];
+                http_post(&webhook, &headers, payload.as_bytes()).map(|_| ())
             }
         })
     }
@@ -409,12 +591,16 @@ impl Driver for HttpOut {
         "sink"
     }
     fn about(&self) -> &'static str {
-        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL."
+        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL, HEADERS (optional doc — put credentials there via secret(), e.g. {\"Authorization\": …})."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let url = ctx.config.str("URL").ok_or("URL required")?;
-        run_sink(ctx, &subject, move |data| http_post(&url, data).map(|_| ()))
+        let mut headers = ctx.config.headers();
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            headers.push(("Content-Type".into(), "application/json".into()));
+        }
+        run_sink(ctx, &subject, move |data| http_post(&url, &headers, data).map(|_| ()))
     }
 }
 
@@ -509,35 +695,209 @@ impl Driver for ExecSink {
     }
 }
 
-// ───────────────────────── tiny HTTP client (curl) ─────────────────────────
-// v0 keeps the dependency graph light; a Rust HTTP client replaces this later.
+// ───────────────────────── HTTP client (curl, argv-safe) ─────────────────────────
+// v0 keeps the dependency graph light (curl); a Rust HTTP client replaces this
+// later. Everything sensitive — the URL and the headers, Authorization above
+// all — travels in a 0600 `--config` file, NEVER in argv: /proc/<pid>/cmdline
+// is world-readable. The body streams over stdin.
 
-fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("curl")
-        .args(["-sS", "-m", "15", url])
-        .output()
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A value quoted for a curl config file.
+fn curl_quote(v: &str) -> String {
+    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// One HTTP request through curl. Returns (status, body) — the caller decides
+/// what a given status means (401 → token refresh, etc.).
+pub fn http_request(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut cfg = String::new();
+    cfg.push_str(&format!("url = {}\n", curl_quote(url)));
+    for (k, v) in headers {
+        cfg.push_str(&format!("header = {}\n", curl_quote(&format!("{k}: {v}"))));
+    }
+    if body.is_some() {
+        cfg.push_str("data-binary = \"@-\"\n");
+    } else if method != "GET" {
+        cfg.push_str(&format!("request = {}\n", curl_quote(method)));
+    }
+    let path = std::env::temp_dir().join(format!(
+        "vejas-req-{}-{}",
+        std::process::id(),
+        REQ_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| f.write_all(cfg.as_bytes()))
         .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    let result = (|| {
+        let mut child = std::process::Command::new("curl")
+            .args(["-sS", "-m", "20", "-w", "\n%{http_code}", "--config"])
+            .arg(&path)
+            .stdin(if body.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        if let Some(b) = body {
+            child
+                .stdin
+                .take()
+                .ok_or("no stdin")?
+                .write_all(b)
+                .map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("curl: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        // split the "\n<code>" marker appended by --write-out
+        let stdout = out.stdout;
+        let pos = stdout
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .ok_or("curl: missing status marker")?;
+        let code: u16 = std::str::from_utf8(&stdout[pos + 1..])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or("curl: bad status marker")?;
+        Ok((code, stdout[..pos].to_vec()))
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
+    match http_request("GET", url, headers, None)? {
+        (code, body) if (200..300).contains(&code) => Ok(body),
+        (code, body) => Err(format!(
+            "HTTP {code}: {}",
+            String::from_utf8_lossy(&body[..body.len().min(300)]).trim()
+        )),
     }
 }
 
-fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
-    let mut child = std::process::Command::new("curl")
-        .args(["-sS", "-m", "15", "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", url])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    child.stdin.take().unwrap().write_all(body).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(out.stdout)
+fn http_post(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<Vec<u8>, String> {
+    match http_request("POST", url, headers, Some(body))? {
+        (code, out) if (200..300).contains(&code) => Ok(out),
+        (code, out) => Err(format!(
+            "HTTP {code}: {}",
+            String::from_utf8_lossy(&out[..out.len().min(300)]).trim()
+        )),
+    }
+}
+
+/// Percent-encoding for form values (RFC 3986 unreserved set passes).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Seconds since the epoch → ISO 8601 UTC (civil-from-days, Hinnant).
+pub fn iso8601_utc(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Join a base URL and an endpoint path; absolute endpoints pass through.
+fn join_url(base: &str, endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        format!("{}/{}", base.trim_end_matches('/'), endpoint.trim_start_matches('/'))
+    }
+}
+
+/// The next page URL out of a response body, if any (absolute or relative).
+fn next_url(base: &str, body: &serde_json::Value, field: &str) -> Option<String> {
+    body.get(field)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| join_url(base, s))
+}
+
+// ───────────────────────── tests ─────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn iso8601_epoch_billennium_and_leap() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(iso8601_utc(951_782_400), "2000-02-29T00:00:00Z"); // leap day
+    }
+
+    #[test]
+    fn url_join_and_next_link() {
+        assert_eq!(join_url("https://api.x/v1/", "/users?a=1"), "https://api.x/v1/users?a=1");
+        assert_eq!(join_url("https://api.x/v1", "users"), "https://api.x/v1/users");
+        assert_eq!(join_url("https://api.x/v1", "https://other/abs"), "https://other/abs");
+        let body = json!({"value": [], "@odata.nextLink": "https://api.x/v1/users?$skip=2"});
+        assert_eq!(
+            next_url("https://api.x/v1", &body, "@odata.nextLink").as_deref(),
+            Some("https://api.x/v1/users?$skip=2")
+        );
+        let rel = json!({"next": "/users?page=2"});
+        assert_eq!(
+            next_url("https://api.x/v1", &rel, "next").as_deref(),
+            Some("https://api.x/v1/users?page=2")
+        );
+        assert_eq!(next_url("https://api.x/v1", &json!({"value": []}), "next"), None);
+    }
+
+    #[test]
+    fn urlencode_and_curl_quote() {
+        assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(urlencode("p@ss wörd+/="), "p%40ss%20w%C3%B6rd%2B%2F%3D");
+        assert_eq!(curl_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn config_headers_doc() {
+        let mut m = Map::new();
+        m.insert(
+            "HEADERS".into(),
+            json!({"Authorization": "Bearer x", "X-N": 42}),
+        );
+        let cfg = Config(m);
+        // non-string values are ignored, string ones pass through
+        assert_eq!(cfg.headers(), vec![("Authorization".to_string(), "Bearer x".to_string())]);
+        assert!(Config::default().headers().is_empty());
     }
 }
