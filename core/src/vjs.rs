@@ -770,6 +770,12 @@ impl<'a> Parser<'a> {
             }
             Tok::Not => Expr::Unary(UnOp::Not, Box::new(self.expr(9)?)),
             Tok::Minus => Expr::Unary(UnOp::Neg, Box::new(self.expr(9)?)),
+            // source/tool/driver are contextual directives (line-start only):
+            // in expression position they are ordinary variable reads — an
+            // invoke argument named `source` (EvidenceFact) must be readable.
+            Tok::Source => Expr::Var("source".into()),
+            Tok::Tool => Expr::Var("tool".into()),
+            Tok::Driver => Expr::Var("driver".into()),
             Tok::Invoke => {
                 let (name, args) = self.invoke_args()?;
                 Expr::Invoke(name, args)
@@ -1631,6 +1637,15 @@ mod tests {
         // surface literal with a keyword key keeps working (span-based editing)
         let prog = parse("T = {\"end\": \"x\", source: \"y\"}\n").unwrap();
         assert_eq!(prog.surface[0].value, json!({"end": "x", "source": "y"}));
+        // source/tool/driver are READABLE as variables (an invoke arg is
+        // literally named `source` in the evidence contract), incl. f-strings
+        let s = one_emit(
+            "emit \"vx.t\", {k: f\"{source}|x\", v: source, t: tool ?? \"none\"}",
+            json!({"source": "microsoft-graph"}),
+        );
+        assert_eq!(s["k"], "microsoft-graph|x");
+        assert_eq!(s["v"], "microsoft-graph");
+        assert_eq!(s["t"], "none");
     }
 
     #[test]
