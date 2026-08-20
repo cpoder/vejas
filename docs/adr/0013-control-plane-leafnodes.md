@@ -63,6 +63,12 @@ pattern built in: **leaf nodes**.
   state.
 - Revocation is a credentials kill: cut a tenant's leaf creds and the hand is
   gone; the collector keeps collecting.
+- **Provisioning is coupled:** the future "provision tenant" operation must
+  also mint the leaf credentials and the hub account pinned to
+  `vx.<tenant>.>`, and offboarding must revoke them — otherwise fleets grow
+  uplink-less tenants or, worse, orphan credentials. The tenant-to-operator
+  id mapping (e.g. a tenant slug to an organization id) lives on the
+  operator's side; Vejas carries no operator ids.
 - **Costs:** the allowlist is now a security boundary to maintain and review;
   hub authorization must be tested per tenant (subject pinning is the
   isolation); v1 commands are interactive request/reply over core NATS — an

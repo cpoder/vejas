@@ -70,6 +70,11 @@ Every request produces exactly one reply and one `ctl.audit` echo:
 { "ts": "<ISO 8601>", "id": "…", "cmd": "…", "ok": true, "summary": "<one line>" }
 ```
 
+The acting *human* behind a command is recorded hub-side by the console,
+keyed on the request `id`. The collector cannot verify an identity claim, so
+none travels on the wire — do not add actor fields here and mistake them for
+authentication.
+
 ## Commands (v1 allowlist — closed; unknown `cmd` is an error)
 
 | Tier | `cmd` | `args` | `result` |
@@ -80,6 +85,7 @@ Every request produces exactly one reply and one `ctl.audit` echo:
 | 1 telemetry | `probe` | `{file}` | connector test verdict (same as `POST /connectors/test`) |
 | 2 operations | `reload` | — | `{total, started, stopped}` |
 | 2 operations | `restart` | `{unit}` | `{ok}` |
+| 2 operations | `rotate_requested` | `{ref}` | `{ok}` — flags the reference in the panel's Secrets card ("rotation requested by the operator"); the new value is typed locally, never transmitted |
 | 3 content | `propose` | see below | `{proposal_id, state: "pending" \| "applied"}` |
 | 3 content | `proposals` | — | pending list `[{id, kind, summary, received_at}]` |
 
@@ -117,9 +123,13 @@ Every `STATUS_SECS` on `vx.<tenant>.ctl.status`:
 
 ```json
 { "ts": "…", "tenant": "…", "bundle": "<REVISION>", "runtime_version": "…",
-  "units": [{"name": "…", "status": "…", "restarts": 0}],
+  "units": [{"name": "…", "status": "…", "restarts": 0, "last_error": null}],
   "pending_proposals": 0 }
 ```
+
+`last_error` is nullable, truncated to ~200 characters — it is what a fleet
+page displays continuously ("collector X: unit y failing") without issuing an
+interactive `status` per tenant per refresh.
 
 This is the operator console's live view; the heartbeat *fact* (ADR-0012)
 remains the data-channel liveness signal and needs no control plane.
@@ -127,7 +137,7 @@ remains the data-channel liveness signal and needs no control plane.
 ## Security invariants (normative)
 
 1. No secret **value** ever appears on any `ctl.*` subject, in any direction.
-   `rotate_requested` (a tier-1 informational command) may flag a reference in
+   `rotate_requested` (tier 2, in the table above) may flag a reference in
    the panel; the value is typed locally.
 2. The allowlist is closed. Unknown commands error. There is no remote shell,
    no remote `exec`, no remote write outside the proposal queue.
