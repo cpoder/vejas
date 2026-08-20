@@ -37,3 +37,8 @@ supervisor are irrelevant.
 Flows (VejasScript) follow the same contract; the runtime does the boring parts
 and guarantees every `emit` is published before the incoming message is acked,
 so a crash means redelivery, never a lost emit.
+
+One subject family is reserved: `vx.<tenant>.ctl.>` — the remote-collector
+control channel (leaf-node uplink, closed command allowlist, local approval
+for content changes). Specification: [CONTROL.md](CONTROL.md), decision:
+ADR-0013.

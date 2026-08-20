@@ -56,6 +56,10 @@ in Vault, deployed from `docker compose` — recordable for a Show HN.
 - Package/connector distribution as git repos; the seam toward a marketplace
   (ADR-0003) — a candidate monetization surface (the paid panel: collaboration,
   approvals, audit, SSO).
+- **Remote control plane** for outbound-only collectors (ADR-0013,
+  `CONTROL.md`): NATS leaf-node uplink, closed command allowlist, content
+  changes as locally-approved proposals (the ADR-0005 loop applied to fleet
+  management), full audit both sides.
 - `vjs-test` as the CI gate; transport-level tests (redelivery, ordering,
   reconnection) beyond the language golden cases.
 
