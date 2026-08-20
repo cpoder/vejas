@@ -153,7 +153,8 @@ impl Driver for HttpIn {
                 Ok(mut sock) => {
                     let js = js.clone();
                     let root = ctx.subj_root.clone();
-                    thread::spawn(move || handle_http_in(&mut sock, &js, &root));
+                    let name = ctx.name.clone();
+                    thread::spawn(move || handle_http_in(&name, &mut sock, &js, &root));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(100));
@@ -165,7 +166,7 @@ impl Driver for HttpIn {
     }
 }
 
-fn handle_http_in(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
+fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -221,8 +222,14 @@ fn handle_http_in(sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStrea
     }
     let subject = format!("{subj_root}.{suffix}");
     match js.publish(&subject, body) {
-        Ok(_) => reply(sock, "202 Accepted", &format!("{{\"published\":\"{subject}\"}}")),
-        Err(e) => reply(sock, "502 Bad Gateway", &format!("{{\"error\":\"{e}\"}}")),
+        Ok(_) => {
+            trace_pub(name, &subject, body);
+            reply(sock, "202 Accepted", &format!("{{\"published\":\"{subject}\"}}"))
+        }
+        Err(e) => {
+            trace_fail(name, &subject, format!("publish: {e}"));
+            reply(sock, "502 Bad Gateway", &format!("{{\"error\":\"{e}\"}}"))
+        }
     }
 }
 
@@ -280,6 +287,7 @@ impl Driver for Timer {
                 if let Err(e) = js.publish(&subject, &bytes) {
                     return Err(format!("publish: {e}"));
                 }
+                trace_pub(&ctx.name, &subject, &bytes);
             }
         }
     }
@@ -314,9 +322,13 @@ impl Driver for HttpPoll {
                 match http_get(&url, &headers) {
                     Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
                         let _ = js.publish(&subject, &body);
+                        trace_pub(&ctx.name, &subject, &body);
                     }
                     Ok(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
-                    Err(e) => eprintln!("[{}] poll: {e}", ctx.name),
+                    Err(e) => {
+                        eprintln!("[{}] poll: {e}", ctx.name);
+                        trace_fail(&ctx.name, &subject, e);
+                    }
                 }
             }
         }
@@ -459,7 +471,11 @@ impl Driver for OAuthPoll {
                             // a broken token config never comes back on its own:
                             // fail the run, let supervision back off and retry
                             let (t, ttl) =
-                                Self::token(&token_url, &client_id, &client_secret, &scope)?;
+                                Self::token(&token_url, &client_id, &client_secret, &scope)
+                                    .map_err(|e| {
+                                        trace_fail(&ctx.name, &subject, e.clone());
+                                        e
+                                    })?;
                             cached = Some((t.clone(), Instant::now() + ttl));
                             t
                         }
@@ -483,11 +499,11 @@ impl Driver for OAuthPoll {
                                 "fetched_at": iso8601_utc(crate::now_secs()),
                                 "body": parsed,
                             });
-                            if let Err(e) =
-                                js.publish(&subject, serde_json::to_vec(&envelope).unwrap_or_default())
-                            {
+                            let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+                            if let Err(e) = js.publish(&subject, &bytes) {
                                 return Err(format!("publish: {e}"));
                             }
+                            trace_pub(&ctx.name, &subject, &bytes);
                             pages += 1;
                             match next_url(&base, &parsed, &next_field) {
                                 Some(next) => url = next,
@@ -495,15 +511,17 @@ impl Driver for OAuthPoll {
                             }
                         }
                         Ok((code, body)) => {
-                            eprintln!(
-                                "[{}] {ep}: HTTP {code}, endpoint skipped this tick: {}",
-                                ctx.name,
+                            let msg = format!(
+                                "{ep}: HTTP {code}: {}",
                                 String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
                             );
+                            eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
+                            trace_fail(&ctx.name, &subject, msg);
                             break;
                         }
                         Err(e) => {
                             eprintln!("[{}] {ep}: {e} — endpoint skipped this tick", ctx.name);
+                            trace_fail(&ctx.name, &subject, format!("{ep}: {e}"));
                             break;
                         }
                     }
@@ -513,13 +531,45 @@ impl Driver for OAuthPoll {
     }
 }
 
+// ───────────────────────── connector traces ─────────────────────────
+
+fn trace_preview(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).chars().take(160).collect()
+}
+
+/// A source publish, in the trace ring (the panel's "is it flowing?").
+fn trace_pub(name: &str, subject: &str, bytes: &[u8]) {
+    crate::record_trace_full(
+        name, subject, true, None,
+        vec![subject.to_string()], trace_preview(bytes), None, None,
+    );
+}
+
+/// A source-side failure worth showing in the panel.
+fn trace_fail(name: &str, subject: &str, err: String) {
+    crate::record_trace_full(name, subject, false, Some(err), vec![], String::new(), None, None);
+}
+
+/// A sink's response-body summary (what the downstream API answered).
+fn summarize(bytes: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(bytes);
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.chars().take(200).collect())
+    }
+}
+
 // ───────────────────────── sinks ─────────────────────────
 
 /// Shared sink loop: durable pull consumer -> handler; ack on Ok, nak on Err.
+/// The handler may return a response summary, recorded in the trace ring so
+/// the panel shows what the downstream answered (rejected facts, skips…).
 fn run_sink(
     ctx: &Ctx,
     subject: &str,
-    handler: impl Fn(&[u8]) -> Result<(), String>,
+    handler: impl Fn(&[u8]) -> Result<Option<String>, String>,
 ) -> Result<(), String> {
     let js = ctx.jetstream()?;
     let durable = ctx.name.replace([':', '.', '-'], "_");
@@ -547,8 +597,12 @@ fn run_sink(
                 // stopped mid-batch: leave the message un-acked, it redelivers
                 return Ok(());
             }
+            let preview = trace_preview(&msg.data);
             match handler(&msg.data) {
-                Ok(()) => {
+                Ok(response) => {
+                    crate::record_trace_full(
+                        &ctx.name, subject, true, None, vec![], preview, None, response,
+                    );
                     let _ = msg.ack();
                 }
                 Err(e) => {
@@ -557,9 +611,17 @@ fn run_sink(
                         msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
                     if delivered >= crate::MAX_DELIVERIES {
                         eprintln!("[{}] {e} -> dropped after {delivered} deliveries", ctx.name);
+                        crate::record_trace_full(
+                            &ctx.name, subject, false,
+                            Some(format!("{e} — dropped after {delivered} deliveries")),
+                            vec![], preview, None, None,
+                        );
                         let _ = msg.ack();
                     } else {
                         eprintln!("[{}] {e} -> nak", ctx.name);
+                        crate::record_trace_full(
+                            &ctx.name, subject, false, Some(e), vec![], preview, None, None,
+                        );
                         let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
                     }
                 }
@@ -591,11 +653,11 @@ impl Driver for SlackOut {
                 .unwrap_or_else(|| String::from_utf8_lossy(data).into_owned());
             if webhook.is_empty() {
                 eprintln!("[{name}] DRY-RUN would post: {text}");
-                Ok(())
+                Ok(Some(format!("DRY-RUN: {}", text.chars().take(160).collect::<String>())))
             } else {
                 let payload = serde_json::json!({ "text": text }).to_string();
                 let headers = [("Content-Type".to_string(), "application/json".to_string())];
-                http_post(&webhook, &headers, payload.as_bytes()).map(|_| ())
+                http_post(&webhook, &headers, payload.as_bytes()).map(|b| summarize(&b))
             }
         })
     }
@@ -616,7 +678,7 @@ impl Driver for HttpOut {
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
-        run_sink(ctx, &subject, move |data| http_post(&url, &headers, data).map(|_| ()))
+        run_sink(ctx, &subject, move |data| http_post(&url, &headers, data).map(|b| summarize(&b)))
     }
 }
 
@@ -657,7 +719,9 @@ impl Driver for ExecSource {
                     .output()
                     .map_err(|e| e.to_string())?;
                 if !out.status.success() {
-                    eprintln!("[{}] exec: {}", ctx.name, String::from_utf8_lossy(&out.stderr).trim());
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    eprintln!("[{}] exec: {err}", ctx.name);
+                    trace_fail(&ctx.name, &subject, format!("exec: {err}"));
                 }
                 for line in out.stdout.split(|&b| b == b'\n') {
                     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -666,6 +730,7 @@ impl Driver for ExecSource {
                     }
                     if serde_json::from_slice::<Value>(line).is_ok() {
                         let _ = js.publish(&subject, line);
+                        trace_pub(&ctx.name, &subject, line);
                     } else {
                         eprintln!("[{}] exec: non-JSON line skipped", ctx.name);
                     }
@@ -692,6 +757,7 @@ impl Driver for ExecSink {
                 .arg("-c")
                 .arg(&cmd)
                 .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| e.to_string())?;
@@ -703,7 +769,7 @@ impl Driver for ExecSink {
                 .map_err(|e| e.to_string())?;
             let out = child.wait_with_output().map_err(|e| e.to_string())?;
             if out.status.success() {
-                Ok(())
+                Ok(summarize(&out.stdout))
             } else {
                 Err(format!("{name}: exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()))
             }

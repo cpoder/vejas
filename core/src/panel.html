@@ -47,6 +47,8 @@
   .newflow input { flex: 1; font: 14px system-ui, sans-serif; padding: 10px 14px;
                    border: 1px solid var(--line); border-radius: 9px; background: transparent; color: var(--ink); }
   .newflow input:focus { outline: none; border-color: var(--accent); background: var(--wash); }
+  .newflow select { font: 14px system-ui, sans-serif; padding: 10px 12px; border: 1px solid var(--line);
+                    border-radius: 9px; background: var(--card); color: var(--ink); }
   .newflow button { font: 600 14px system-ui, sans-serif; padding: 10px 18px; border-radius: 9px;
                     border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
                     cursor: pointer; white-space: nowrap; }
@@ -133,13 +135,16 @@
   </header>
 
   <div class="card">
-    <h2>New flow</h2>
+    <h2>New flow or connector</h2>
     <div class="newflow">
       <input id="prompt" placeholder="Describe the integration — your agent writes it in VejasScript, one screen of readable code">
+      <select id="gentype"><option value="flow">Flow</option><option value="connector">Connector</option></select>
       <button id="gen">Generate</button>
     </div>
-    <p class="hint">The flow lands below, running, with its tables and constants ready for review.
-    Open the script to read or edit the whole treatment; open the input to change the sample event.</p>
+    <p class="hint">It lands below, running, with its tables and constants ready for review.
+    Open the script to read or edit the whole treatment.</p>
+    <details class="hint"><summary>Connector drivers available in this runtime</summary>
+      <div id="driverlist">loading…</div></details>
   </div>
 
   <div class="card">
@@ -229,13 +234,21 @@ function renderReplay(anchor, p, res) {
   strip.appendChild(bar);
   card.appendChild(strip);
 }
-function applyBtn(dirtyEl, params) {
+function applyBtn(dirtyEl, params, direct) {
   const btn = document.createElement('button');
   btn.className = 'apply'; btn.textContent = 'Apply';
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = '…';
     const p = params();
     try {
+      if (direct) {
+        // connector config: no event stream to shadow-replay against —
+        // the edit applies and the connector restarts with the new config
+        await setLiteral(p.file, p.name, p.key, p.value);
+        toast('Updated — connector restarted');
+        await load();
+        return;
+      }
       const res = await (await post('/surface/replay', {...p, n: 20})).json();
       if (!res.events) {
         await setLiteral(p.file, p.name, p.key, p.value);
@@ -327,7 +340,7 @@ function drawPipe(graph, topo) {
 }
 
 /* ---------- sections ---------- */
-function mappingSection(card, file, entry, previewEntries) {
+function mappingSection(card, file, entry, previewEntries, direct) {
   const sect = document.createElement('div');
   sect.className = 'sect'; sect.textContent = entry.name.toLowerCase();
   card.appendChild(sect);
@@ -345,20 +358,20 @@ function mappingSection(card, file, entry, previewEntries) {
         const input = document.createElement('input');
         input.className = 'rule'; input.value = ruleToText(subRule);
         const tr = row(table, { label: '· ' + sub, input,
-          btn: applyBtn(() => tr, () => ({file, name: entry.name, key: `${target}/map/${sub}`, value: textToRule(input.value)})) });
+          btn: applyBtn(() => tr, () => ({file, name: entry.name, key: `${target}/map/${sub}`, value: textToRule(input.value)}), direct) });
         input.oninput = () => tr.classList.add('dirty');
       }
     } else {
       const input = document.createElement('input');
       input.className = 'rule'; input.value = ruleToText(rule);
       const tr = row(table, { label: target, input, sample: sampleFor(target),
-        btn: applyBtn(() => tr, () => ({file, name: entry.name, key: target, value: textToRule(input.value)})) });
+        btn: applyBtn(() => tr, () => ({file, name: entry.name, key: target, value: textToRule(input.value)}), direct) });
       input.oninput = () => tr.classList.add('dirty');
     }
   }
   card.appendChild(table);
 }
-function tableSection(card, file, entry) {
+function tableSection(card, file, entry, direct) {
   const sect = document.createElement('div');
   sect.className = 'sect'; sect.textContent = `${entry.name.toLowerCase()} — transcoding table`;
   card.appendChild(sect);
@@ -368,12 +381,12 @@ function tableSection(card, file, entry) {
     const input = document.createElement('input');
     input.className = 'rule'; input.value = String(v);
     const tr = row(table, { label: k, input, arrow: '→',
-      btn: applyBtn(() => tr, () => ({file, name: entry.name, key: k, value: parseConst(input.value)})) });
+      btn: applyBtn(() => tr, () => ({file, name: entry.name, key: k, value: parseConst(input.value)}), direct) });
     input.oninput = () => tr.classList.add('dirty');
   }
   card.appendChild(table);
 }
-function constsSection(card, file, entries) {
+function constsSection(card, file, entries, direct) {
   const sect = document.createElement('div');
   sect.className = 'sect'; sect.textContent = 'constants';
   card.appendChild(sect);
@@ -392,7 +405,7 @@ function constsSection(card, file, entries) {
       ? input.value.split(',').map(s => parseConst(s)).filter(v => v !== '')
       : parseConst(input.value);
     rw.appendChild(input);
-    rw.appendChild(applyBtn(() => box, () => ({file, name: entry.name, key: '-', value: parse()})));
+    rw.appendChild(applyBtn(() => box, () => ({file, name: entry.name, key: '-', value: parse()}), direct));
     box.appendChild(label); box.appendChild(rw); grid.appendChild(box);
   }
   card.appendChild(grid);
@@ -467,30 +480,36 @@ async function load() {
   const byFile = {};
   for (const e of surface) (byFile[e.file] ??= []).push(e);
   const previews = {};
-  await Promise.all(Object.keys(byFile).filter(f => !byFile[f][0].service).map(f =>
-    fetch('/preview?file=' + encodeURIComponent(f)).then(r => r.json())
+  await Promise.all(Object.keys(byFile)
+    .filter(f => !byFile[f][0].service && !byFile[f][0].connector)
+    .map(f => fetch('/preview?file=' + encodeURIComponent(f)).then(r => r.json())
       .then(p => previews[f] = p).catch(() => {})));
 
   const root = $('#root'); root.innerHTML = '';
+  const rank = f => byFile[f][0].service ? 2 : (byFile[f][0].connector ? 1 : 0);
   const ordered = Object.entries(byFile).sort(([a], [b]) =>
-    (byFile[a][0].service ? 1 : 0) - (byFile[b][0].service ? 1 : 0) || a.localeCompare(b));
+    rank(a) - rank(b) || a.localeCompare(b));
   for (const [file, list] of ordered) {
     const meta = list[0];
     const short = file.split('/').pop();
-    const info = (topo.flows || []).find(f => f.file === file || f.file.endsWith('/' + short)) || {};
     const isService = !!meta.service;
+    const isConnector = !!meta.connector;
+    const pool = (isConnector ? topo.connectors : topo.flows) || [];
+    const info = pool.find(f => f.file === file || (f.file || '').endsWith('/' + short)) || {};
     const lang = meta.lang || (file.endsWith('.vjs') ? 'vjs' : 'py');
     const card = document.createElement('div'); card.className = 'card';
     const badges = `<span class="badge">${lang === 'vjs' ? 'VejasScript' : 'Python'}</span>` +
+      (isConnector ? `<span class="badge">${esc(meta.driver)}</span><span class="badge pkg">${esc(meta.driver_kind)}</span>` : '') +
       (meta.pkg && meta.pkg !== 'default' ? `<span class="badge pkg">pkg: ${esc(meta.pkg)}</span>` : '') +
       (isService ? `<span class="badge pkg">service</span>` : '');
-    card.innerHTML = `<h2>${isService ? '' : `<span class="dot" style="background:${info.status === 'running' ? 'var(--ok)' : 'var(--muted)'}"></span>`}${esc(short.replace(/\.(py|vjs)$/,''))} ${badges}</h2>
-      <p class="sub">${esc(file)}${info.status ? ' · ' + info.status : ''}${info.restarts ? ' · ' + info.restarts + ' reload' + (info.restarts > 1 ? 's' : '') : ''}</p>`;
-    if (!isService) runStrip(card, previews[file]);
-    for (const e of list.filter(x => x.kind === 'mapping')) mappingSection(card, file, e, (previews[file] || {}).entries);
-    for (const e of list.filter(x => x.kind === 'table')) tableSection(card, file, e);
+    const running = (info.status || '').startsWith('running');
+    card.innerHTML = `<h2>${isService ? '' : `<span class="dot" style="background:${running ? 'var(--ok)' : 'var(--muted)'}"></span>`}${esc(short.replace(/\.(py|vjs)$/,''))} ${badges}</h2>
+      <p class="sub" ${info.last_error ? `title="${esc(info.last_error)}"` : ''}>${esc(file)}${info.status ? ' · ' + info.status : ''}${info.restarts ? ' · ' + info.restarts + ' reload' + (info.restarts > 1 ? 's' : '') : ''}${info.last_error ? ` · <span style="color:var(--err)">⚠ ${esc(trunc(info.last_error, 90))}</span>` : ''}</p>`;
+    if (!isService && !isConnector) runStrip(card, previews[file]);
+    for (const e of list.filter(x => x.kind === 'mapping')) mappingSection(card, file, e, (previews[file] || {}).entries, isConnector);
+    for (const e of list.filter(x => x.kind === 'table')) tableSection(card, file, e, isConnector);
     const consts = list.filter(x => x.kind === 'constant');
-    if (consts.length) constsSection(card, file, consts);
+    if (consts.length) constsSection(card, file, consts, isConnector);
     const toolbar = document.createElement('div'); toolbar.className = 'toolbar';
     const scriptEd = editorRow('script', file);
     const btnScript = document.createElement('button'); btnScript.className = 'tool';
@@ -498,7 +517,7 @@ async function load() {
     btnScript.onclick = () => scriptEd.toggle();
     toolbar.appendChild(btnScript);
     let inputEd = null;
-    if (!isService) {
+    if (!isService && !isConnector) {
       inputEd = editorRow('input', file);
       const btnInput = document.createElement('button'); btnInput.className = 'tool';
       btnInput.textContent = 'Edit input';
@@ -520,11 +539,14 @@ async function loadEvents() {
     if (!evs.length) return;
     const rows = evs.map(e => {
       const t = new Date((e.ts || 0) * 1000).toLocaleTimeString();
-      const outcome = e.ok
+      const resp = e.response
+        ? ` <span class="sample" title="${esc(e.response)}">↩ ${esc(trunc(e.response, 32))}</span>`
+        : '';
+      const outcome = (e.ok
         ? ((e.emits || []).length
             ? e.emits.map(s => `<code>${esc(s)}</code>`).join(' ')
-            : '<span style="color:var(--muted)">no emit</span>')
-        : `<span style="color:var(--err)">${esc(trunc(e.error || 'error', 60))}</span>`;
+            : '<span style="color:var(--muted)">delivered</span>')
+        : `<span style="color:var(--err)">${esc(trunc(e.error || 'error', 60))}</span>`) + resp;
       return `<tr>
         <td class="sample">${t}</td>
         <td class="field"><code>${esc(String(e.flow || '').replace(/^flow:/, ''))}</code></td>
@@ -542,18 +564,29 @@ setInterval(loadEvents, 4000);
 
 $('#gen').onclick = async () => {
   const prompt = $('#prompt').value.trim();
-  if (!prompt) return toast('Describe the flow first', true);
+  if (!prompt) return toast('Describe it first', true);
+  const type = $('#gentype').value;
   const btn = $('#gen');
   btn.disabled = true; btn.textContent = 'Asking the agent…';
   try {
-    const res = await post('/flows/new', {prompt});
+    const res = await post(type === 'connector' ? '/connectors/new' : '/flows/new', {prompt});
     const body = await res.json();
-    toast(`Flow ${body.flow} created and running`);
+    toast(`${type === 'connector' ? 'Connector ' + body.connector : 'Flow ' + body.flow} created and running`);
     $('#prompt').value = '';
     await load();
   } catch (e) { toast(e.message.slice(0, 160), true); }
   btn.disabled = false; btn.textContent = 'Generate';
 };
+
+async function loadDrivers() {
+  try {
+    const list = await fetch('/drivers').then(r => r.json());
+    $('#driverlist').innerHTML = list.map(d =>
+      `<div style="margin: 6px 0"><code>${esc(d.driver)}</code> <span class="badge pkg">${esc(d.kind)}</span> — ${esc(d.about)}</div>`
+    ).join('');
+  } catch {}
+}
+loadDrivers();
 
 load().catch(e => { $('#root').textContent = 'cannot load: ' + e.message; });
 </script>

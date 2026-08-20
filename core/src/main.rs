@@ -83,7 +83,7 @@ static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// retry mechanism, not an infinite loop for poison messages.
 pub const MAX_DELIVERIES: i64 = 5;
 
-fn record_trace(
+pub fn record_trace(
     flow: &str,
     subject: &str,
     ok: bool,
@@ -92,12 +92,30 @@ fn record_trace(
     preview: String,
     event: Option<Value>,
 ) {
+    record_trace_full(flow, subject, ok, error, emits, preview, event, None)
+}
+
+/// Full form: `response` carries a sink's response-body summary (what the
+/// downstream API answered — rejected facts, scoring skips…), so mapping
+/// problems are visible in the panel instead of dying in an acked 2xx.
+#[allow(clippy::too_many_arguments)]
+pub fn record_trace_full(
+    unit: &str,
+    subject: &str,
+    ok: bool,
+    error: Option<String>,
+    emits: Vec<String>,
+    preview: String,
+    event: Option<Value>,
+    response: Option<String>,
+) {
     let seq = TRACE_SEQ.fetch_add(1, Ordering::SeqCst);
     let mut map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    let ring = map.entry(flow.to_string()).or_default();
+    let ring = map.entry(unit.to_string()).or_default();
     ring.push_back(json!({
-        "seq": seq, "ts": now_secs(), "flow": flow, "subject": subject,
+        "seq": seq, "ts": now_secs(), "flow": unit, "subject": subject,
         "ok": ok, "error": error, "emits": emits, "preview": preview,
+        "response": response,
         // the full event, kept for shadow-replay; stripped from /events output
         "event": event,
     }));
@@ -728,6 +746,30 @@ fn vjs_files(root: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// Connector manifests (root connectors/ + packages/<pkg>/connectors/).
+fn connector_files(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    fn push_dir(dir: PathBuf, pkg: &str, out: &mut Vec<(PathBuf, String)>) {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "vjs").unwrap_or(false) {
+                    out.push((p, pkg.to_string()));
+                }
+            }
+        }
+    }
+    push_dir(root.join("connectors"), "default", &mut out);
+    if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
+        for p in pkgs.flatten() {
+            let pkg = p.file_name().to_string_lossy().to_string();
+            push_dir(p.path().join("connectors"), &pkg, &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
 fn surface_json(root: &Path) -> Value {
     let mut entries: Vec<Value> = Vec::new();
     for (path, pkg) in vjs_files(root) {
@@ -764,6 +806,44 @@ fn surface_json(root: &Path) -> Value {
                 "pkg": pkg,
                 "service": is_service,
             }));
+        }
+    }
+    // connector manifests get cards too: their literal config IS a business
+    // surface (edited with the same set_literal machinery, applied directly)
+    for (path, pkg) in connector_files(root) {
+        let Ok(src) = fs::read_to_string(&path) else { continue };
+        let Ok(prog) = vjs::parse(&src) else { continue };
+        let Some(driver) = prog.driver.clone() else { continue };
+        let driver_kind = connectors::driver_for(&driver)
+            .map(|d| d.kind())
+            .unwrap_or("unknown");
+        let base = json!({
+            "file": path.display().to_string(),
+            "lang": "vjs",
+            "pkg": pkg,
+            "service": false,
+            "connector": true,
+            "driver": driver,
+            "driver_kind": driver_kind,
+        });
+        let mut pushed = false;
+        for e in &prog.surface {
+            let mut v = base.clone();
+            let o = v.as_object_mut().unwrap();
+            o.insert("name".into(), json!(e.name));
+            o.insert("kind".into(), json!(vjs_kind_of(&e.name, &e.value)));
+            o.insert("value".into(), e.value.clone());
+            o.insert("list".into(), json!(e.value.is_array()));
+            entries.push(v);
+            pushed = true;
+        }
+        if !pushed {
+            let mut v = base.clone();
+            let o = v.as_object_mut().unwrap();
+            o.insert("name".into(), json!(""));
+            o.insert("kind".into(), json!("none"));
+            o.insert("value".into(), Value::Null);
+            entries.push(v);
         }
     }
     Value::Array(entries)
@@ -1348,6 +1428,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let flow = qparam(&url, "flow");
             respond(request, 200, events_json(flow.as_deref()), "application/json")
         }
+        (tiny_http::Method::Get, "/drivers") => {
+            let list: Vec<Value> = connectors::catalog()
+                .into_iter()
+                .map(|(n, k, a)| json!({"driver": n, "kind": k, "about": a}))
+                .collect();
+            respond(request, 200, Value::Array(list).to_string(), "application/json")
+        }
         (tiny_http::Method::Get, "/preview") => {
             let Some(file) = qparam(&url, "file") else {
                 return respond(request, 400, "missing file".into(), "text/plain");
@@ -1752,6 +1839,32 @@ mod tests {
         assert!(guard_path(root, "/etc/passwd").is_none());
         assert!(guard_path(root, "/srv/vejas/core/x.vjs").is_none());
         assert!(guard_path(root, "flows/../core/x.vjs").is_none());
+    }
+
+    #[test]
+    fn surface_includes_connector_manifests() {
+        let root = std::env::temp_dir().join(format!("vejas-surf-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("connectors")).unwrap();
+        std::fs::write(
+            root.join("connectors").join("surf_probe.vjs"),
+            "# connector: surf_probe\ndriver \"timer\"\nSUBJECT = \"vx.surf.probe\"\nINTERVAL_SECS = 30\n",
+        )
+        .unwrap();
+        let v = surface_json(&root);
+        let entries: Vec<&Value> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["file"].as_str().unwrap_or("").ends_with("surf_probe.vjs"))
+            .collect();
+        assert_eq!(entries.len(), 2, "SUBJECT + INTERVAL_SECS");
+        for e in &entries {
+            assert_eq!(e["connector"], true);
+            assert_eq!(e["driver"], "timer");
+            assert_eq!(e["driver_kind"], "source:interval");
+        }
+        assert!(entries.iter().any(|e| e["name"] == "SUBJECT"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
