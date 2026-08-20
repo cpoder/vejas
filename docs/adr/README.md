@@ -23,7 +23,7 @@ the old one.
 | [0010](0010-transformation-doctrine.md) | Transformation doctrine: small registry + code-by-example | Accepted |
 | [0011](0011-connector-extensibility.md) | Connector extensibility: external process, not native libs; WASM later | Accepted |
 | [0012](0012-deployment-topologies.md) | Deployment topologies: cells and outbound-only collectors | Accepted |
-| [0013](0013-control-plane-leafnodes.md) | Remote control plane over NATS leaf nodes | Proposed |
+| [0013](0013-control-plane-leafnodes.md) | Remote control plane over NATS leaf nodes | Accepted (partial) |
 
 ## Template
 

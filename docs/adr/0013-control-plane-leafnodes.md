@@ -1,6 +1,6 @@
 # 0013 — Remote control plane over NATS leaf nodes
 
-- Status: Proposed
+- Status: Accepted (partial) — v1 built (uplink, allowlist, status, audit); proposals (v2) and queued delivery (v3) pending
 - Date: 2026-08-20
 
 ## Context
@@ -25,11 +25,13 @@ pattern built in: **leaf nodes**.
 
 - **Uplink:** the collector's NATS connects as a *leaf node* to the operator's
   hub — outbound TLS, per-tenant credentials, and hub-side authorization that
-  pins the tenant to its own subjects (`vx.<tenant>.>`). Enabled by
+  pins the tenant to its own subjects (`vx.<tenant>.>` and the transient
+  control root `vxc.<tenant>.>`, kept outside every JetStream capture — a
+  stream on the command subject answers requests with its pub-ack). Enabled by
   configuration in the bundle (`VEJAS_TENANT` + a leafnode remote in the NATS
   config); absent configuration means no control plane, and the collector
   behaves exactly as today.
-- **Control consumer:** the runtime subscribes to `vx.<tenant>.ctl.cmd` and
+- **Control consumer:** the runtime subscribes to `vxc.<tenant>.cmd` and
   executes a **closed allowlist** of commands (wire format and command set:
   `docs/CONTROL.md`), replying per request and pushing periodic status
   upstream. Unknown commands are errors, not extensions.
@@ -51,7 +53,7 @@ pattern built in: **leaf nodes**.
   including the auto-approve switch.
 - **Audit:** every command, reply and proposal decision is recorded in the
   local trace ring (panel-visible) and echoed upstream on
-  `vx.<tenant>.ctl.audit` for the operator's console.
+  `vxc.<tenant>.audit` for the operator's console.
 
 ## Consequences
 

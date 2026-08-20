@@ -24,10 +24,11 @@
 //   POST /reload                   rescan; restart changed files (mtime)
 
 mod connectors;
+mod control;
 mod secrets;
 mod vjs;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -82,6 +83,35 @@ static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// retrying and drops it (acked, visible in the trace) — redelivery is the
 /// retry mechanism, not an infinite loop for poison messages.
 pub const MAX_DELIVERIES: i64 = 5;
+
+/// Secret references the operator asked to rotate (`rotate_requested` over
+/// the control channel, CONTROL.md). A flag, nothing more: the value is typed
+/// locally, and setting the secret clears it.
+static ROTATIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub fn flag_rotation(reference: &str) {
+    ROTATIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(reference.to_string());
+}
+
+fn rotation_flagged(reference: &str) -> bool {
+    ROTATIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .contains(reference)
+}
+
+fn clear_rotation(reference: &str) {
+    ROTATIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .remove(reference);
+}
 
 pub fn record_trace(
     flow: &str,
@@ -643,7 +673,8 @@ fn secrets_json(root: &Path) -> String {
                 Ok(_) => "ok",
                 Err(_) => "missing",
             };
-            json!({"ref": r, "used_by": used_by, "status": status})
+            json!({"ref": r, "used_by": used_by, "status": status,
+                   "rotation_requested": rotation_flagged(&r)})
         })
         .collect();
     json!({"backend": store.kind(), "writable": !matches!(store.kind(), "env"), "secrets": list})
@@ -654,6 +685,7 @@ fn secrets_json(root: &Path) -> String {
 /// config was evaluated at start). Returns the restarted unit names.
 fn set_secret(registry: &Registry, root: &Path, reference: &str, value: &str) -> Result<Vec<String>, String> {
     secrets::default_store().set(reference, value)?;
+    clear_rotation(reference); // a set satisfies an operator rotation request
     let mut restarted = Vec::new();
     for spec in scan_all(root) {
         let Ok(src) = fs::read_to_string(&spec.path) else { continue };
@@ -1908,6 +1940,9 @@ fn main() {
     // flows AND declared connector instances start here (reload supervises both)
     let (total, started, _) = reload(&registry, &root);
     eprintln!("[vejas] supervising {total} units ({started} started)");
+
+    // the control channel, only when this runtime names a tenant (ADR-0013)
+    control::start(registry.clone(), root.clone());
 
     {
         let registry = registry.clone();

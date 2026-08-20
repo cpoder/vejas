@@ -617,7 +617,7 @@ async function loadSecrets() {
       return `<tr>
         <td class="field">${dot} <code>${esc(s.ref)}</code></td>
         <td class="sample" title="${esc((s.used_by || []).join('\n'))}">${(s.used_by || []).length} file${(s.used_by || []).length > 1 ? 's' : ''}</td>
-        <td>${s.status === 'ok' ? '<span style="color:var(--ok)">resolves</span>' : '<span style="color:var(--err)">missing</span>'}</td>
+        <td>${s.status === 'ok' ? '<span style="color:var(--ok)">resolves</span>' : '<span style="color:var(--err)">missing</span>'}${s.rotation_requested ? ' <span class="badge" title="The operator asked for a rotation — paste the new value here.">rotation requested</span>' : ''}</td>
         <td style="text-align:right; white-space:nowrap">${action}</td></tr>`;
     }).join('');
     $('#secrets').innerHTML = rows

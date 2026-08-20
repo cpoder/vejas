@@ -1,7 +1,8 @@
 # The control channel (remote collectors) — specification
 
-Status: specified with ADR-0013 (Proposed), not built. This document is the
-wire-level contract; it is deliberately small and closed.
+Status: v1 BUILT and validated live (leaf-node uplink, full v1 allowlist,
+status push, double audit); proposals are v2. This document is the wire-level
+contract; it is deliberately small and closed.
 
 A **collector** (ADR-0012) may connect its local NATS to an operator's hub as
 a **leaf node** — an outbound TLS connection with per-tenant credentials. Over
@@ -30,7 +31,8 @@ leafnodes {
 ```
 
 Hub-side, the tenant's account authorization pins imports and exports to
-`vx.<tenant>.>` — subject pinning IS the isolation between tenants. Revoking
+`vx.<tenant>.>` **and** `vxc.<tenant>.>` (data and control roots) — subject
+pinning IS the isolation between tenants. Revoking
 the tenant's credentials severs the hand; the collector keeps collecting.
 
 Optional: `VEJAS_AUTO_APPROVE=1` (local only) applies tier-3 proposals
@@ -38,11 +40,19 @@ without local approval — for fleets that want zero-touch. Default: off.
 
 ## Subjects
 
+Control subjects live under their **own root** — `vxc.` by default (the data
+root suffixed with `c`; override with `VEJAS_CONTROL_ROOT`) — **deliberately
+outside the persisted data root**. This is normative: a JetStream stream
+capturing the command subject answers every request with its pub-ack before
+the runtime can, silently breaking request/reply. Never bind a stream to the
+control root. Control traffic is transient by design; its durable record is
+the audit (local ring + hub console).
+
 | Subject | Direction | What |
 |---|---|---|
-| `vx.<tenant>.ctl.cmd` | hub → collector | command requests (core NATS request/reply) |
-| `vx.<tenant>.ctl.status` | collector → hub | periodic state push (`STATUS_SECS`, default 60) |
-| `vx.<tenant>.ctl.audit` | collector → hub | one message per executed command / proposal decision |
+| `vxc.<tenant>.cmd` | hub → collector | command requests (core NATS request/reply) |
+| `vxc.<tenant>.status` | collector → hub | periodic state push (`STATUS_SECS`, default 60) |
+| `vxc.<tenant>.audit` | collector → hub | one message per executed command / proposal decision |
 
 Commands are **interactive**: core NATS request/reply, no queueing. An offline
 collector fails a command visibly at the console (timeout), it does not apply
@@ -51,7 +61,7 @@ it changes nothing in the payloads below.)
 
 ## Wire format
 
-Request (hub → `vx.<tenant>.ctl.cmd`):
+Request (hub → `vxc.<tenant>.cmd`):
 
 ```json
 { "id": "<hub-generated id>", "cmd": "<name>", "args": { } }
@@ -64,7 +74,7 @@ Reply (same NATS request/reply exchange):
 { "id": "<same id>", "ok": false, "error": "<plain words>" }
 ```
 
-Every request produces exactly one reply and one `ctl.audit` echo:
+Every request produces exactly one reply and one `…audit` echo:
 
 ```json
 { "ts": "<ISO 8601>", "id": "…", "cmd": "…", "ok": true, "summary": "<one line>" }
@@ -119,7 +129,7 @@ actions, by design: the approval queue is the client's hand.
 
 ## Status push
 
-Every `STATUS_SECS` on `vx.<tenant>.ctl.status`:
+Every `STATUS_SECS` on `vxc.<tenant>.status`:
 
 ```json
 { "ts": "…", "tenant": "…", "bundle": "<REVISION>", "runtime_version": "…",
@@ -136,7 +146,7 @@ remains the data-channel liveness signal and needs no control plane.
 
 ## Security invariants (normative)
 
-1. No secret **value** ever appears on any `ctl.*` subject, in any direction.
+1. No secret **value** ever appears on any control subject (`vxc.…`), in any direction.
    `rotate_requested` (tier 2, in the table above) may flag a reference in
    the panel; the value is typed locally.
 2. The allowlist is closed. Unknown commands error. There is no remote shell,
@@ -145,9 +155,12 @@ remains the data-channel liveness signal and needs no control plane.
    `VEJAS_AUTO_APPROVE`, leafnode credentials and this allowlist are local
    configuration only.
 4. Everything is audited twice: locally (trace ring, panel) and upstream
-   (`ctl.audit`).
+   (`vxc.<tenant>.audit`).
 5. Hub-side subject pinning per tenant is mandatory; a hub must never grant a
-   leaf credentials broader than `vx.<tenant>.>`.
+   leaf credentials broader than `vx.<tenant>.>` + `vxc.<tenant>.>`.
+6. The control root stays outside every JetStream stream binding, on the
+   collector and on the hub — a stream on the command subject hijacks
+   request/reply with its pub-ack (observed, not theoretical).
 
 ## Rollout
 
