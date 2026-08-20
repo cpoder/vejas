@@ -15,8 +15,10 @@ hot-addable). No subprocess, no Python. Drivers today:
   TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
   pagination via NEXT_LINK_FIELD (default `@odata.nextLink`, absolute links followed
   as-is) capped by MAX_PAGES, publishes one `{endpoint, fetched_at, body}` message
-  per page on SUBJECT. One generic OAuth+REST driver stands in for most of a
-  connector catalog.
+  per page on SUBJECT. `EXPAND = [{name, list, detail, key, as}]` adds a
+  client-side $expand — every list item enriched with its per-item detail call,
+  the page shipped as one envelope — for list APIs without a server-side expand.
+  One generic OAuth+REST driver stands in for most of a connector catalog.
 - **slack-out** (sink) — consumes vx.slack.out → Slack webhook / DRY-RUN.
 - **http-out** (sink) — consumes SUBJECT → POST to URL. Optional HEADERS doc for
   authenticated pushes, values via `secret()`:

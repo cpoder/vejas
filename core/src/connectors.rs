@@ -399,6 +399,82 @@ pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::
 
 struct OAuthPoll;
 
+/// Client-credentials token cache: refresh a minute early, invalidate on 401.
+struct TokenCache {
+    token_url: String,
+    client_id: String,
+    client_secret: String,
+    scope: String,
+    cached: Option<(String, Instant)>,
+}
+
+impl TokenCache {
+    fn bearer(&mut self) -> Result<String, String> {
+        if let Some((t, deadline)) = &self.cached {
+            if Instant::now() < *deadline {
+                return Ok(t.clone());
+            }
+        }
+        let (t, ttl) =
+            OAuthPoll::token(&self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
+        self.cached = Some((t.clone(), Instant::now() + ttl));
+        Ok(t)
+    }
+    fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+
+/// GET with the cached bearer; ONE fresh-token retry on 401.
+fn authed_get(tc: &mut TokenCache, url: &str) -> Result<(u16, Vec<u8>), String> {
+    let tok = tc.bearer()?;
+    let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
+    match http_request("GET", url, &headers, None)? {
+        (401, _) => {
+            tc.invalidate();
+            let tok = tc.bearer()?;
+            let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
+            http_request("GET", url, &headers, None)
+        }
+        ok => Ok(ok),
+    }
+}
+
+/// `{key}` placeholder substitution for EXPAND detail templates.
+fn fill_template(template: &str, key: &str, value: &str) -> String {
+    template.replace(&format!("{{{key}}}"), value)
+}
+
+/// A client-side $expand: list endpoint + per-item detail endpoint, joined by
+/// the driver into ONE envelope per page — so flows stay stateless (no
+/// cross-message correlation) exactly as with a server-side $expand.
+struct Expand {
+    name: String,
+    list: String,
+    detail: String,
+    key: String,
+    as_field: String,
+}
+
+fn parse_expands(cfg: &Config) -> Result<Vec<Expand>, String> {
+    let Some(raw) = cfg.value("EXPAND") else { return Ok(Vec::new()) };
+    let entries = raw
+        .as_array()
+        .cloned()
+        .ok_or("EXPAND must be a list of {name, list, detail, key, as} docs")?;
+    let mut out = Vec::new();
+    for e in &entries {
+        let field = |k: &str| e.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+        match (field("name"), field("list"), field("detail"), field("key"), field("as")) {
+            (Some(name), Some(list), Some(detail), Some(key), Some(as_field)) => {
+                out.push(Expand { name, list, detail, key, as_field })
+            }
+            _ => return Err("every EXPAND entry needs name, list, detail, key and as".into()),
+        }
+    }
+    Ok(out)
+}
+
 impl OAuthPoll {
     fn token(
         token_url: &str,
@@ -440,7 +516,7 @@ impl Driver for OAuthPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE, BASE_URL, ENDPOINTS, SUBJECT, INTERVAL_SECS, MAX_PAGES."
+        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. EXPAND = [{name, list, detail, key, as}] does a client-side $expand: each list item is enriched with its per-item detail call ({key} substituted in the detail path) and the page ships as ONE envelope under endpoint=name — sized for list APIs without a server-side expand (sequential detail calls, keep pages small). Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE, BASE_URL, ENDPOINTS and/or EXPAND, SUBJECT, INTERVAL_SECS, MAX_PAGES."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
@@ -452,7 +528,10 @@ impl Driver for OAuthPoll {
             .config
             .value("ENDPOINTS")
             .and_then(|v| v.as_array().and_then(|a| a.first().and_then(|e| e.as_str().map(|s| s.to_string()))))
-            .ok_or("ENDPOINTS required")?;
+            .or_else(|| {
+                parse_expands(&ctx.config).ok().and_then(|ex| ex.first().map(|s| s.list.clone()))
+            })
+            .ok_or("ENDPOINTS or EXPAND required")?;
         let (tok, _) = Self::token(&token_url, &client_id, &client_secret, &scope)
             .map_err(|e| humanize(&e))?;
         let url = join_url(&base, &ep);
@@ -491,19 +570,29 @@ impl Driver for OAuthPoll {
                         .collect::<Vec<_>>()
                 })
             })
-            .filter(|v: &Vec<String>| !v.is_empty())
-            .ok_or("ENDPOINTS required (a non-empty list of paths)")?;
+            .unwrap_or_default();
+        let expands = parse_expands(&ctx.config)?;
+        if endpoints.is_empty() && expands.is_empty() {
+            return Err("ENDPOINTS or EXPAND required".into());
+        }
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let interval = ctx.config.u64_or("INTERVAL_SECS", 300).max(1);
         let max_pages = ctx.config.u64_or("MAX_PAGES", 10).max(1);
         let next_field = ctx.config.str_or("NEXT_LINK_FIELD", "@odata.nextLink");
         let js = ctx.jetstream()?;
         eprintln!(
-            "[{}] oauth-poll {} endpoint(s) on {base} every {interval}s -> {subject}",
+            "[{}] oauth-poll {} endpoint(s) + {} expand(s) on {base} every {interval}s -> {subject}",
             ctx.name,
-            endpoints.len()
+            endpoints.len(),
+            expands.len()
         );
-        let mut cached: Option<(String, Instant)> = None;
+        let mut tc = TokenCache {
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+            cached: None,
+        };
         let mut waited = interval * 1000; // fire immediately on start
         loop {
             if !ctx.alive() {
@@ -515,35 +604,34 @@ impl Driver for OAuthPoll {
                 continue;
             }
             waited = 0;
+            // a broken token config never comes back on its own: validate it
+            // once per tick, and fail the run (supervised backoff) if not
+            tc.bearer().map_err(|e| {
+                trace_fail(&ctx.name, &subject, e.clone());
+                e
+            })?;
+            let publish_page =
+                |parsed: &Value, logical: &str, js: &nats::jetstream::JetStream| -> Result<(), String> {
+                    let envelope = serde_json::json!({
+                        "endpoint": logical,
+                        "fetched_at": iso8601_utc(crate::now_secs()),
+                        "body": parsed,
+                    });
+                    let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+                    if let Err(e) = js.publish(&subject, &bytes) {
+                        return Err(format!("publish: {e}"));
+                    }
+                    trace_pub(&ctx.name, &subject, &bytes);
+                    Ok(())
+                };
             for ep in &endpoints {
                 let mut url = join_url(&base, ep);
-                let mut retried_401 = false;
                 let mut pages = 0;
                 while pages < max_pages {
                     if !ctx.alive() {
                         return Ok(());
                     }
-                    let tok = match &cached {
-                        Some((t, deadline)) if Instant::now() < *deadline => t.clone(),
-                        _ => {
-                            // a broken token config never comes back on its own:
-                            // fail the run, let supervision back off and retry
-                            let (t, ttl) =
-                                Self::token(&token_url, &client_id, &client_secret, &scope)
-                                    .map_err(|e| {
-                                        trace_fail(&ctx.name, &subject, e.clone());
-                                        e
-                                    })?;
-                            cached = Some((t.clone(), Instant::now() + ttl));
-                            t
-                        }
-                    };
-                    let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
-                    match http_request("GET", &url, &headers, None) {
-                        Ok((401, _)) if !retried_401 => {
-                            cached = None; // expired/revoked mid-flight: one fresh retry
-                            retried_401 = true;
-                        }
+                    match authed_get(&mut tc, &url) {
                         Ok((code, body)) if (200..300).contains(&code) => {
                             let parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
@@ -552,16 +640,7 @@ impl Driver for OAuthPoll {
                                     break;
                                 }
                             };
-                            let envelope = serde_json::json!({
-                                "endpoint": ep,
-                                "fetched_at": iso8601_utc(crate::now_secs()),
-                                "body": parsed,
-                            });
-                            let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
-                            if let Err(e) = js.publish(&subject, &bytes) {
-                                return Err(format!("publish: {e}"));
-                            }
-                            trace_pub(&ctx.name, &subject, &bytes);
+                            publish_page(&parsed, ep, &js)?;
                             pages += 1;
                             match next_url(&base, &parsed, &next_field) {
                                 Some(next) => url = next,
@@ -580,6 +659,94 @@ impl Driver for OAuthPoll {
                         Err(e) => {
                             eprintln!("[{}] {ep}: {e} — endpoint skipped this tick", ctx.name);
                             trace_fail(&ctx.name, &subject, format!("{ep}: {e}"));
+                            break;
+                        }
+                    }
+                }
+            }
+            // client-side $expand: list page fetched, every item enriched with
+            // its detail call, ONE envelope per page — flows stay stateless
+            for spec in &expands {
+                let mut url = join_url(&base, &spec.list);
+                let mut pages = 0;
+                while pages < max_pages {
+                    if !ctx.alive() {
+                        return Ok(());
+                    }
+                    match authed_get(&mut tc, &url) {
+                        Ok((code, body)) if (200..300).contains(&code) => {
+                            let mut parsed: Value = match serde_json::from_slice(&body) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("[{}] {}: non-JSON page skipped: {e}", ctx.name, spec.name);
+                                    break;
+                                }
+                            };
+                            if let Some(items) =
+                                parsed.get_mut("value").and_then(|v| v.as_array_mut())
+                            {
+                                for item in items.iter_mut() {
+                                    if !ctx.alive() {
+                                        return Ok(());
+                                    }
+                                    let Some(id) = item
+                                        .get(&spec.key)
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                    else {
+                                        continue;
+                                    };
+                                    let durl = join_url(
+                                        &base,
+                                        &fill_template(&spec.detail, &spec.key, &id),
+                                    );
+                                    // a failing detail leaves null on THAT item;
+                                    // the page still ships (per-item resilience)
+                                    let detail = match authed_get(&mut tc, &durl) {
+                                        Ok((c, b)) if (200..300).contains(&c) => {
+                                            serde_json::from_slice::<Value>(&b)
+                                                .unwrap_or(Value::Null)
+                                        }
+                                        Ok((c, _)) => {
+                                            eprintln!(
+                                                "[{}] {}: detail for {id} -> HTTP {c}",
+                                                ctx.name, spec.name
+                                            );
+                                            Value::Null
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[{}] {}: detail for {id}: {e}",
+                                                ctx.name, spec.name
+                                            );
+                                            Value::Null
+                                        }
+                                    };
+                                    if let Some(o) = item.as_object_mut() {
+                                        o.insert(spec.as_field.clone(), detail);
+                                    }
+                                }
+                            }
+                            publish_page(&parsed, &spec.name, &js)?;
+                            pages += 1;
+                            match next_url(&base, &parsed, &next_field) {
+                                Some(next) => url = next,
+                                None => break,
+                            }
+                        }
+                        Ok((code, body)) => {
+                            let msg = format!(
+                                "{}: HTTP {code}: {}",
+                                spec.name,
+                                String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
+                            );
+                            eprintln!("[{}] {msg} — expand skipped this tick", ctx.name);
+                            trace_fail(&ctx.name, &subject, msg);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] {}: {e} — expand skipped this tick", ctx.name, spec.name);
+                            trace_fail(&ctx.name, &subject, format!("{}: {e}", spec.name));
                             break;
                         }
                     }
@@ -1060,6 +1227,28 @@ mod tests {
         // an explicit ts is preserved, non-objects pass through untouched
         assert_eq!(stamp_ts(&json!({"ts": "x"}), 0), json!({"ts": "x"}));
         assert_eq!(stamp_ts(&json!("ping"), 0), json!("ping"));
+    }
+
+    #[test]
+    fn expand_template_and_config() {
+        assert_eq!(
+            fill_template("/users/{id}/authentication/methods", "id", "u-42"),
+            "/users/u-42/authentication/methods"
+        );
+        let mut m = Map::new();
+        m.insert(
+            "EXPAND".into(),
+            json!([{"name": "ua", "list": "/users", "detail": "/users/{id}/x", "key": "id", "as": "x"}]),
+        );
+        let ex = parse_expands(&Config(m)).unwrap();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].name, "ua");
+        assert_eq!(ex[0].as_field, "x");
+        // malformed entries are an error, not a silent drop
+        let mut bad = Map::new();
+        bad.insert("EXPAND".into(), json!([{"name": "ua", "list": "/users"}]));
+        assert!(parse_expands(&Config(bad)).is_err());
+        assert!(parse_expands(&Config::default()).unwrap().is_empty());
     }
 
     #[test]
