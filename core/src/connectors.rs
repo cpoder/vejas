@@ -237,13 +237,28 @@ fn content_length(head: &str) -> usize {
 
 // ───────────────────────── source: interval (timer) ─────────────────────────
 
+/// A timer event carries its tick timestamp: an object payload without a `ts`
+/// field gets one (ISO 8601 UTC). A dated event is what lets downstream flows
+/// build idempotency keys — same reasoning as oauth-poll's `fetched_at` (the
+/// language has no clock, on purpose).
+fn stamp_ts(payload: &Value, secs: u64) -> Value {
+    match payload {
+        Value::Object(o) if !o.contains_key("ts") => {
+            let mut o = o.clone();
+            o.insert("ts".into(), Value::String(iso8601_utc(secs)));
+            Value::Object(o)
+        }
+        other => other.clone(),
+    }
+}
+
 struct Timer;
 impl Driver for Timer {
     fn kind(&self) -> &'static str {
         "source:interval"
     }
     fn about(&self) -> &'static str {
-        "Emits a fixed payload on a subject every INTERVAL_SECS. Config: SUBJECT, INTERVAL_SECS, PAYLOAD."
+        "Emits PAYLOAD on SUBJECT every INTERVAL_SECS; an object payload gains a ts field (ISO 8601 UTC) when absent. Config: SUBJECT, INTERVAL_SECS, PAYLOAD."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
@@ -251,7 +266,6 @@ impl Driver for Timer {
         let payload = ctx.config.value("PAYLOAD").unwrap_or(Value::Object(Map::new()));
         let js = ctx.jetstream()?;
         eprintln!("[{}] timer every {interval}s -> {subject}", ctx.name);
-        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let mut waited = 0;
         loop {
             if !ctx.alive() {
@@ -261,6 +275,8 @@ impl Driver for Timer {
             waited += 250;
             if waited >= interval * 1000 {
                 waited = 0;
+                let bytes = serde_json::to_vec(&stamp_ts(&payload, crate::now_secs()))
+                    .unwrap_or_default();
                 if let Err(e) = js.publish(&subject, &bytes) {
                     return Err(format!("publish: {e}"));
                 }
@@ -886,6 +902,15 @@ mod tests {
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(urlencode("p@ss wörd+/="), "p%40ss%20w%C3%B6rd%2B%2F%3D");
         assert_eq!(curl_quote(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn timer_payload_gains_ts_once() {
+        let stamped = stamp_ts(&json!({"origin": "collector"}), 1_000_000_000);
+        assert_eq!(stamped, json!({"origin": "collector", "ts": "2001-09-09T01:46:40Z"}));
+        // an explicit ts is preserved, non-objects pass through untouched
+        assert_eq!(stamp_ts(&json!({"ts": "x"}), 0), json!({"ts": "x"}));
+        assert_eq!(stamp_ts(&json!("ping"), 0), json!("ping"));
     }
 
     #[test]

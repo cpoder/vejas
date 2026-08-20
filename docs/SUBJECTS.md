@@ -8,7 +8,8 @@ Bundled connectors are **native Rust drivers** run from a declarative manifest
 hot-addable). No subprocess, no Python. Drivers today:
 
 - **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT.
-- **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS.
+- **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS
+  (an object payload gains a `ts` field, ISO 8601 UTC, when absent).
 - **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS.
 - **oauth-poll** (source:poll) — OAuth2 client-credentials REST poller: token from
   TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
