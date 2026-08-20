@@ -417,6 +417,40 @@ impl<'a> Parser<'a> {
             self.i += 1;
         }
     }
+    /// A name in key position: doc keys, field names after `.`, assignment
+    /// path segments, invoke argument names. Keywords are allowed HERE (an
+    /// EvidenceFact has a field literally called `source`; real-world JSON has
+    /// keys named `in`, `end`, `tool`…) — but never as variable names.
+    fn word(&mut self, what: &str) -> Result<String, String> {
+        let w = match self.peek() {
+            Tok::Ident(s) | Tok::Str(s) => Some(s.clone()),
+            Tok::If => Some("if".into()),
+            Tok::Elif => Some("elif".into()),
+            Tok::Else => Some("else".into()),
+            Tok::End => Some("end".into()),
+            Tok::For => Some("for".into()),
+            Tok::In => Some("in".into()),
+            Tok::And => Some("and".into()),
+            Tok::Or => Some("or".into()),
+            Tok::Not => Some("not".into()),
+            Tok::Emit => Some("emit".into()),
+            Tok::Invoke => Some("invoke".into()),
+            Tok::Source => Some("source".into()),
+            Tok::Tool => Some("tool".into()),
+            Tok::Driver => Some("driver".into()),
+            Tok::True => Some("true".into()),
+            Tok::False => Some("false".into()),
+            Tok::Null => Some("null".into()),
+            _ => None,
+        };
+        match w {
+            Some(w) => {
+                self.i += 1;
+                Ok(w)
+            }
+            None => Err(self.err(&format!("expected {what}, found {:?}", self.peek()))),
+        }
+    }
     fn at_end(&self) -> bool {
         self.i >= self.toks.len() - 1
     }
@@ -572,10 +606,7 @@ impl<'a> Parser<'a> {
                 let mut spans = Vec::new();
                 self.skip_newlines();
                 while *self.peek() != Tok::RBrace {
-                    let key = match self.next() {
-                        Tok::Ident(k) | Tok::Str(k) => k,
-                        _ => return Err(self.err("expected key")),
-                    };
+                    let key = self.word("key")?;
                     self.eat(Tok::Colon, ":")?;
                     let vstart = self.pos();
                     let (v, _, _) = self.literal_value()?;
@@ -630,10 +661,7 @@ impl<'a> Parser<'a> {
         self.eat(Tok::LParen, "(")?;
         let mut args = Vec::new();
         while *self.peek() != Tok::RParen {
-            let key = match self.next() {
-                Tok::Ident(k) => k,
-                _ => return Err(self.err("expected argument name")),
-            };
+            let key = self.word("argument name")?;
             self.eat(Tok::Colon, ":")?;
             args.push((key, self.expr(0)?));
             if *self.peek() == Tok::Comma {
@@ -705,10 +733,7 @@ impl<'a> Parser<'a> {
                 let mut path = vec![first];
                 while *self.peek() == Tok::Dot {
                     self.next();
-                    match self.next() {
-                        Tok::Ident(p) => path.push(p),
-                        _ => return Err(self.err("expected field name")),
-                    }
+                    path.push(self.word("field name")?);
                 }
                 self.eat(Tok::Eq, "=")?;
                 if *self.peek() == Tok::Invoke {
@@ -772,10 +797,7 @@ impl<'a> Parser<'a> {
                 let mut fields = Vec::new();
                 self.skip_newlines();
                 while *self.peek() != Tok::RBrace {
-                    let key = match self.next() {
-                        Tok::Ident(k) | Tok::Str(k) => k,
-                        _ => return Err(self.err("expected key")),
-                    };
+                    let key = self.word("key")?;
                     self.eat(Tok::Colon, ":")?;
                     fields.push((key, self.expr(0)?));
                     self.skip_newlines();
@@ -810,17 +832,13 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Tok::Dot => {
                     self.next();
-                    match self.next() {
-                        Tok::Ident(f) => lhs = Expr::Field(Box::new(lhs), f, false),
-                        _ => return Err(self.err("expected field name")),
-                    }
+                    let f = self.word("field name")?;
+                    lhs = Expr::Field(Box::new(lhs), f, false);
                 }
                 Tok::QDot => {
                     self.next();
-                    match self.next() {
-                        Tok::Ident(f) => lhs = Expr::Field(Box::new(lhs), f, true),
-                        _ => return Err(self.err("expected field name")),
-                    }
+                    let f = self.word("field name")?;
+                    lhs = Expr::Field(Box::new(lhs), f, true);
                 }
                 Tok::LBrack => {
                     self.next();
@@ -1593,6 +1611,26 @@ mod tests {
             json!({"lines": [{"sku": "A", "q": "2"}, {"sku": "B", "q": "3"}]}),
         );
         assert_eq!(p["out"], json!([{"s": "A", "q": 2}, {"s": "B", "q": 3}]));
+    }
+
+    #[test]
+    fn keywords_as_keys_and_fields() {
+        // `source`, `tool`, `in`, `end`… are valid doc keys and field names
+        // (an EvidenceFact literally has a `source` field) — never variables.
+        let p = one_emit(
+            "fact = {source: \"graph\", tool: 1, in: 2, end: doc.source}\nemit \"vx.t\", fact",
+            json!({"doc": {"source": "s1"}}),
+        );
+        assert_eq!(p, json!({"source": "graph", "tool": 1, "in": 2, "end": "s1"}));
+        // null-safe field access on a keyword-named field
+        let q = one_emit("emit \"vx.t\", {a: e?.driver ?? \"none\"}", json!({"e": {}}));
+        assert_eq!(q["a"], "none");
+        // assignment path segments too
+        let r = one_emit("d.source = 7\nemit \"vx.t\", d", json!({}));
+        assert_eq!(r, json!({"source": 7}));
+        // surface literal with a keyword key keeps working (span-based editing)
+        let prog = parse("T = {\"end\": \"x\", source: \"y\"}\n").unwrap();
+        assert_eq!(prog.surface[0].value, json!({"end": "x", "source": "y"}));
     }
 
     #[test]
