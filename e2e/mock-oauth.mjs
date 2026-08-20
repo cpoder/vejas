@@ -93,5 +93,5 @@ createServer(async (req, res) => {
 
   if (route === 'GET /received') return json(res, 200, { batches: received });
   json(res, 404, { error: 'not found' });
-}).listen(PORT, '127.0.0.1', () =>
-  console.log(`mock oauth+rest+ingestion on http://127.0.0.1:${PORT}`));
+}).listen(PORT, process.env.HOST || '127.0.0.1', () =>
+  console.log(`mock oauth+rest+ingestion on http://${process.env.HOST || '127.0.0.1'}:${PORT}`));
