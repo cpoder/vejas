@@ -155,8 +155,14 @@
 
   <div class="card">
     <h2>Recent events</h2>
-    <p class="sub">The last events the flows processed — live from the runtime, newest first.</p>
+    <p class="sub">The last events processed — flows and connectors, live, newest first.</p>
     <div id="events"><span style="color:var(--muted)">No events yet — send one to a source subject.</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Secrets</h2>
+    <p class="sub">References and whether they resolve — values are write-only and never displayed.</p>
+    <div id="secrets"><span style="color:var(--muted)">loading…</span></div>
   </div>
 
   <div id="root">loading…</div>
@@ -511,6 +517,25 @@ async function load() {
     const consts = list.filter(x => x.kind === 'constant');
     if (consts.length) constsSection(card, file, consts, isConnector);
     const toolbar = document.createElement('div'); toolbar.className = 'toolbar';
+    if (isConnector) {
+      const btnTest = document.createElement('button'); btnTest.className = 'tool';
+      btnTest.textContent = 'Test';
+      btnTest.onclick = async () => {
+        btnTest.disabled = true; btnTest.textContent = 'Testing…';
+        try {
+          const v = await (await post('/connectors/test', {file})).json();
+          card.querySelectorAll('.probe').forEach(x => x.remove());
+          const strip = document.createElement('div');
+          strip.className = 'run probe';
+          strip.innerHTML = v.ok
+            ? `<b style="color:var(--ok)">✓ Test OK</b> — ${esc(v.detail)}`
+            : `<b style="color:var(--err)">✗ Test failed</b> — ${esc(v.detail)}`;
+          card.appendChild(strip);
+        } catch (e) { toast(e.message.slice(0, 160), true); }
+        btnTest.disabled = false; btnTest.textContent = 'Test';
+      };
+      toolbar.appendChild(btnTest);
+    }
     const scriptEd = editorRow('script', file);
     const btnScript = document.createElement('button'); btnScript.className = 'tool';
     btnScript.textContent = 'Edit script';
@@ -529,6 +554,7 @@ async function load() {
     if (inputEd) card.appendChild(inputEd);
     root.appendChild(card);
   }
+  loadSecrets();
 }
 
 /* ---------- recent events (live) ---------- */
@@ -577,6 +603,43 @@ $('#gen').onclick = async () => {
   } catch (e) { toast(e.message.slice(0, 160), true); }
   btn.disabled = false; btn.textContent = 'Generate';
 };
+
+/* ---------- secrets (references + status; values write-only) ---------- */
+async function loadSecrets() {
+  try {
+    const d = await fetch('/secrets').then(r => r.json());
+    const rows = (d.secrets || []).map(s => {
+      const dot = `<span class="dot" style="background:${s.status === 'ok' ? 'var(--ok)' : 'var(--err)'}"></span>`;
+      const action = d.writable
+        ? `<input type="password" class="rule" style="max-width:230px" autocomplete="new-password"
+             placeholder="${s.status === 'ok' ? 'new value (rotate)' : 'paste the value'}" data-ref="${esc(s.ref)}"><button class="apply" onclick="setSecretRow(this)">Set</button>`
+        : `<span class="sample">read-only backend</span>`;
+      return `<tr>
+        <td class="field">${dot} <code>${esc(s.ref)}</code></td>
+        <td class="sample" title="${esc((s.used_by || []).join('\n'))}">${(s.used_by || []).length} file${(s.used_by || []).length > 1 ? 's' : ''}</td>
+        <td>${s.status === 'ok' ? '<span style="color:var(--ok)">resolves</span>' : '<span style="color:var(--err)">missing</span>'}</td>
+        <td style="text-align:right; white-space:nowrap">${action}</td></tr>`;
+    }).join('');
+    $('#secrets').innerHTML = rows
+      ? `<table><tr><th>reference</th><th>used by</th><th>status</th><th></th></tr>${rows}</table>
+         <p class="hint">backend: ${esc(d.backend)} — setting a value restarts the units that reference it.</p>`
+      : '<span style="color:var(--muted)">No secret references declared.</span>';
+  } catch {}
+}
+async function setSecretRow(btn) {
+  const input = btn.previousElementSibling;
+  const ref = input.dataset.ref, value = input.value;
+  if (!value) return toast('Paste a value first', true);
+  btn.disabled = true;
+  try {
+    const res = await (await post('/secrets/set', {ref, value})).json();
+    input.value = '';
+    toast(`Secret set — restarted: ${(res.restarted || []).join(', ') || 'nothing'}`);
+    await loadSecrets();
+    await load();
+  } catch (e) { toast(e.message.slice(0, 160), true); }
+  btn.disabled = false;
+}
 
 async function loadDrivers() {
   try {

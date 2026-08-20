@@ -21,15 +21,105 @@ use serde_json::Value;
 pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
     fn get(&self, reference: &str) -> Result<String, String>;
+    /// Write a secret (rotation included). Write-only: a value that enters
+    /// here is never rendered back by any surface. Backends that cannot
+    /// write stay read-only and say so.
+    fn set(&self, _reference: &str, _value: &str) -> Result<(), String> {
+        Err(format!("the {} secret backend is read-only", self.kind()))
+    }
 }
 
-/// The store the runtime uses, selected at startup. Vault if configured, else
-/// the dev env backend.
+/// The store the runtime uses, selected at startup: Vault if configured, else
+/// the writable file backend if configured, else the dev env backend.
 pub fn default_store() -> Arc<dyn SecretStore> {
     if std::env::var("VAULT_ADDR").map(|v| !v.is_empty()).unwrap_or(false) {
         Arc::new(VaultStore::from_env())
+    } else if let Ok(path) = std::env::var("VEJAS_SECRETS_FILE") {
+        if !path.is_empty() {
+            return Arc::new(FileStore::new(path.into()));
+        }
+        Arc::new(EnvStore)
     } else {
         Arc::new(EnvStore)
+    }
+}
+
+/// Writable secrets file (0600, JSON object {"path/key": "value"}), read on
+/// every get so a rotation needs no restart of the runtime itself. The
+/// on-prem collector's backend: the admin pastes values in the panel, they
+/// land here, they never leave the machine.
+pub struct FileStore {
+    path: std::path::PathBuf,
+}
+
+impl FileStore {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        FileStore { path }
+    }
+    fn load(&self) -> Result<serde_json::Map<String, Value>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(s) if s.trim().is_empty() => Ok(Default::default()),
+            Ok(s) => serde_json::from_str::<Value>(&s)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .ok_or_else(|| {
+                    format!("secrets file {} is not a JSON object", self.path.display())
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+impl SecretStore for FileStore {
+    fn kind(&self) -> &'static str {
+        "file"
+    }
+    fn get(&self, reference: &str) -> Result<String, String> {
+        self.load()?
+            .get(reference)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("secret {reference:?} not set (panel Secrets card, or {})", self.path.display()))
+    }
+    fn set(&self, reference: &str, value: &str) -> Result<(), String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut map = self.load()?;
+        map.insert(reference.to_string(), Value::String(value.to_string()));
+        let rendered =
+            serde_json::to_string_pretty(&Value::Object(map)).map_err(|e| e.to_string())?;
+        // atomic replace so a concurrent get never sees a torn file
+        let tmp = self.path.with_extension("tmp");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(rendered.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        match std::fs::rename(&tmp, &self.path) {
+            Ok(()) => Ok(()),
+            // a single-file docker bind mount cannot be renamed over (EBUSY):
+            // fall back to writing in place — mount a DIRECTORY to keep the
+            // atomic path (the collector bundle does)
+            Err(e) if e.raw_os_error() == Some(16) => {
+                let _ = std::fs::remove_file(&tmp);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&self.path)
+                    .and_then(|mut f| f.write_all(rendered.as_bytes()))
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.to_string())
+            }
+        }
     }
 }
 
@@ -94,5 +184,57 @@ impl SecretStore for VaultStore {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| format!("secret key {key:?} not found at {path:?}"))
+    }
+    fn set(&self, reference: &str, value: &str) -> Result<(), String> {
+        let (path, key) = reference
+            .rsplit_once('/')
+            .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
+        let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
+        let headers = [("X-Vault-Token".to_string(), self.token.clone())];
+        // KV v2 writes replace the whole path: merge with the existing keys
+        let mut data = match crate::connectors::http_request("GET", &url, &headers, None) {
+            Ok((code, body)) if (200..300).contains(&code) => {
+                serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["data"]["data"].as_object().cloned())
+                    .unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+        data.insert(key.to_string(), Value::String(value.to_string()));
+        let body = serde_json::json!({ "data": data }).to_string();
+        let mut headers = headers.to_vec();
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        match crate::connectors::http_request("POST", &url, &headers, Some(body.as_bytes())) {
+            Ok((code, _)) if (200..300).contains(&code) => Ok(()),
+            Ok((code, _)) => Err(format!("vault: HTTP {code} writing {path:?}")),
+            Err(e) => Err(format!("vault: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_store_set_get_rotate_merge_and_mode() {
+        let path = std::env::temp_dir().join(format!("vejas-secrets-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = FileStore::new(path.clone());
+        assert!(s.get("a/b").is_err(), "missing secret fails closed");
+        s.set("a/b", "v1").unwrap();
+        assert_eq!(s.get("a/b").unwrap(), "v1");
+        s.set("a/b", "v2").unwrap(); // rotation
+        assert_eq!(s.get("a/b").unwrap(), "v2");
+        s.set("c/d", "x").unwrap(); // merge keeps other keys
+        assert_eq!(s.get("a/b").unwrap(), "v2");
+        assert_eq!(s.get("c/d").unwrap(), "x");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "secrets file must be private");
+        // env backend refuses writes
+        assert!(EnvStore.set("a/b", "x").is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -101,6 +101,26 @@ pub trait Driver: Send + Sync {
     /// Blocking; loops until `ctx.running` clears. Returning Err triggers a
     /// supervised restart.
     fn run(&self, ctx: &Ctx) -> Result<(), String>;
+    /// One synchronous end-to-end check of THIS instance's config — reach the
+    /// remote side with the real credentials, touch nothing (no publish, no
+    /// data written). The admin's "does my secret and my network work?"
+    /// button. Default: the driver has no probe.
+    fn probe(&self, _ctx: &Ctx) -> Result<String, String> {
+        Err("this driver has no test probe".into())
+    }
+}
+
+/// Plain-words prefix for the errors an admin actually meets.
+pub fn humanize(e: &str) -> String {
+    if e.contains("HTTP 401") || e.contains("HTTP 403") {
+        format!("authentication refused (invalid or expired secret?) — {e}")
+    } else if e.contains("not set") || e.contains("not found (set env") || (e.contains("secret") && e.contains("not found")) {
+        format!("missing secret — {e}")
+    } else if e.starts_with("curl:") || e.contains("Connection refused") || e.contains("Could not resolve") || e.contains("timed out") {
+        format!("unreachable (network, URL, proxy?) — {e}")
+    } else {
+        e.to_string()
+    }
 }
 
 /// The compiled-in driver catalog. New drivers are added here (and, later,
@@ -303,6 +323,13 @@ impl Driver for HttpPoll {
     fn about(&self) -> &'static str {
         "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …})."
     }
+    fn probe(&self, ctx: &Ctx) -> Result<String, String> {
+        let url = ctx.config.str("URL").ok_or("URL required")?;
+        match http_get(&url, &ctx.config.headers()) {
+            Ok(body) => Ok(format!("GET OK ({} bytes)", body.len())),
+            Err(e) => Err(humanize(&e)),
+        }
+    }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let url = ctx.config.str("URL").ok_or("URL required")?;
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
@@ -414,6 +441,37 @@ impl Driver for OAuthPoll {
     }
     fn about(&self) -> &'static str {
         "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE, BASE_URL, ENDPOINTS, SUBJECT, INTERVAL_SECS, MAX_PAGES."
+    }
+    fn probe(&self, ctx: &Ctx) -> Result<String, String> {
+        let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
+        let client_id = ctx.config.str("CLIENT_ID").ok_or("CLIENT_ID required")?;
+        let client_secret = ctx.config.str("CLIENT_SECRET").ok_or("CLIENT_SECRET required")?;
+        let scope = ctx.config.str("SCOPE").ok_or("SCOPE required")?;
+        let base = ctx.config.str("BASE_URL").ok_or("BASE_URL required")?;
+        let ep = ctx
+            .config
+            .value("ENDPOINTS")
+            .and_then(|v| v.as_array().and_then(|a| a.first().and_then(|e| e.as_str().map(|s| s.to_string()))))
+            .ok_or("ENDPOINTS required")?;
+        let (tok, _) = Self::token(&token_url, &client_id, &client_secret, &scope)
+            .map_err(|e| humanize(&e))?;
+        let url = join_url(&base, &ep);
+        let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
+        match http_request("GET", &url, &headers, None) {
+            Ok((code, body)) if (200..300).contains(&code) => {
+                let items = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["value"].as_array().map(|a| a.len()));
+                Ok(match items {
+                    Some(n) => format!("token OK · GET {ep} OK ({n} items)"),
+                    None => format!("token OK · GET {ep} OK ({} bytes)", body.len()),
+                })
+            }
+            Ok((code, _)) => Err(humanize(&format!(
+                "token OK, but GET {ep} answered HTTP {code} (missing permission / admin consent?)"
+            ))),
+            Err(e) => Err(humanize(&format!("GET {ep}: {e}"))),
+        }
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
@@ -669,7 +727,32 @@ impl Driver for HttpOut {
         "sink"
     }
     fn about(&self) -> &'static str {
-        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL, HEADERS (optional doc — put credentials there via secret(), e.g. {\"Authorization\": …})."
+        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL, HEADERS (optional doc — put credentials there via secret(), e.g. {\"Authorization\": …}), TEST_BODY (optional harmless payload enabling the test probe)."
+    }
+    fn probe(&self, ctx: &Ctx) -> Result<String, String> {
+        let url = ctx.config.str("URL").ok_or("URL required")?;
+        let body = ctx.config.value("TEST_BODY").ok_or(
+            "no TEST_BODY in the manifest: add a harmless payload the target accepts (e.g. an empty batch) to enable this probe",
+        )?;
+        let mut headers = ctx.config.headers();
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            headers.push(("Content-Type".into(), "application/json".into()));
+        }
+        let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+        match http_request("POST", &url, &headers, Some(&bytes)) {
+            Ok((code, resp)) if (200..300).contains(&code) => Ok(format!(
+                "POST OK · answered: {}",
+                summarize(&resp).unwrap_or_else(|| "(empty)".into())
+            )),
+            Ok((401 | 403, _)) => Err(humanize(&format!("HTTP 401: authentication rejected by {url}"))),
+            // any other answer past auth still proves network + credentials;
+            // only the probe payload was refused
+            Ok((code, resp)) => Ok(format!(
+                "reachable and authenticated · but TEST_BODY was refused (HTTP {code}: {})",
+                summarize(&resp).unwrap_or_default()
+            )),
+            Err(e) => Err(humanize(&e)),
+        }
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);

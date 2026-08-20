@@ -21,6 +21,8 @@ inspect, edit, generate, run — with no side channel.
 | `vejas_events` | the last events the flows processed (subject, ok/error, emits, preview) |
 | `vejas_new_flow` | agent writes a new VejasScript flow from a prompt; it lands running |
 | `vejas_reload` | rescan flows/packages |
+| `vejas_set_secret` | write one secret value (write-only) and restart its users |
+| `vejas_test_connector` | probe one connector instance end to end — plain-words verdict |
 
 `vejas_new_flow` and `vejas_new_connector` shell out to an agent CLI
 (`VEJAS_AGENT_CMD`, default `claude`) and are advertised **only where one

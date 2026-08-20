@@ -533,16 +533,86 @@ impl<'a> Parser<'a> {
         collect_static(&prog.stmts, &consts, &mut emits, &mut invokes);
         prog.emit_subjects = emits;
         prog.invokes = invokes;
-        // static secret references: NAME = secret("path/key")
-        for s in &prog.stmts {
-            if let Stmt::Assign(path, Expr::Call(fname, args)) = s {
-                if path.len() == 1 && fname == "secret" {
-                    if let Some(Expr::Lit(Value::String(r))) = args.first() {
-                        prog.secret_refs.push((path[0].clone(), r.clone()));
+        // static secret references: EVERY secret("path/key") call, wherever it
+        // sits — a direct assignment, a HEADERS doc, an f-string, a condition.
+        // The panel's Secrets inventory depends on this being exhaustive.
+        fn walk_expr(e: &Expr, ctx: &str, out: &mut Vec<(String, String)>) {
+            match e {
+                Expr::Call(name, args) => {
+                    if name == "secret" {
+                        if let Some(Expr::Lit(Value::String(r))) = args.first() {
+                            let entry = (ctx.to_string(), r.clone());
+                            if !out.contains(&entry) {
+                                out.push(entry);
+                            }
+                        }
+                    }
+                    for a in args {
+                        walk_expr(a, ctx, out);
+                    }
+                }
+                Expr::FString(parts) => {
+                    for p in parts {
+                        if let FStringPart::Expr(e) = p {
+                            walk_expr(e, ctx, out);
+                        }
+                    }
+                }
+                Expr::Doc(fields) => {
+                    for (_, v) in fields {
+                        walk_expr(v, ctx, out);
+                    }
+                }
+                Expr::Array(items) => {
+                    for i in items {
+                        walk_expr(i, ctx, out);
+                    }
+                }
+                Expr::Field(b, _, _) | Expr::Projection(b) | Expr::Unary(_, b) => {
+                    walk_expr(b, ctx, out)
+                }
+                Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => {
+                    walk_expr(a, ctx, out);
+                    walk_expr(b, ctx, out);
+                }
+                Expr::Invoke(_, args) => {
+                    for (_, v) in args {
+                        walk_expr(v, ctx, out);
+                    }
+                }
+                Expr::Lit(_) | Expr::Var(_) => {}
+            }
+        }
+        fn walk_stmts(stmts: &[Stmt], out: &mut Vec<(String, String)>) {
+            for s in stmts {
+                match s {
+                    Stmt::Assign(path, e) => walk_expr(e, &path.join("."), out),
+                    Stmt::Emit(a, b) => {
+                        walk_expr(a, "emit", out);
+                        walk_expr(b, "emit", out);
+                    }
+                    Stmt::InvokeMerge(_, args) => {
+                        for (_, v) in args {
+                            walk_expr(v, "invoke", out);
+                        }
+                    }
+                    Stmt::If(arms, els) => {
+                        for (c, b) in arms {
+                            walk_expr(c, "if", out);
+                            walk_stmts(b, out);
+                        }
+                        if let Some(b) = els {
+                            walk_stmts(b, out);
+                        }
+                    }
+                    Stmt::For(_, it, b) => {
+                        walk_expr(it, "for", out);
+                        walk_stmts(b, out);
                     }
                 }
             }
         }
+        walk_stmts(&prog.stmts, &mut prog.secret_refs);
         Ok(prog)
     }
 
@@ -1741,6 +1811,15 @@ mod tests {
         let prog = parse("k = secret(\"api/key\")\nemit \"vx.t\", {len: len(k), auth: len(k) > 0}").unwrap();
         // static reference is captured for the panel, value is not
         assert_eq!(prog.secret_refs, vec![("k".to_string(), "api/key".to_string())]);
+        // NESTED references are captured too (a HEADERS doc with an f-string)
+        let nested = parse(
+            "HEADERS = {\"Authorization\": f\"Bearer {secret(\"reglyze/api_token\")}\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            nested.secret_refs,
+            vec![("HEADERS".to_string(), "reglyze/api_token".to_string())]
+        );
         let mut eng = Engine::with_secrets(std::env::temp_dir(), "default".into(), store.clone());
         let ctx = run(&prog, &json!({}), &mut eng).unwrap();
         assert_eq!(ctx.emits[0].1, json!({"len": 10, "auth": true}));

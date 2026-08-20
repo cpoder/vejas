@@ -104,7 +104,10 @@ recent traffic the change applies directly.
 | `GET /topology` | flows (status) + connectors |
 | `GET /graph` | pipeline graph (sources, flows, services, destinations) |
 | `GET /surface` | business surface of every flow |
-| `GET /events?flow=` | the last events processed (in-memory ring, 50 per flow) |
+| `GET /events?flow=` | the last events processed (in-memory ring, 50 per unit; sinks include the downstream response summary) |
+| `GET /drivers` | the connector driver catalog |
+| `GET /secrets` · `POST /secrets/set` | secret references + resolve-status (never values) · write one value (write-only) and restart its users |
+| `POST /connectors/test` | probe one connector instance end to end (real secrets, remote reached, nothing written) |
 | `GET /preview?file=` | run a flow on its fixture → emits + pipeline |
 | `GET /file?path=` · `POST /file/set` | read / write a script (parse-validated) |
 | `GET /fixture?file=` · `POST /fixture/set` | read / write a sample input |
@@ -158,8 +161,13 @@ Secret references in manifests use secret() (ADR-0008). Connector-by-prompt is b
 ## Secrets (ADR-0008)
 
 A `SecretStore` trait (`core/src/secrets.rs`): `VaultStore` (HashiCorp Vault KV
-v2 when `VAULT_ADDR` is set) or `EnvStore` (dev: `secret("a/b")` → env
-`VEJAS_SECRET_A_B`). The `secret("path/key")` builtin resolves at run time,
+v2 when `VAULT_ADDR` is set), `FileStore` (a 0600 JSON file when
+`VEJAS_SECRETS_FILE` is set — the on-prem collector's backend, written from the
+panel's Secrets card) or `EnvStore` (dev: `secret("a/b")` → env
+`VEJAS_SECRET_A_B`). Stores may implement `set` (write-only: no surface ever
+returns a value); setting a secret restarts the units that reference it. The
+panel lists references with a resolve-status probed against the store, value
+discarded. The `secret("path/key")` builtin resolves at run time,
 fail-closed. The value is never a literal, so it never enters the business
 surface, the file, or the panel; a connector's config is produced by evaluating
 its manifest, so `WEBHOOK_URL = secret("…")` yields the real value to the driver

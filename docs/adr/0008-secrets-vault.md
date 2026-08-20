@@ -28,6 +28,12 @@ a sidecar.
 - Static `NAME = secret("…")` references are captured (`Program.secret_refs`)
   and surfaced via `/graph` and the `vejas_secrets` MCP tool — references only,
   never values.
+- **Built since:** a writable `FileStore` backend (0600 JSON file via
+  `VEJAS_SECRETS_FILE` — the on-prem collector's store) and a **write-only
+  `set`** on the trait (Vault KV v2 write-through with merge; env stays
+  read-only). Setting a value restarts the units referencing it. The panel's
+  Secrets card lists references with a resolve-status (probed, value
+  discarded) and takes values without ever displaying one.
 
 ## Consequences
 

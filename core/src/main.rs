@@ -600,6 +600,73 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
     set_state(&handle, |st| st.status = "stopped".into());
 }
 
+/// Stop one unit and start it again from a fresh scan (secret rotation, etc.).
+fn restart_unit(registry: &Registry, root: &Path, name: &str) -> bool {
+    let Some(spec) = scan_all(root).into_iter().find(|s| s.name == name) else {
+        return false;
+    };
+    if let Some(handle) = registry.lock().unwrap().get(name) {
+        handle.stop.store(true, Ordering::SeqCst);
+    }
+    start_proc(registry, spec, root);
+    true
+}
+
+/// Every secret reference declared anywhere, aggregated: ref -> using files.
+fn secrets_inventory(root: &Path) -> Vec<(String, Vec<String>)> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut scan = |files: Vec<(PathBuf, String)>| {
+        for (path, _pkg) in files {
+            let Ok(src) = fs::read_to_string(&path) else { continue };
+            let Ok(prog) = vjs::parse(&src) else { continue };
+            for (_var, r) in prog.secret_refs {
+                map.entry(r).or_default().push(path.display().to_string());
+            }
+        }
+    };
+    scan(vjs_files(root));
+    scan(connector_files(root));
+    let mut out: Vec<(String, Vec<String>)> = map.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// The Secrets surface: references, who uses them, and whether each one
+/// RESOLVES (probed against the store, the value immediately discarded).
+/// Values never appear anywhere.
+fn secrets_json(root: &Path) -> String {
+    let store = secrets::default_store();
+    let list: Vec<Value> = secrets_inventory(root)
+        .into_iter()
+        .map(|(r, used_by)| {
+            let status = match store.get(&r) {
+                Ok(_) => "ok",
+                Err(_) => "missing",
+            };
+            json!({"ref": r, "used_by": used_by, "status": status})
+        })
+        .collect();
+    json!({"backend": store.kind(), "writable": !matches!(store.kind(), "env"), "secrets": list})
+        .to_string()
+}
+
+/// Write one secret, then restart every unit whose file references it (their
+/// config was evaluated at start). Returns the restarted unit names.
+fn set_secret(registry: &Registry, root: &Path, reference: &str, value: &str) -> Result<Vec<String>, String> {
+    secrets::default_store().set(reference, value)?;
+    let mut restarted = Vec::new();
+    for spec in scan_all(root) {
+        let Ok(src) = fs::read_to_string(&spec.path) else { continue };
+        let Ok(prog) = vjs::parse(&src) else { continue };
+        if prog.secret_refs.iter().any(|(_, r)| r == reference)
+            && restart_unit(registry, root, &spec.name)
+        {
+            restarted.push(spec.name);
+        }
+    }
+    Ok(restarted)
+}
+
 fn reload(registry: &Registry, root: &Path) -> (usize, usize, usize) {
     let mut wanted: HashMap<String, Spec> = HashMap::new();
     for spec in scan_all(root) {
@@ -1123,6 +1190,49 @@ fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// One synchronous test of a connector instance: evaluate its manifest with
+/// the REAL secrets (a missing one fails here, in words), then run the
+/// driver's probe — reach the remote side, touch nothing.
+fn probe_connector(root: &Path, file: &str) -> Value {
+    let verdict = (|| -> Result<String, String> {
+        let path = guard_path(root, file).ok_or("path not allowed")?;
+        let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let prog = vjs::parse(&src)?;
+        let driver_name = prog.driver.clone().ok_or("not a connector manifest (no `driver`)")?;
+        let driver = connectors::driver_for(&driver_name)
+            .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
+            .map_err(|e| connectors::humanize(&e))?;
+        let mut config = serde_json::Map::new();
+        for (k, v) in cfg_ctx.vars {
+            if k != "event"
+                && k.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                && k.chars().any(|c| c.is_ascii_uppercase())
+            {
+                config.insert(k, v);
+            }
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ctx = connectors::Ctx {
+            name: format!("probe:{stem}"),
+            nats_url: String::new(),
+            stream: String::new(),
+            subj_root: env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into()),
+            config: connectors::Config(config),
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        driver.probe(&ctx)
+    })();
+    match verdict {
+        Ok(detail) => json!({"ok": true, "detail": detail}),
+        Err(detail) => json!({"ok": false, "detail": detail}),
+    }
+}
+
 // ───────────────────────── http ─────────────────────────
 
 // ───────────────────────── MCP server ─────────────────────────
@@ -1182,7 +1292,9 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_reload", "description": "Rescan flows and packages; start new, stop removed, restart changed.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_drivers", "description": "List the available connector drivers (name, kind, description) for writing connector manifests.", "inputSchema": obj(json!({}), vec![])}),
-        json!({"name": "vejas_secrets", "description": "List the secret references (var, path) declared by flows and connectors — references only, never values.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_secrets", "description": "The secret references declared by flows and connectors, who uses each, and whether it RESOLVES against the store — references and statuses only, never values.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_set_secret", "description": "Write one secret value into the store (rotation included) and restart the units that reference it. WRITE-ONLY: no surface ever returns the value.", "inputSchema": obj(json!({"ref": {"type": "string", "description": "the secret(\"path/key\") reference"}, "value": {"type": "string"}}), vec!["ref", "value"])}),
+        json!({"name": "vejas_test_connector", "description": "Synchronously test one connector instance: evaluate its manifest with the real secrets, reach the remote side with the driver's probe, touch nothing. Returns {ok, detail} in plain words.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -1281,23 +1393,19 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
                 .collect();
             text(Value::Array(list).to_string())
         }
-        "vejas_secrets" => {
-            let mut refs = Vec::new();
-            for (path, _pkg) in vjs_files(root) {
-                if let Ok(prog) = fs::read_to_string(&path).ok().map(|s| vjs::parse(&s)).unwrap_or(Err(String::new())) {
-                    for (var, r) in prog.secret_refs {
-                        refs.push(json!({"file": path.display().to_string(), "var": var, "ref": r}));
-                    }
-                }
+        "vejas_secrets" => text(secrets_json(root)),
+        "vejas_set_secret" => {
+            let r = args["ref"].as_str().ok_or("ref required")?;
+            let v = args["value"].as_str().ok_or("value required")?;
+            if v.is_empty() {
+                return Err("empty value".into());
             }
-            for c in connector_graph(root) {
-                if let Some(sr) = c.get("secret_refs").and_then(|v| v.as_array()) {
-                    for s in sr {
-                        refs.push(json!({"connector": c["name"], "var": s["var"], "ref": s["ref"]}));
-                    }
-                }
-            }
-            text(Value::Array(refs).to_string())
+            let restarted = set_secret(registry, root, r, v)?;
+            text(json!({"ok": true, "ref": r, "restarted": restarted}).to_string())
+        }
+        "vejas_test_connector" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            text(probe_connector(root, file).to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -1434,6 +1542,34 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 .map(|(n, k, a)| json!({"driver": n, "kind": k, "about": a}))
                 .collect();
             respond(request, 200, Value::Array(list).to_string(), "application/json")
+        }
+        (tiny_http::Method::Get, "/secrets") => {
+            respond(request, 200, secrets_json(&root), "application/json")
+        }
+        (tiny_http::Method::Post, "/secrets/set") => {
+            let body = read_body(&mut request);
+            let (Some(r), Some(v)) = (body["ref"].as_str(), body["value"].as_str()) else {
+                return respond(request, 400, "need ref+value".into(), "text/plain");
+            };
+            if v.is_empty() {
+                return respond(request, 400, "empty value".into(), "text/plain");
+            }
+            match set_secret(&registry, &root, r, v) {
+                Ok(restarted) => respond(
+                    request,
+                    200,
+                    json!({"ok": true, "ref": r, "restarted": restarted}).to_string(),
+                    "application/json",
+                ),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/connectors/test") => {
+            let body = read_body(&mut request);
+            let Some(file) = body["file"].as_str() else {
+                return respond(request, 400, "need file".into(), "text/plain");
+            };
+            respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
         }
         (tiny_http::Method::Get, "/preview") => {
             let Some(file) = qparam(&url, "file") else {
