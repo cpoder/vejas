@@ -16,12 +16,12 @@ import { createServer } from 'node:http';
 const PORT = Number(process.env.PORT || 9098);
 const HOST = process.env.HOST || '127.0.0.1';
 
-// 4 hôtes CrowdStrike, 2 dégradés → edr_agents_healthy 2/4
+// 4 hôtes CrowdStrike, 2 dégradés → edr_agents_healthy 2/4 (symétrie avec S1)
 const CS_HOSTS = {
   h1: { device_id: 'h1', hostname: 'PC-1', status: 'normal' },
   h2: { device_id: 'h2', hostname: 'PC-2', status: 'normal' },
   h3: { device_id: 'h3', hostname: 'PC-3', status: 'reduced_functionality_mode' },
-  h4: { device_id: 'h4', hostname: 'PC-4', status: 'normal' },
+  h4: { device_id: 'h4', hostname: 'PC-4', status: 'reduced_functionality_mode' },
 };
 // 4 agents SentinelOne, 1 inactif + 1 infecté → 2/4 sains
 const S1_AGENTS = [
