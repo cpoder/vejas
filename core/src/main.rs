@@ -1427,6 +1427,67 @@ fn probe_connector(root: &Path, file: &str) -> Value {
     }
 }
 
+/// Connector manifest paths (root connectors/ + packages/<pkg>/connectors/).
+fn connector_manifest_paths(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut scan = |dir: PathBuf| {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let named = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                if p.extension().map(|x| x == "vjs").unwrap_or(false) && !named.starts_with('_') {
+                    out.push(p);
+                }
+            }
+        }
+    };
+    scan(root.join("connectors"));
+    if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
+        for p in pkgs.flatten() {
+            scan(p.path().join("connectors"));
+        }
+    }
+    out
+}
+
+/// Drive the interactive SAP connector over the bus: send one JSON op to the
+/// exec-rpc connector's REQUEST_SUBJECT (found by evaluating connector
+/// manifests, secret()-resolved) via NATS request/reply, return its reply. This
+/// is how the sap_* MCP tools reach the live SAP without holding any state here.
+fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
+    let mut subject = None;
+    for path in connector_manifest_paths(root) {
+        let Ok(src) = fs::read_to_string(&path) else { continue };
+        let Ok(prog) = vjs::parse(&src) else { continue };
+        if prog.driver.as_deref() != Some("exec-rpc") {
+            continue;
+        }
+        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let cfg = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
+            .map_err(|e| connectors::humanize(&e))?;
+        for (k, v) in cfg.vars {
+            if k == "REQUEST_SUBJECT" {
+                if let Value::String(s) = v {
+                    subject = Some(s);
+                }
+            }
+        }
+        if subject.is_some() {
+            break;
+        }
+    }
+    let subject = subject.ok_or(
+        "no exec-rpc SAP connector found — add a manifest with driver \"exec-rpc\" and REQUEST_SUBJECT (see docs/examples/sap_rpc.vjs.example)",
+    )?;
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+    let payload = serde_json::to_vec(op).map_err(|e| e.to_string())?;
+    let msg = nc
+        .request_timeout(&subject, payload, Duration::from_secs(30))
+        .map_err(|e| format!("SAP connector did not answer on {subject}: {e}"))?;
+    serde_json::from_slice::<Value>(&msg.data).map_err(|e| e.to_string())
+}
+
 // ───────────────────────── http ─────────────────────────
 
 // ───────────────────────── MCP server ─────────────────────────
@@ -1490,6 +1551,9 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_set_secret", "description": "Write one secret value into the store (rotation included) and restart the units that reference it. WRITE-ONLY: no surface ever returns the value.", "inputSchema": obj(json!({"ref": {"type": "string", "description": "the secret(\"path/key\") reference"}, "value": {"type": "string"}}), vec!["ref", "value"])}),
         json!({"name": "vejas_test_connector", "description": "Synchronously test one connector instance: evaluate its manifest with the real secrets, reach the remote side with the driver's probe, touch nothing. Returns {ok, detail} in plain words.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_provision", "description": "Instantiate a tenant package from a template (templates/<name>/, ${param} substitution, every file parse-checked, hot-started). Returns created files, started units and the secret references left to write. Refuses an existing package unless force (which overwrites template-rendered files).", "inputSchema": obj(json!({"template": {"type": "string"}, "tenant_slug": {"type": "string"}, "params": {"type": "object"}, "force": {"type": "boolean"}}), vec!["template", "tenant_slug"])}),
+        json!({"name": "sap_list", "description": "List SAP function modules (BAPIs/RFCs) on the live system whose name matches a pattern (SAP wildcards, e.g. \"BAPI_USER*\"). Needs an exec-rpc SAP connector running (driver \"exec-rpc\").", "inputSchema": obj(json!({"pattern": {"type": "string"}}), vec![])}),
+        json!({"name": "sap_describe", "description": "Describe a SAP function module's interface: every parameter's name, direction (import/export/changing/tables), type and length. Read this before sap_call.", "inputSchema": obj(json!({"func": {"type": "string"}}), vec!["func"])}),
+        json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -1608,6 +1672,25 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let params = args["params"].as_object().cloned().unwrap_or_default();
             let force = args["force"].as_bool().unwrap_or(false);
             text(provision(registry, root, template, slug, &params, force)?.to_string())
+        }
+        "sap_list" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+            text(sap_rpc_request(root, &json!({"op": "list", "pattern": pattern}))?.to_string())
+        }
+        "sap_describe" => {
+            let func = args["func"].as_str().ok_or("func required")?;
+            text(sap_rpc_request(root, &json!({"op": "describe", "func": func}))?.to_string())
+        }
+        "sap_call" => {
+            let func = args["func"].as_str().ok_or("func required")?;
+            let mut op = json!({"op": "call", "func": func});
+            if let Some(imp) = args.get("import") {
+                op["import"] = imp.clone();
+            }
+            if let Some(mr) = args.get("max_rows") {
+                op["max_rows"] = mr.clone();
+            }
+            text(sap_rpc_request(root, &op)?.to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments

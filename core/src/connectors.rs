@@ -154,6 +154,7 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
         "exec-source" => Some(Box::new(ExecSource)),
         "exec-sink" => Some(Box::new(ExecSink)),
         "exec-stream-source" => Some(Box::new(ExecStreamSource)),
+        "exec-rpc" => Some(Box::new(ExecRpc)),
         _ => None,
     }
 }
@@ -161,7 +162,7 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
 pub fn catalog() -> Vec<(&'static str, &'static str, &'static str)> {
     [
         "http-in", "timer", "http-poll", "oauth-poll", "slack-out", "http-out",
-        "exec-source", "exec-sink", "exec-stream-source",
+        "exec-source", "exec-sink", "exec-stream-source", "exec-rpc",
     ]
     .iter()
     .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
@@ -1175,6 +1176,119 @@ impl Driver for ExecStreamSource {
             }
         }
         Ok(())
+    }
+}
+
+// ───────────────────────── rpc: request/reply exec ─────────────────────────
+
+struct ExecRpc;
+impl Driver for ExecRpc {
+    fn kind(&self) -> &'static str {
+        "rpc:exec"
+    }
+    fn about(&self) -> &'static str {
+        "Runs CMD as a long-running request/reply process (one JSON request per line on stdin -> one JSON reply per line on stdout) and serves it over NATS request/reply on REQUEST_SUBJECT — so MCP tools (and flows) can drive an interactive connector like SAP (sap_list / sap_describe / sap_call). Keep REQUEST_SUBJECT OUTSIDE the vx.* JetStream subjects (e.g. \"vxrpc.sap\"). ENV = {\"KEY\": secret(\"…\")} is handed to the child environment (secrets never touch argv). One SAP logon is held open and requests are serialized. Config: CMD, REQUEST_SUBJECT, ENV (optional)."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
+        let subject = ctx
+            .config
+            .str("REQUEST_SUBJECT")
+            .ok_or("REQUEST_SUBJECT required")?;
+        if subject.starts_with(&format!("{}.", ctx.subj_root)) {
+            return Err(format!(
+                "REQUEST_SUBJECT must not be under {}.* (JetStream-captured); use e.g. vxrpc.sap",
+                ctx.subj_root
+            ));
+        }
+        let env = ctx.config.env_vars();
+        let nc = nats::connect(&ctx.nats_url).map_err(|e| e.to_string())?;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().ok_or("no child stdin")?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or("no child stdout")?);
+        // The process announces readiness with a first stdout line — consume it
+        // so it isn't mistaken for a reply.
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).map_err(|e| e.to_string())?;
+        eprintln!("[{}] exec-rpc: `{cmd}` serving {subject}", ctx.name);
+
+        let sub = nc.subscribe(&subject).map_err(|e| e.to_string())?;
+        loop {
+            if !ctx.alive() {
+                let _ = child.kill();
+                return Ok(());
+            }
+            match sub.next_timeout(Duration::from_millis(300)) {
+                Ok(msg) => {
+                    // One request line in, one reply line out (serialized).
+                    let mut req = msg.data.clone();
+                    req.push(b'\n');
+                    if stdin.write_all(&req).is_err() {
+                        return Err("child stdin closed".into());
+                    }
+                    let _ = stdin.flush();
+                    let mut line = String::new();
+                    match stdout.read_line(&mut line) {
+                        Ok(0) => return Err("child stdout closed".into()),
+                        Ok(_) => {
+                            let _ = msg.respond(line.trim().as_bytes());
+                            trace_pub(&ctx.name, &subject, line.trim().as_bytes());
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Err(_) => {
+                    // Idle timeout: notice if the child died so we restart.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Err(format!("child exited: {:?}", status.code()));
+                    }
+                }
+            }
+        }
+    }
+    fn probe(&self, ctx: &Ctx) -> Result<String, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
+        let env = ctx.config.env_vars();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().ok_or("no child stdin")?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or("no child stdout")?);
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).map_err(|e| e.to_string())?; // ready line
+        stdin
+            .write_all(b"{\"op\":\"ping\"}\n")
+            .map_err(|e| e.to_string())?;
+        let _ = stdin.flush();
+        let mut line = String::new();
+        stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+        let _ = child.kill();
+        let v: Value = serde_json::from_str(line.trim()).map_err(|e| e.to_string())?;
+        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            Ok(format!("ping ok — {}", line.trim()))
+        } else {
+            Err(format!("ping failed: {}", line.trim()))
+        }
     }
 }
 

@@ -1,0 +1,15 @@
+# connector: sap_rpc — interactive SAP over MCP (sap_list / sap_describe / sap_call).
+#
+# Runs `vejas-sap-rfc` in request/reply mode (native Rust over libsapnwrfc —
+# ADR-0014, isolated exec process — ADR-0011). The exec-rpc driver serves it over
+# NATS request/reply on REQUEST_SUBJECT, which the runtime's sap_* MCP tools call.
+# One SAP logon stays open and requests are serialized. Password via secret()
+# (ADR-0008) — never a literal; ENV hands it to the child environment, not argv.
+#
+# REQUEST_SUBJECT must stay OUTSIDE vx.* so JetStream does not capture the
+# request/reply (a core-NATS request on a captured subject gets its pub-ack
+# confused with the reply).
+driver "exec-rpc"
+REQUEST_SUBJECT = "vxrpc.sap"
+CMD = "/opt/vejas/vejas-sap-rfc"
+ENV = {LD_LIBRARY_PATH: "/usr/sap/NPL/D00/exe", SAP_ASHOST: "localhost", SAP_SYSNR: "00", SAP_CLIENT: "001", SAP_USER: "DEVELOPER", SAP_PASSWD: secret("sap/npl/passwd"), SAP_LANG: "EN"}
