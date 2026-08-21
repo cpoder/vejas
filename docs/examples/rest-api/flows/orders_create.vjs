@@ -1,5 +1,10 @@
 # flow: create an order (POST /orders)
 tool "Create an order"
 api "POST /orders"
+
+# Optional typed schemas -> richer OpenAPI (field: type). The business surface.
+API_REQUEST = {customer: "string", total: "number"}
+API_RESPONSE = {id: "string", status: "string", total: "number"}
+
 emit "vx.orders.created", {customer: customer, total: total}
 respond 201, {id: "ord-1001", status: "created", customer: customer, total: total}

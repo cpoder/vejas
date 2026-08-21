@@ -1070,11 +1070,20 @@ const LANGUAGE_VJS: &str = r#"VejasScript in 20 lines:
       emit "vx.slack.out", {text: f"[{code}] {subject}"}
   end                                <- every if/for closes with `end`
 
+Exposing a flow (instead of, or besides, `source`):
+  tool "what calling this flow does" <- exposes the flow as an MCP tool
+  api "POST /orders"                 <- expose the flow as a SYNCHRONOUS HTTP endpoint under /api (POST /api/orders)
+  api "GET /orders/{id}"             <- a REST resource = several flows, ONE per verb; {path params} become event variables (here `id`)
+  API_REQUEST = {customer: "string", total: "number"}   <- optional: typed request schema for the generated OpenAPI
+  API_RESPONSE = {id: "string", status: "string"}       <- optional: typed 200 response schema
+  respond 201, {id: id, status: "created"}   <- the SYNCHRONOUS HTTP response (status code + JSON body); `emit` still fires bus side-effects
+
 Rules:
 - Known sinks: vx.slack.out (payload {text: "..."}). All subjects start with "vx.".
 - Put every business-meaningful value (thresholds, tables, queue names) in UPPERCASE literals.
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
+- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -1528,6 +1537,9 @@ struct ApiRoute {
     file: String,
     summary: String,
     op_id: String,
+    /// Optional typed schemas (field -> type name) from API_REQUEST / API_RESPONSE.
+    req_schema: Option<Value>,
+    resp_schema: Option<Value>,
 }
 
 /// Parse an `api` spec ("POST /orders", "GET /orders/{id}") into (method, segs).
@@ -1559,15 +1571,46 @@ fn api_routes(root: &Path) -> Vec<ApiRoute> {
         let Some(spec) = prog.api.clone() else { continue };
         let Some((method, segs)) = parse_api_spec(&spec) else { continue };
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let literal = |name: &str| prog.surface.iter().find(|e| e.name == name).map(|e| e.value.clone());
         out.push(ApiRoute {
             method,
             segs,
             file: path.display().to_string(),
             summary: prog.tool.clone().unwrap_or_else(|| stem.clone()),
             op_id: stem,
+            req_schema: literal("API_REQUEST"),
+            resp_schema: literal("API_RESPONSE"),
         });
     }
     out
+}
+
+/// Turn a `{field: "type"}` literal into a JSON-Schema object. Unknown types → string.
+fn json_schema_from_literal(v: &Value) -> Value {
+    let map_type = |t: &str| match t.to_ascii_lowercase().as_str() {
+        "number" | "float" | "double" | "decimal" => "number",
+        "int" | "integer" => "integer",
+        "bool" | "boolean" => "boolean",
+        "array" | "list" => "array",
+        "object" | "map" => "object",
+        _ => "string",
+    };
+    match v {
+        Value::Object(o) => {
+            let mut props = serde_json::Map::new();
+            for (k, val) in o {
+                let t = match val {
+                    Value::String(s) => map_type(s),
+                    Value::Object(_) => "object",
+                    Value::Array(_) => "array",
+                    _ => "string",
+                };
+                props.insert(k.clone(), json!({"type": t}));
+            }
+            json!({"type": "object", "properties": Value::Object(props)})
+        }
+        _ => json!({"type": "object"}),
+    }
 }
 
 /// Match a request (method, path under /api/) to a route; capture path params.
@@ -1690,18 +1733,41 @@ fn openapi_json(root: &Path) -> Value {
                 _ => None,
             })
             .collect();
+        // Tag operations by their resource (the first literal path segment).
+        let tag = r
+            .segs
+            .iter()
+            .find_map(|s| match s {
+                Seg::Lit(l) => Some(l.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "default".into());
+        let ok_schema = r
+            .resp_schema
+            .as_ref()
+            .map(json_schema_from_literal)
+            .unwrap_or_else(|| json!({"type": "object"}));
         let mut op = json!({
             "summary": r.summary,
             "operationId": r.op_id,
-            "responses": {"200": {"description": "OK"}, "500": {"description": "Flow error"}},
+            "tags": [tag],
+            "responses": {
+                "200": {"description": "OK", "content": {"application/json": {"schema": ok_schema}}},
+                "500": {"description": "Flow error"}
+            },
         });
         if !params.is_empty() {
             op["parameters"] = Value::Array(params);
         }
         if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
+            let req_schema = r
+                .req_schema
+                .as_ref()
+                .map(json_schema_from_literal)
+                .unwrap_or_else(|| json!({"type": "object"}));
             op["requestBody"] = json!({
                 "required": true,
-                "content": {"application/json": {"schema": {"type": "object"}}}
+                "content": {"application/json": {"schema": req_schema}}
             });
         }
         let entry = paths.entry(path_str).or_insert_with(|| json!({}));
