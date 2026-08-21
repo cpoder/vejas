@@ -1511,6 +1511,214 @@ fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value
         .collect())
 }
 
+// ───────────────────────── HTTP API (flow-as-endpoint) ─────────────────────────
+// A flow declares `api "VERB /path"`; the runtime routes (method, path) to it,
+// binds {path params} into the event, runs it, and returns its `respond`. Several
+// flows (one per verb) compose a REST resource. GET /api/openapi.json describes
+// the whole surface. All served under /api/…
+
+enum Seg {
+    Lit(String),
+    Param(String),
+}
+
+struct ApiRoute {
+    method: String,
+    segs: Vec<Seg>,
+    file: String,
+    summary: String,
+    op_id: String,
+}
+
+/// Parse an `api` spec ("POST /orders", "GET /orders/{id}") into (method, segs).
+fn parse_api_spec(spec: &str) -> Option<(String, Vec<Seg>)> {
+    let mut it = spec.split_whitespace();
+    let method = it.next()?.to_ascii_uppercase();
+    let path = it.next()?;
+    let segs = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.starts_with('{') && s.ends_with('}') {
+                Seg::Param(s[1..s.len() - 1].to_string())
+            } else {
+                Seg::Lit(s.to_string())
+            }
+        })
+        .collect();
+    Some((method, segs))
+}
+
+/// Every flow that declares `api "..."`, as routes.
+fn api_routes(root: &Path) -> Vec<ApiRoute> {
+    let mut out = Vec::new();
+    for (path, _pkg) in vjs_files(root) {
+        let Ok(src) = fs::read_to_string(&path) else { continue };
+        let Ok(prog) = vjs::parse(&src) else { continue };
+        let Some(spec) = prog.api.clone() else { continue };
+        let Some((method, segs)) = parse_api_spec(&spec) else { continue };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        out.push(ApiRoute {
+            method,
+            segs,
+            file: path.display().to_string(),
+            summary: prog.tool.clone().unwrap_or_else(|| stem.clone()),
+            op_id: stem,
+        });
+    }
+    out
+}
+
+/// Match a request (method, path under /api/) to a route; capture path params.
+fn match_api_route(root: &Path, method: &str, rel: &str) -> Option<(String, Vec<(String, String)>)> {
+    let parts: Vec<&str> = rel.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    for r in api_routes(root) {
+        if r.method != method || r.segs.len() != parts.len() {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut ok = true;
+        for (seg, part) in r.segs.iter().zip(parts.iter()) {
+            match seg {
+                Seg::Lit(l) => {
+                    if l != part {
+                        ok = false;
+                        break;
+                    }
+                }
+                Seg::Param(name) => params.push((name.clone(), (*part).to_string())),
+            }
+        }
+        if ok {
+            return Some((r.file, params));
+        }
+    }
+    None
+}
+
+fn method_str(m: &tiny_http::Method) -> String {
+    m.as_str().to_ascii_uppercase()
+}
+
+fn parse_query(url: &str) -> Value {
+    let mut q = serde_json::Map::new();
+    if let Some(qs) = url.split('?').nth(1) {
+        for pair in qs.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let mut kv = pair.splitn(2, '=');
+            let k = kv.next().unwrap_or("").to_string();
+            let v = kv.next().unwrap_or("").to_string();
+            if !k.is_empty() {
+                q.insert(k, Value::String(v));
+            }
+        }
+    }
+    Value::Object(q)
+}
+
+/// Run a flow and return its full context (emits + response).
+fn run_flow_ctx(root: &Path, file: &str, input: &Value) -> Result<vjs::Ctx, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let prog = vjs::parse(&src)?;
+    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    vjs::run(&prog, input, &mut engine)
+}
+
+/// Publish an API flow's side-effect emits to the bus (best-effort).
+fn publish_emits(emits: &[(String, Value)]) {
+    if emits.is_empty() {
+        return;
+    }
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    if let Ok(nc) = nats::connect(&url) {
+        for (subj, payload) in emits {
+            let _ = nc.publish(subj, serde_json::to_vec(payload).unwrap_or_default());
+        }
+        let _ = nc.flush();
+    }
+}
+
+/// Run an API flow on the request event; map its `respond` to (status, body).
+fn run_api_flow(root: &Path, file: &str, input: &Value) -> (u16, String) {
+    match run_flow_ctx(root, file, input) {
+        Ok(ctx) => {
+            publish_emits(&ctx.emits);
+            match ctx.response {
+                Some((status, body)) => {
+                    let code = status
+                        .as_u64()
+                        .or_else(|| status.as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(200) as u16;
+                    (code, body.to_string())
+                }
+                None => (
+                    200,
+                    json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
+                ),
+            }
+        }
+        Err(e) => (500, json!({"error": e}).to_string()),
+    }
+}
+
+/// The OpenAPI 3.0 document for every `api` flow. Info configurable via env.
+fn openapi_json(root: &Path) -> Value {
+    let mut paths = serde_json::Map::new();
+    for r in api_routes(root) {
+        let path_str = format!(
+            "/{}",
+            r.segs
+                .iter()
+                .map(|s| match s {
+                    Seg::Lit(l) => l.clone(),
+                    Seg::Param(p) => format!("{{{p}}}"),
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let params: Vec<Value> = r
+            .segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Param(p) => Some(json!({
+                    "name": p, "in": "path", "required": true, "schema": {"type": "string"}
+                })),
+                _ => None,
+            })
+            .collect();
+        let mut op = json!({
+            "summary": r.summary,
+            "operationId": r.op_id,
+            "responses": {"200": {"description": "OK"}, "500": {"description": "Flow error"}},
+        });
+        if !params.is_empty() {
+            op["parameters"] = Value::Array(params);
+        }
+        if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
+            op["requestBody"] = json!({
+                "required": true,
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            });
+        }
+        let entry = paths.entry(path_str).or_insert_with(|| json!({}));
+        entry[r.method.to_ascii_lowercase()] = op;
+    }
+    json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": env::var("VEJAS_API_TITLE").unwrap_or_else(|_| "Vejas API".into()),
+            "version": env::var("VEJAS_API_VERSION").unwrap_or_else(|_| "1.0.0".into()),
+            "description": env::var("VEJAS_API_DESCRIPTION").unwrap_or_default(),
+        },
+        "servers": [{"url": "/api"}],
+        "paths": paths,
+    })
+}
+
 /// Flows/services that declare `tool "..."`, as (mcp_tool_name, file, description).
 fn tool_flows(root: &Path) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
@@ -1801,6 +2009,35 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
     }
+    // ── HTTP API surface: flows declared `api "VERB /path"`, served under /api/ ──
+    if path_only == "/api/openapi.json" {
+        return respond(request, 200, openapi_json(&root).to_string(), "application/json");
+    }
+    if let Some(rel) = path_only.strip_prefix("/api/") {
+        let m = method_str(&method);
+        return match match_api_route(&root, &m, rel) {
+            Some((file, params)) => {
+                let body = read_body(&mut request);
+                let mut ev = match body {
+                    Value::Object(o) => o,
+                    _ => serde_json::Map::new(),
+                };
+                for (k, v) in params {
+                    ev.insert(k, Value::String(v));
+                }
+                ev.insert("query".into(), parse_query(&url));
+                let (code, out) = run_api_flow(&root, &file, &Value::Object(ev));
+                respond(request, code, out, "application/json")
+            }
+            None => respond(
+                request,
+                404,
+                json!({"error": "no API route", "method": m, "path": format!("/{rel}")}).to_string(),
+                "application/json",
+            ),
+        };
+    }
+
     match (method, path_only.as_str()) {
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
             request,

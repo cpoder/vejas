@@ -1,0 +1,3 @@
+tool "Delete an order"
+api "DELETE /orders/{id}"
+respond 200, {id: id, deleted: true}

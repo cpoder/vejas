@@ -1,0 +1,3 @@
+tool "Update an order"
+api "PUT /orders/{id}"
+respond 200, {id: id, updated: true, status: status}

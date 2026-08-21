@@ -1,0 +1,5 @@
+# flow: create an order (POST /orders)
+tool "Create an order"
+api "POST /orders"
+emit "vx.orders.created", {customer: customer, total: total}
+respond 201, {id: "ord-1001", status: "created", customer: customer, total: total}

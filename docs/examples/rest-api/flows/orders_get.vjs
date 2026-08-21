@@ -1,0 +1,3 @@
+tool "Get an order by id"
+api "GET /orders/{id}"
+respond 200, {id: id, status: "open", note: "demo order"}

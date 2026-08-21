@@ -58,6 +58,8 @@ pub enum Tok {
     Source,
     Tool,
     Driver,
+    Api,
+    Respond,
     Newline,
     Colon,
     Comma,
@@ -158,6 +160,8 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                     "source" => Tok::Source,
                     "tool" => Tok::Tool,
                     "driver" => Tok::Driver,
+                    "api" => Tok::Api,
+                    "respond" => Tok::Respond,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "null" => Tok::Null,
@@ -344,6 +348,10 @@ pub enum Stmt {
     If(Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
     For(String, Expr, Vec<Stmt>),
     Emit(Expr, Expr),
+    /// `respond <status>, <body>` — set the synchronous HTTP response of an
+    /// `api` flow (status code + JSON body). Side-effect `emit`s still go to the
+    /// bus; `respond` is what the caller gets back.
+    Respond(Expr, Expr),
     InvokeMerge(String, Vec<(String, Expr)>),
 }
 
@@ -359,6 +367,11 @@ pub struct Program {
     /// When set, this flow/service is exposed as an MCP tool (and as an API):
     /// `tool "one-line description of what calling it does"`.
     pub tool: Option<String>,
+    /// When set, this flow is exposed as a synchronous HTTP endpoint:
+    /// `api "POST /orders"` / `api "GET /orders/{id}"`. The runtime routes
+    /// (method, path) here, binds {path params} into the event, and returns the
+    /// flow's `respond`. Several flows (one per verb) compose a REST resource.
+    pub api: Option<String>,
     /// When set, this file is a connector instance manifest: `driver "http-in"`
     /// plus UPPERCASE literal config. It is run by a native driver, not as a flow.
     pub driver: Option<String>,
@@ -438,6 +451,8 @@ impl<'a> Parser<'a> {
             Tok::Source => Some("source".into()),
             Tok::Tool => Some("tool".into()),
             Tok::Driver => Some("driver".into()),
+            Tok::Api => Some("api".into()),
+            Tok::Respond => Some("respond".into()),
             Tok::True => Some("true".into()),
             Tok::False => Some("false".into()),
             Tok::Null => Some("null".into()),
@@ -459,6 +474,7 @@ impl<'a> Parser<'a> {
         let mut source = None;
         let mut tool = None;
         let mut driver = None;
+        let mut api = None;
         let mut stmts = Vec::new();
         let mut surface = Vec::new();
         loop {
@@ -490,6 +506,14 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            if *self.peek() == Tok::Api {
+                self.next();
+                match self.next() {
+                    Tok::Str(s) => api = Some(s),
+                    _ => return Err(self.err("api expects a string like \"POST /orders\"")),
+                }
+                continue;
+            }
             if let Tok::Ident(name) = self.peek().clone() {
                 let uppercase = name
                     .chars()
@@ -518,6 +542,7 @@ impl<'a> Parser<'a> {
             source,
             tool,
             driver,
+            api,
             stmts,
             surface,
             emit_subjects: Vec::new(),
@@ -590,6 +615,10 @@ impl<'a> Parser<'a> {
                     Stmt::Emit(a, b) => {
                         walk_expr(a, "emit", out);
                         walk_expr(b, "emit", out);
+                    }
+                    Stmt::Respond(a, b) => {
+                        walk_expr(a, "respond", out);
+                        walk_expr(b, "respond", out);
                     }
                     Stmt::InvokeMerge(_, args) => {
                         for (_, v) in args {
@@ -751,6 +780,13 @@ impl<'a> Parser<'a> {
                 let payload = self.expr(0)?;
                 Ok(Stmt::Emit(subject, payload))
             }
+            Tok::Respond => {
+                self.next();
+                let status = self.expr(0)?;
+                self.eat(Tok::Comma, ",")?;
+                let body = self.expr(0)?;
+                Ok(Stmt::Respond(status, body))
+            }
             Tok::Invoke => {
                 self.next();
                 let (name, args) = self.invoke_args()?;
@@ -846,6 +882,7 @@ impl<'a> Parser<'a> {
             Tok::Source => Expr::Var("source".into()),
             Tok::Tool => Expr::Var("tool".into()),
             Tok::Driver => Expr::Var("driver".into()),
+            Tok::Api => Expr::Var("api".into()),
             Tok::Invoke => {
                 let (name, args) = self.invoke_args()?;
                 Expr::Invoke(name, args)
@@ -1168,6 +1205,8 @@ impl Engine {
 pub struct Ctx {
     pub vars: Map<String, Value>,
     pub emits: Vec<(String, Value)>,
+    /// Set by `respond <status>, <body>` in an `api` flow: the HTTP response.
+    pub response: Option<(Value, Value)>,
 }
 
 pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, String> {
@@ -1178,7 +1217,7 @@ pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, St
         }
     }
     vars.insert("event".into(), event.clone());
-    let mut ctx = Ctx { vars, emits: Vec::new() };
+    let mut ctx = Ctx { vars, emits: Vec::new(), response: None };
     exec_block(&prog.stmts, &mut ctx, engine)?;
     Ok(ctx)
 }
@@ -1203,7 +1242,7 @@ fn run_service(
     };
     // The invoked service's own invokes resolve within ITS package.
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
-    let mut ctx = Ctx { vars: args.clone(), emits: Vec::new() };
+    let mut ctx = Ctx { vars: args.clone(), emits: Vec::new(), response: None };
     ctx.vars.insert("event".into(), Value::Object(args));
     let result = exec_block(&stmts, &mut ctx, engine);
     engine.caller_pkg = saved_pkg;
@@ -1274,6 +1313,11 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
                 };
                 let p = eval(payload, ctx, engine)?;
                 ctx.emits.push((s, p));
+            }
+            Stmt::Respond(status, body) => {
+                let st = eval(status, ctx, engine)?;
+                let b = eval(body, ctx, engine)?;
+                ctx.response = Some((st, b));
             }
         }
     }
