@@ -1,0 +1,9 @@
+# connector: sap_idoc_in — SAP IDoc inbound as a stream (registered RFC server).
+# vejas-sap-rfc registers at the SAP gateway and streams each inbound call
+# (IDOC_INBOUND_ASYNCHRONOUS control + data records) onto SUBJECT. See
+# ../../sap_idoc.vjs.example for the full notes. Password via secret().
+driver "exec-stream-source"
+SUBJECT = "vx.sap.idoc"
+CMD = "/opt/vejas/vejas-sap-rfc idoc-server"
+ENV = {LD_LIBRARY_PATH: "/usr/sap/NPL/D00/exe", SAP_ASHOST: "localhost", SAP_SYSNR: "00", SAP_CLIENT: "001", SAP_USER: "DEVELOPER", SAP_PASSWD: secret("sap/npl/passwd"), SAP_LANG: "EN", SAP_PROGRAM_ID: "VEJAS_IDOC", SAP_GWHOST: "localhost", SAP_GWSERV: "sapgw00"}
+RESTART_SECS = 5

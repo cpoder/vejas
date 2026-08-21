@@ -1,0 +1,9 @@
+# connector: sf_export — Salesforce Bulk 2.0 export as a stream (one account per
+# message on SUBJECT). Client-credentials OAuth (durable); for a quick dev run
+# you can instead set SF_ACCESS_TOKEN=secret("sf/access_token") from
+# `sf org display --verbose`. SF_INTERVAL_SECS>0 = periodic sync.
+driver "exec-stream-source"
+SUBJECT = "vx.sf.accounts"
+CMD = "/opt/vejas/vejas-salesforce"
+ENV = {SF_LOGIN_URL: "https://YOURORG.my.salesforce.com", SF_GRANT_TYPE: "client_credentials", SF_CLIENT_ID: "3MVG9...consumer_key", SF_CLIENT_SECRET: secret("sf/client_secret"), SF_QUERY: "SELECT Id, Name FROM Account", SF_API_VERSION: "v60.0", SF_INTERVAL_SECS: "3600"}
+RESTART_SECS = 30

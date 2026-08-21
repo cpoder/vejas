@@ -1,0 +1,7 @@
+# connector: sap_out — SAP IDoc outbound sink. Each message on SUBJECT is a
+# send_idoc request ({op, control, data}); vejas-sap-rfc (request/reply mode)
+# sends it into SAP over tRFC (exactly-once). Password via secret().
+driver "exec-sink"
+SUBJECT = "vx.sap.idoc.out"
+CMD = "/opt/vejas/vejas-sap-rfc"
+ENV = {LD_LIBRARY_PATH: "/usr/sap/NPL/D00/exe", SAP_ASHOST: "localhost", SAP_SYSNR: "00", SAP_CLIENT: "001", SAP_USER: "DEVELOPER", SAP_PASSWD: secret("sap/npl/passwd"), SAP_LANG: "EN"}

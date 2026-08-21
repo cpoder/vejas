@@ -1,0 +1,14 @@
+# flow: sf_to_sap_idoc — each Salesforce account -> one IDoc into SAP (tRFC).
+#
+# The Salesforce Bulk export (sf_export) streams one account per message onto
+# vx.sf.accounts. We map each to an IDOC_INBOUND_ASYNCHRONOUS request and hand it
+# to the SAP sink (sap_out), which sends it into SAP exactly-once over tRFC.
+source "vx.sf.accounts"
+
+emit "vx.sap.idoc.out", {
+    op: "send_idoc",
+    control: {TABNAM: "EDI_DC40", IDOCTYP: "MATMAS05", MESTYP: "MATMAS",
+              SNDPRN: "SFDC", SNDPRT: "LS", RCVPRN: "NPLCLNT001",
+              RCVPRT: "LS", DIRECT: "2"},
+    data: [{SEGNAM: "E1MARAM", SDATA: row["Name"]}]
+}

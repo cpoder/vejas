@@ -1,0 +1,7 @@
+# connector: sf_ingest — Salesforce Bulk 2.0 insert sink. Each message on SUBJECT
+# is a batch ({rows: [...]}); vejas-salesforce (ingest mode) creates the records
+# in one bulk job. Client-credentials OAuth (or SF_ACCESS_TOKEN for a dev run).
+driver "exec-sink"
+SUBJECT = "vx.sf.ingest"
+CMD = "/opt/vejas/vejas-salesforce ingest"
+ENV = {SF_LOGIN_URL: "https://YOURORG.my.salesforce.com", SF_GRANT_TYPE: "client_credentials", SF_CLIENT_ID: "3MVG9...consumer_key", SF_CLIENT_SECRET: secret("sf/client_secret"), SF_OBJECT: "Account", SF_OPERATION: "insert", SF_API_VERSION: "v60.0"}

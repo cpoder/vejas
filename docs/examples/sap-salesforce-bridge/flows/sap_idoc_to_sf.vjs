@@ -1,0 +1,15 @@
+# flow: sap_idoc_to_sf — a SAP IDoc's account segments -> a Salesforce bulk insert.
+#
+# SAP pushes an inbound IDoc to our registered RFC server (sap_idoc_in), which
+# streams it onto vx.sap.idoc. Each IDOC_DATA_REC_40 segment carries one account
+# name in SDATA; we build the batch and hand it to the Salesforce bulk-insert
+# sink (sf_ingest) in one message.
+source "vx.sap.idoc"
+
+if func == "IDOC_INBOUND_ASYNCHRONOUS":
+    accounts = []
+    for seg in tables["IDOC_DATA_REC_40"]["rows"]:
+        accounts = accounts + [{Name: seg["SDATA"], Industry: "From SAP IDoc"}]
+    end
+    emit "vx.sf.ingest", {rows: accounts}
+end
