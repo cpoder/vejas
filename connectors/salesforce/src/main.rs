@@ -231,12 +231,13 @@ fn auth(s: &Session) -> Vec<(String, String)> {
     vec![("Authorization".into(), format!("Bearer {}", s.token))]
 }
 
-/// Create a Bulk 2.0 query job, return its id.
-fn create_job(s: &Session, ver: &str, query: &str) -> Result<String, String> {
+/// Create a Bulk 2.0 query job, return its id. `operation` is "query" or
+/// "queryAll" (queryAll includes deleted/archived records).
+fn create_job(s: &Session, ver: &str, query: &str, operation: &str) -> Result<String, String> {
     let url = format!("{}/services/data/{ver}/jobs/query", s.instance);
     let mut h = auth(s);
     h.push(("Content-Type".into(), "application/json".into()));
-    let body = json!({"operation": "query", "query": query}).to_string();
+    let body = json!({"operation": operation, "query": query}).to_string();
     let (code, _hd, resp) = http("POST", &url, &h, Some(&body))?;
     if code != 200 {
         return Err(format!("create job failed ({code}): {}", resp.trim()));
@@ -320,10 +321,10 @@ fn session() -> Result<Session, String> {
     }
 }
 
-fn export_once(ver: &str, query: &str, max_records: u64) -> Result<u64, String> {
+fn export_once(ver: &str, query: &str, operation: &str, max_records: u64) -> Result<u64, String> {
     let s = session()?;
     status(&json!({"stage": "auth", "instance": s.instance}));
-    let id = create_job(&s, ver, query)?;
+    let id = create_job(&s, ver, query, operation)?;
     status(&json!({"stage": "job", "id": id}));
     poll_job(&s, ver, &id)?;
     let n = stream_results(&s, ver, &id, max_records)?;
@@ -429,9 +430,41 @@ fn ingest(s: &Session, ver: &str, object: &str, operation: &str, external_id: &s
     let final_job = poll_ingest(s, ver, &id)?;
     let processed = final_job["numberRecordsProcessed"].as_u64().unwrap_or(0);
     let failed = final_job["numberRecordsFailed"].as_u64().unwrap_or(0);
-    Ok(json!({"ok": true, "job": id, "object": object, "operation": operation,
+    let mut out = json!({"ok": failed == 0, "job": id, "object": object, "operation": operation,
               "records": rows.len(), "processed": processed, "failed": failed,
-              "created": processed.saturating_sub(failed)}))
+              "succeeded": processed.saturating_sub(failed)});
+    // Surface a sample of what failed (the sf__Error column) for diagnostics.
+    if failed > 0 {
+        if let Some(errs) = fetch_failed(s, ver, &id) {
+            out["failures"] = errs;
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch the failedResults CSV of an ingest job and return a sample of rows
+/// (each with its sf__Error), for diagnostics — capped so a huge failure set
+/// doesn't flood the bus.
+fn fetch_failed(s: &Session, ver: &str, id: &str) -> Option<Value> {
+    let url = format!("{}/services/data/{ver}/jobs/ingest/{id}/failedResults", s.instance);
+    let (code, _h, body) = http("GET", &url, &auth(s), None).ok()?;
+    if code != 200 {
+        return None;
+    }
+    let rows = parse_csv(&body);
+    let (head, data) = rows.split_first()?;
+    let sample: Vec<Value> = data
+        .iter()
+        .take(20)
+        .map(|r| {
+            let mut o = serde_json::Map::new();
+            for (i, col) in head.iter().enumerate() {
+                o.insert(col.clone(), Value::String(r.get(i).cloned().unwrap_or_default()));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    Some(json!({"returned": sample.len(), "total": data.len(), "rows": sample}))
 }
 
 /// Read rows from stdin (a JSON array, or JSON-lines; a per-object "row"/"fields"
@@ -523,9 +556,11 @@ fn main() {
     };
     let max_records = env_or("SF_MAX_RECORDS", "10000").parse::<u64>().unwrap_or(10000);
     let interval = env_or("SF_INTERVAL_SECS", "0").parse::<u64>().unwrap_or(0);
+    // "query" (default) or "queryAll" (includes deleted/archived records).
+    let query_op = env_or("SF_QUERY_OPERATION", "query");
 
     loop {
-        match export_once(&ver, &query, max_records) {
+        match export_once(&ver, &query, &query_op, max_records) {
             Ok(_n) => {}
             Err(e) => {
                 status(&json!({"ok": false, "error": e}));
