@@ -1,0 +1,8 @@
+# connector: slack_post — post messages to Slack via the Web API (chat.postMessage).
+# A flow emits {channel, text, ...} on SUBJECT; this sink POSTs it with the bot
+# token. (For the simplest case an incoming-webhook works too — see slack_out.)
+driver "http-out"
+SUBJECT = "vx.slack.post"
+URL = "https://slack.com/api/chat.postMessage"
+HEADERS = {"Authorization": f"Bearer {secret("slack/bot_token")}", "Content-Type": "application/json; charset=utf-8"}
+TEST_BODY = {"channel": "#it-alerts", "text": "Vejas connector test"}

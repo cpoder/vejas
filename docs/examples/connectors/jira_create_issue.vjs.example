@@ -1,0 +1,7 @@
+# connector: jira_create_issue — create a Jira issue (Cloud REST API v3).
+# A flow emits an issue body ({fields: {project, summary, issuetype, ...}}) on SUBJECT.
+driver "http-out"
+SUBJECT = "vx.jira.create"
+URL = "https://YOURSITE.atlassian.net/rest/api/3/issue"
+HEADERS = {"Authorization": f"Basic {secret("jira/basic")}", "Content-Type": "application/json", "Accept": "application/json"}
+TEST_BODY = {"fields": {"project": {"key": "OPS"}, "summary": "Vejas connector test", "issuetype": {"name": "Task"}}}

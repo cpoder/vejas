@@ -1,0 +1,7 @@
+# connector: servicenow_create_incident — create incidents in ServiceNow (Table API).
+# A flow emits an incident body ({short_description, urgency, ...}) on SUBJECT.
+driver "http-out"
+SUBJECT = "vx.servicenow.create"
+URL = "https://YOURINSTANCE.service-now.com/api/now/table/incident"
+HEADERS = {"Authorization": f"Basic {secret("servicenow/basic")}", "Content-Type": "application/json", "Accept": "application/json"}
+TEST_BODY = {"short_description": "Vejas connector test", "urgency": "3"}

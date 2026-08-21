@@ -1,0 +1,9 @@
+# connector: servicenow_incidents_poll — read new incidents from ServiceNow (Table API).
+# Publishes {result:[...]} every INTERVAL_SECS. Auth: store base64("user:password")
+# as the secret (ServiceNow also supports OAuth2 -> oauth-poll if you prefer).
+driver "http-poll"
+URL = "https://YOURINSTANCE.service-now.com/api/now/table/incident?sysparm_limit=100&sysparm_query=active=true^ORDERBYDESCsys_created_on"
+SUBJECT = "vx.servicenow.incidents"
+INTERVAL_SECS = 300
+HEADERS = {"Authorization": f"Basic {secret("servicenow/basic")}", "Accept": "application/json"}
+ENVELOPE = true

@@ -1,0 +1,8 @@
+# connector: jira_issues_poll — read Jira issues (Cloud REST API v3, JQL search).
+# Auth: store base64("email:api_token") as the secret (Atlassian Basic auth).
+driver "http-poll"
+URL = "https://YOURSITE.atlassian.net/rest/api/3/search?jql=updated%3E%3D-1d%20ORDER%20BY%20updated%20DESC&maxResults=100"
+SUBJECT = "vx.jira.issues"
+INTERVAL_SECS = 300
+HEADERS = {"Authorization": f"Basic {secret("jira/basic")}", "Accept": "application/json"}
+ENVELOPE = true

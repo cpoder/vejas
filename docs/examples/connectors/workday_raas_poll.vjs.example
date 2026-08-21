@@ -1,0 +1,10 @@
+# connector: workday_raas_poll — read a Workday "Report as a Service" (RaaS) as JSON.
+# RaaS exposes a custom report at a REST URL (format=json), Basic auth
+# (base64("user@tenant:password")). This covers Workday READS on the existing
+# socle. Workday transactional WWS (SOAP) needs a native/exec connector — later.
+driver "http-poll"
+URL = "https://SERVICE.myworkday.com/ccx/service/customreport2/TENANT/ISU_USER/Your_Report?format=json"
+SUBJECT = "vx.workday.report"
+INTERVAL_SECS = 3600
+HEADERS = {"Authorization": f"Basic {secret("workday/basic")}", "Accept": "application/json"}
+ENVELOPE = true
