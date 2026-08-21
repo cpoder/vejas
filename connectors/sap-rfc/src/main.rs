@@ -794,7 +794,7 @@ fn run_server() -> ! {
     let client = match open_connection(sdk) {
         Ok(c) => c,
         Err(je) => {
-            reply(&je);
+            emit_err(&je);
             std::process::exit(1);
         }
     };
@@ -808,10 +808,10 @@ fn run_server() -> ! {
                     (sdk.install_server_function)(std::ptr::null(), fd, on_server_call, &mut e)
                 };
                 if rc != RFC_OK {
-                    reply(&e.to_json(&format!("install:{fname}")));
+                    emit_err(&e.to_json(&format!("install:{fname}")));
                 }
             }
-            Err(je) => reply(&json!({"ok": false, "stage": format!("metadata:{fname}"), "detail": je})),
+            Err(je) => emit_err(&json!({"ok": false, "stage": format!("metadata:{fname}"), "detail": je})),
         }
     }
 
@@ -837,10 +837,10 @@ fn run_server() -> ! {
     let mut e = RfcErrorInfo::zeroed();
     let server = unsafe { (sdk.register_server)(params.as_ptr(), params.len() as c_uint, &mut e) };
     if server.is_null() {
-        reply(&e.to_json("register_server"));
+        emit_err(&e.to_json("register_server"));
         std::process::exit(1);
     }
-    reply(&json!({
+    emit_err(&json!({
         "ok": true, "ready": true, "mode": "idoc-server",
         "program_id": program_id, "gwhost": gwhost, "gwserv": gwserv,
         "connector": "sap-rfc",
@@ -854,17 +854,26 @@ fn run_server() -> ! {
             RFC_OK | RFC_RETRY => {}
             RFC_CLOSED | RFC_COMMUNICATION_FAILURE => {
                 // Gateway dropped us; report and exit so the supervisor restarts.
-                reply(&e.to_json("listen"));
+                emit_err(&e.to_json("listen"));
                 std::process::exit(1);
             }
-            _ => reply(&e.to_json("dispatch")),
+            _ => emit_err(&e.to_json("dispatch")),
         }
     }
 }
 
 // ─────────────────────────── main loop ───────────────────────────
+/// Data channel: request/reply results (RPC) and streamed events (server mode)
+/// go to stdout — this is what the runtime's exec-stream-source publishes.
 fn reply(v: &Value) {
     let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
+}
+/// Status channel: readiness and operational errors go to stderr, so stdout in
+/// server mode stays a pure event stream for the bus.
+fn emit_err(v: &Value) {
+    let mut out = io::stderr().lock();
     let _ = writeln!(out, "{v}");
     let _ = out.flush();
 }

@@ -56,6 +56,24 @@ impl Config {
             })
             .unwrap_or_default()
     }
+    /// Optional ENV doc: `ENV = {"SAP_PASSWD": secret("…"), "SAP_USER": "DEV"}`.
+    /// Evaluated at manifest time, so secret()/f-strings resolve here; passed to
+    /// an exec child's environment — never argv (`/proc/<pid>/environ` is
+    /// owner-only, `cmdline` is world-readable). Non-string values are stringified.
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        self.0
+            .get("ENV")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| match v {
+                        Value::String(s) => (k.clone(), s.clone()),
+                        other => (k.clone(), other.to_string()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub struct Ctx {
@@ -135,6 +153,7 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
         "http-out" => Some(Box::new(HttpOut)),
         "exec-source" => Some(Box::new(ExecSource)),
         "exec-sink" => Some(Box::new(ExecSink)),
+        "exec-stream-source" => Some(Box::new(ExecStreamSource)),
         _ => None,
     }
 }
@@ -142,7 +161,7 @@ pub fn driver_for(name: &str) -> Option<Box<dyn Driver>> {
 pub fn catalog() -> Vec<(&'static str, &'static str, &'static str)> {
     [
         "http-in", "timer", "http-poll", "oauth-poll", "slack-out", "http-out",
-        "exec-source", "exec-sink",
+        "exec-source", "exec-sink", "exec-stream-source",
     ]
     .iter()
     .filter_map(|n| driver_for(n).map(|d| (*n, d.kind(), d.about())))
@@ -1058,6 +1077,104 @@ impl Driver for ExecSink {
                 Err(format!("{name}: exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()))
             }
         })
+    }
+}
+
+// ───────────────────────── source: streaming exec ─────────────────────────
+
+struct ExecStreamSource;
+impl Driver for ExecStreamSource {
+    fn kind(&self) -> &'static str {
+        "source:stream"
+    }
+    fn about(&self) -> &'static str {
+        "Runs CMD as a long-running process and publishes each JSON line it streams on stdout to SUBJECT — line by line, with back-pressure (a bounded internal buffer; when the bus is slow the child's stdout blocks, so a burst can't overrun memory). For push sources like SAP IDoc inbound and Salesforce Bulk 2.0. ENV = {\"KEY\": secret(\"…\")} is handed to the child's environment (secrets never touch argv). On child exit it restarts after RESTART_SECS. Config: CMD, SUBJECT, ENV (optional), RESTART_SECS (optional, default 2)."
+    }
+    fn run(&self, ctx: &Ctx) -> Result<(), String> {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+
+        let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
+        let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
+        let env = ctx.config.env_vars();
+        let restart = ctx.config.u64_or("RESTART_SECS", 2).max(1);
+        let js = ctx.jetstream()?;
+        eprintln!("[{}] exec-stream-source: `{cmd}` -> {subject} (streaming)", ctx.name);
+
+        while ctx.alive() {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit()) // child status/errors flow to our logs
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let stdout = child.stdout.take().ok_or("no child stdout")?;
+
+            // Bounded channel = back-pressure: when we stop consuming (slow bus),
+            // the reader blocks on send, the OS pipe fills, the child blocks on
+            // write. Memory stays bounded no matter how fast SAP pushes.
+            let (tx, rx) = sync_channel::<String>(64);
+            let reader = thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(l) => {
+                            if tx.send(l).is_err() {
+                                break; // consumer gone
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            loop {
+                if !ctx.alive() {
+                    let _ = child.kill();
+                    break;
+                }
+                match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(line) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if serde_json::from_str::<Value>(line).is_ok() {
+                            match js.publish(&subject, line.as_bytes()) {
+                                Ok(_) => trace_pub(&ctx.name, &subject, line.as_bytes()),
+                                Err(e) => {
+                                    trace_fail(&ctx.name, &subject, format!("publish: {e}"))
+                                }
+                            }
+                        } else {
+                            eprintln!("[{}] stream: non-JSON line skipped", ctx.name);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break, // child stdout closed
+                }
+            }
+
+            let _ = reader.join();
+            let status = child.wait();
+            if !ctx.alive() {
+                return Ok(());
+            }
+            eprintln!(
+                "[{}] stream process ended ({:?}); restart in {restart}s",
+                ctx.name,
+                status.ok().and_then(|s| s.code())
+            );
+            let mut slept = 0;
+            while slept < restart * 1000 && ctx.alive() {
+                thread::sleep(Duration::from_millis(200));
+                slept += 200;
+            }
+        }
+        Ok(())
     }
 }
 

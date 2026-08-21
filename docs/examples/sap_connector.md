@@ -1,89 +1,90 @@
-# Connecting to SAP (and other native-SDK systems)
+# Connecting to SAP (native Rust, no JVM)
 
-Short answer to "how do we do SAP in Rust — is a `.so` enough?": **you don't
-rewrite SAP in Rust, and no, a `.so` is the wrong tool.** SAP is the textbook
-case for an **external-process connector** (ADR-0011): you keep your working
-Java (SAP JCo) code and wrap it, and the runtime bridges it to the bus over
-stdio.
+> **Superseded direction.** An earlier version of this note recommended keeping
+> SAP JCo (Java) and wrapping it as an exec connector. **ADR-0014** replaces that:
+> the SAP connector is a **native Rust binary over the SAP NW RFC SDK
+> (`libsapnwrfc`)** — no JVM, no Python — run as an isolated exec process. This
+> note now describes that connector, which is built and validated against a live
+> SAP NetWeaver AS ABAP system (`connectors/sap-rfc/`).
 
-## Why not a native `.so`
+## Shape
 
-SAP JCo already ships a native library (`libsapjco3.so`), and there is a C RFC
-SDK (`libsapnwrfc`). Loading either **into the Vejas runtime process** via FFI
-means: SAP's proprietary, licensed native library running in your Rust binary's
-memory and privileges, an unstable-ABI FFI boundary, and a JCo/JVM/native-lib
-crash taking the whole runtime down. SAP supports its libraries next to a JVM in
-a known environment — not embedded in an arbitrary Rust host. This is exactly
-what ADR-0011 rejects.
+`vejas-sap-rfc` is a small Rust binary that **`dlopen`s `libsapnwrfc.so` at
+runtime**. Consequences:
 
-## The right shape: your Java connector, as an exec connector
+- **No JVM, no Python** — aligns with ADR-0009.
+- **No build-time SAP dependency** — it builds anywhere; only *running* needs the
+  SDK, which ships with the SAP kernel (`/usr/sap/<SID>/SYS/exe/.../libsapnwrfc.so`)
+  and is present on every SAP host. Build once, run beside any SAP.
+- **Isolated exec process** (ADR-0011) — the FFI lives in this binary, never in
+  the Vejas runtime; a native crash restarts only the connector.
+- **Secrets via `secret()`** (ADR-0008), handed to the process environment, never
+  argv.
 
-Keep the Java you already know. Package it as a small program that speaks
-**stdio JSON**; the runtime does the NATS bridging, so your program needs no
-NATS client. The SAP native library lives where SAP supports it — inside the
-isolated JVM process — and if it crashes, the runtime restarts it.
+It speaks two shapes, both over stdio JSON (one object per line):
 
-### Source: poll SAP → the bus
+### 1. Request/reply (client) — read & call
 
-`sap-connector.jar` uses JCo to call an RFC/BAPI (or read IDocs) and prints one
-JSON object per line on stdout:
+Default mode is a request/reply loop: a JSON request per line on stdin, a JSON
+reply per line on stdout.
 
-```
-# connector: sap_material_master — polls SAP via your Java JCo jar
-driver "exec-source"
-CMD = "java -jar /opt/vejas/sap-connector.jar poll BAPI_MATERIAL_GETLIST"
-SUBJECT = "vx.sap.materials"
-INTERVAL_SECS = 300
-```
+- `{"op":"ping"}` — RfcPing.
+- `{"op":"describe","func":"BAPI_USER_GETLIST"}` — interface metadata
+  (name / direction / type / length), from `RfcGetParameterDescByIndex`.
+- `{"op":"list","pattern":"BAPI_*"}` — function-module search
+  (via the ABAP `RFC_FUNCTION_SEARCH`).
+- `{"op":"call","func":"RFC_READ_TABLE","import":{"QUERY_TABLE":"T000"},"max_rows":50}`
+  — invoke any function module. `call` **auto-marshals from metadata**: every
+  EXPORT/CHANGING scalar & structure and every TABLES parameter comes back
+  without the caller knowing types. Inputs may be scalars, structures (JSON
+  object) or tables (JSON array of rows).
 
-Your `main(...)` (sketch): connect with JCo, call the BAPI, and for each row
-`System.out.println(mapper.writeValueAsString(row))`. That's it — the runtime
-publishes each line on `vx.sap.materials`, where your flows pick it up.
+This is the path a future `exec-rpc` driver exposes as MCP tools
+(`sap_list` / `sap_describe` / `sap_call`).
 
-### Sink: the bus → SAP
+### 2. Streaming (server) — IDoc inbound
 
-Consume a subject and call a BAPI (e.g. create a sales order) with each message
-piped to the jar's stdin:
-
-```
-# connector: sap_create_order
-driver "exec-sink"
-CMD = "java -jar /opt/vejas/sap-connector.jar create BAPI_SALESORDER_CREATEFROMDAT2"
-SUBJECT = "vx.sap.orders.create"
-```
-
-Your `main(...)`: read stdin (the JSON message), map it to the BAPI import
-parameters, call it, and exit non-zero on failure (the runtime will `nak` →
-redeliver).
-
-### Credentials
-
-Never put SAP credentials in the manifest. Reference the Vault (ADR-0008) and
-pass them into the process via env:
+`vejas-sap-rfc idoc-server` **registers at the SAP gateway** as a server program
+(`RfcRegisterServer`) and enters `RfcListenAndDispatch`. Every call SAP makes to
+it is marshalled from metadata and emitted as one JSON line on stdout. For
+`IDOC_INBOUND_ASYNCHRONOUS`, the IDoc control (EDI_DC40) and data (EDI_DD40)
+records ride in the `tables`. This is the long-running **exec-stream-source**
+shape, so a Vejas manifest publishes each line to the bus — see
+`sap_idoc.vjs.example`.
 
 ```
-driver "exec-source"
-CMD = "java -jar /opt/vejas/sap-connector.jar poll BAPI_MATERIAL_GETLIST"
-SUBJECT = "vx.sap.materials"
-INTERVAL_SECS = 300
-SAP_PASSWORD = secret("sap/prod/password")
+driver "exec-stream-source"
+SUBJECT = "vx.sap.idoc"
+CMD = "/opt/vejas/vejas-sap-rfc idoc-server"
+ENV = {LD_LIBRARY_PATH: "…/exe", SAP_ASHOST: "…", SAP_USER: "…",
+       SAP_PASSWD: secret("sap/…"), SAP_PROGRAM_ID: "VEJAS_IDOC",
+       SAP_GWHOST: "…", SAP_GWSERV: "sapgw00"}
 ```
 
-(Passing resolved config as child-process env to exec connectors is a small
-runtime addition on the roadmap; until then the jar can read the same Vault or
-its own env.)
+SAP side (once, by a Basis admin): an RFC destination (SM59, "Registered Server
+Program", Program ID = `SAP_PROGRAM_ID`), a port over it (WE21), and a partner
+profile (WE20) routing the message type. Then outbound IDocs land on `vx.sap.idoc`.
 
-## When SAP is modern (S/4HANA)
+## Why not a native `.so` loaded into the runtime
 
-If you're on S/4HANA with OData/REST gateways, you may not need JCo at all: an
-`http-poll` source and an `http-out` sink (pure manifests, no Java) can talk to
-the OData services directly, with the token from the Vault. Use the Java/JCo
-exec connector for classic RFC/BAPI/IDoc (ECC), the HTTP drivers for OData.
+The reasoning ADR-0011 gives still holds — and the connector honours it: the
+vendor C library is `dlopen`ed **inside the connector binary**, a separate
+process, never inside the runtime. So we get the SDK's full capability (all ABAP
+types, codepages, IDocs, DDIC introspection) with process isolation and no
+unstable-ABI FFI boundary crossing into the runtime.
 
-## The general rule
+## Why not reverse-engineer the RFC protocol
 
-Any system with a native/vendor SDK (SAP, Tibco, MQ series, proprietary
-drivers) follows this pattern: **wrap the working SDK in its own language as an
-exec connector; bridge over stdio; isolate by process.** Rust built-in drivers
-are for universal protocols (HTTP, timers, polling); WASM (later) is for pure,
-portable, sandboxed connectors — never for embedding a vendor's native SDK.
+Rejected in ADR-0014: weeks of high-risk work to remove a dependency that already
+ships on every SAP host and that our Rust FFI drives in an evening. OData/SOAP
+over Gateway stays a possible accelerator where exposed, but not the primary path
+— the large installed base is classic NetWeaver AS ABAP where only the RFC
+gateway is guaranteed.
+
+## Validated
+
+Against a live SAP NetWeaver AS ABAP (NPL, kernel 7.53): `ping`; `describe`;
+`list`; `call` reading `RFC_READ_TABLE`/`RFC_SYSTEM_INFO` (scalars, structures,
+tables) and running input-table FMs; and a real `IDOC_INBOUND_ASYNCHRONOUS`
+received by the registered server and published end-to-end onto NATS via
+exec-stream-source.
