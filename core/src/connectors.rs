@@ -1050,16 +1050,18 @@ impl Driver for ExecSink {
         "sink:exec"
     }
     fn about(&self) -> &'static str {
-        "Consumes SUBJECT; pipes each message body to CMD's stdin. Any language, no NATS client. Config: CMD, SUBJECT."
+        "Consumes SUBJECT; pipes each message body to CMD's stdin. Any language, no NATS client. ENV = {\"KEY\": secret(\"…\")} is handed to the child environment (secrets never touch argv). Config: CMD, SUBJECT, ENV (optional)."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let name = ctx.name.clone();
+        let env = ctx.config.env_vars();
         run_sink(ctx, &subject, move |data| {
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

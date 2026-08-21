@@ -331,8 +331,189 @@ fn export_once(ver: &str, query: &str, max_records: u64) -> Result<u64, String> 
     Ok(n)
 }
 
+// ─────────────────────────── Bulk 2.0 ingest (insert/upsert) ───────────────────────────
+fn csv_cell(v: &Value) -> String {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+/// Build a CSV document from JSON rows: header = union of keys (first-seen order).
+fn rows_to_csv(rows: &[serde_json::Map<String, Value>]) -> (Vec<String>, String) {
+    let mut cols: Vec<String> = Vec::new();
+    for r in rows {
+        for k in r.keys() {
+            if !cols.iter().any(|c| c == k) {
+                cols.push(k.clone());
+            }
+        }
+    }
+    let mut out = cols
+        .iter()
+        .map(|c| csv_cell(&Value::String(c.clone())))
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push('\n');
+    for r in rows {
+        let line = cols
+            .iter()
+            .map(|c| csv_cell(r.get(c).unwrap_or(&Value::Null)))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    (cols, out)
+}
+
+fn poll_ingest(s: &Session, ver: &str, id: &str) -> Result<Value, String> {
+    let url = format!("{}/services/data/{ver}/jobs/ingest/{id}", s.instance);
+    loop {
+        let (code, _h, resp) = http("GET", &url, &auth(s), None)?;
+        if code != 200 {
+            return Err(format!("poll ingest failed ({code}): {}", resp.trim()));
+        }
+        let v: Value = serde_json::from_str(resp.trim()).map_err(|e| e.to_string())?;
+        match v["state"].as_str().unwrap_or("") {
+            "JobComplete" => return Ok(v),
+            "Failed" | "Aborted" => return Err(format!("ingest job {}: {}", v["state"], v["errorMessage"])),
+            other => {
+                status(&json!({"stage": "poll", "state": other}));
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        }
+    }
+}
+
+/// Create a Bulk 2.0 ingest job, upload the rows as CSV, close it, and wait.
+fn ingest(s: &Session, ver: &str, object: &str, operation: &str, external_id: &str,
+          rows: &[serde_json::Map<String, Value>]) -> Result<Value, String> {
+    // 1. create the job
+    let mut create = json!({"object": object, "operation": operation, "contentType": "CSV", "lineEnding": "LF"});
+    if operation == "upsert" && !external_id.is_empty() {
+        create["externalIdFieldName"] = json!(external_id);
+    }
+    let mut h = auth(s);
+    h.push(("Content-Type".into(), "application/json".into()));
+    let (code, _hd, resp) = http("POST", &format!("{}/services/data/{ver}/jobs/ingest", s.instance), &h, Some(&create.to_string()))?;
+    if code != 200 {
+        return Err(format!("create ingest failed ({code}): {}", resp.trim()));
+    }
+    let job: Value = serde_json::from_str(resp.trim()).map_err(|e| e.to_string())?;
+    let id = job["id"].as_str().ok_or("no ingest job id")?.to_string();
+    status(&json!({"stage": "ingest_job", "id": id, "object": object, "operation": operation}));
+
+    // 2. upload the CSV batch
+    let (_cols, csv) = rows_to_csv(rows);
+    let mut hu = auth(s);
+    hu.push(("Content-Type".into(), "text/csv".into()));
+    let (uc, _uh, ur) = http("PUT", &format!("{}/services/data/{ver}/jobs/ingest/{id}/batches", s.instance), &hu, Some(&csv))?;
+    if uc != 201 {
+        return Err(format!("upload failed ({uc}): {}", ur.trim()));
+    }
+
+    // 3. close the job -> processing starts
+    let (pc, _ph, pr) = http("PATCH", &format!("{}/services/data/{ver}/jobs/ingest/{id}", s.instance), &h, Some(&json!({"state": "UploadComplete"}).to_string()))?;
+    if pc != 200 {
+        return Err(format!("close failed ({pc}): {}", pr.trim()));
+    }
+
+    // 4. wait for completion
+    let final_job = poll_ingest(s, ver, &id)?;
+    let processed = final_job["numberRecordsProcessed"].as_u64().unwrap_or(0);
+    let failed = final_job["numberRecordsFailed"].as_u64().unwrap_or(0);
+    Ok(json!({"ok": true, "job": id, "object": object, "operation": operation,
+              "records": rows.len(), "processed": processed, "failed": failed,
+              "created": processed.saturating_sub(failed)}))
+}
+
+/// Read rows from stdin (a JSON array, or JSON-lines; a per-object "row"/"fields"
+/// wrapper is unwrapped) and Bulk-insert them.
+fn run_ingest(ver: &str) {
+    use std::io::Read;
+    let s = match session() {
+        Ok(s) => s,
+        Err(e) => { status(&json!({"ok": false, "fatal": true, "error": e})); std::process::exit(1); }
+    };
+    let object = env_or("SF_OBJECT", "Account");
+    let operation = env_or("SF_OPERATION", "insert");
+    let external_id = env_or("SF_EXTERNAL_ID", "");
+
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        status(&json!({"ok": false, "error": "read stdin failed"}));
+        std::process::exit(1);
+    }
+    let unwrap = |v: Value| -> Option<serde_json::Map<String, Value>> {
+        match v {
+            Value::Object(m) => {
+                // unwrap a single {"row": {...}} or {"fields": {...}} wrapper
+                for key in ["row", "fields"] {
+                    if m.len() == 1 {
+                        if let Some(Value::Object(inner)) = m.get(key) {
+                            return Some(inner.clone());
+                        }
+                    }
+                }
+                Some(m)
+            }
+            _ => None,
+        }
+    };
+    let mut rows: Vec<serde_json::Map<String, Value>> = Vec::new();
+    // Prefer a single JSON document (an array, or an object wrapping a rows/
+    // accounts array — the shape a flow emits); fall back to JSON-lines.
+    if let Ok(v) = serde_json::from_str::<Value>(input.trim()) {
+        match v {
+            Value::Array(arr) => rows = arr.into_iter().filter_map(unwrap).collect(),
+            Value::Object(m) => {
+                let inner = m.get("rows").or_else(|| m.get("accounts"));
+                if let Some(Value::Array(arr)) = inner {
+                    rows = arr.iter().cloned().filter_map(unwrap).collect();
+                } else if let Some(r) = unwrap(Value::Object(m)) {
+                    rows.push(r);
+                }
+            }
+            _ => {}
+        }
+    } else {
+        for line in input.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                match v {
+                    Value::Array(arr) => rows.extend(arr.into_iter().filter_map(unwrap)),
+                    other => { if let Some(r) = unwrap(other) { rows.push(r); } }
+                }
+            }
+        }
+    }
+    if rows.is_empty() {
+        status(&json!({"ok": true, "note": "no rows to ingest"}));
+        emit(&json!({"ok": true, "processed": 0, "created": 0}));
+        return;
+    }
+    match ingest(&s, ver, &object, &operation, &external_id, &rows) {
+        Ok(res) => { status(&res); emit(&res); }
+        Err(e) => { status(&json!({"ok": false, "error": e})); emit(&json!({"ok": false, "error": e})); std::process::exit(1); }
+    }
+}
+
 fn main() {
     let ver = env_or("SF_API_VERSION", "v60.0");
+    let mode = std::env::args().nth(1).or_else(|| std::env::var("SF_MODE").ok()).unwrap_or_default();
+    if mode == "ingest" {
+        run_ingest(&ver);
+        return;
+    }
+
     let query = match std::env::var("SF_QUERY") {
         Ok(q) if !q.is_empty() => q,
         _ => {
