@@ -10,14 +10,17 @@ hot-addable). No subprocess, no Python. Drivers today:
 - **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT.
 - **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS
   (an object payload gains a `ts` field, ISO 8601 UTC, when absent).
-- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS.
+- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS; optional `ENVELOPE = true` publishes `{endpoint, fetched_at, body}` (like oauth-poll) so a stateless flow gets a `collected_at`.
 - **oauth-poll** (source:poll) — OAuth2 client-credentials REST poller: token from
   TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
   pagination via NEXT_LINK_FIELD (default `@odata.nextLink`, absolute links followed
   as-is) capped by MAX_PAGES, publishes one `{endpoint, fetched_at, body}` message
-  per page on SUBJECT. `EXPAND = [{name, list, detail, key, as}]` adds a
-  client-side $expand — every list item enriched with its per-item detail call,
-  the page shipped as one envelope — for list APIs without a server-side expand.
+  per page on SUBJECT. SCOPE is optional (omitted from the token form when empty —
+  e.g. CrowdStrike). `EXPAND = [{name, list, detail, key, as, list_field?}]` adds a
+  client-side $expand — every item of the list array (`list_field`, default
+  `value`; a bare-string item becomes `{key: id}`, so CrowdStrike's
+  `resources: [ids]` → per-id detail works) enriched with its detail call, the
+  page shipped as one envelope — for list APIs without a server-side expand.
   One generic OAuth+REST driver stands in for most of a connector catalog.
 - **slack-out** (sink) — consumes vx.slack.out → Slack webhook / DRY-RUN.
 - **http-out** (sink) — consumes SUBJECT → POST to URL. Optional HEADERS doc for

@@ -321,7 +321,7 @@ impl Driver for HttpPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …})."
+        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …}), ENVELOPE (optional bool: when true, publish {endpoint, fetched_at, body} like oauth-poll so a stateless flow gets a collected_at — the language has no clock)."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let url = ctx.config.str("URL").ok_or("URL required")?;
@@ -335,6 +335,7 @@ impl Driver for HttpPoll {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let interval = ctx.config.u64_or("INTERVAL_SECS", 60).max(1);
         let headers = ctx.config.headers();
+        let envelope = ctx.config.0.get("ENVELOPE").and_then(|v| v.as_bool()).unwrap_or(false);
         let js = ctx.jetstream()?;
         eprintln!("[{}] polling {url} every {interval}s -> {subject}", ctx.name);
         let mut waited = interval * 1000; // fire immediately on start
@@ -347,11 +348,25 @@ impl Driver for HttpPoll {
             if waited >= interval * 1000 {
                 waited = 0;
                 match http_get(&url, &headers) {
-                    Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
-                        let _ = js.publish(&subject, &body);
-                        trace_pub(&ctx.name, &subject, &body);
-                    }
-                    Ok(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
+                    Ok(raw) => match serde_json::from_slice::<Value>(&raw) {
+                        Ok(parsed) => {
+                            // ENVELOPE=true: {endpoint, fetched_at, body} (stateless
+                            // flow gets collected_at); else the raw body (compat)
+                            let bytes = if envelope {
+                                serde_json::to_vec(&serde_json::json!({
+                                    "endpoint": url,
+                                    "fetched_at": iso8601_utc(crate::now_secs()),
+                                    "body": parsed,
+                                }))
+                                .unwrap_or_default()
+                            } else {
+                                raw.clone()
+                            };
+                            let _ = js.publish(&subject, &bytes);
+                            trace_pub(&ctx.name, &subject, &bytes);
+                        }
+                        Err(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
+                    },
                     Err(e) => {
                         eprintln!("[{}] poll: {e}", ctx.name);
                         trace_fail(&ctx.name, &subject, e);
@@ -454,6 +469,9 @@ struct Expand {
     detail: String,
     key: String,
     as_field: String,
+    /// The array field in the list response (default "value" à la Graph;
+    /// "resources" for CrowdStrike, "data" for many others).
+    list_field: String,
 }
 
 fn parse_expands(cfg: &Config) -> Result<Vec<Expand>, String> {
@@ -466,9 +484,14 @@ fn parse_expands(cfg: &Config) -> Result<Vec<Expand>, String> {
     for e in &entries {
         let field = |k: &str| e.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
         match (field("name"), field("list"), field("detail"), field("key"), field("as")) {
-            (Some(name), Some(list), Some(detail), Some(key), Some(as_field)) => {
-                out.push(Expand { name, list, detail, key, as_field })
-            }
+            (Some(name), Some(list), Some(detail), Some(key), Some(as_field)) => out.push(Expand {
+                name,
+                list,
+                detail,
+                key,
+                as_field,
+                list_field: field("list_field").unwrap_or_else(|| "value".into()),
+            }),
             _ => return Err("every EXPAND entry needs name, list, detail, key and as".into()),
         }
     }
@@ -482,12 +505,16 @@ impl OAuthPoll {
         client_secret: &str,
         scope: &str,
     ) -> Result<(String, Duration), String> {
-        let form = format!(
-            "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
+        // scope is optional: CrowdStrike (and other client-credentials APIs)
+        // reject a scope param they don't define — omit it entirely when empty
+        let mut form = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}",
             urlencode(client_id),
-            urlencode(client_secret),
-            urlencode(scope)
+            urlencode(client_secret)
         );
+        if !scope.is_empty() {
+            form.push_str(&format!("&scope={}", urlencode(scope)));
+        }
         let headers = [(
             "Content-Type".to_string(),
             "application/x-www-form-urlencoded".to_string(),
@@ -516,13 +543,13 @@ impl Driver for OAuthPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. EXPAND = [{name, list, detail, key, as}] does a client-side $expand: each list item is enriched with its per-item detail call ({key} substituted in the detail path) and the page ships as ONE envelope under endpoint=name — sized for list APIs without a server-side expand (sequential detail calls, keep pages small). Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE, BASE_URL, ENDPOINTS and/or EXPAND, SUBJECT, INTERVAL_SECS, MAX_PAGES."
+        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. EXPAND = [{name, list, detail, key, as, list_field?}] does a client-side $expand: each item of the list response's array (list_field, default \"value\"; use \"resources\"/\"data\" for other APIs; a bare-string item becomes {key: id}) is enriched with its per-item detail call ({key} substituted in the detail path) and the page ships as ONE envelope under endpoint=name — sized for list APIs without a server-side expand (sequential detail calls, keep pages small). Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE (optional — omitted when empty, e.g. CrowdStrike), BASE_URL, ENDPOINTS and/or EXPAND, SUBJECT, INTERVAL_SECS, MAX_PAGES."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
         let client_id = ctx.config.str("CLIENT_ID").ok_or("CLIENT_ID required")?;
         let client_secret = ctx.config.str("CLIENT_SECRET").ok_or("CLIENT_SECRET required")?;
-        let scope = ctx.config.str("SCOPE").ok_or("SCOPE required")?;
+        let scope = ctx.config.str_or("SCOPE", ""); // optional (CrowdStrike: none)
         let base = ctx.config.str("BASE_URL").ok_or("BASE_URL required")?;
         let ep = ctx
             .config
@@ -556,9 +583,7 @@ impl Driver for OAuthPoll {
         let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
         let client_id = ctx.config.str("CLIENT_ID").ok_or("CLIENT_ID required")?;
         let client_secret = ctx.config.str("CLIENT_SECRET").ok_or("CLIENT_SECRET required")?;
-        let scope = ctx.config.str("SCOPE").ok_or(
-            "SCOPE required (e.g. \"https://graph.microsoft.com/.default\" — the API origin, not BASE_URL)",
-        )?;
+        let scope = ctx.config.str_or("SCOPE", ""); // optional: omitted from the token form when empty
         let base = ctx.config.str("BASE_URL").ok_or("BASE_URL required")?;
         let endpoints: Vec<String> = ctx
             .config
@@ -683,11 +708,20 @@ impl Driver for OAuthPoll {
                                 }
                             };
                             if let Some(items) =
-                                parsed.get_mut("value").and_then(|v| v.as_array_mut())
+                                parsed.get_mut(&spec.list_field).and_then(|v| v.as_array_mut())
                             {
                                 for item in items.iter_mut() {
                                     if !ctx.alive() {
                                         return Ok(());
+                                    }
+                                    // an item may be an OBJECT with a {key} field, or a
+                                    // bare STRING id (CrowdStrike queries → [ids]); a
+                                    // scalar becomes {key: id} so detail + as land on it
+                                    if item.is_string() {
+                                        let id = item.as_str().unwrap().to_string();
+                                        let mut o = serde_json::Map::new();
+                                        o.insert(spec.key.clone(), Value::String(id));
+                                        *item = Value::Object(o);
                                     }
                                     let Some(id) = item
                                         .get(&spec.key)
@@ -1244,6 +1278,12 @@ mod tests {
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name, "ua");
         assert_eq!(ex[0].as_field, "x");
+        assert_eq!(ex[0].list_field, "value"); // default à la Graph
+        // list_field is configurable (CrowdStrike: "resources")
+        let mut cs = Map::new();
+        cs.insert("EXPAND".into(), json!([{"name":"d","list":"/q","detail":"/e?ids={id}","key":"id","as":"device","list_field":"resources"}]));
+        let cex = parse_expands(&Config(cs)).unwrap();
+        assert_eq!(cex[0].list_field, "resources");
         // malformed entries are an error, not a silent drop
         let mut bad = Map::new();
         bad.insert("EXPAND".into(), json!([{"name": "ua", "list": "/users"}]));
