@@ -1,0 +1,21 @@
+[package]
+name = "vejas-salesforce"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vejas Salesforce connector: OAuth2 + Bulk API 2.0 query, streaming large-volume exports row-by-row as JSON lines. Native Rust; HTTP via curl (argv-safe)."
+
+# Like the SAP connector, built to run as an isolated exec process (ADR-0011) and
+# bridged to the bus by the runtime's exec-stream-source driver. HTTP goes through
+# curl with a 0600 config file so the bearer token never touches argv (ADR-0008).
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "vejas-salesforce"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true

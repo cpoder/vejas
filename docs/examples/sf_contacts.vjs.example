@@ -1,0 +1,18 @@
+# connector: sf_contacts — Salesforce large-volume export (Bulk API 2.0) as a stream.
+#
+# vejas-salesforce runs an OAuth2 login, submits a Bulk 2.0 query job, polls it to
+# completion, and streams each result row (CSV pages paginated by Sforce-Locator)
+# as one JSON line — which exec-stream-source publishes to SUBJECT with
+# back-pressure, so a multi-million-row export flows through bounded memory.
+# Isolated exec process (ADR-0011); HTTP via curl, bearer token in a 0600 config
+# (never argv, ADR-0008); secrets via secret() — never literals.
+#
+# Under exec-stream-source, set SF_INTERVAL_SECS > 0: the process stays alive and
+# re-exports on that cadence (a periodic sync). SF_INTERVAL_SECS=0 is a one-shot
+# that exits — use that only with a manual run, not this driver (which would
+# restart it into a re-export loop).
+driver "exec-stream-source"
+SUBJECT = "vx.salesforce.contacts"
+CMD = "/opt/vejas/vejas-salesforce"
+ENV = {SF_LOGIN_URL: "https://login.salesforce.com", SF_GRANT_TYPE: "password", SF_CLIENT_ID: "3MVG9...consumer_key", SF_CLIENT_SECRET: secret("sf/client_secret"), SF_USERNAME: "integration@acme.com", SF_PASSWORD: secret("sf/password"), SF_QUERY: "SELECT Id, Name, Email FROM Contact", SF_API_VERSION: "v60.0", SF_MAX_RECORDS: "50000", SF_INTERVAL_SECS: "3600"}
+RESTART_SECS = 30
