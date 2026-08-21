@@ -108,6 +108,7 @@ recent traffic the change applies directly.
 | `GET /drivers` | the connector driver catalog |
 | `GET /secrets` · `POST /secrets/set` | secret references + resolve-status (never values) · write one value (write-only) and restart its users |
 | `POST /connectors/test` | probe one connector instance end to end (real secrets, remote reached, nothing written) |
+| `POST /provision` | instantiate a tenant package from a template (render, parse-check, hot-start) |
 | `GET /preview?file=` | run a flow on its fixture → emits + pipeline |
 | `GET /file?path=` · `POST /file/set` | read / write a script (parse-validated) |
 | `GET /fixture?file=` · `POST /fixture/set` | read / write a sample input |

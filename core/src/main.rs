@@ -1222,6 +1222,168 @@ fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
         .to_string())
 }
 
+// ───────────────────────── provision (templates) ─────────────────────────
+//
+// Instantiate a tenant package from a template directory: files under
+// templates/<name>/ are rendered with ${param} substitution, parse-checked,
+// written under packages/<tenant_slug>/, and started. This is the machine
+// behind an operator's "connect your account" button — the runtime stays
+// declarative (files on disk), the operator's app calls one operation.
+
+fn valid_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn valid_template_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Params land inside executed .vjs files: a hostile value must not be able
+/// to break out of a string literal or smuggle statements (that path ends at
+/// an exec-source manifest). Whitelist, not blacklist.
+fn valid_param_value(s: &str) -> bool {
+    s.len() <= 512
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "-_./:?=&%$@#+, ".contains(c)
+        })
+}
+
+fn render_template(src: &str, slug: &str, params: &serde_json::Map<String, Value>) -> Result<String, String> {
+    let mut out = src.replace("${tenant_slug}", slug);
+    for (k, v) in params {
+        let Some(v) = v.as_str() else {
+            return Err(format!("param {k:?} must be a string"));
+        };
+        out = out.replace(&format!("${{{k}}}"), v);
+    }
+    // an unfilled ${placeholder} means a missing param — refuse loudly
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("${") {
+        let tail = &rest[i + 2..];
+        if let Some(j) = tail.find('}') {
+            let name = &tail[..j];
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Err(format!("missing param {name:?}"));
+            }
+        }
+        rest = &rest[i + 2..];
+    }
+    Ok(out)
+}
+
+fn template_files(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                template_files(&p, base, out);
+            } else if let Ok(rel) = p.strip_prefix(base) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+}
+
+fn provision(
+    registry: &Registry,
+    root: &Path,
+    template: &str,
+    slug: &str,
+    params: &serde_json::Map<String, Value>,
+    force: bool,
+) -> Result<Value, String> {
+    if !valid_template_name(template) {
+        return Err("invalid template name".into());
+    }
+    if !valid_slug(slug) {
+        return Err("invalid tenant_slug (lowercase [a-z0-9_], starts with a letter)".into());
+    }
+    for (k, v) in params {
+        if !k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(format!("invalid param name {k:?}"));
+        }
+        match v.as_str() {
+            Some(s) if valid_param_value(s) => {}
+            Some(_) => return Err(format!("param {k:?} contains forbidden characters")),
+            None => return Err(format!("param {k:?} must be a string")),
+        }
+    }
+    let tdir = root.join("templates").join(template);
+    if !tdir.is_dir() {
+        return Err(format!("unknown template {template:?} (no templates/{template}/)"));
+    }
+    let pkg_dir = root.join("packages").join(slug);
+    if pkg_dir.exists() && !force {
+        return Err(format!(
+            "package {slug:?} already exists — pass force to overwrite the template-rendered files (local corrections in them will be lost)"
+        ));
+    }
+    // two phases: render + validate EVERYTHING in memory, then write
+    let mut rels = Vec::new();
+    template_files(&tdir, &tdir, &mut rels);
+    if rels.is_empty() {
+        return Err(format!("template {template:?} is empty"));
+    }
+    let mut rendered: Vec<(PathBuf, String)> = Vec::new();
+    for rel in &rels {
+        let src = fs::read_to_string(tdir.join(rel)).map_err(|e| e.to_string())?;
+        let body = render_template(&src, slug, params)
+            .map_err(|e| format!("{}: {e}", rel.display()))?;
+        let name = rel.to_string_lossy();
+        if name.ends_with(".vjs") {
+            vjs::parse(&body).map_err(|e| format!("{}: {e}", rel.display()))?;
+        } else if name.ends_with(".json") {
+            serde_json::from_str::<Value>(&body)
+                .map_err(|e| format!("{}: invalid JSON: {e}", rel.display()))?;
+        }
+        rendered.push((rel.clone(), body));
+    }
+    let mut created = Vec::new();
+    for (rel, body) in &rendered {
+        let target = pkg_dir.join(rel);
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        fs::write(&target, body).map_err(|e| e.to_string())?;
+        created.push(format!("packages/{slug}/{}", rel.display()));
+    }
+    let (_, _, _) = reload(registry, root);
+    let started: Vec<String> = scan_all(root)
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|n| n.starts_with(&format!("flow:{slug}:")) || n.starts_with(&format!("connector:{slug}:")))
+        .collect();
+    // the provisioner's next step is writing these — hand it the exact list
+    let store = secrets::default_store();
+    let mut secret_refs = Vec::new();
+    for (rel, body) in &rendered {
+        if rel.to_string_lossy().ends_with(".vjs") {
+            if let Ok(prog) = vjs::parse(body) {
+                for (_, r) in prog.secret_refs {
+                    if !secret_refs.iter().any(|e: &Value| e["ref"] == r.as_str()) {
+                        let status = match store.get(&r) {
+                            Ok(_) => "ok",
+                            Err(_) => "missing",
+                        };
+                        secret_refs.push(json!({"ref": r, "status": status}));
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({
+        "ok": true, "tenant": slug, "template": template,
+        "created": created, "started": started, "secret_refs": secret_refs,
+    }))
+}
+
 /// One synchronous test of a connector instance: evaluate its manifest with
 /// the REAL secrets (a missing one fails here, in words), then run the
 /// driver's probe — reach the remote side, touch nothing.
@@ -1327,6 +1489,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_secrets", "description": "The secret references declared by flows and connectors, who uses each, and whether it RESOLVES against the store — references and statuses only, never values.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_set_secret", "description": "Write one secret value into the store (rotation included) and restart the units that reference it. WRITE-ONLY: no surface ever returns the value.", "inputSchema": obj(json!({"ref": {"type": "string", "description": "the secret(\"path/key\") reference"}, "value": {"type": "string"}}), vec!["ref", "value"])}),
         json!({"name": "vejas_test_connector", "description": "Synchronously test one connector instance: evaluate its manifest with the real secrets, reach the remote side with the driver's probe, touch nothing. Returns {ok, detail} in plain words.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_provision", "description": "Instantiate a tenant package from a template (templates/<name>/, ${param} substitution, every file parse-checked, hot-started). Returns created files, started units and the secret references left to write. Refuses an existing package unless force (which overwrites template-rendered files).", "inputSchema": obj(json!({"template": {"type": "string"}, "tenant_slug": {"type": "string"}, "params": {"type": "object"}, "force": {"type": "boolean"}}), vec!["template", "tenant_slug"])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -1438,6 +1601,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         "vejas_test_connector" => {
             let file = args["file"].as_str().ok_or("file required")?;
             text(probe_connector(root, file).to_string())
+        }
+        "vejas_provision" => {
+            let template = args["template"].as_str().ok_or("template required")?;
+            let slug = args["tenant_slug"].as_str().ok_or("tenant_slug required")?;
+            let params = args["params"].as_object().cloned().unwrap_or_default();
+            let force = args["force"].as_bool().unwrap_or(false);
+            text(provision(registry, root, template, slug, &params, force)?.to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -1602,6 +1772,20 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "need file".into(), "text/plain");
             };
             respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
+        }
+        (tiny_http::Method::Post, "/provision") => {
+            let body = read_body(&mut request);
+            let (Some(template), Some(slug)) =
+                (body["template"].as_str(), body["tenant_slug"].as_str())
+            else {
+                return respond(request, 400, "need template+tenant_slug".into(), "text/plain");
+            };
+            let params = body["params"].as_object().cloned().unwrap_or_default();
+            let force = body["force"].as_bool().unwrap_or(false);
+            match provision(&registry, &root, template, slug, &params, force) {
+                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
         }
         (tiny_http::Method::Get, "/preview") => {
             let Some(file) = qparam(&url, "file") else {
@@ -1996,6 +2180,49 @@ mod tests {
         // nothing was written: the file still holds the original threshold
         let src = std::fs::read_to_string(root.join("flows").join("replay_probe.vjs")).unwrap();
         assert!(src.contains("TH = 500"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provision_renders_checks_and_guards() {
+        let root = std::env::temp_dir().join(format!("vejas-prov-{}", std::process::id()));
+        let t = root.join("templates").join("demo");
+        std::fs::create_dir_all(t.join("connectors")).unwrap();
+        std::fs::write(t.join("package.vjs"), "ENABLED = true\nEXPORTS = []\n").unwrap();
+        std::fs::write(
+            t.join("connectors").join("hb.vjs"),
+            "# connector: hb\ndriver \"timer\"\nSUBJECT = \"vx.${tenant_slug}.ping\"\nINTERVAL_SECS = 300\nPAYLOAD = {origin: \"${origin}\"}\n",
+        )
+        .unwrap();
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let mut params = serde_json::Map::new();
+        params.insert("origin".into(), json!("acme"));
+        let out = provision(&registry, &root, "demo", "acme_it", &params, false).unwrap();
+        assert_eq!(out["ok"], true);
+        let rendered =
+            std::fs::read_to_string(root.join("packages/acme_it/connectors/hb.vjs")).unwrap();
+        assert!(rendered.contains("vx.acme_it.ping"));
+        assert!(rendered.contains("\"acme\""));
+        // create-only by default; force overwrites
+        assert!(provision(&registry, &root, "demo", "acme_it", &params, false)
+            .unwrap_err()
+            .contains("already exists"));
+        assert!(provision(&registry, &root, "demo", "acme_it", &params, true).is_ok());
+        // missing param -> loud refusal, nothing written
+        let empty = serde_json::Map::new();
+        assert!(provision(&registry, &root, "demo", "fresh_t", &empty, false)
+            .unwrap_err()
+            .contains("missing param"));
+        assert!(!root.join("packages/fresh_t").exists());
+        // injection guard: a value that could escape a string literal is refused
+        let mut evil = serde_json::Map::new();
+        evil.insert("origin".into(), json!("x\"\nCMD = \"rm -rf /\""));
+        assert!(provision(&registry, &root, "demo", "evil_t", &evil, false)
+            .unwrap_err()
+            .contains("forbidden characters"));
+        // slug and template names are pinned
+        assert!(provision(&registry, &root, "demo", "../oops", &params, false).is_err());
+        assert!(provision(&registry, &root, "../etc", "okslug", &params, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
