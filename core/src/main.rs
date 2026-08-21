@@ -1554,6 +1554,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_list", "description": "List SAP function modules (BAPIs/RFCs) on the live system whose name matches a pattern (SAP wildcards, e.g. \"BAPI_USER*\"). Needs an exec-rpc SAP connector running (driver \"exec-rpc\").", "inputSchema": obj(json!({"pattern": {"type": "string"}}), vec![])}),
         json!({"name": "sap_describe", "description": "Describe a SAP function module's interface: every parameter's name, direction (import/export/changing/tables), type and length. Read this before sap_call.", "inputSchema": obj(json!({"func": {"type": "string"}}), vec!["func"])}),
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
+        json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -1689,6 +1690,15 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             }
             if let Some(mr) = args.get("max_rows") {
                 op["max_rows"] = mr.clone();
+            }
+            text(sap_rpc_request(root, &op)?.to_string())
+        }
+        "sap_send_idoc" => {
+            let mut op = json!({"op": "send_idoc"});
+            op["control"] = args.get("control").cloned().unwrap_or(json!({}));
+            op["data"] = args.get("data").cloned().unwrap_or(json!([]));
+            if let Some(t) = args.get("tid") {
+                op["tid"] = t.clone();
             }
             text(sap_rpc_request(root, &op)?.to_string())
         }
