@@ -1,0 +1,22 @@
+[package]
+name = "vejas-sap-rfc"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vejas SAP connector: native Rust over the SAP NW RFC SDK (libsapnwrfc), dlopen'd at runtime. Isolated exec process (ADR-0011, ADR-0014). No JVM, no Python."
+
+# NOT a member of the runtime workspace: it dlopen's libsapnwrfc at runtime, so
+# it has NO build-time SAP dependency and builds anywhere; only *running* needs
+# the SDK (present on every SAP host, shipped with the kernel). Build it where it
+# will run (matching glibc) — e.g. a rust container on the SAP host.
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "vejas-sap-rfc"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true

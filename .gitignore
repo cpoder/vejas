@@ -1,4 +1,5 @@
 /core/target/
+/connectors/sap-rfc/target/
 /e2e/node_modules/
 /e2e/out/
 .env
