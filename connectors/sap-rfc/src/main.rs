@@ -28,6 +28,14 @@ use serde_json::{json, Value};
 use std::ffi::{c_void, CString};
 use std::io::{self, BufRead, Write};
 use std::os::raw::{c_char, c_int, c_uint};
+use std::sync::OnceLock;
+
+/// The SDK is process-global so the C server callback (an `extern "C" fn` with
+/// no user-data pointer) can reach the marshalling helpers.
+static SDK: OnceLock<Sdk> = OnceLock::new();
+fn sdk() -> &'static Sdk {
+    SDK.get().expect("sdk not loaded")
+}
 
 // ─────────────────────────── FFI: types ───────────────────────────
 // SAP_UC on Linux is UTF-16LE (2 bytes). Proven against a live NPL system.
@@ -71,14 +79,27 @@ impl RfcErrorInfo {
         unsafe { std::mem::zeroed() }
     }
     fn to_json(&self, stage: &str) -> Value {
-        json!({
-            "ok": false,
-            "stage": stage,
-            "code": self.code,
-            "group": self.group,
-            "key": from_uc(&self.key),
-            "message": from_uc(&self.message),
-        })
+        let mut m = serde_json::Map::new();
+        m.insert("ok".into(), Value::Bool(false));
+        m.insert("stage".into(), Value::String(stage.to_string()));
+        m.insert("code".into(), json!(self.code));
+        m.insert("group".into(), json!(self.group));
+        m.insert("key".into(), Value::String(from_uc(&self.key)));
+        m.insert("message".into(), Value::String(from_uc(&self.message)));
+        // Surface the ABAP message coordinates when the failure is an ABAP raise.
+        let cls = from_uc(&self.abap_msg_class);
+        if !cls.is_empty() {
+            m.insert("abap_msg".into(), json!({
+                "class": cls,
+                "type": from_uc(&self.abap_msg_type),
+                "number": from_uc(&self.abap_msg_number),
+                "v1": from_uc(&self.abap_msg_v1),
+                "v2": from_uc(&self.abap_msg_v2),
+                "v3": from_uc(&self.abap_msg_v3),
+                "v4": from_uc(&self.abap_msg_v4),
+            }));
+        }
+        Value::Object(m)
     }
 }
 
@@ -161,6 +182,16 @@ type FnGetTable =
 type FnGetRowCount = unsafe extern "C" fn(RfcHandle, *mut c_uint, *mut RfcErrorInfo) -> RfcRc;
 type FnMoveTo = unsafe extern "C" fn(RfcHandle, c_uint, *mut RfcErrorInfo) -> RfcRc;
 type FnGetCurrentRow = unsafe extern "C" fn(RfcHandle, *mut RfcErrorInfo) -> RfcHandle;
+type FnAppendNewRow = unsafe extern "C" fn(RfcHandle, *mut RfcErrorInfo) -> RfcHandle;
+// Server side (registered server program — how SAP calls us, e.g. IDocs).
+type FnDescribeFunction = unsafe extern "C" fn(RfcHandle, *mut RfcErrorInfo) -> RfcHandle;
+type FnGetFunctionName = unsafe extern "C" fn(RfcHandle, *mut SapUc, *mut RfcErrorInfo) -> RfcRc;
+/// RFC_SERVER_FUNCTION: (serverConnection, funcHandle, errorInfo) -> RFC_RC.
+type ServerFn = unsafe extern "C" fn(RfcHandle, RfcHandle, *mut RfcErrorInfo) -> RfcRc;
+type FnRegisterServer = unsafe extern "C" fn(*const RfcConnParam, c_uint, *mut RfcErrorInfo) -> RfcHandle;
+type FnInstallServerFunction =
+    unsafe extern "C" fn(*const SapUc, RfcHandle, ServerFn, *mut RfcErrorInfo) -> RfcRc;
+type FnListenAndDispatch = unsafe extern "C" fn(RfcHandle, c_int, *mut RfcErrorInfo) -> RfcRc;
 
 /// Function pointers resolved from `libsapnwrfc` at startup.
 struct Sdk {
@@ -183,6 +214,12 @@ struct Sdk {
     get_row_count: FnGetRowCount,
     move_to: FnMoveTo,
     get_current_row: FnGetCurrentRow,
+    append_new_row: FnAppendNewRow,
+    describe_function: FnDescribeFunction,
+    get_function_name: FnGetFunctionName,
+    register_server: FnRegisterServer,
+    install_server_function: FnInstallServerFunction,
+    listen_and_dispatch: FnListenAndDispatch,
 }
 
 impl Sdk {
@@ -223,6 +260,12 @@ impl Sdk {
             get_row_count: sym!("RfcGetRowCount", FnGetRowCount),
             move_to: sym!("RfcMoveTo", FnMoveTo),
             get_current_row: sym!("RfcGetCurrentRow", FnGetCurrentRow),
+            append_new_row: sym!("RfcAppendNewRow", FnAppendNewRow),
+            describe_function: sym!("RfcDescribeFunction", FnDescribeFunction),
+            get_function_name: sym!("RfcGetFunctionName", FnGetFunctionName),
+            register_server: sym!("RfcRegisterServer", FnRegisterServer),
+            install_server_function: sym!("RfcInstallServerFunction", FnInstallServerFunction),
+            listen_and_dispatch: sym!("RfcListenAndDispatch", FnListenAndDispatch),
         })
     }
 }
@@ -451,6 +494,60 @@ fn marshal_table(sdk: &Sdk, container: RfcHandle, name: &str, max_rows: usize) -
     Ok(json!({"rows": Value::Array(arr), "total": total, "returned": limit}))
 }
 
+/// Set an input parameter/field from JSON, recursively: a JSON object fills a
+/// STRUCTURE, a JSON array fills a TABLE (one appended row per element), any
+/// scalar is set as a string (the SDK converts to the field's real type).
+fn set_field(sdk: &Sdk, container: RfcHandle, name: &str, value: &Value) -> Result<(), Value> {
+    match value {
+        Value::Array(rows) => {
+            let n = to_uc(name);
+            let mut table: RfcHandle = std::ptr::null_mut();
+            let mut e = RfcErrorInfo::zeroed();
+            if unsafe { (sdk.get_table)(container, n.as_ptr(), &mut table, &mut e) } != 0 {
+                return Err(e.to_json(&format!("get_table:{name}")));
+            }
+            for row in rows {
+                let Value::Object(m) = row else { continue };
+                let mut er = RfcErrorInfo::zeroed();
+                let rh = unsafe { (sdk.append_new_row)(table, &mut er) };
+                if rh.is_null() {
+                    return Err(er.to_json(&format!("append_row:{name}")));
+                }
+                for (k, v) in m {
+                    set_field(sdk, rh, k, v)?;
+                }
+            }
+            Ok(())
+        }
+        Value::Object(m) => {
+            let n = to_uc(name);
+            let mut st: RfcHandle = std::ptr::null_mut();
+            let mut e = RfcErrorInfo::zeroed();
+            if unsafe { (sdk.get_structure)(container, n.as_ptr(), &mut st, &mut e) } != 0 {
+                return Err(e.to_json(&format!("get_structure:{name}")));
+            }
+            for (k, v) in m {
+                set_field(sdk, st, k, v)?;
+            }
+            Ok(())
+        }
+        _ => {
+            let val = match value {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let ku = to_uc(name);
+            let vu = to_uc(&val);
+            let len = vu.len().saturating_sub(1) as c_uint; // exclude NUL
+            let mut e = RfcErrorInfo::zeroed();
+            if unsafe { (sdk.set_string)(container, ku.as_ptr(), vu.as_ptr(), len, &mut e) } != 0 {
+                return Err(e.to_json(&format!("set_string:{name}")));
+            }
+            Ok(())
+        }
+    }
+}
+
 // ─────────────────────────── ops ───────────────────────────
 fn op_ping(sdk: &Sdk, conn: RfcHandle) -> Value {
     let mut err = RfcErrorInfo::zeroed();
@@ -539,23 +636,12 @@ fn op_call(sdk: &Sdk, conn: RfcHandle, req: &Value) -> Value {
         return e.to_json("create_func");
     }
 
-    // Set scalar imports. (Import tables/structures: a later increment.)
+    // Set imports (scalars, structures, and tables — recursively).
     if let Some(imports) = req.get("import").and_then(|v| v.as_object()) {
         for (k, v) in imports {
-            if v.is_array() || v.is_object() {
-                continue; // non-scalar import not yet supported
-            }
-            let val = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let ku = to_uc(k);
-            let vu = to_uc(&val);
-            let len = vu.len().saturating_sub(1) as c_uint; // exclude NUL
-            let mut ei = RfcErrorInfo::zeroed();
-            if unsafe { (sdk.set_string)(f, ku.as_ptr(), vu.as_ptr(), len, &mut ei) } != 0 {
+            if let Err(je) = set_field(sdk, f, k, v) {
                 unsafe { (sdk.destroy_func)(f, &mut RfcErrorInfo::zeroed()) };
-                return ei.to_json(&format!("set_string:{k}"));
+                return je;
             }
         }
     }
@@ -632,6 +718,150 @@ fn op_list(sdk: &Sdk, conn: RfcHandle, req: &Value) -> Value {
     res
 }
 
+// ─────────────────── server mode (SAP calls us: IDocs) ───────────────────
+// RFC_RC values we branch on in the dispatch loop.
+const RFC_OK: RfcRc = 0;
+const RFC_COMMUNICATION_FAILURE: RfcRc = 1;
+const RFC_CLOSED: RfcRc = 6;
+const RFC_RETRY: RfcRc = 14;
+
+/// The server function SAP invokes on our registered program. Generic: it
+/// marshals every input (IMPORT/CHANGING scalars & structures, TABLES) of the
+/// received call from metadata and emits it as one JSON stream line, then acks
+/// (RFC_OK). For IDOC_INBOUND_ASYNCHRONOUS the IDoc rides in the tables
+/// IDOC_CONTROL_REC_40 / IDOC_DATA_REC_40.
+extern "C" fn on_server_call(_conn: RfcHandle, func: RfcHandle, _err: *mut RfcErrorInfo) -> RfcRc {
+    let sdk = sdk();
+    let mut e = RfcErrorInfo::zeroed();
+    let fd = unsafe { (sdk.describe_function)(func, &mut e) };
+
+    let mut namebuf = [0 as SapUc; 31];
+    let name = if !fd.is_null()
+        && unsafe { (sdk.get_function_name)(fd, namebuf.as_mut_ptr(), &mut RfcErrorInfo::zeroed()) }
+            == RFC_OK
+    {
+        from_uc(&namebuf)
+    } else {
+        "?".to_string()
+    };
+
+    let mut import = serde_json::Map::new();
+    let mut tables = serde_json::Map::new();
+    if !fd.is_null() {
+        if let Ok(params) = parameters(sdk, fd) {
+            for p in &params {
+                let pn = from_uc(&p.name);
+                match p.direction {
+                    RFC_TABLES => {
+                        if let Ok(v) = marshal_table(sdk, func, &pn, usize::MAX) {
+                            tables.insert(pn, v);
+                        }
+                    }
+                    RFC_IMPORT | RFC_CHANGING => {
+                        let v = if p.rtype == RFCTYPE_STRUCTURE {
+                            marshal_structure(sdk, func, &pn).unwrap_or(Value::Null)
+                        } else {
+                            get_string(sdk, func, &pn)
+                                .map(Value::String)
+                                .unwrap_or(Value::Null)
+                        };
+                        import.insert(pn, v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    reply(&json!({
+        "stream": true,
+        "kind": "call",
+        "func": name,
+        "import": Value::Object(import),
+        "tables": Value::Object(tables),
+    }));
+    RFC_OK
+}
+
+/// Register at the SAP gateway as a server program and stream every call SAP
+/// makes to us. This is the long-running exec-stream-source shape (one JSON line
+/// per event on stdout) that IDoc inbound and, later, SF Bulk both reuse.
+fn run_server() -> ! {
+    let sdk = sdk();
+
+    // A client (logon) connection to pull the metadata for the functions we
+    // serve — the server itself needs no logon.
+    let client = match open_connection(sdk) {
+        Ok(c) => c,
+        Err(je) => {
+            reply(&je);
+            std::process::exit(1);
+        }
+    };
+    // Functions SAP may call on us. IDOC_INBOUND_ASYNCHRONOUS is the real target;
+    // STFC_CONNECTION lets an admin validate dispatch from SE37/SM59 easily.
+    for fname in ["IDOC_INBOUND_ASYNCHRONOUS", "STFC_CONNECTION"] {
+        match func_desc(sdk, client, fname) {
+            Ok(fd) => {
+                let mut e = RfcErrorInfo::zeroed();
+                let rc = unsafe {
+                    (sdk.install_server_function)(std::ptr::null(), fd, on_server_call, &mut e)
+                };
+                if rc != RFC_OK {
+                    reply(&e.to_json(&format!("install:{fname}")));
+                }
+            }
+            Err(je) => reply(&json!({"ok": false, "stage": format!("metadata:{fname}"), "detail": je})),
+        }
+    }
+
+    // Register at the gateway.
+    let program_id = env_or("SAP_PROGRAM_ID", "VEJAS_IDOC");
+    let gwhost = env_or("SAP_GWHOST", &env_or("SAP_ASHOST", "localhost"));
+    let gwserv = env_or("SAP_GWSERV", "sapgw00");
+    let pairs = [
+        ("program_id", program_id.clone()),
+        ("gwhost", gwhost.clone()),
+        ("gwserv", gwserv.clone()),
+    ];
+    let bufs: Vec<(Vec<SapUc>, Vec<SapUc>)> =
+        pairs.iter().map(|(k, v)| (to_uc(k), to_uc(v))).collect();
+    let params: Vec<RfcConnParam> = bufs
+        .iter()
+        .map(|(k, v)| RfcConnParam {
+            name: k.as_ptr(),
+            value: v.as_ptr(),
+        })
+        .collect();
+
+    let mut e = RfcErrorInfo::zeroed();
+    let server = unsafe { (sdk.register_server)(params.as_ptr(), params.len() as c_uint, &mut e) };
+    if server.is_null() {
+        reply(&e.to_json("register_server"));
+        std::process::exit(1);
+    }
+    reply(&json!({
+        "ok": true, "ready": true, "mode": "idoc-server",
+        "program_id": program_id, "gwhost": gwhost, "gwserv": gwserv,
+        "connector": "sap-rfc",
+    }));
+
+    // Dispatch loop. RFC_RETRY = idle timeout (no call arrived); keep waiting.
+    loop {
+        let mut e = RfcErrorInfo::zeroed();
+        let rc = unsafe { (sdk.listen_and_dispatch)(server, 5, &mut e) };
+        match rc {
+            RFC_OK | RFC_RETRY => {}
+            RFC_CLOSED | RFC_COMMUNICATION_FAILURE => {
+                // Gateway dropped us; report and exit so the supervisor restarts.
+                reply(&e.to_json("listen"));
+                std::process::exit(1);
+            }
+            _ => reply(&e.to_json("dispatch")),
+        }
+    }
+}
+
 // ─────────────────────────── main loop ───────────────────────────
 fn reply(v: &Value) {
     let mut out = io::stdout().lock();
@@ -640,14 +870,28 @@ fn reply(v: &Value) {
 }
 
 fn main() {
-    let sdk = match Sdk::load() {
-        Ok(s) => s,
+    match Sdk::load() {
+        Ok(s) => {
+            let _ = SDK.set(s);
+        }
         Err(e) => {
             reply(&json!({"ok": false, "fatal": true, "error": e}));
             std::process::exit(1);
         }
-    };
-    let conn = match open_connection(&sdk) {
+    }
+    let sdk = sdk();
+
+    // Mode: `idoc-server` (register at the gateway, stream calls SAP makes to us)
+    // vs the default request/reply RPC client. Selected by argv[1] or SAP_MODE.
+    let mode = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("SAP_MODE").ok())
+        .unwrap_or_default();
+    if mode == "idoc-server" || mode == "serve" {
+        run_server();
+    }
+
+    let conn = match open_connection(sdk) {
         Ok(c) => c,
         Err(je) => {
             reply(&je);
@@ -672,10 +916,10 @@ fn main() {
         };
         let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let out = match op {
-            "ping" => op_ping(&sdk, conn),
-            "describe" => op_describe(&sdk, conn, &req),
-            "list" => op_list(&sdk, conn, &req),
-            "call" => op_call(&sdk, conn, &req),
+            "ping" => op_ping(sdk, conn),
+            "describe" => op_describe(sdk, conn, &req),
+            "list" => op_list(sdk, conn, &req),
+            "call" => op_call(sdk, conn, &req),
             other => json!({"ok": false, "error": format!("unknown op: {other}")}),
         };
         let out = match (req.get("id"), out) {
