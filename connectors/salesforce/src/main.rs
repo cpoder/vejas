@@ -308,8 +308,20 @@ fn stream_results(s: &Session, ver: &str, id: &str, max_records: u64) -> Result<
     Ok(total)
 }
 
+/// A ready session: either a caller-supplied access token + instance URL
+/// (e.g. from `sf org display --verbose`, or any prior OAuth), or a fresh OAuth.
+fn session() -> Result<Session, String> {
+    match (
+        std::env::var("SF_ACCESS_TOKEN").ok().filter(|s| !s.is_empty()),
+        std::env::var("SF_INSTANCE_URL").ok().filter(|s| !s.is_empty()),
+    ) {
+        (Some(token), Some(instance)) => Ok(Session { token, instance }),
+        _ => oauth(),
+    }
+}
+
 fn export_once(ver: &str, query: &str, max_records: u64) -> Result<u64, String> {
-    let s = oauth()?;
+    let s = session()?;
     status(&json!({"stage": "auth", "instance": s.instance}));
     let id = create_job(&s, ver, query)?;
     status(&json!({"stage": "job", "id": id}));
