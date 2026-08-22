@@ -73,7 +73,22 @@ loss test: 0 lost, DLQ clean), with `no_wait` pulls killing the batch-fill
 wait (#3) at the same time. 16× on the isolated hop; the true ceiling needs
 a faster publisher to measure.
 
+## The true hop ceiling and multi-flow scaling
+
+With parallel publishers (`PUBS=4/8`), the single-flow hop tops out around
+**7–8 k/s** (the publisher pushes 9.7 k/s, the flow drains just behind).
+Scaling the number of flows (`bench/multi-flow.sh`):
+
+| Flows | Aggregate rate | Runtime RSS |
+|---|---|---|
+| 1 | 7–8 k/s | 6 MB |
+| 10 | **9 948/s** | 12.9 MB |
+| 50 | 8 410/s | 49.3 MB |
+
+Throughput *rises* with flow count (consumers parallelize; the bus, not the
+interpreter, is the bound) and memory stays ~1 MB per running flow — fifty
+live, persisted flows in under 50 MB.
+
 ## Not measured yet
 
-Multi-flow scaling, comparative runs (same scenario on n8n / Windmill /
-Benthos) — after the ceilings above fall.
+Comparative runs beyond Redpanda Connect (n8n, Windmill) — in progress.
