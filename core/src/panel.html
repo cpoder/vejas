@@ -111,6 +111,27 @@
   .const label { display: block; font: 600 11px var(--mono); color: var(--ink2); margin-bottom: 7px; }
   .const .row { display: flex; gap: 7px; }
 
+  /* rules-view (ADR-0019): read-only projection of the flow's if/elif/else */
+  .rules { display: flex; flex-direction: column; gap: 8px; }
+  .rule-line { border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px;
+               font-size: 13.5px; color: var(--ink); line-height: 2.1;
+               display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .rule-kw { font: 600 10px var(--mono); letter-spacing: .06em; color: var(--muted);
+             text-transform: uppercase; }
+  .rule-then { font: 12.5px var(--mono); color: var(--ink2); background: var(--chip);
+               border-radius: 7px; padding: 1px 8px; }
+  .lit-chip { display: inline-flex; align-items: center; gap: 5px; }
+  .lit-chip input { font: 12.5px var(--mono); padding: 2px 7px; border: 1px solid var(--line);
+                    border-radius: 7px; background: var(--wash); color: var(--ink);
+                    width: auto; min-width: 4ch; max-width: 20ch; }
+  .lit-chip input:focus { outline: none; border-color: var(--accent); }
+  .lit-chip.dirty input { border-color: var(--accent); }
+  .rule-adv { font: 600 9.5px var(--mono); letter-spacing: .07em; text-transform: uppercase;
+              color: var(--err); border: 1px solid var(--err); border-radius: 6px; padding: 1px 6px; }
+  .rule-raw { font: 12.5px var(--mono); color: var(--ink); background: var(--wash);
+              border-radius: 7px; padding: 1px 8px; }
+  .rule-hint { flex-basis: 100%; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+
   .run { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-top: 4px;
          font-size: 13px; color: var(--ink2); }
   .run b { color: var(--ink); font-weight: 650; }
@@ -449,6 +470,71 @@ function constsSection(card, file, entries, direct) {
   }
   card.appendChild(grid);
 }
+
+// Rules-view (ADR-0019): a READ-ONLY projection of the flow's top-level
+// if/elif/else. A guard that renders exactly becomes a sentence with its surface
+// literals inline-editable (same Apply→replay→Promote loop as the constants); a
+// composed guard is shown as its verbatim source, flagged "advanced", and pointed
+// at the agent loop. No new write path — structure is never editable here.
+function literalChip(name, entry, file, direct) {
+  const chip = document.createElement('span'); chip.className = 'lit-chip';
+  const input = document.createElement('input');
+  const isList = Array.isArray(entry.value);
+  input.value = isList ? entry.value.join(', ') : String(entry.value);
+  if (isSecretKey(name)) maskInput(input);
+  input.size = Math.max(String(input.value).length, 3);
+  input.oninput = () => { chip.classList.add('dirty'); input.size = Math.max(input.value.length, 3); };
+  const parse = () => isList
+    ? input.value.split(',').map(s => parseConst(s)).filter(v => v !== '')
+    : parseConst(input.value);
+  chip.appendChild(input);
+  chip.appendChild(applyBtn(() => chip, () => ({file, name, key: '-', value: parse()}), direct));
+  return chip;
+}
+function rulesSection(card, file, entries, direct) {
+  const sect = document.createElement('div');
+  sect.className = 'sect'; sect.textContent = 'rules';
+  const holder = document.createElement('div'); holder.className = 'rules';
+  card.appendChild(sect); card.appendChild(holder);
+  const byName = {}; for (const e of entries) byName[e.name] = e;
+  fetch('/rules?file=' + encodeURIComponent(file)).then(r => r.json()).then(d => {
+    const rules = (d && d.rules) || [];
+    if (!rules.length) { sect.remove(); holder.remove(); return; }  // no if/elif → no section
+    for (const rule of rules) {
+      const line = document.createElement('div'); line.className = 'rule-line';
+      if (rule.projectable) {
+        const kw = document.createElement('span'); kw.className = 'rule-kw';
+        kw.textContent = rule.kind === 'else' ? 'otherwise' : 'when';
+        line.appendChild(kw);
+        if (rule.kind !== 'else' && rule.when != null) {
+          // splice inline literal editors into the rendered condition
+          const names = (rule.literals || []).filter(n => byName[n]);
+          const re = names.length ? new RegExp('(' + names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')') : null;
+          const segs = re ? rule.when.split(re) : [rule.when];
+          for (const seg of segs) {
+            if (seg === '') continue;
+            if (names.includes(seg)) line.appendChild(literalChip(seg, byName[seg], file, direct));
+            else line.appendChild(document.createTextNode(seg));
+          }
+          const then = document.createElement('span'); then.className = 'rule-kw'; then.textContent = 'then';
+          line.appendChild(then);
+        }
+        for (const a of rule.then || []) {
+          const t = document.createElement('span'); t.className = 'rule-then'; t.textContent = a;
+          line.appendChild(t);
+        }
+      } else {
+        const kw = document.createElement('span'); kw.className = 'rule-kw'; kw.textContent = 'when';
+        const adv = document.createElement('span'); adv.className = 'rule-adv'; adv.textContent = 'advanced';
+        const raw = document.createElement('code'); raw.className = 'rule-raw'; raw.textContent = rule.raw;
+        const hint = document.createElement('div'); hint.className = 'rule-hint';
+        hint.textContent = 'Composed condition — change it through the agent (prompt → rewrite → shadow-replay → promote), not here.';
+        line.appendChild(kw); line.appendChild(adv); line.appendChild(raw); line.appendChild(hint);
+      }
+      holder.appendChild(line);
+    }
+  }).catch(() => { sect.remove(); holder.remove(); });
+}
 function runStrip(card, preview) {
   const run = document.createElement('div'); run.className = 'run';
   if (!preview || !preview.fixture) {
@@ -549,6 +635,9 @@ async function load() {
     for (const e of list.filter(x => x.kind === 'table')) tableSection(card, file, e, isConnector);
     const consts = list.filter(x => x.kind === 'constant');
     if (consts.length) constsSection(card, file, consts, isConnector);
+    // Rules-view: only for flows (if/elif/else live in flow scripts, not
+    // connector manifests); services may carry rules too, so include them.
+    if (!isConnector && lang === 'vjs') rulesSection(card, file, list, isConnector);
     const toolbar = document.createElement('div'); toolbar.className = 'toolbar';
     if (isConnector) {
       const btnTest = document.createElement('button'); btnTest.className = 'tool';

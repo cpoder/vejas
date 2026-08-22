@@ -66,20 +66,26 @@ vault, from `docker compose`.
   (`e2e/transport/run.sh`, in CI), asserting the at-least-once / publish-before-
   ack / anti-zombie invariants (ADR-0002) against a live nats+runtime.
 
-## Phase 5 — Operator credibility · NEXT
+## Phase 5 — Operator credibility · IN PROGRESS
 
 What turns "nice project" into "I can run this in production":
 
-1. **Persistent dead letters**: a poisoned message stops being dropped — it
-   lands on a dedicated DLQ stream with a death envelope (subject, unit,
-   attempts, last error, payload), visible in the panel, re-injected
-   explicitly after the fix. The sister loop of ADR-0005.
-2. **Real observability**: OpenTelemetry traces + a Prometheus `/metrics`
-   endpoint. (The manifesto stops claiming this until it ships.)
-3. **Full shadow-replay** (ADR-0005): JetStream-hydrated history, audit trail,
-   one-click rollback.
+1. **Persistent dead letters** · built (ADR-0015): a poisoned message stops
+   being dropped — it lands on a dedicated DLQ stream with a death envelope
+   (subject, unit, attempts, last error, payload), visible in the panel,
+   re-injected explicitly after the fix. The sister loop of ADR-0005.
+2. **Real observability** · built (ADR-0016): OTLP/HTTP-JSON traces + a
+   Prometheus `/metrics` endpoint, hand-rolled to keep the footprint. The
+   manifesto claims it again now that it ships.
+3. **Full shadow-replay** · built (ADR-0018): JetStream-hydrated history,
+   promote audit trail (git + `VEJAS_AUDIT`), forward-only rollback.
 4. **Published, reproducible benchmarks**: throughput, memory, image size,
-   cold start — against the incumbents, same scenario.
+   cold start — against the incumbents, same scenario. (In progress.)
+5. **Rules-view (N2)** · built (ADR-0019): a read-only projection of a flow's
+   `if/elif/else` into readable sentences with the surface literals editable
+   inline; a composed guard is shown verbatim and routed to the agent (N3).
+   The rule-editing doctrine (N1 parameters / N2 reading / N3 structure, no
+   graphical rule editor) is settled there.
 
 ## Cross-cutting, ongoing
 

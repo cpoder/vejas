@@ -1178,6 +1178,18 @@ fn graph_json(root: &Path) -> Value {
     json!({ "flows": flows, "services": services, "connectors": connectors })
 }
 
+/// The rules-view projection of a flow (ADR-0019): its top-level if/elif/else
+/// arms as faithful sentences or verbatim-raw blocks, plus the source file (so
+/// the panel can edit the inline literals through the existing surface loop).
+fn rules_json(root: &Path, file: &str) -> Result<String, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let prog = vjs::parse(&src)?;
+    let surface: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
+    let rules = vjs::flow_rules(&prog, &src, &surface);
+    Ok(json!({"file": file, "rules": rules}).to_string())
+}
+
 fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -2561,6 +2573,15 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "missing file".into(), "text/plain");
             };
             match preview_json(&root, &file) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, "/rules") => {
+            let Some(file) = qparam(&url, "file") else {
+                return respond(request, 400, "missing file".into(), "text/plain");
+            };
+            match rules_json(&root, &file) {
                 Ok(json) => respond(request, 200, json, "application/json"),
                 Err(err) => respond(request, 500, err, "text/plain"),
             }

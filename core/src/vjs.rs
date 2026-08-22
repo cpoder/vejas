@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde_json::{Map, Number, Value};
+use serde_json::{json, Map, Number, Value};
 
 // ───────────────────────────── lexer ─────────────────────────────
 
@@ -345,7 +345,10 @@ pub enum BinOp {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Assign(Vec<String>, Expr),
-    If(Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
+    /// Each arm is (condition, condition source span, body). The span lets the
+    /// rules-view (ADR-0019) show a non-projectable guard's exact source rather
+    /// than a paraphrase; the interpreter ignores it.
+    If(Vec<(Expr, (usize, usize), Vec<Stmt>)>, Option<Vec<Stmt>>),
     For(String, Expr, Vec<Stmt>),
     Emit(Expr, Expr),
     /// `respond <status>, <body>` — set the synchronous HTTP response of an
@@ -382,6 +385,140 @@ pub struct Program {
     /// Top-level `NAME = secret("path/key")` references (name, reference).
     /// Lets the panel show which secrets a flow/connector uses, never values.
     pub secret_refs: Vec<(String, String)>,
+}
+
+// ───────────────────────── rules-view projection (ADR-0019) ─────────────────────────
+//
+// N2 of the rule-editing doctrine: a READ-ONLY projection of a flow's top-level
+// `if/elif/else` into sentences a domain expert can read, with the surface
+// literals they reference marked inline-editable (they reuse the existing
+// Apply→replay→Promote loop — no new write path). The projection is FAITHFUL or
+// RAW, never a lossy paraphrase and never half-French/half-code: an arm whose
+// guard is EXACTLY renderable (one comparison of simple operands) becomes a
+// sentence; anything composed (and/or, optional `?.`, projections, calls) is
+// shown as its verbatim source, flagged "advanced", and pointed at the agent
+// loop (N3). Granularity is per-arm and binary.
+
+/// Render an operand of a comparison, faithfully, or None if it is not a simple
+/// value navigation (which forces the whole guard to RAW).
+fn render_atom(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(n) => Some(n.clone()),
+        Expr::Lit(Value::String(s)) => Some(format!("\"{s}\"")),
+        Expr::Lit(v) => Some(v.to_string()),
+        // plain field access only: an optional `?.` (flag = true) is "advanced".
+        Expr::Field(b, name, false) => Some(format!("{}.{name}", render_atom(b)?)),
+        Expr::Index(b, idx) => Some(format!("{}[{}]", render_atom(b)?, render_atom(idx)?)),
+        _ => None,
+    }
+}
+
+/// Collect the surface-constant names an operand references (UPPERCASE Vars that
+/// exist in the flow's surface) — those become the inline-editable literals.
+fn collect_surface_refs(e: &Expr, surface: &[String], out: &mut Vec<String>) {
+    match e {
+        Expr::Var(n) if surface.iter().any(|s| s == n) => {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        Expr::Field(b, _, _) => collect_surface_refs(b, surface, out),
+        Expr::Index(b, i, ..) => {
+            collect_surface_refs(b, surface, out);
+            collect_surface_refs(i, surface, out);
+        }
+        _ => {}
+    }
+}
+
+fn cmp_symbol(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Eq => Some("="),
+        BinOp::Ne => Some("≠"),
+        BinOp::Lt => Some("<"),
+        BinOp::Le => Some("≤"),
+        BinOp::Gt => Some(">"),
+        BinOp::Ge => Some("≥"),
+        BinOp::In => Some("in"),
+        _ => None, // and/or/coalesce/arithmetic are not a single comparison
+    }
+}
+
+/// A projectable guard is exactly ONE comparison of two simple operands. Returns
+/// the rendered sentence fragment and the surface literals it references.
+fn render_guard(cond: &Expr, surface: &[String]) -> Option<(String, Vec<String>)> {
+    if let Expr::Bin(op, a, b) = cond {
+        let sym = cmp_symbol(*op)?;
+        let (la, lb) = (render_atom(a)?, render_atom(b)?);
+        let mut refs = Vec::new();
+        collect_surface_refs(a, surface, &mut refs);
+        collect_surface_refs(b, surface, &mut refs);
+        return Some((format!("{la} {sym} {lb}"), refs));
+    }
+    None
+}
+
+/// The action a projectable arm performs: its emit subjects (and `respond`),
+/// rendered only when each is a literal subject and the body has no nested
+/// control flow. None means the body is not a simple action → the arm is RAW.
+fn render_action(body: &[Stmt]) -> Option<Vec<String>> {
+    let mut acts = Vec::new();
+    for st in body {
+        match st {
+            Stmt::Emit(subject, _) => match subject {
+                Expr::Lit(Value::String(s)) => acts.push(format!("→ {s}")),
+                _ => return None, // dynamic subject: not exactly renderable
+            },
+            Stmt::Respond(status, _) => acts.push(match status {
+                Expr::Lit(v) => format!("respond {v}"),
+                _ => "respond".to_string(),
+            }),
+            // assignments are internal plumbing — allowed, not shown
+            Stmt::Assign(_, _) | Stmt::InvokeMerge(_, _) => {}
+            // nested control flow makes the arm advanced → RAW
+            Stmt::If(..) | Stmt::For(..) => return None,
+        }
+    }
+    if acts.is_empty() {
+        None // no visible action to project
+    } else {
+        Some(acts)
+    }
+}
+
+/// Project a flow's top-level `if/elif/else` arms into rule views (ADR-0019).
+/// `src` is the flow source (for the verbatim RAW slice); `surface` is the set of
+/// business-surface literal names (the inline-editable ones).
+pub fn flow_rules(prog: &Program, src: &str, surface: &[String]) -> Vec<Value> {
+    let mut rules = Vec::new();
+    for st in &prog.stmts {
+        let Stmt::If(arms, otherwise) = st else { continue };
+        for (i, (cond, span, body)) in arms.iter().enumerate() {
+            let kind = if i == 0 { "if" } else { "elif" };
+            let raw = src.get(span.0..span.1).map(|s| s.trim()).unwrap_or("");
+            match (render_guard(cond, surface), render_action(body)) {
+                (Some((when, literals)), Some(then)) => rules.push(json!({
+                    "kind": kind, "projectable": true,
+                    "when": when, "then": then, "literals": literals,
+                })),
+                _ => rules.push(json!({
+                    "kind": kind, "projectable": false, "raw": raw,
+                })),
+            }
+        }
+        if let Some(body) = otherwise {
+            match render_action(body) {
+                Some(then) => rules.push(json!({
+                    "kind": "else", "projectable": true,
+                    "when": Value::Null, "then": then, "literals": [],
+                })),
+                None => rules.push(json!({
+                    "kind": "else", "projectable": false, "raw": "…",
+                })),
+            }
+        }
+    }
+    rules
 }
 
 // ───────────────────────────── parser ─────────────────────────────
@@ -626,7 +763,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Stmt::If(arms, els) => {
-                        for (c, b) in arms {
+                        for (c, _span, b) in arms {
                             walk_expr(c, "if", out);
                             walk_stmts(b, out);
                         }
@@ -795,17 +932,21 @@ impl<'a> Parser<'a> {
             Tok::If => {
                 self.next();
                 let mut arms = Vec::new();
+                let cstart = self.pos();
                 let cond = self.expr(0)?;
+                let cend = self.pos(); // the ':' token position — condition is src[cstart..cend]
                 self.eat(Tok::Colon, ":")?;
-                arms.push((cond, self.block()?));
+                arms.push((cond, (cstart, cend), self.block()?));
                 let mut otherwise = None;
                 loop {
                     match self.peek() {
                         Tok::Elif => {
                             self.next();
+                            let cstart = self.pos();
                             let c = self.expr(0)?;
+                            let cend = self.pos();
                             self.eat(Tok::Colon, ":")?;
-                            arms.push((c, self.block()?));
+                            arms.push((c, (cstart, cend), self.block()?));
                         }
                         Tok::Else => {
                             self.next();
@@ -1042,7 +1183,7 @@ fn collect_static(
             Stmt::InvokeMerge(name, _) => push(invokes, name.clone()),
             Stmt::Assign(_, Expr::Invoke(name, _)) => push(invokes, name.clone()),
             Stmt::If(arms, otherwise) => {
-                for (_, b) in arms {
+                for (_, _, b) in arms {
                     collect_static(b, consts, emits, invokes);
                 }
                 if let Some(b) = otherwise {
@@ -1284,7 +1425,7 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
             }
             Stmt::If(arms, otherwise) => {
                 let mut done = false;
-                for (cond, body) in arms {
+                for (cond, _span, body) in arms {
                     if truthy(&eval(cond, ctx, engine)?) {
                         exec_block(body, ctx, engine)?;
                         done = true;
@@ -1680,6 +1821,35 @@ mod tests {
         let prog = parse(src)?;
         let mut engine = Engine::new(std::env::temp_dir(), "default".into());
         run(&prog, &event, &mut engine).map(|c| c.emits)
+    }
+
+    #[test]
+    fn rules_projection_faithful_or_raw() {
+        let src = "source \"vx.orders.in\"\n\
+                   MIN_TOTAL_EUR = 1000\n\
+                   if event.total >= MIN_TOTAL_EUR:\n\
+                     emit \"vx.erp.dispatch\", { id: event.id }\n\
+                   elif event.total > 0 and event.status == \"OPEN\":\n\
+                     emit \"vx.review.queue\", { id: event.id }\n\
+                   else:\n\
+                     emit \"vx.orders.reject\", { id: event.id }\n\
+                   end\n";
+        let prog = parse(src).unwrap();
+        let surface: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
+        let rules = flow_rules(&prog, src, &surface);
+        assert_eq!(rules.len(), 3);
+        // arm 1: a single comparison against a surface literal → projectable
+        assert_eq!(rules[0]["projectable"], true);
+        assert_eq!(rules[0]["when"], "event.total ≥ MIN_TOTAL_EUR");
+        assert_eq!(rules[0]["then"][0], "→ vx.erp.dispatch");
+        assert_eq!(rules[0]["literals"][0], "MIN_TOTAL_EUR");
+        // arm 2: composed (and) → RAW, verbatim source, no paraphrase
+        assert_eq!(rules[1]["projectable"], false);
+        assert_eq!(rules[1]["raw"], "event.total > 0 and event.status == \"OPEN\"");
+        // else: simple action → projectable, no condition
+        assert_eq!(rules[2]["kind"], "else");
+        assert_eq!(rules[2]["projectable"], true);
+        assert_eq!(rules[2]["then"][0], "→ vx.orders.reject");
     }
     fn one_emit(src: &str, event: Value) -> Value {
         let emits = eval_flow(src, event).expect("run");

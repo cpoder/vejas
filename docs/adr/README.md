@@ -29,6 +29,7 @@ the old one.
 | [0016](0016-observability-metrics-otlp.md) | Observability: hand-rolled Prometheus `/metrics` and OTLP trace export | Accepted |
 | [0017](0017-connector-admission-test.md) | The connector admission test | Accepted |
 | [0018](0018-shadow-replay-on-persisted-traffic.md) | Shadow-replay on persisted traffic (+ promote audit trail) | Accepted |
+| [0019](0019-rules-view-read-only-projection.md) | Rules-view: read-only rule projection (N1/N2/N3 doctrine) | Accepted |
 
 ## Template
 
