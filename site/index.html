@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vejas — integration with no builder UI</title>
+<meta name="description" content="An open-source integration platform with no builder UI. Agents write flows as readable code; domain experts correct what it means; one Rust binary on NATS runs it. Drivable over MCP.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Instrument+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&display=swap">
+<style>
+  :root{
+    --paper:#F6F7F5;
+    --ink:#1C2622;
+    --mist:#5F6C65;
+    --line:#DCE1DD;
+    --amber:#A86D07;
+    --amber-soft:#F4E3C2;
+    --sea:#2F6B5C;
+    --panel:#131D19;
+    --panel-line:#243430;
+    --code:#C9D6CF;
+    --code-dim:#5C6D66;
+    --code-lit:#EFC168;
+    --code-str:#8FBCA9;
+    --card:#FFFFFF;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#101715; --ink:#E3E8E4; --mist:#94A29A; --line:#26312C;
+      --amber:#E0A339; --amber-soft:#3A2E14; --sea:#6FB39E;
+      --panel:#0B120F; --panel-line:#1E2A25; --card:#161F1B;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#101715; --ink:#E3E8E4; --mist:#94A29A; --line:#26312C;
+    --amber:#E0A339; --amber-soft:#3A2E14; --sea:#6FB39E;
+    --panel:#0B120F; --panel-line:#1E2A25; --card:#161F1B;
+  }
+  *{box-sizing:border-box; margin:0}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto}
+    *, *::before, *::after{transition:none !important; animation:none !important}
+  }
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:"Instrument Sans", system-ui, -apple-system, sans-serif;
+    font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--sea); text-decoration-thickness:1px; text-underline-offset:3px}
+  a:hover{color:var(--amber)}
+  a:focus-visible, button:focus-visible{outline:2px solid var(--amber); outline-offset:3px; border-radius:2px}
+  .wrap{max-width:1080px; margin:0 auto; padding:0 24px}
+  .serif{font-family:"Instrument Serif", Georgia, serif; font-weight:400}
+  .mono{font-family:"IBM Plex Mono", ui-monospace, monospace}
+
+  /* header */
+  header{padding:28px 0}
+  .nav{display:flex; align-items:baseline; gap:28px}
+  .wordmark{font-family:"Instrument Serif", Georgia, serif; font-size:28px; letter-spacing:.01em; color:var(--ink); text-decoration:none}
+  .wordmark:hover{color:var(--ink)}
+  .nav-links{margin-left:auto; display:flex; gap:22px; font-size:15px}
+  .nav-links a{color:var(--mist); text-decoration:none}
+  .nav-links a:hover{color:var(--amber)}
+
+  /* hero */
+  .hero{display:grid; grid-template-columns:minmax(0,10fr) minmax(0,11fr); gap:56px; align-items:center; padding:56px 0 40px}
+  .hero h1{font-family:"Instrument Serif", Georgia, serif; font-weight:400; font-size:clamp(40px,5.2vw,62px); line-height:1.06; letter-spacing:-.01em; text-wrap:balance}
+  .hero h1 em{font-style:italic; color:var(--amber)}
+  .eyebrow{font-family:"IBM Plex Mono", monospace; font-size:12.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--mist); margin-bottom:18px}
+  .hero .sub{margin-top:22px; font-size:18px; color:var(--ink); max-width:34em}
+  .hero .sub b{font-weight:600}
+  .ctas{margin-top:30px; display:flex; gap:14px; flex-wrap:wrap}
+  .btn{display:inline-block; padding:11px 20px; border-radius:3px; font-size:15.5px; font-weight:500; text-decoration:none; border:1px solid transparent}
+  .btn-primary{background:var(--ink); color:var(--paper)}
+  .btn-primary:hover{background:var(--amber); color:#161006}
+  .btn-ghost{border-color:var(--line); color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--amber); color:var(--amber)}
+  .windline{margin-top:34px; font-family:"Instrument Serif", Georgia, serif; font-style:italic; font-size:17px; color:var(--mist); max-width:30em}
+
+  /* code card — the signature */
+  .codecard{background:var(--panel); border:1px solid var(--panel-line); border-radius:6px; overflow:hidden; box-shadow:0 24px 60px -32px rgba(10,20,16,.5)}
+  .codecard-top{display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--panel-line)}
+  .filechip{font-family:"IBM Plex Mono", monospace; font-size:12.5px; color:#8FA096}
+  .views{margin-left:auto; display:flex; border:1px solid var(--panel-line); border-radius:4px; overflow:hidden}
+  .views button{font-family:"Instrument Sans", sans-serif; font-size:12.5px; padding:6px 12px; background:transparent; color:#8FA096; border:0; cursor:pointer}
+  .views button[aria-pressed="true"]{background:var(--amber); color:#161006; font-weight:600}
+  .codecard pre{padding:18px 20px; overflow-x:auto; font-family:"IBM Plex Mono", monospace; font-size:13px; line-height:1.72; color:var(--code)}
+  .codecard .cm{color:var(--code-dim); font-style:italic}
+  .codecard .st{color:var(--code-str)}
+  .codecard .kw{color:#B9C9C1; font-weight:500}
+  .codecard .lit{transition:background .25s, box-shadow .25s}
+  .codecard .alg{transition:opacity .25s}
+  .codecard.expert .alg{opacity:.28}
+  .codecard.expert .lit{background:rgba(239,193,104,.14); box-shadow:0 0 0 3px rgba(239,193,104,.14); border-radius:2px; color:var(--code-lit)}
+  .codecard.expert .lit .st{color:var(--code-lit)}
+  .codecaption{padding:12px 16px 14px; border-top:1px solid var(--panel-line); font-size:13.5px; color:#93A49B}
+  .codecaption b{color:#C4D2CA; font-weight:500}
+
+  /* facts line */
+  .facts{border-top:1px solid var(--line); border-bottom:1px solid var(--line); padding:16px 0; margin:34px 0 0}
+  .facts p{font-family:"IBM Plex Mono", monospace; font-size:13.5px; color:var(--mist); text-align:center; letter-spacing:.02em}
+  .facts b{color:var(--amber); font-weight:500}
+
+  /* essay sections */
+  section{padding:64px 0 8px}
+  .kicker{font-family:"IBM Plex Mono", monospace; font-size:12.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--amber); margin-bottom:14px}
+  h2{font-family:"Instrument Serif", Georgia, serif; font-weight:400; font-size:clamp(28px,3.4vw,38px); line-height:1.15; letter-spacing:-.005em; margin-bottom:18px; text-wrap:balance}
+  .prose{max-width:66ch}
+  .prose p{margin-bottom:16px; color:var(--ink)}
+  .prose p b{font-weight:600}
+
+  /* two surfaces */
+  .split{display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:30px}
+  .who{background:var(--card); border:1px solid var(--line); border-radius:6px; padding:26px 26px 20px}
+  .who h3{font-family:"Instrument Serif", Georgia, serif; font-weight:400; font-size:24px; margin-bottom:6px}
+  .who .role{font-family:"IBM Plex Mono", monospace; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mist); margin-bottom:14px}
+  .who ul{list-style:none; padding:0}
+  .who li{padding:7px 0; border-top:1px solid var(--line); font-size:15.5px}
+  .who li:first-child{border-top:0}
+  .who.expert-side{border-color:var(--amber); box-shadow:0 0 0 1px var(--amber)}
+  .who.expert-side .role{color:var(--amber)}
+
+  /* how it carries */
+  .arch{margin:30px 0 10px; overflow-x:auto}
+  .arch svg{display:block; min-width:640px; width:100%; height:auto}
+  .arch text{font-family:"IBM Plex Mono", monospace; font-size:12.5px; fill:var(--ink)}
+  .arch .dim{fill:var(--mist)}
+  .arch .box{fill:var(--card); stroke:var(--line)}
+  .arch .core{fill:var(--panel); stroke:var(--panel-line)}
+  .arch .coretext{fill:#C9D6CF}
+  .arch .flowline{stroke:var(--mist); stroke-width:1.2; fill:none}
+  .arch .pulse{fill:var(--amber)}
+  @keyframes drift{from{offset-distance:0%} to{offset-distance:100%}}
+  .bullets{max-width:74ch; margin-top:22px}
+  .bullets p{margin-bottom:13px; font-size:16px}
+  .bullets b{font-weight:600}
+  .bullets .m{font-family:"IBM Plex Mono", monospace; font-size:14px; color:var(--sea)}
+
+  /* running for real */
+  .proof{display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:28px}
+  .proofcard{border-left:2px solid var(--amber); padding:4px 0 4px 22px}
+  .proofcard h3{font-family:"Instrument Serif", Georgia, serif; font-weight:400; font-size:22px; margin-bottom:8px}
+  .proofcard p{font-size:15.5px; color:var(--ink)}
+  .proofcard .m{font-family:"IBM Plex Mono", monospace; font-size:13.5px; color:var(--mist)}
+
+  /* three ways this fails */
+  .fails .prose p em{font-family:"Instrument Serif", Georgia, serif; font-style:italic; font-size:19px; color:var(--amber)}
+
+  /* footer */
+  footer{margin-top:80px; border-top:1px solid var(--line); padding:44px 0 56px}
+  .foot-cta{font-family:"Instrument Serif", Georgia, serif; font-size:clamp(24px,3vw,32px); max-width:24em; line-height:1.25; margin-bottom:26px; text-wrap:balance}
+  .foot-row{display:flex; gap:22px; flex-wrap:wrap; align-items:center; font-size:15px}
+  .foot-row .lic{margin-left:auto; color:var(--mist); font-family:"IBM Plex Mono", monospace; font-size:13px}
+
+  @media (max-width: 860px){
+    .hero{grid-template-columns:1fr; gap:36px; padding-top:36px}
+    .split,.proof{grid-template-columns:1fr}
+    .nav-links{gap:14px}
+  }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <nav class="nav" aria-label="Main">
+    <a class="wordmark" href="/">vejas</a>
+    <div class="nav-links">
+      <a href="https://github.com/cpoder/vejas/blob/master/MANIFESTO.md">Manifesto</a>
+      <a href="https://github.com/cpoder/vejas/blob/master/docs/ARCHITECTURE.md">Architecture</a>
+      <a href="https://github.com/cpoder/vejas/blob/master/docs/MCP.md">MCP</a>
+      <a href="https://github.com/cpoder/vejas">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Open source · Apache-2.0 · one Rust binary on NATS</p>
+      <h1>Integration doesn't need an <em>IDE</em> anymore.</h1>
+      <p class="sub">Vejas is an integration platform with <b>no builder UI</b>. An agent
+      writes each flow as plain, readable code. A domain expert corrects what it
+      <b>means</b> — a table, a threshold — without touching the code. One Rust
+      binary runs it all, and the whole platform is drivable over MCP.</p>
+      <div class="ctas">
+        <a class="btn btn-primary" href="https://github.com/cpoder/vejas">Read the code on GitHub</a>
+        <a class="btn btn-ghost" href="https://github.com/cpoder/vejas/blob/master/MANIFESTO.md">Read the manifesto</a>
+      </div>
+      <p class="windline">Vėjas is the old Baltic god of the wind. Wind moves
+      things without anyone drawing the route.</p>
+    </div>
+
+    <div class="codecard" id="codecard">
+      <div class="codecard-top">
+        <span class="filechip">flows/order_sync.vjs</span>
+        <div class="views" role="group" aria-label="Two readings of the same file">
+          <button type="button" id="view-agent" aria-pressed="true">What the agent wrote</button>
+          <button type="button" id="view-expert" aria-pressed="false">What the expert corrects</button>
+        </div>
+      </div>
+      <pre><code><span class="alg"><span class="cm"># flow: order_sync</span>
+<span class="kw">source</span> <span class="st">"vx.shop.orders"</span>
+
+<span class="cm"># The shop sends country names; the ERP wants ISO codes.</span>
+</span><span class="lit">COUNTRY_CODES = {<span class="st">"France"</span>: <span class="st">"FR"</span>, <span class="st">"Germany"</span>: <span class="st">"DE"</span>,
+                 <span class="st">"Italy"</span>: <span class="st">"IT"</span>, <span class="st">"Portugal"</span>: <span class="st">"PT"</span>}</span><span class="alg">
+
+</span><span class="lit">MIN_TOTAL_EUR = 0</span><span class="alg">
+</span><span class="lit">ERP_QUEUE = <span class="st">"vx.erp.orders.upsert"</span></span><span class="alg">
+
+order_ref = split(id, <span class="st">"#"</span>)[1]
+customer_email = lower(email)
+total_eur = num(total_price)
+country = </span><span class="lit">COUNTRY_CODES</span><span class="alg">[shipping_address.country]
+          ?? shipping_address.country
+
+<span class="cm"># project order lines into ERP positions</span>
+positions = []
+<span class="kw">for</span> line <span class="kw">in</span> line_items:
+    positions = positions + [{sku: line.sku,
+        qty: num(line.quantity),
+        unit_eur: round(line.unit_price_cents / 100, 2)}]
+<span class="kw">end</span>
+
+<span class="kw">if</span> total_eur &gt;= </span><span class="lit">MIN_TOTAL_EUR</span><span class="alg">:
+    <span class="kw">emit</span> </span><span class="lit">ERP_QUEUE</span><span class="alg">, {order_ref: order_ref,
+        customer_email: customer_email, total_eur: total_eur,
+        country: country, positions: positions}
+<span class="kw">end</span></span></code></pre>
+      <div class="codecaption" id="codecaption">
+        <b>Written by an agent from one sentence.</b> Plain text in your git repo —
+        diffed, reviewed, unit-tested like any other code.
+      </div>
+    </div>
+  </div>
+
+  <div class="facts">
+    <p>1 binary&nbsp;&nbsp;·&nbsp;&nbsp;1 dependency (NATS)&nbsp;&nbsp;·&nbsp;&nbsp;<b>0 builder UI</b>&nbsp;&nbsp;·&nbsp;&nbsp;nothing proprietary to export</p>
+  </div>
+
+  <section id="thesis">
+    <p class="kicker">The bet</p>
+    <h2>The canvas existed to protect humans from code. That constraint is gone.</h2>
+    <div class="prose">
+      <p>Visual designers exist for one reason: developers were expensive, and
+      integration logic is 80% repetitive. So the industry built canvases that let
+      fewer people produce more flows — and locked the logic in proprietary JSON
+      you cannot diff, review, or test without the whole platform running.</p>
+      <p>In 2026 an agent writes correct glue code for cents. Working flows, not
+      demo snippets: parse this webhook, enrich from that system, handle the
+      retry. Agents don't need protection from code — <b>code is their native
+      interface, and ours too when it comes to review</b>.</p>
+      <p>Delete the visual designer, and what remains of an integration platform
+      is the runtime, the transport, the connectors, and the observability.
+      That reduced platform is Vejas.</p>
+    </div>
+  </section>
+
+  <section id="surfaces">
+    <p class="kicker">The differentiator</p>
+    <h2>The agent owns <span class="serif" style="font-style:italic">how</span>. The human owns <span class="serif" style="font-style:italic">what it means</span>.</h2>
+    <div class="prose">
+      <p>Agents are better than us at the algorithmic side. They have no idea
+      whether amounts arrive in cents or euros, or what threshold is worth waking
+      someone up for. That knowledge lives in a person's head — so every flow has
+      two surfaces:</p>
+    </div>
+    <div class="split">
+      <div class="who">
+        <h3>The algorithmic body</h3>
+        <p class="role">agent territory</p>
+        <ul>
+          <li>parsing, pagination, retries, idempotency</li>
+          <li>written and rewritten by agents</li>
+          <li>reviewed like code, in git</li>
+          <li>golden-tested end to end</li>
+        </ul>
+      </div>
+      <div class="who expert-side">
+        <h3>The business surface</h3>
+        <p class="role">expert territory</p>
+        <ul>
+          <li>mapping tables, thresholds, constants — literals, extracted from the AST</li>
+          <li>rendered in a panel a non-developer can read</li>
+          <li>corrected in place, no code touched</li>
+          <li><b>shadow-replayed on real events</b> — before/after diff, then promote or discard</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <p class="kicker">How it carries</p>
+    <h2>Deliberately boring architecture.</h2>
+    <div class="arch" aria-label="An agent drives the runtime over MCP; the runtime runs flows on NATS between your systems">
+      <svg viewBox="0 0 880 150" role="img">
+        <rect class="box" x="10" y="50" width="150" height="50" rx="4"/>
+        <text x="85" y="72" text-anchor="middle">your agent</text>
+        <text class="dim" x="85" y="90" text-anchor="middle">any MCP client</text>
+        <path class="flowline" d="M160 75 H 280" stroke-dasharray="3 4"/>
+        <text class="dim" x="220" y="66" text-anchor="middle">MCP</text>
+        <rect class="core" x="280" y="30" width="220" height="90" rx="4"/>
+        <text class="coretext" x="390" y="62" text-anchor="middle">vejas runtime</text>
+        <text class="dim" x="390" y="82" text-anchor="middle">flows · connectors · panel</text>
+        <text class="dim" x="390" y="100" text-anchor="middle">one Rust binary</text>
+        <path class="flowline" d="M500 75 H 620"/>
+        <text class="dim" x="560" y="66" text-anchor="middle">vx.&gt;</text>
+        <rect class="box" x="620" y="15" width="250" height="36" rx="4"/>
+        <text x="745" y="38" text-anchor="middle">SAP · Salesforce · ServiceNow</text>
+        <rect class="box" x="620" y="58" width="250" height="36" rx="4"/>
+        <text x="745" y="81" text-anchor="middle">webhooks · REST · Slack</text>
+        <rect class="box" x="620" y="101" width="250" height="36" rx="4"/>
+        <text x="745" y="124" text-anchor="middle">any language, over stdio</text>
+        <circle class="pulse" r="3" style="offset-path:path('M160 75 H 280'); animation:drift 3s linear infinite"/>
+        <circle class="pulse" r="3" style="offset-path:path('M500 75 H 620'); animation:drift 2.2s linear infinite"/>
+      </svg>
+    </div>
+    <div class="bullets">
+      <p><b>Runtime</b> — one Rust binary. Flows run in-process, hot-reload on
+      edit, publish before ack (at-least-once, never a lost emit). The runtime is
+      its own MCP server; a flow declaring <span class="m">tool "…"</span> becomes an MCP tool, one
+      declaring <span class="m">api "VERB /path"</span> becomes an HTTP endpoint with generated OpenAPI.</p>
+      <p><b>Transport</b> — NATS with JetStream, the only infrastructure
+      dependency. Two containers, one <span class="m">docker compose up</span>.</p>
+      <p><b>Connectors</b> — a typed driver SDK, plus bridges that wrap a program
+      in any language over stdio, isolated by process. That's how SAP ships:
+      native Rust over the official RFC library — BAPIs, IDocs over tRFC,
+      <b>no JVM</b>. Salesforce speaks Bulk API 2.0, streaming. A generic OAuth2
+      poller stands in for much of a catalog, and an agent writes a new connector
+      from a prompt.</p>
+      <p><b>Secrets</b> — <span class="m">secret("path/key")</span> resolves from a vault at run time,
+      fail-closed. Never a literal, so never in git, the panel, or the surface.</p>
+      <p><b>Two screens survive</b> — monitoring for operators, the business
+      panel for experts. Neither can draw a flow.</p>
+    </div>
+  </section>
+
+  <section id="proof">
+    <p class="kicker">Running for real</p>
+    <h2>Young, but not a demo.</h2>
+    <div class="proof">
+      <div class="proofcard">
+        <h3>In production today</h3>
+        <p>The first deployment collects NIS2 compliance evidence across four EU
+        countries — outbound-only collectors, remote-piloted through a closed
+        command allowlist, secrets unreadable even by the operator.</p>
+        <p class="m">Microsoft Graph · EDR · leaf-node control plane</p>
+      </div>
+      <div class="proofcard">
+        <h3>SAP ⇄ Salesforce, both ways, streaming</h3>
+        <p>IDocs over transactional RFC on one side, Bulk API 2.0 on the other,
+        wired through two small VejasScript flows a domain expert can read —
+        validated against a real NetWeaver system and a real Salesforce org.</p>
+        <p class="m">docs/examples/sap-salesforce-bridge</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="fails" class="fails">
+    <p class="kicker">Arguing against myself</p>
+    <h2>Three ways this fails.</h2>
+    <div class="prose">
+      <p><em>Connectors.</em> The value of an iPaaS is its catalog, and catalogs
+      take years. The counter-bet: connector code is exactly what agents produce
+      well, so a small catalog plus a good SDK plus agents might compound faster
+      than catalogs used to. Unproven.</p>
+      <p><em>Buyers.</em> Enterprises buy governance and someone to blame. Vejas
+      starts with people who run their own infrastructure and read the code they
+      deploy. Whether it climbs from there is an open question.</p>
+      <p><em>Timing.</em> Maybe letting agents write production glue is two years
+      early for most shops. Fine — the demo was cheap and git does not expire.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="foot-cta">If you run integrations for a living and think this is
+    wrong, I want the strongest version of your objection. If you think it's
+    obvious — come help with the connector SDK.</p>
+    <div class="foot-row">
+      <a class="btn btn-primary" href="https://github.com/cpoder/vejas">github.com/cpoder/vejas</a>
+      <a href="https://github.com/cpoder/vejas/blob/master/MANIFESTO.md">Manifesto</a>
+      <a href="https://github.com/cpoder/vejas/blob/master/docs/adr/">ADRs</a>
+      <span class="lic">Apache-2.0 · vejas.dev</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function(){
+    var card = document.getElementById('codecard');
+    var cap  = document.getElementById('codecaption');
+    var bA = document.getElementById('view-agent');
+    var bE = document.getElementById('view-expert');
+    var caps = {
+      agent: '<b>Written by an agent from one sentence.</b> Plain text in your git repo — diffed, reviewed, unit-tested like any other code.',
+      expert: '<b>The business surface: literals, extracted from the AST.</b> A domain expert edits the table or the threshold in the panel; the change is shadow-replayed on the last real events before it lands.'
+    };
+    function set(mode){
+      card.classList.toggle('expert', mode === 'expert');
+      bA.setAttribute('aria-pressed', String(mode === 'agent'));
+      bE.setAttribute('aria-pressed', String(mode === 'expert'));
+      cap.innerHTML = caps[mode];
+    }
+    bA.addEventListener('click', function(){ set('agent'); });
+    bE.addEventListener('click', function(){ set('expert'); });
+  })();
+</script>
+
+</body>
+</html>
