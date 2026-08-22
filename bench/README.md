@@ -100,6 +100,7 @@ Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh`:
 | Graceful handoff (SIGTERM leader) | **2.6 s** ≈ tick interval + 1 s standby retry |
 | Crash failover (kill -9 leader, TTL 3 s) | **5.9 s** ≈ TTL + retry + tick (worst case) |
 | Split-brain guard | clustered instance answers 409 on local-file mutation, file untouched |
+| Live promote across the cluster (ADR-0021) | **60 ms convergence**, first new-version emit at 680 ms, zero interleave, 40 000/40 000 delivered mid-burst |
 
 ## Not measured yet
 

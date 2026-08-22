@@ -54,8 +54,10 @@ it without touching code:
   fail over natively (measured: an instance kill -9'd under load, every
   message still delivered exactly-all), singleton sources take a KV lease
   (graceful handoff 2.6 s, crash failover bounded by the TTL), and a
-  clustered instance refuses local-file mutations — promotes flow through
-  git. (ADR-0020, measured in [bench/](bench/))
+  clustered instance refuses local-file mutations — a live promote instead
+  publishes a **version** every instance converges on (measured: 60 ms
+  convergence, lossless mid-burst). (ADR-0020/0021, measured in
+  [bench/](bench/))
 - **Language** — VejasScript: `source` in, `emit` out, `invoke` to compose
   services (pipeline-merge composition), transcoding tables and thresholds
   as editable literals.
