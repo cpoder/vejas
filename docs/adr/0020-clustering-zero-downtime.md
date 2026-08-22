@@ -1,7 +1,23 @@
 # 0020 — Clustering and zero-downtime, the NATS-native way
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-23
+
+## Validated on the bench (before the build)
+
+`bench/cluster.sh` measured the taxonomy directly, and it holds:
+
+- **Competing-safe is free and lossless.** Two instances on the same durables,
+  `kill -9` one at 1.5s under load → **20000/20000 processed, zero duplicates,
+  zero loss**; the survivor takes over the whole stream.
+- **The flow unavailability window is `ack_wait`, not the crash.** In-flight
+  un-acked messages of a killed instance only redeliver after `ack_wait`: the
+  30s default drains in ~31.5s, `VEJAS_ACK_WAIT_SECS=1` drains the same scenario
+  in ~2.1–2.5s at 8–9.6k/s aggregated. This is why the deployment note below
+  recommends a low ack-wait in a cluster.
+- **Singleton duplication is real and measured.** Two instances running a 1s
+  timer produced ~16 ticks in 8s vs the ~8 expected — the concrete case the KV
+  lease closes.
 
 ## Context
 
@@ -100,20 +116,37 @@ leases. No gap, no loss — the bus is the only shared state.
 
 - Horizontal scale is real and nearly free; the only genuinely new code is the
   KV lease around singleton sources — a small, self-contained module.
-- **Per-instance local state.** The trace ring (`/events`) and the metrics
-  counters live in each instance's memory. Prometheus already scrapes per-target,
-  so `/metrics` aggregates correctly across instances; the panel's `/events`
-  ring, however, shows only the instance that served the page. Aggregating the
-  ring (or a sticky panel) is a follow-up, called out rather than hidden.
-- **Live promotes vs. the cluster.** The business-surface live edit
-  (`/surface/set`, ADR-0005/0018) writes one instance's local file; other
-  instances would not see it. In a clustered deployment, promotes must flow
-  through **GitOps** (the repo is the shared source of truth) — which is already
-  the intended production path, and already the git half of the ADR-0018 audit
-  trail. Live panel promotes remain a single-instance / development affordance.
-  Propagating a live promote cluster-wide (e.g. instances watching `VEJAS_AUDIT`)
-  is possible but deferred; it also interacts with versioning (the next ADR), so
-  it should be designed there, not bolted on here.
+- **Per-instance local state — but not the replay.** The trace ring (`/events`)
+  and the metrics counters live in each instance's memory. Prometheus already
+  scrapes per-target, so `/metrics` aggregates correctly across instances. Only
+  the panel's `/events` *view* is local — it shows the instance that served the
+  page. Crucially, **shadow-replay is not affected**: it hydrates from JetStream
+  (ADR-0018), which is cluster-global, so previewing a change replays the real
+  cluster-wide traffic regardless of which instance answers. Aggregating the ring
+  view (or a sticky panel) is a follow-up, called out rather than hidden.
+- **Live promotes vs. the cluster — fail loud, never split-brain.** The
+  business-surface live edit (`/surface/set`, ADR-0005/0018) writes *one*
+  instance's local file; the others would not see it. Silently mutating one
+  instance is the **worst** failure mode for the whole thesis: the expert
+  believes they corrected the meaning while half the traffic still applies the
+  old rule. So in cluster mode — declared explicitly by `VEJAS_CLUSTER=1` — every
+  endpoint that mutates a **local file** REFUSES with a didactic error
+  (`clustered: promote via git — see ADR-0020`): `/surface/set`, the
+  `vejas_set_literal` MCP tool, `/file/set`, `/fixture/set`, provisioning, and
+  `/secrets/set` when it is backed by the local `FileStore`. What stays allowed:
+  `/reload` (per-instance, and *needed* after a GitOps pull), DLQ replay
+  (bus-side, cluster-safe), and secret writes to a **shared** Vault backend.
+  Promotes in a cluster flow through **GitOps** (the repo is the shared source of
+  truth — already the git half of the ADR-0018 audit trail); live panel promotes
+  remain a single-instance / development affordance.
+
+  This GitOps-only state is an **intermediate**, not the destination: an
+  enterprise panel that cannot promote live loses its reason to exist. The
+  **versioning ADR (next) MUST solve cluster-wide live promotion** — a promote
+  that fans out to every instance atomically (the `VEJAS_AUDIT` stream is the
+  likely seam, and versioning needs the same fan-out for a candidate rollout).
+  It is deferred there deliberately, because doing it here without the version
+  machinery would bolt on a half-answer.
 - **Duplicates are bounded, not impossible.** During a crash failover a singleton
   can double-publish for at most the TTL window. The pollers were already
   designed for this — `fetched_at` and the idempotency keys derived from it
@@ -121,6 +154,23 @@ leases. No gap, no loss — the bus is the only shared state.
   downstream idempotent sink absorbs the duplicate. At-least-once was always the
   contract; clustering does not weaken it.
 - No new dependency: the lease is JetStream KV, already in the client we link.
+- **LB-safe means between machines.** Each instance binds its own `http-in` /
+  `/api` / panel ports, which is conflict-free across nodes. Two instances on the
+  *same* host collide on the port — a clustered same-host deploy must give each
+  instance its own `VEJAS_HTTP_ADDR` / connector `PORT` (env override). Real
+  clusters run one instance per node/pod and never hit this.
+
+## Deployment notes
+
+- **`VEJAS_ACK_WAIT_SECS=3–5` in a cluster.** The bench shows the drain window
+  after a lost instance is the ack-wait, so a low value makes failover fast. The
+  **30s default stays** for single-instance runs (safe for slow sinks that need
+  the time) — a stated tradeoff, tuned per deployment, not changed globally.
+- **Lease TTL ~10s** matches the real pollers (`INTERVAL_SECS ≥ 60`), so a normal
+  failover loses at most one poll cycle's slack. For a fast timer (e.g. 1s) the
+  worst-case gap after a *crash* is the TTL — bounded and acceptable; a graceful
+  restart has no gap (the lease is released, not aged out). Documented so nobody
+  is surprised by a ~10s pause of a 1s timer after a hard kill.
 
 ## Interactions
 
