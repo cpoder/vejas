@@ -17,6 +17,15 @@ move fast. Start here: [VISION](docs/VISION.md) ·
 [ADRs](docs/adr/) · [MCP](docs/MCP.md). The bet, long-form:
 [MANIFESTO.md](MANIFESTO.md).
 
+**The demo, 53 seconds** — a real SAP NetWeaver and a real Salesforce org,
+bridged both ways by two readable flows; a domain expert corrects a business
+rule on screen, the change is shadow-replayed on the real events, promoted,
+and the next IDoc lives the corrected rule. The recording is also a green
+end-to-end test ([the script](e2e/bridge-film.mjs)) — the video cannot lie.
+[Full video (mp4)](docs/demo/vejas-bridge-film.mp4).
+
+![The expert corrects the meaning; the pipes never move](docs/demo/bridge-teaser.gif)
+
 ![Prompt-to-flow and the pipeline, derived from the code itself](docs/screenshots/panel-top.png)
 
 Below: a flow an agent wrote from one sentence, in VejasScript. Its transcoding

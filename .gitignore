@@ -6,3 +6,4 @@
 .env
 *.log
 .DS_Store
+e2e/film-out/
