@@ -14,6 +14,7 @@
 //
 // HTTP surface (one request = one thread; /flows/new can take minutes):
 //   GET  /            panel        GET /healthz        GET /topology
+//   GET  /metrics     Prometheus exposition (OTLP traces: OTEL_EXPORTER_OTLP_ENDPOINT)
 //   GET  /graph       pipeline     GET /surface        business surface
 //   GET  /events?flow=             last processed events (in-memory ring)
 //   GET  /preview?file=            fixture -> sample run
@@ -25,6 +26,7 @@
 
 mod connectors;
 mod control;
+mod metrics;
 mod secrets;
 mod vjs;
 
@@ -33,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use serde_json::{json, Value};
@@ -461,8 +463,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
+                            metrics::observe(&handle.spec.name, false, 0, 0.0);
                             match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data) {
                                 Ok(()) => {
+                                    metrics::inc_dead_letter(&handle.spec.name);
                                     record_trace(&handle.spec.name, &msg.subject, false,
                                         Some(format!("{err} — dead-lettered")), vec![], prev, None);
                                     let _ = msg.ack();
@@ -476,6 +480,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             continue;
                         }
                     };
+                    let t0 = Instant::now();
+                    let start_nanos = metrics::now_nanos();
                     match vjs::run(&prog, &event, &mut engine) {
                         Ok(ctx) => {
                             let mut ok = true;
@@ -490,6 +496,17 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     ok = false;
                                 }
                             }
+                            let emits = ctx.emits.len() as u64;
+                            metrics::observe(&handle.spec.name, ok, emits, t0.elapsed().as_secs_f64());
+                            metrics::span(metrics::Span {
+                                unit: handle.spec.name.clone(),
+                                subject: msg.subject.clone(),
+                                ok,
+                                error: None,
+                                start_nanos,
+                                end_nanos: metrics::now_nanos(),
+                                emits,
+                            });
                             record_trace(
                                 &handle.spec.name,
                                 &msg.subject,
@@ -505,6 +522,16 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
+                            metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
+                            metrics::span(metrics::Span {
+                                unit: handle.spec.name.clone(),
+                                subject: msg.subject.clone(),
+                                ok: false,
+                                error: Some(e.clone()),
+                                start_nanos,
+                                end_nanos: metrics::now_nanos(),
+                                emits: 0,
+                            });
                             // poison guard: past MAX_DELIVERIES the message is
                             // dead-lettered (ADR-0015) rather than dropped; publish
                             // before ack, nak if the DLQ write fails.
@@ -513,6 +540,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             if delivered >= MAX_DELIVERIES {
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data) {
                                     Ok(()) => {
+                                        metrics::inc_dead_letter(&handle.spec.name);
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
                                             vec![], preview_of(&event), Some(event.clone()));
@@ -2290,6 +2318,30 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             "text/html; charset=utf-8",
         ),
         (tiny_http::Method::Get, "/healthz") => respond(request, 200, "ok".into(), "text/plain"),
+        (tiny_http::Method::Get, "/metrics") => {
+            // Prometheus exposition. Gauges (unit/kind/restarts) come live from
+            // the supervision registry; counters & histograms from the metrics
+            // module accumulated on the flow hot path.
+            let gauges: Vec<(String, String, u64)> = {
+                let reg = registry.lock().unwrap();
+                reg.values()
+                    .map(|h| {
+                        let kind = match h.spec.kind {
+                            Kind::Connector => "connector",
+                            Kind::Flow => "flow",
+                        };
+                        let restarts = h.state.lock().unwrap().restarts;
+                        (h.spec.name.clone(), kind.to_string(), restarts)
+                    })
+                    .collect()
+            };
+            respond(
+                request,
+                200,
+                metrics::render(&gauges),
+                "text/plain; version=0.0.4",
+            )
+        }
         (tiny_http::Method::Get, "/topology") => respond(
             request,
             200,
@@ -2708,6 +2760,10 @@ fn main() {
     let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
     let addr = env::var("VEJAS_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8686".into());
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Traces to an OTLP collector iff OTEL_EXPORTER_OTLP_ENDPOINT is set; metrics
+    // are always scrapeable at GET /metrics. No-op (no thread) when unset.
+    metrics::otlp_init();
 
     ctrlc::set_handler(|| {
         eprintln!("[vejas] shutdown requested");
