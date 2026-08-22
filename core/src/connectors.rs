@@ -406,20 +406,27 @@ impl Driver for HttpPoll {
 /// wedged in `recv()`, reported "running", and processed one more message
 /// before dying (the zombie-consumer trap caught while rehearsing the demo).
 pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
-    // server-side expiry (ns) strictly below the client-side wait, so every
-    // pull is resolved by the server and none accumulates in max_waiting
-    const PULL_EXPIRES_NS: usize = 700_000_000;
+    // no_wait: the server returns IMMEDIATELY with whatever is available (up to
+    // `batch`) instead of holding the request until the batch fills — so a single
+    // available message is delivered at once (no batch-fill latency), and no pull
+    // ever parks in max_waiting (the anti-zombie invariant: every pull resolves
+    // now, the loop re-checks its stop flag between rounds). Idle rounds come back
+    // empty; a short sleep paces them (and bounds the stop-response latency).
     let iter = sub
         .timeout_fetch(
             nats::jetstream::BatchOptions {
-                batch: 10,
-                expires: Some(PULL_EXPIRES_NS),
-                no_wait: false,
+                batch: 64,
+                expires: Some(100_000_000),
+                no_wait: true,
             },
-            Duration::from_millis(1000),
+            Duration::from_millis(500),
         )
         .map_err(|e| e.to_string())?;
-    Ok(iter.map_while(|m| m.ok()).collect())
+    let msgs: Vec<nats::Message> = iter.map_while(|m| m.ok()).collect();
+    if msgs.is_empty() {
+        thread::sleep(Duration::from_millis(150));
+    }
+    Ok(msgs)
 }
 
 // ───────────────────────── source: oauth-poll ─────────────────────────

@@ -379,7 +379,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 return Err("no `source` declaration".into());
             };
             let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let js = nats::jetstream::new(nc);
+            let js = nats::jetstream::new(nc.clone());
             let _ = js.add_stream(&nats::jetstream::StreamConfig {
                 name: stream.clone(),
                 subjects: vec![format!("{subj_root}.>")],
@@ -418,7 +418,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     return Ok(());
                 }
                 engine.invalidate(); // pick up live service edits
-                for msg in connectors::fetch_round(&sub)? {
+                let batch = connectors::fetch_round(&sub)?;
+                // Emits are buffered (core publish) and confirmed by ONE flush per
+                // batch before their source messages are acked — one round-trip a
+                // batch instead of one per emit, at-least-once preserved (ADR-0002).
+                let mut to_ack: Vec<&nats::Message> = Vec::new();
+                for msg in &batch {
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                         // stopped mid-batch: leave the message un-acked, it
                         // redelivers to whoever holds the durable next
@@ -455,7 +460,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let mut ok = true;
                             for (subj, payload) in &ctx.emits {
                                 let bytes = serde_json::to_vec(payload).unwrap_or_default();
-                                if let Err(e) = js.publish(subj, bytes) {
+                                // buffered core publish; flushed once per batch below
+                                if let Err(e) = nc.publish(subj, bytes) {
                                     eprintln!(
                                         "[vejas] {}: publish {subj}: {e}",
                                         handle.spec.name
@@ -473,7 +479,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 Some(event.clone()),
                             );
                             if ok {
-                                let _ = msg.ack();
+                                to_ack.push(msg); // acked after the batch flush
                             }
                         }
                         Err(e) => {
@@ -505,6 +511,23 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             }
                             set_state(&handle, |st| st.last_error = Some(e));
                         }
+                    }
+                }
+                // Publish-before-ack barrier for the batch: one flush confirms the
+                // server received every buffered emit, THEN ack the fully-published
+                // source messages. On flush failure, ack none — the batch
+                // redelivers (nothing is lost; at-least-once, ADR-0002).
+                if !to_ack.is_empty() {
+                    match nc.flush() {
+                        Ok(_) => {
+                            for m in &to_ack {
+                                let _ = m.ack();
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
+                            handle.spec.name
+                        ),
                     }
                 }
             }
