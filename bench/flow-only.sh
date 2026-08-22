@@ -8,6 +8,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N="${1:-20000}"
+PUBS="${PUBS:-4}"           # parallel publishers — one sequential publisher caps ~2.8k/s
+N=$(( (N / PUBS) * PUBS ))  # keep the count exactly divisible
 BIN="core/target/release/vejas-runtime"
 NATS_PORT=4224
 STORE=$(mktemp -d)
@@ -36,7 +38,12 @@ sleep 0.5
 
 EVENT=$(tr -d '\n' < bench/root/flows/fixtures/bench_orders.json)
 T0=$(date +%s%N)
-nats -s nats://127.0.0.1:$NATS_PORT pub vx.bench.orders --count="$N" "$EVENT" > /dev/null 2>&1
+PUB_PIDS=()
+for _ in $(seq "$PUBS"); do
+  nats -s nats://127.0.0.1:$NATS_PORT pub vx.bench.orders --count=$((N / PUBS)) "$EVENT" > /dev/null 2>&1 &
+  PUB_PIDS+=($!)
+done
+wait "${PUB_PIDS[@]}"
 PUB_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 
 wait $SUB_PID
