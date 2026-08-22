@@ -89,6 +89,19 @@ Throughput *rises* with flow count (consumers parallelize; the bus, not the
 interpreter, is the bound) and memory stays ~1 MB per running flow — fifty
 live, persisted flows in under 50 MB.
 
+## Clustering (ADR-0020, measured)
+
+Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh`:
+
+| Invariant | Result |
+|---|---|
+| Flows under kill -9 (1.5s into load) | **20 000/20 000 exactly-all**, ~8 k/s aggregate |
+| Singleton duplication (timer, 2 instances) | **eliminated** — 8 ticks/8 s (was 16 pre-lease) |
+| Graceful handoff (SIGTERM leader) | **2.6 s** ≈ tick interval + 1 s standby retry |
+| Crash failover (kill -9 leader, TTL 3 s) | **5.9 s** ≈ TTL + retry + tick (worst case) |
+| Split-brain guard | clustered instance answers 409 on local-file mutation, file untouched |
+
 ## Not measured yet
 
-Comparative runs beyond Redpanda Connect (n8n, Windmill) — in progress.
+Comparative runs beyond Redpanda Connect (n8n, Windmill done/in table) —
+Windmill pending. Cluster scaling beyond 2 instances.

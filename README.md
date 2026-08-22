@@ -50,6 +50,12 @@ it without touching code:
 - **Transport** — NATS with JetStream, the only infrastructure dependency
   (persistence, KV, object store). Two containers, one `docker compose up`.
   (ADR-0002)
+- **Clustering** — run N runtimes on the same NATS: flows load-balance and
+  fail over natively (measured: an instance kill -9'd under load, every
+  message still delivered exactly-all), singleton sources take a KV lease
+  (graceful handoff 2.6 s, crash failover bounded by the TTL), and a
+  clustered instance refuses local-file mutations — promotes flow through
+  git. (ADR-0020, measured in [bench/](bench/))
 - **Language** — VejasScript: `source` in, `emit` out, `invoke` to compose
   services (pipeline-merge composition), transcoding tables and thresholds
   as editable literals.
