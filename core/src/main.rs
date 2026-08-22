@@ -29,6 +29,7 @@ mod connectors;
 mod control;
 mod metrics;
 mod secrets;
+mod versions;
 mod vjs;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -286,6 +287,38 @@ fn replay_literal(
     }))
 }
 
+/// Promote a literal change as a cluster-wide VERSION (ADR-0021) instead of a
+/// local file write: compute the new source by applying set_literal to the
+/// current EFFECTIVE source (overlay-or-baseline), then publish it to
+/// VEJAS_VERSIONS forked from the git baseline hash. Every instance's version
+/// watch then hot-reloads the flow. Also records the ADR-0018 audit trail.
+fn promote_version(
+    root: &Path,
+    file: &str,
+    name: &str,
+    key: &str,
+    value: &Value,
+    actor: &str,
+) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let unit = flow_proc_name(&path);
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let store = versions::open_store(&js).ok_or("version store unavailable")?;
+    // current effective source: a prior overlay if valid, else the baseline
+    let (current, _) = versions::resolve_source(Some(&store), &unit, &baseline);
+    let before = vjs::get_literal(&current, name, key).unwrap_or(Value::Null);
+    let new_src = vjs::set_literal(&current, name, key, value)?;
+    // overlays always fork from the GIT baseline, so a deploy that moves the
+    // baseline evicts the whole overlay chain (resolve_source).
+    let parent = versions::hash_content(&baseline);
+    versions::put_version(&store, &unit, &new_src, &parent, actor, now_secs())?;
+    record_promote(root, file, name, key, &before, value, actor);
+    Ok(json!({"ok": true, "versioned": true, "flow": unit, "parent": parent}))
+}
+
 /// In cluster mode (`VEJAS_CLUSTER=1`), refuse any mutation of this instance's
 /// LOCAL files. A promote that lands on one instance while the others keep the old
 /// rule is the worst failure mode for the business-surface thesis (ADR-0020) — the
@@ -507,7 +540,22 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             break;
         }
         let attempt = (|| -> Result<(), String> {
-            let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
+            let baseline = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
+            // Cluster-wide overlay (ADR-0021): a promoted version overrides the
+            // file iff it forked from exactly this baseline; a stale overlay
+            // (baseline advanced / flow git-deleted) is evicted here — git wins.
+            let src = {
+                let vstore = nats::connect(&url)
+                    .ok()
+                    .map(nats::jetstream::new)
+                    .and_then(|js| versions::open_store(&js));
+                let (s, from_overlay) =
+                    versions::resolve_source(vstore.as_ref(), &handle.spec.name, &baseline);
+                if from_overlay {
+                    eprintln!("[vejas] {} on a promoted version (overlay)", handle.spec.name);
+                }
+                s
+            };
             let prog = vjs::parse(&src)?;
             let Some(source) = prog.source.clone() else {
                 // An api-only / tool-only flow has no bus source: it is served
@@ -889,6 +937,48 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
         }
     }
     set_state(&handle, |st| st.status = "stopped".into());
+}
+
+/// Watch VEJAS_VERSIONS for promotes/evictions and hot-reload the affected flow
+/// on every instance (ADR-0021). The KV value is the authority; this watch is the
+/// notification — a missed event self-heals because the restarted flow re-reads
+/// the current value via `resolve_source`. Reconnects on a dropped watch.
+fn version_watch(registry: Registry, root: PathBuf) {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    while RUNNING.load(Ordering::SeqCst) {
+        let store = nats::connect(&url)
+            .ok()
+            .map(nats::jetstream::new)
+            .and_then(|js| versions::open_store(&js));
+        let Some(store) = store else {
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        let watch = match store.watch_all() {
+            Ok(w) => w,
+            Err(_) => {
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        for entry in watch {
+            if !RUNNING.load(Ordering::SeqCst) {
+                return;
+            }
+            // map the KV key token back to a supervised flow unit and restart it
+            // (it then re-resolves the overlay: apply on a promote, baseline on
+            // an eviction/delete).
+            let target = {
+                let reg = registry.lock().unwrap();
+                reg.keys().find(|n| versions::key_token(n) == entry.key).cloned()
+            };
+            if let Some(name) = target {
+                eprintln!("[vejas] version change for {name} → hot-reloading");
+                restart_unit(&registry, &root, &name);
+            }
+        }
+        thread::sleep(Duration::from_secs(1)); // watch ended: reconnect
+    }
 }
 
 /// Stop one unit and start it again from a fresh scan (secret rotation, etc.).
@@ -2281,10 +2371,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"ok": true, "started": started, "stopped": stopped}).to_string())
         }
         "vejas_set_literal" => {
-            cluster_write_guard()?;
             let file = args["file"].as_str().ok_or("file required")?;
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
+            // In a cluster a promote is a version (fans out), not a local write.
+            if cluster::clustered() {
+                return text(promote_version(root, file, lname, key, &args["value"], "mcp")?.to_string());
+            }
             let path = guard_path(root, file).ok_or("path not allowed")?;
             let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let before = vjs::get_literal(&src, lname, key).unwrap_or(Value::Null);
@@ -2794,14 +2887,18 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/surface/set") => {
-            if let Err(e) = cluster_write_guard() {
-                return respond(request, 409, e, "text/plain");
-            }
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             let name = body["name"].as_str().unwrap_or("").to_string();
             let key = body["key"].as_str().unwrap_or("-").to_string();
             let value = body["value"].clone();
+            // In a cluster, a promote is a cluster-wide VERSION, not a local write.
+            if cluster::clustered() {
+                return match promote_version(&root, &file, &name, &key, &value, "panel") {
+                    Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                    Err(e) => respond(request, 422, e, "text/plain"),
+                };
+            }
             let Some(p) = guard_path(&root, &file) else {
                 return respond(request, 400, "path not allowed".into(), "text/plain");
             };
@@ -3079,6 +3176,13 @@ fn main() {
 
     // the control channel, only when this runtime names a tenant (ADR-0013)
     control::start(registry.clone(), root.clone());
+
+    // watch VEJAS_VERSIONS: a promote on any instance fans out here (ADR-0021)
+    {
+        let registry = registry.clone();
+        let root = root.clone();
+        thread::spawn(move || version_watch(registry, root));
+    }
 
     {
         let registry = registry.clone();
