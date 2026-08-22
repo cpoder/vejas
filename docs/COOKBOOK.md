@@ -162,8 +162,8 @@ this one **without any agent** — it is the panel's Apply → shadow-replay →
 Promote button path. The prompt and the panel are two doors to the same
 governed change. *(The validation pass ran exactly this prompt on real
 traffic: two silent `bloquante` tickets, then the correction, then the next
-`bloquante` alerted — and caught a live-reload regression on the way, fixed
-since. Validation that finds bugs is validation working.)*
+`bloquante` alerted — and caught a live-reload regression on the way — reported,
+fix under way. Validation that finds bugs is validation working.)*
 
 ---
 
