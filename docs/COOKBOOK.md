@@ -160,7 +160,16 @@ with `vejas_set_literal`. The bus was never touched during the rehearsal
 Same loop, one table entry: replay, diff, promote. A domain expert can do
 this one **without any agent** — it is the panel's Apply → shadow-replay →
 Promote button path. The prompt and the panel are two doors to the same
-governed change. *(The validation pass ran exactly this prompt on real
+governed change.
+
+And the expert *reads* the rules before touching anything: every flow card
+carries a **Rules** section — the flow's `if/elif/else`, projected straight
+from the AST as readable sentences (« WHEN total ≥ MIN_TOTAL_EUR THEN
+→ vx.erp.orders »), the thresholds and tables in them editable inline
+through the same replay-promote loop. A condition too complex to render
+*exactly* is shown as its verbatim source, marked *advanced* — never a
+lossy paraphrase — and changing a rule's *structure* goes through the
+agent, in plain words (ADR-0019). Reading is free; meaning is governed. *(The validation pass ran exactly this prompt on real
 traffic: two silent `bloquante` tickets, then the correction, then the next
 `bloquante` alerted — and caught a promote-no-op bug on the way (sub-second mtime),
 fixed and re-validated live: two consecutive promotes, each visible in the
