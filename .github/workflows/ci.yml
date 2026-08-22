@@ -32,7 +32,7 @@ jobs:
               echo "FAIL $f: $out"
               fail=1
             fi
-          done < <(find flows services connectors packages docs/examples \
+          done < <(find flows services connectors packages docs/examples bench \
                      \( -name '*.vjs' -o -name '*.vjs.example' \) \
                      -not -path '*/target/*')
           exit $fail

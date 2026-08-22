@@ -1,0 +1,3 @@
+# connector: bench_in — the webhook entry the load generator hits
+driver "http-in"
+PORT = 8790

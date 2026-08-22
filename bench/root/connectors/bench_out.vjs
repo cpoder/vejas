@@ -1,0 +1,4 @@
+# connector: bench_out — delivers the flow's output to the counting sink
+driver "http-out"
+SUBJECT = "vx.bench.out"
+URL = "http://127.0.0.1:9099/hit"

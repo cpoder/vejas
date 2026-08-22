@@ -1,0 +1,23 @@
+# flow: bench_orders — the benchmark workload, shaped like a real flow:
+# a lookup, conversions, a projection loop, a threshold branch.
+source "vx.bench.orders"
+
+COUNTRY_CODES = {"France": "FR", "Germany": "DE", "Italy": "IT", "Portugal": "PT"}
+MIN_TOTAL_EUR = 0
+OUT = "vx.bench.out"
+
+order_ref = split(id, "#")[1]
+customer_email = lower(email)
+total_eur = num(total_price)
+country = COUNTRY_CODES[shipping_address.country] ?? shipping_address.country
+
+positions = []
+for line in line_items:
+    positions = positions + [{sku: line.sku, qty: num(line.quantity),
+        unit_eur: round(line.unit_price_cents / 100, 2)}]
+end
+
+if total_eur >= MIN_TOTAL_EUR:
+    emit OUT, {order_ref: order_ref, customer_email: customer_email,
+        total_eur: total_eur, country: country, positions: positions, t: t}
+end
