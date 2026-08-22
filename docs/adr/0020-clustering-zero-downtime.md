@@ -44,6 +44,14 @@ instance's in-flight (un-acked) messages redeliver to the survivors
 (at-least-once, ADR-0002). This already works — the task is to *prove* it (the
 multi-instance bench) and document it, not to build it.
 
+One unit in this regime needs a **one-line** change: the RPC responder
+(`exec-rpc`, `rpc:exec`) today subscribes with a plain core subscription
+(`nc.subscribe`), so N instances would each answer every request — duplicate
+replies. It must join a NATS **queue group** (`nc.queue_subscribe(subject,
+"vejas")`) so exactly one instance answers each request, load-shared across the
+group. That is competing-safe like the durables, not a singleton — no lease, each
+instance keeps its own child process (e.g. its own SAP logon).
+
 ### 2. LB-safe — run everywhere behind a load balancer
 
 `http-in` (webhook), the synchronous `/api` path, and the panel/HTTP surface are
