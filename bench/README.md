@@ -51,8 +51,23 @@ These are the first three tickets the harness produced. Numbers here are
 updated by re-running `bench/run.sh` after each fix — never quoted without
 the scenario and the machine.
 
+## The isolated flow hop (`bench/flow-only.sh`)
+
+Publish straight onto the bus, run only the flow, count its emits with a
+plain subscription — no HTTP anywhere:
+
+| Metric | Value |
+|---|---|
+| Flow-hop rate | **171/s** |
+| Runtime RSS | 5.6 MB |
+
+That is finding **#4, the structural one**: ~5.8 ms per message with no I/O
+in the path points at the per-message synchronous JetStream round-trips in
+the consumer loop (one publish-with-ack per emit, one ack per consumed
+message). Async/batched publishes and acks are the fix candidates — this is
+the ceiling the other three were hiding behind.
+
 ## Not measured yet
 
-Interpreter-only throughput (masked by the sink ceiling), multi-flow scaling,
-comparative runs (same scenario on n8n / Windmill / Benthos) — after the
-ceilings above fall.
+Multi-flow scaling, comparative runs (same scenario on n8n / Windmill /
+Benthos) — after the ceilings above fall.
