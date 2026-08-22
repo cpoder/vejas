@@ -25,9 +25,22 @@ CI admission job:
    purpose, subjects in/out, every secret path it expects, and the remote's
    pagination/rate notes when relevant.
 2. **The credential rule, linted** — any literal whose key matches the
-   credential pattern (`pass(wd|word)|secret|token|api[_-]?key`) must be a
-   `secret()` reference; the lint fails the admission job on a literal
-   credential. **Single-source requirement**: today that regex lives only in
+   credential pattern must be a `secret()` reference; the lint fails the
+   admission job on a literal credential. The pattern (chosen empirically,
+   2026-08-22, on a 55-key labeled benchmark of real harvested keys — repo,
+   agent-generated, production deployment — plus common env conventions):
+
+   `pass(wd|word)|secret|(^|[_-])token$|api[_-]?key|^auth$|[_-]auth$|^auth[_-]|authorization|webhook_url`
+
+   Two measured subtleties: `token` matches as a **suffix only** — real
+   tokens end with it (`GITHUB_TOKEN`, `ACCESS_TOKEN`) while plain config
+   keys prefix or pluralize it (`TOKEN_URL`, an observed production false
+   positive of the previous pattern; `MAX_TOKENS`) — and `_key$` was
+   **rejected on data**: it would mask real business keys observed in our
+   own corpus (`JIRA_PROJECT_KEY`, `FRAMEWORK_KEY`). Benchmark result vs
+   the previous pattern: missed credentials 12→8, false masks 3→1. The
+   benchmark itself is committed (`e2e/admission/pattern-bench.py`) and
+   re-measures the profile whenever the single-sourced const changes. **Single-source requirement**: today that regex lives only in
    the panel's JS (`isSecretKey`, panel.html) — duplicating it in a Rust
    lint would create two definitions whose divergence is a security hole.
    The decided mechanism: a `pub const SECRET_KEY_PATTERN` in `secrets.rs`
@@ -37,12 +50,16 @@ CI admission job:
    true only once that extraction lands, and the extraction is part of
    implementing this ADR.
 
-   **Stated limit of the heuristic**: it matches key *names*, not values. A
-   credential under an unmatched key (`AUTH = "Bearer …"`, a raw
-   `Authorization` header value) slips the lint and the panel mask alike —
-   consistently, but silently. Widening the pattern with `auth` would catch
-   it at the cost of false positives (`author`, `oauth_url`); the current
-   decision is to keep the pattern as is and document the limit here.
+   **Stated limit of the heuristic**: it matches key *names*, not values,
+   and the benchmark shows an irreducible floor — `PASSPHRASE`,
+   `CREDENTIALS`, `BEARER`, `DATABASE_URL` (embedded password),
+   `SERVICE_ACCOUNT_JSON` and the bare `PRIVATE_KEY`/`SIGNING_KEY` family
+   slip any name pattern that does not also flag real business keys. That
+   floor is covered by the other layers: the generation contract
+   (empirically, agents used `secret()` unprompted in every validation run)
+   and ADR-0008 as the documented rule. The lint also descends into
+   doc-literal sub-keys (`ENV = {SAP_PASSWD: …}`), matching the panel's
+   masking scope.
 3. **A golden fixture** (`fixture.json`) — one real-shaped sample of what
    the connector publishes (source) or consumes (sink), envelope included
    when the driver adds one. This is what downstream flows are golden-tested

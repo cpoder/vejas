@@ -32,11 +32,22 @@ for NAME in "${RECIPES[@]}"; do
   # ── lint: credential-shaped keys must be secret() ─────────────────────
   LINT=$(python3 - "$MANIFEST" "$PAT" << 'PY'
 import re, sys
+pat = sys.argv[2]
 bad = []
 for line in open(sys.argv[1]):
     m = re.match(r'\s*([A-Z][A-Z0-9_]*)\s*=\s*(.+)$', line)
-    if m and re.search(sys.argv[2], m.group(1), re.I) and 'secret(' not in m.group(2):
-        bad.append(m.group(1))
+    if not m:
+        continue
+    key, val = m.group(1), m.group(2)
+    if re.search(pat, key, re.I) and 'secret(' not in val:
+        bad.append(key)
+    # config-carrying doc literals: their SUB-keys must honor the rule too
+    # (the panel masks them; the lint matches its scope). Test/sample bodies
+    # are exempt — they carry fake data by definition.
+    if val.lstrip().startswith('{') and 'BODY' not in key and 'PAYLOAD' not in key:
+        for sk, sv in re.findall(r'["\']?([A-Za-z_][A-Za-z0-9_-]*)["\']?\s*:\s*([^,}]*)', val):
+            if re.search(pat, sk, re.I) and 'secret(' not in sv:
+                bad.append(f'{key}.{sk}')
 print(','.join(bad))
 PY
 )
