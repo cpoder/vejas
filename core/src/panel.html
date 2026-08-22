@@ -82,6 +82,19 @@
   .edge.dashed { stroke-dasharray: 4 4; opacity: .3; stroke: var(--muted); }
   .edge.svc { stroke-dasharray: 2 3; opacity: .5; }
   .colh { font: 600 10px system-ui, sans-serif; fill: var(--muted); letter-spacing: .08em; }
+  /* clickable diagram: select nodes to focus the cards below on a path */
+  .node { cursor: pointer; }
+  .node rect, .node text, .node circle { transition: opacity .12s; }
+  [data-sel] .sel-ring { stroke: var(--accent); stroke-width: 2.4; }
+  svg.has-sel .dim { opacity: .18; }
+  svg.has-sel .edge.dim { opacity: .06; }
+  svg.has-sel .hl.edge { opacity: .95; stroke-width: 2.2; }
+  .pill.sel, .fnode.sel, .snode.sel { stroke: var(--accent); stroke-width: 2.4; }
+  .diagbar { display: flex; align-items: center; gap: 10px; margin: 2px 0 8px; min-height: 20px;
+             font-size: 12.5px; color: var(--ink2); }
+  .diagbar .clear { font: 600 11px var(--mono); padding: 3px 10px; border: 1px solid var(--line);
+                    border-radius: 8px; background: var(--wash); color: var(--ink2); cursor: pointer; }
+  .card.hidden-by-focus { display: none; }
 
   .sect { font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
           color: var(--muted); margin: 16px 0 8px; }
@@ -185,7 +198,9 @@
 
   <div class="card">
     <h2>Pipeline</h2>
-    <p class="sub">Derived from the code itself — sources, flows, composed services, destinations, connectors.</p>
+    <p class="sub">Derived from the code itself — sources, flows, composed services, destinations, connectors.
+      <span style="color:var(--muted)">Click a node to focus the cards below on its path; click more to add.</span></p>
+    <div class="diagbar" id="diagbar"></div>
     <svg id="pipe"></svg>
   </div>
 
@@ -327,8 +342,11 @@ function row(table, {label, input, sample, btn, arrow}) {
   return tr;
 }
 
-/* ---------- pipeline ---------- */
+/* ---------- pipeline (clickable) ---------- */
+let PIPE = null;           // last graph, for the selection logic
+const pipeSel = new Set(); // selected node keys (f:/s:/k:/v:/c:)
 function drawPipe(graph, topo) {
+  PIPE = graph;
   const svg = $('#pipe');
   const flows = graph.flows || [], services = graph.services || [], cons = graph.connectors || [];
   const srcs = [...new Set(flows.flatMap(f => f.sources || []))];
@@ -344,48 +362,176 @@ function drawPipe(graph, topo) {
   const colh = (x, t) => out += `<text class="colh" x="${x}" y="${top - 14}">${t}</text>`;
   colh(X.src, 'SOURCES'); colh(X.flow, 'FLOWS & SERVICES'); colh(X.sink, 'DESTINATIONS');
   const pos = {};
-  const pill = (x, yy, text, w) => out += `<rect class="pill" x="${x}" y="${yy - 14}" rx="14" width="${w}" height="28"/>
-    <text class="pill-t" x="${x + w/2}" y="${yy + 4}" text-anchor="middle">${esc(text)}</text>`;
-  srcs.forEach((s, i) => { const yy = y(i, srcs.length); pos['s:' + s] = yy; pill(X.src, yy, s, 190); });
-  sinks.forEach((s, i) => { const yy = y(i, sinks.length); pos['k:' + s] = yy; pill(X.sink, yy, s, 165); });
+  // every node carries data-k on a <g class="node"> so a click on rect or text selects it
+  const pill = (x, yy, text, w, k) => out += `<g class="node" data-k="${esc(k)}">
+    <rect class="pill" data-el="${esc(k)}" x="${x}" y="${yy - 14}" rx="14" width="${w}" height="28"/>
+    <text class="pill-t" x="${x + w/2}" y="${yy + 4}" text-anchor="middle">${esc(text)}</text></g>`;
+  srcs.forEach((s, i) => { const yy = y(i, srcs.length); pos['s:' + s] = yy; pill(X.src, yy, s, 190, 's:' + s); });
+  sinks.forEach((s, i) => { const yy = y(i, sinks.length); pos['k:' + s] = yy; pill(X.sink, yy, s, 165, 'k:' + s); });
   const nAll = flows.length + services.length;
   const statusOf = f => (topo.flows || []).find(t => t.file === f.file) || {};
   flows.forEach((f, i) => {
     const yy = y(i, nAll); pos['f:' + f.name] = yy;
     const st = statusOf(f); const c = st.status === 'running' ? 'var(--ok)' : 'var(--muted)';
-    out += `<rect class="fnode" x="${X.flow}" y="${yy - 17}" rx="9" width="176" height="34"/>
+    out += `<g class="node" data-k="f:${esc(f.name)}">
+      <rect class="fnode" data-el="f:${esc(f.name)}" x="${X.flow}" y="${yy - 17}" rx="9" width="176" height="34"/>
       <circle cx="${X.flow + 15}" cy="${yy}" r="4" fill="${c}"/>
-      <text class="fnode-t" x="${X.flow + 26}" y="${yy + 4}">${esc(trunc(f.name, 18))}</text>`;
+      <text class="fnode-t" x="${X.flow + 26}" y="${yy + 4}">${esc(trunc(f.name, 18))}</text></g>`;
   });
   services.forEach((s, i) => {
-    const yy = y(flows.length + i, nAll); pos['v:' + (s.name.split(':').pop())] = yy;
-    out += `<rect class="snode" x="${X.flow + 14}" y="${yy - 13}" rx="7" width="148" height="26"/>
-      <text class="snode-t" x="${X.flow + 26}" y="${yy + 4}">⚙ ${esc(trunc(s.name, 16))}</text>`;
+    const short = s.name.split(':').pop();
+    const yy = y(flows.length + i, nAll); pos['v:' + short] = yy;
+    out += `<g class="node" data-k="v:${esc(short)}">
+      <rect class="snode" data-el="v:${esc(short)}" x="${X.flow + 14}" y="${yy - 13}" rx="7" width="148" height="26"/>
+      <text class="snode-t" x="${X.flow + 26}" y="${yy + 4}">⚙ ${esc(trunc(s.name, 16))}</text></g>`;
   });
-  const curve = (x1, y1, x2, y2, cls) => out += `<path class="edge ${cls || ''}" d="M${x1} ${y1} C ${x1 + 55} ${y1}, ${x2 - 55} ${y2}, ${x2} ${y2}"/>`;
+  const curve = (x1, y1, x2, y2, cls, a, b) => out += `<path class="edge ${cls || ''}" data-a="${esc(a||'')}" data-b="${esc(b||'')}" d="M${x1} ${y1} C ${x1 + 55} ${y1}, ${x2 - 55} ${y2}, ${x2} ${y2}"/>`;
   flows.forEach(f => {
-    (f.sources || []).forEach(s => { if (pos['s:' + s] != null) curve(X.src + 190, pos['s:' + s], X.flow, pos['f:' + f.name]); });
-    (f.emits || []).forEach(e => { if (pos['k:' + e] != null) curve(X.flow + 176, pos['f:' + f.name], X.sink, pos['k:' + e]); });
+    (f.sources || []).forEach(s => { if (pos['s:' + s] != null) curve(X.src + 190, pos['s:' + s], X.flow, pos['f:' + f.name], '', 's:' + s, 'f:' + f.name); });
+    (f.emits || []).forEach(e => { if (pos['k:' + e] != null) curve(X.flow + 176, pos['f:' + f.name], X.sink, pos['k:' + e], '', 'f:' + f.name, 'k:' + e); });
     (f.invokes || []).forEach(v => {
       const key = 'v:' + v.split(':').pop();
-      if (pos[key] != null) curve(X.flow + 88, pos['f:' + f.name] + 17, X.flow + 80, pos[key] - 13, 'svc');
+      if (pos[key] != null) curve(X.flow + 88, pos['f:' + f.name] + 17, X.flow + 80, pos[key] - 13, 'svc', 'f:' + f.name, key);
     });
   });
   consOut.forEach((c, i) => {
     const yy = top + 6 + i * 24;
-    out += `<text class="chip-t" x="${X.con}" y="${yy}">▸ ${esc(c.name)} (${esc((c.subjects_out||[]).join(','))})</text>`;
-    srcs.forEach(s => curve(X.con + 108, yy - 4, X.src, pos['s:' + s], 'dashed'));
+    out += `<g class="node" data-k="c:${esc(c.name)}"><text class="chip-t" x="${X.con}" y="${yy}">▸ ${esc(c.name)} (${esc((c.subjects_out||[]).join(','))})</text></g>`;
+    (c.subjects_out || []).forEach(s => { if (pos['s:' + s] != null) curve(X.con + 108, yy - 4, X.src, pos['s:' + s], 'dashed', 'c:' + c.name, 's:' + s); });
   });
   consIn.forEach(c => {
     (c.subjects_in || []).forEach(s => {
       if (pos['k:' + s] == null) return;
       const yy = pos['k:' + s];
-      out += `<text class="chip-t" x="${X.conIn}" y="${yy + 4}">▸ ${esc(c.name)}</text>`;
-      curve(X.sink + 165, yy, X.conIn - 6, yy, 'dashed');
+      out += `<g class="node" data-k="c:${esc(c.name)}"><text class="chip-t" x="${X.conIn}" y="${yy + 4}">▸ ${esc(c.name)}</text></g>`;
+      curve(X.sink + 165, yy, X.conIn - 6, yy, 'dashed', 'k:' + s, 'c:' + c.name);
     });
   });
   svg.innerHTML = out;
+  applyPipeSelection();
 }
+
+// A flow is "active" under the current selection if it is selected, or it touches
+// a selected source / sink / service / connector — the path around what you picked.
+function activeFlowNames() {
+  if (!PIPE || !pipeSel.size) return null; // null = no focus (show everything)
+  const flows = PIPE.flows || [], cons = PIPE.connectors || [];
+  const conSubjects = name => {
+    const c = cons.find(c => c.name === name);
+    return c ? [...(c.subjects_out || []), ...(c.subjects_in || [])] : [];
+  };
+  const active = new Set();
+  for (const f of flows) {
+    let hit = pipeSel.has('f:' + f.name)
+      || (f.sources || []).some(s => pipeSel.has('s:' + s))
+      || (f.emits || []).some(e => pipeSel.has('k:' + e))
+      || (f.invokes || []).some(v => pipeSel.has('v:' + v.split(':').pop()));
+    if (!hit) {
+      // a selected connector pulls in the flows sharing its subjects
+      for (const k of pipeSel) if (k.startsWith('c:')) {
+        const subs = conSubjects(k.slice(2));
+        if ((f.sources || []).some(s => subs.includes(s)) || (f.emits || []).some(e => subs.includes(e))) { hit = true; break; }
+      }
+    }
+    if (hit) active.add(f.name);
+  }
+  return active;
+}
+
+// The set of node keys to highlight: the active flows plus their endpoints.
+function activeNodeKeys(activeFlows) {
+  const keys = new Set(pipeSel);
+  if (!PIPE || activeFlows == null) return keys;
+  const cons = PIPE.connectors || [];
+  for (const f of (PIPE.flows || [])) {
+    if (!activeFlows.has(f.name)) continue;
+    keys.add('f:' + f.name);
+    (f.sources || []).forEach(s => keys.add('s:' + s));
+    (f.emits || []).forEach(e => keys.add('k:' + e));
+    (f.invokes || []).forEach(v => keys.add('v:' + v.split(':').pop()));
+  }
+  // connectors whose subjects touch an active endpoint
+  for (const c of cons) {
+    const subs = [...(c.subjects_out || []), ...(c.subjects_in || [])];
+    if (subs.some(s => keys.has('s:' + s) || keys.has('k:' + s))) keys.add('c:' + c.name);
+  }
+  return keys;
+}
+
+function applyPipeSelection() {
+  const svg = $('#pipe'); if (!svg) return;
+  const active = activeFlowNames();
+  const focus = active != null;
+  svg.classList.toggle('has-sel', focus);
+  const keys = activeNodeKeys(active);
+  // nodes
+  svg.querySelectorAll('.node').forEach(g => {
+    const k = g.getAttribute('data-k');
+    const on = !focus || keys.has(k);
+    g.querySelectorAll('rect,text,circle').forEach(el => el.classList.toggle('dim', focus && !on));
+    g.querySelectorAll('rect').forEach(el => el.classList.toggle('sel', pipeSel.has(k)));
+  });
+  // edges: highlight those between two active nodes
+  svg.querySelectorAll('.edge').forEach(e => {
+    const a = e.getAttribute('data-a'), b = e.getAttribute('data-b');
+    const on = !focus || (keys.has(a) && keys.has(b));
+    e.classList.toggle('dim', focus && !on);
+    e.classList.toggle('hl', focus && on);
+  });
+  // cards: show only those for active flows/services/connectors
+  const activeFiles = new Set();
+  if (focus && PIPE) {
+    const byName = {};
+    [...(PIPE.flows || []), ...(PIPE.services || []), ...(PIPE.connectors || [])].forEach(n => byName[n.name] = n.file);
+    for (const f of (PIPE.flows || [])) if (active.has(f.name)) activeFiles.add(f.file);
+    for (const k of keys) {
+      const nm = k.slice(2);
+      if (byName[nm]) activeFiles.add(byName[nm]);
+      // services keyed by short name
+      (PIPE.services || []).forEach(s => { if (s.name.split(':').pop() === nm) activeFiles.add(s.file); });
+      (PIPE.connectors || []).forEach(c => { if (c.name === nm) activeFiles.add(c.file); });
+    }
+  }
+  document.querySelectorAll('#root .card').forEach(card => {
+    const f = card.dataset.file;
+    card.classList.toggle('hidden-by-focus', focus && f && !activeFiles.has(f));
+  });
+  // the bar
+  const bar = $('#diagbar');
+  if (bar) {
+    if (!focus) { bar.innerHTML = ''; }
+    else {
+      const n = active.size;
+      bar.innerHTML = `<span>Focused on ${n} flow${n === 1 ? '' : 's'} (${[...pipeSel].map(k => k.slice(2)).join(', ')})</span>`;
+      const btn = document.createElement('button'); btn.className = 'clear'; btn.textContent = 'Clear';
+      btn.onclick = () => { pipeSel.clear(); applyPipeSelection(); };
+      bar.appendChild(btn);
+    }
+  }
+  pipeFocusToHash();
+}
+
+// The focus selection is deep-linkable: #focus=f:order_sync,s:vx.in shares (or
+// reloads) a focused pipeline view. Read it once at startup, write it on change.
+function pipeFocusToHash() {
+  const h = pipeSel.size ? '#focus=' + [...pipeSel].join(',') : '';
+  history.replaceState(null, '', location.pathname + location.search + h);
+}
+(function initPipeFocusFromHash() {
+  const m = /(?:^|#|&)focus=([^&]+)/.exec(location.hash);
+  if (m) decodeURIComponent(m[1]).split(',').filter(Boolean).forEach(k => pipeSel.add(k));
+})();
+
+// click delegation on the diagram: toggle a node in/out of the selection
+document.addEventListener('click', e => {
+  const svg = e.target.closest && e.target.closest('#pipe');
+  if (!svg) return;
+  const g = e.target.closest('.node');
+  if (!g) return;
+  const k = g.getAttribute('data-k');
+  if (pipeSel.has(k)) pipeSel.delete(k); else pipeSel.add(k);
+  applyPipeSelection();
+});
 
 /* ---------- sections ---------- */
 function mappingSection(card, file, entry, previewEntries, direct) {
@@ -622,7 +768,7 @@ async function load() {
     const pool = (isConnector ? topo.connectors : topo.flows) || [];
     const info = pool.find(f => f.file === file || (f.file || '').endsWith('/' + short)) || {};
     const lang = meta.lang || (file.endsWith('.vjs') ? 'vjs' : 'py');
-    const card = document.createElement('div'); card.className = 'card';
+    const card = document.createElement('div'); card.className = 'card'; card.dataset.file = file;
     const badges = `<span class="badge">${lang === 'vjs' ? 'VejasScript' : 'Python'}</span>` +
       (isConnector ? `<span class="badge">${esc(meta.driver)}</span><span class="badge pkg">${esc(meta.driver_kind)}</span>` : '') +
       (meta.pkg && meta.pkg !== 'default' ? `<span class="badge pkg">pkg: ${esc(meta.pkg)}</span>` : '') +
@@ -676,6 +822,7 @@ async function load() {
     if (inputEd) card.appendChild(inputEd);
     root.appendChild(card);
   }
+  applyPipeSelection(); // re-apply focus to the freshly rendered cards
   loadSecrets();
 }
 
