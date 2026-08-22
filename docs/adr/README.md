@@ -28,6 +28,7 @@ the old one.
 | [0015](0015-dead-letter-queue.md) | Persistent dead-letter queue with operator replay | Accepted |
 | [0016](0016-observability-metrics-otlp.md) | Observability: hand-rolled Prometheus `/metrics` and OTLP trace export | Accepted |
 | [0017](0017-connector-admission-test.md) | The connector admission test | Proposed |
+| [0018](0018-shadow-replay-on-persisted-traffic.md) | Shadow-replay on persisted traffic (+ promote audit trail) | Accepted (partial) |
 
 ## Template
 

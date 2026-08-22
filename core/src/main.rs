@@ -211,15 +211,46 @@ fn replay_literal(
     let before = vjs::parse(&src)?;
     let after = vjs::parse(&patched)?;
     let proc = flow_proc_name(&path);
-    // snapshot the last n full events (newest first), then release the lock
-    let events: Vec<Value> = {
-        let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        map.get(&proc)
-            .map(|ring| ring.iter().rev().take(n.clamp(1, 50)).cloned().collect())
-            .unwrap_or_default()
+    // Shadow-replay fuel (ADR-0018): prefer REAL persisted traffic hydrated from
+    // JetStream (read-only, the bus untouched) so replay reflects history that
+    // survived restarts and reaches past the 50-entry ring. Fall back to the
+    // in-memory trace ring when there is no bus source (api/tool flow), the
+    // stream is empty, or NATS is unreachable — always with a `source` tag so the
+    // operator knows what the diff was computed against.
+    let (events, replay_source): (Vec<Value>, &str) = {
+        let hydrated = before.source.as_deref().and_then(|subject| {
+            let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+            let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+            let nc = nats::connect(&url).ok()?;
+            let js = nats::jetstream::new(nc);
+            connectors::hydrate_recent(&js, &stream, subject, n).ok()
+        });
+        match hydrated {
+            Some(rows) if !rows.is_empty() => (
+                rows.into_iter()
+                    .map(|(subject, event)| {
+                        json!({
+                            "ts": Value::Null,
+                            "subject": subject,
+                            "preview": preview_of(&event),
+                            "event": event,
+                        })
+                    })
+                    .collect(),
+                "jetstream",
+            ),
+            _ => {
+                let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+                let ring = map
+                    .get(&proc)
+                    .map(|ring| ring.iter().rev().take(n.clamp(1, 50)).cloned().collect())
+                    .unwrap_or_default();
+                (ring, "trace-ring")
+            }
+        }
     };
     let pkg = pkg_of_path(&path);
-    let mut run_one = |prog: &vjs::Program, ev: &Value| -> Value {
+    let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
         let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
         match vjs::run(prog, ev, &mut engine) {
             Ok(ctx) => json!({
@@ -249,6 +280,7 @@ fn replay_literal(
     }
     Ok(json!({
         "file": file, "name": name, "key": key, "value": value,
+        "source": replay_source,
         "events": results.len(), "changed": changed_count, "results": results,
     }))
 }
@@ -2004,7 +2036,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
-        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change: rerun the flow's last real events against the current AND the patched script, return the before/after emit diff. Nothing is written, the bus is untouched — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),

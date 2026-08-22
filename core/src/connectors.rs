@@ -454,6 +454,76 @@ pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::
     Ok(msgs)
 }
 
+/// Hydrate up to `n` recent REAL events for `subject` from the persisted stream,
+/// for shadow-replay (ADR-0018). Read-only: an **ephemeral** pull consumer (no
+/// durable name → a server-assigned name, wholly separate from the flow's own
+/// durable) reads history and is never acked — so the live flow's delivery state
+/// is untouched and the bus is not consumed. Returns (subject, event) newest
+/// last, at most `n`.
+///
+/// To bound work on a large stream, it starts a window before the stream's last
+/// sequence rather than from the beginning: at most `window` messages are
+/// scanned, of which the last `n` matching `subject` are kept.
+pub fn hydrate_recent(
+    js: &nats::jetstream::JetStream,
+    stream: &str,
+    subject: &str,
+    n: usize,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let n = n.clamp(1, 5000);
+    let last = js
+        .stream_info(stream)
+        .map(|si| si.state.last_seq)
+        .unwrap_or(0);
+    if last == 0 {
+        return Ok(Vec::new()); // empty stream: nothing persisted yet
+    }
+    // Over-scan so we still find n matching events when other subjects interleave,
+    // but keep it bounded (an operator action, not the hot path).
+    let window = (n as u64).saturating_mul(8).max(256).min(200_000);
+    let start = last.saturating_sub(window).max(1);
+    let cfg = nats::jetstream::ConsumerConfig {
+        deliver_policy: nats::jetstream::DeliverPolicy::ByStartSeq,
+        opt_start_seq: Some(start),
+        // Explicit but never acked: the consumer is ephemeral and discarded, so
+        // un-acked messages simply expire with it — nothing redelivers to the
+        // flow, nothing is consumed off the stream.
+        ack_policy: nats::jetstream::AckPolicy::Explicit,
+        filter_subject: subject.to_string(),
+        // auto-reap the ephemeral consumer shortly after we stop pulling
+        inactive_threshold: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let sub = js
+        .pull_subscribe_with_options(
+            subject,
+            &nats::jetstream::PullSubscribeOptions::new().consumer_config(cfg),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut ring: std::collections::VecDeque<(String, serde_json::Value)> =
+        std::collections::VecDeque::with_capacity(n);
+    let mut scanned = 0u64;
+    loop {
+        let batch = fetch_round(&sub)?;
+        if batch.is_empty() {
+            break; // no_wait + fully-persisted stream: empty means exhausted
+        }
+        for m in &batch {
+            scanned += 1;
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data) {
+                ring.push_back((m.subject.clone(), v));
+                while ring.len() > n {
+                    ring.pop_front();
+                }
+            }
+        }
+        if scanned >= window {
+            break; // safety bound hit
+        }
+    }
+    Ok(ring.into_iter().collect())
+}
+
 // ───────────────────────── source: oauth-poll ─────────────────────────
 //
 // The generic OAuth2 client-credentials REST poller — the driver that stands
