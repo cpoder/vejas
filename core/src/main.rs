@@ -24,6 +24,7 @@
 //   POST /flows/new                agent CLI writes a VejasScript flow
 //   POST /reload                   rescan; restart changed files (mtime)
 
+mod cluster;
 mod connectors;
 mod control;
 mod metrics;
@@ -794,20 +795,68 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
                 config: connectors::Config(config),
                 running: running.clone(),
             };
-            // watch the handle's stop flag in a sidecar thread → clears ctx.running
+            // watch the handle's stop flag in a sidecar thread → clears ctx.running.
+            // Also exits if `running` was cleared elsewhere (a lost singleton lease),
+            // so it doesn't outlive its attempt.
             let h2 = handle.clone();
             let r2 = running.clone();
             thread::spawn(move || {
-                while RUNNING.load(Ordering::SeqCst) && !h2.stop.load(Ordering::SeqCst) {
+                while RUNNING.load(Ordering::SeqCst)
+                    && !h2.stop.load(Ordering::SeqCst)
+                    && r2.load(Ordering::SeqCst)
+                {
                     thread::sleep(Duration::from_millis(200));
                 }
                 r2.store(false, Ordering::SeqCst);
             });
+            // Singleton sources run on exactly one instance (ADR-0020): stand by
+            // until this instance holds the lease, then run. The guard releases the
+            // lease when it drops (after driver.run returns) — instant handoff on a
+            // graceful stop. If the lease is lost mid-run, the renewal thread clears
+            // `running`, the driver returns, and the supervisor re-enters standby.
+            let _lease = if cluster::is_singleton(driver.kind()) {
+                let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+                let js = nats::jetstream::new(nc);
+                match cluster::open_lease_store(&js) {
+                    Some(store) => {
+                        let key = connectors::dlq_unit_token(&handle.spec.name);
+                        set_state(&handle, |st| {
+                            st.status = format!("standby ({})", driver.kind())
+                        });
+                        let h3 = handle.clone();
+                        let alive = move || {
+                            RUNNING.load(Ordering::SeqCst) && !h3.stop.load(Ordering::SeqCst)
+                        };
+                        match cluster::acquire_blocking(&store, &key, running.clone(), alive) {
+                            Some(guard) => {
+                                set_state(&handle, |st| {
+                                    st.status = format!("running ({}, leader)", driver.kind())
+                                });
+                                Some(guard)
+                            }
+                            None => return Ok(()), // asked to stop while standing by
+                        }
+                    }
+                    // No JetStream KV: run unleased — single-instance behaviour.
+                    None => None,
+                }
+            } else {
+                None
+            };
             driver.run(&ctx)
         })();
         stop.store(false, Ordering::SeqCst);
         match attempt {
-            Ok(()) => break,
+            Ok(()) => {
+                // Driver stopped. On shutdown/removal, finish. Otherwise a
+                // singleton lost its lease mid-run — loop back to standby and
+                // re-acquire rather than exiting the connector (ADR-0020).
+                if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                delay = Duration::from_secs(1);
+                thread::sleep(Duration::from_millis(300));
+            }
             Err(e) => {
                 eprintln!("[vejas] connector {}: {e}", handle.spec.name);
                 set_state(&handle, |st| {
@@ -2950,6 +2999,15 @@ fn main() {
     // Traces to an OTLP collector iff OTEL_EXPORTER_OTLP_ENDPOINT is set; metrics
     // are always scrapeable at GET /metrics. No-op (no thread) when unset.
     metrics::otlp_init();
+
+    // Clustering (ADR-0020): singleton sources take a KV lease so exactly one
+    // instance runs them; announce this instance's identity for the operator.
+    if cluster::clustered() {
+        eprintln!(
+            "[vejas] cluster mode — instance {} (singletons run under a lease)",
+            cluster::instance_id()
+        );
+    }
 
     ctrlc::set_handler(|| {
         eprintln!("[vejas] shutdown requested");

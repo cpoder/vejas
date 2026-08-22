@@ -8,7 +8,9 @@ description = "Vejas runtime: supervises agent-written integration flows and bus
 [dependencies]
 tiny_http = "0.12"
 serde_json = "1"
-ctrlc = "3.4"
+# `termination` so SIGTERM/SIGHUP (a k8s rolling restart) hit the graceful drain
+# path, not default immediate kill — needed for lease handoff (ADR-0020).
+ctrlc = { version = "3.4", features = ["termination"] }
 nats = "0.25"
 # Pooled, blocking HTTP(S) client for the http-out/http-poll/oauth-poll drivers
 # (replaces one curl process per request). Pure-Rust TLS (rustls), self-contained.
