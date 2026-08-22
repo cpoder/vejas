@@ -840,6 +840,70 @@ fn summarize(bytes: &[u8]) -> Option<String> {
     }
 }
 
+// ───────────────────────── dead-letter queue (ADR-0015) ─────────────────────────
+// Poison messages are parked, not dropped, in a DEDICATED JetStream stream on a
+// sibling root (vxdlq.<unit>, never vx.> — overlapping stream subjects are
+// forbidden and the DLQ's retention must be independent of the hot path). The
+// caller acks the original ONLY when to_dlq() returns Ok (publish-before-ack).
+
+pub const DLQ_STREAM: &str = "VEJAS_DLQ";
+pub const DLQ_ROOT: &str = "vxdlq";
+pub const DLQ_MAX_MSGS: i64 = 100_000;
+
+/// Ensure the dead-letter stream exists (idempotent). Bounded + discard-oldest:
+/// a full DLQ is itself an operator signal, never a silent unbounded growth.
+pub fn ensure_dlq_stream(js: &nats::jetstream::JetStream) {
+    let _ = js.add_stream(&nats::jetstream::StreamConfig {
+        name: DLQ_STREAM.to_string(),
+        subjects: vec![format!("{DLQ_ROOT}.>")],
+        max_msgs: DLQ_MAX_MSGS,
+        discard: nats::jetstream::DiscardPolicy::Old,
+        ..Default::default()
+    });
+}
+
+/// A unit name (e.g. "connector:sap_out", "flow:orders") as a NATS subject token.
+pub fn dlq_unit_token(unit: &str) -> String {
+    unit.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Park one poison message in the DLQ as a death envelope. Returns Ok only when
+/// JetStream has stored it — the caller must ack the original only on Ok.
+pub fn to_dlq(
+    js: &nats::jetstream::JetStream,
+    unit: &str,
+    subject: &str,
+    attempts: i64,
+    last_error: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    ensure_dlq_stream(js);
+    let now = epoch_secs();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "original_subject": subject,
+        "unit": unit,
+        "attempts": attempts,
+        "first_seen": now,
+        "dead_at": now,
+        "last_error": last_error,
+        // Raw text of the original message — replayed verbatim, so JSON and
+        // non-JSON alike re-inject faithfully; the panel pretty-prints it if JSON.
+        "payload": String::from_utf8_lossy(payload),
+    }))
+    .map_err(|e| e.to_string())?;
+    let dlq_subject = format!("{DLQ_ROOT}.{}", dlq_unit_token(unit));
+    js.publish(&dlq_subject, body).map(|_| ()).map_err(|e| e.to_string())
+}
+
 // ───────────────────────── sinks ─────────────────────────
 
 /// Shared sink loop: durable pull consumer -> handler; ack on Ok, nak on Err.
@@ -889,13 +953,28 @@ fn run_sink(
                     let delivered =
                         msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
                     if delivered >= crate::MAX_DELIVERIES {
-                        eprintln!("[{}] {e} -> dropped after {delivered} deliveries", ctx.name);
-                        crate::record_trace_full(
-                            &ctx.name, subject, false,
-                            Some(format!("{e} — dropped after {delivered} deliveries")),
-                            vec![], preview, None, None,
-                        );
-                        let _ = msg.ack();
+                        // Poison: park it in the DLQ, then ack — publish before ack
+                        // so it is never lost (ADR-0015). On DLQ failure, nak.
+                        match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data) {
+                            Ok(()) => {
+                                eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);
+                                crate::record_trace_full(
+                                    &ctx.name, subject, false,
+                                    Some(format!("{e} — dead-lettered after {delivered} deliveries")),
+                                    vec![], preview, None, None,
+                                );
+                                let _ = msg.ack();
+                            }
+                            Err(de) => {
+                                eprintln!("[{}] {e} -> DLQ publish failed ({de}); nak", ctx.name);
+                                crate::record_trace_full(
+                                    &ctx.name, subject, false,
+                                    Some(format!("{e} — DLQ publish failed: {de}")),
+                                    vec![], preview, None, None,
+                                );
+                                let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                            }
+                        }
                     } else {
                         eprintln!("[{}] {e} -> nak", ctx.name);
                         crate::record_trace_full(

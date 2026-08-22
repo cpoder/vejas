@@ -427,17 +427,26 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let event: Value = match serde_json::from_slice(&msg.data) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[vejas] {}: bad json: {e}", handle.spec.name);
-                            record_trace(
-                                &handle.spec.name,
-                                &msg.subject,
-                                false,
-                                Some(format!("bad json: {e}")),
-                                vec![],
-                                String::from_utf8_lossy(&msg.data).chars().take(160).collect(),
-                                None,
-                            );
-                            let _ = msg.ack();
+                            // Not JSON: permanent poison. Dead-letter it (ADR-0015)
+                            // — publish before ack, nak if the DLQ write fails.
+                            let err = format!("bad json: {e}");
+                            eprintln!("[vejas] {}: {err}", handle.spec.name);
+                            let delivered =
+                                msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                            let prev: String =
+                                String::from_utf8_lossy(&msg.data).chars().take(160).collect();
+                            match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data) {
+                                Ok(()) => {
+                                    record_trace(&handle.spec.name, &msg.subject, false,
+                                        Some(format!("{err} — dead-lettered")), vec![], prev, None);
+                                    let _ = msg.ack();
+                                }
+                                Err(de) => {
+                                    record_trace(&handle.spec.name, &msg.subject, false,
+                                        Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None);
+                                    let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                }
+                            }
                             continue;
                         }
                     };
@@ -469,29 +478,32 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
-                            // poison guard: after MAX_DELIVERIES failed runs the
-                            // message is dropped (acked), not redelivered forever
+                            // poison guard: past MAX_DELIVERIES the message is
+                            // dead-lettered (ADR-0015) rather than dropped; publish
+                            // before ack, nak if the DLQ write fails.
                             let delivered =
                                 msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
-                            let dropped = delivered >= MAX_DELIVERIES;
-                            record_trace(
-                                &handle.spec.name,
-                                &msg.subject,
-                                false,
-                                Some(if dropped {
-                                    format!("{e} — dropped after {delivered} deliveries")
-                                } else {
-                                    e.clone()
-                                }),
-                                vec![],
-                                preview_of(&event),
-                                Some(event.clone()),
-                            );
-                            set_state(&handle, |st| st.last_error = Some(e));
-                            if dropped {
-                                let _ = msg.ack();
+                            if delivered >= MAX_DELIVERIES {
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data) {
+                                    Ok(()) => {
+                                        record_trace(&handle.spec.name, &msg.subject, false,
+                                            Some(format!("{e} — dead-lettered after {delivered} deliveries")),
+                                            vec![], preview_of(&event), Some(event.clone()));
+                                        let _ = msg.ack();
+                                    }
+                                    Err(de) => {
+                                        record_trace(&handle.spec.name, &msg.subject, false,
+                                            Some(format!("{e} — DLQ publish failed: {de}")),
+                                            vec![], preview_of(&event), Some(event.clone()));
+                                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                    }
+                                }
+                            } else {
+                                record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
+                                    vec![], preview_of(&event), Some(event.clone()));
+                                // no ack -> redelivery after ack_wait
                             }
-                            // else: no ack -> redelivery after ack_wait
+                            set_state(&handle, |st| st.last_error = Some(e));
                         }
                     }
                 }
@@ -1497,6 +1509,111 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
     serde_json::from_slice::<Value>(&msg.data).map_err(|e| e.to_string())
 }
 
+// ───────────────────────── dead-letter queue (ADR-0015) ─────────────────────────
+fn dlq_js() -> Result<nats::jetstream::JetStream, String> {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+    let js = nats::jetstream::new(nc);
+    connectors::ensure_dlq_stream(&js);
+    Ok(js)
+}
+
+/// List dead letters, newest first (each carries its stream `seq` for replay/purge).
+fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
+    let js = dlq_js()?;
+    let info = js.stream_info(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
+    let (first, last) = (info.state.first_seq, info.state.last_seq);
+    let mut out = Vec::new();
+    if last == 0 || info.state.messages == 0 {
+        return Ok(out);
+    }
+    let mut seq = last;
+    loop {
+        if let Ok(m) = js.get_message(connectors::DLQ_STREAM, seq) {
+            if let Ok(mut env) = serde_json::from_slice::<Value>(&m.data) {
+                if let Some(o) = env.as_object_mut() {
+                    o.insert("seq".into(), json!(m.sequence));
+                }
+                out.push(env);
+            }
+        }
+        if seq <= first || out.len() >= limit {
+            break;
+        }
+        seq -= 1;
+    }
+    Ok(out)
+}
+
+/// Replay dead letters: re-publish each to its ORIGINAL subject (where the
+/// corrected flow reprocesses it), then remove it from the DLQ. Publish-before-
+/// delete, so a failed re-inject keeps the dead letter. By `seq`, by `unit`, or
+/// all (both None).
+fn dlq_replay(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+    let js = dlq_js()?;
+    let mut targets: Vec<(u64, String, Vec<u8>)> = Vec::new();
+    let take = |env: &Value| -> (u64, String, Vec<u8>) {
+        (
+            env["seq"].as_u64().unwrap_or(0),
+            env["original_subject"].as_str().unwrap_or("").to_string(),
+            env["payload"].as_str().unwrap_or("").as_bytes().to_vec(),
+        )
+    };
+    if let Some(s) = seq {
+        let m = js.get_message(connectors::DLQ_STREAM, s).map_err(|e| e.to_string())?;
+        let mut env: Value = serde_json::from_slice(&m.data).map_err(|e| e.to_string())?;
+        if let Some(o) = env.as_object_mut() {
+            o.insert("seq".into(), json!(m.sequence));
+        }
+        targets.push(take(&env));
+    } else {
+        for env in dlq_list(100_000)? {
+            if unit.map(|u| env["unit"].as_str() == Some(u)).unwrap_or(true) {
+                targets.push(take(&env));
+            }
+        }
+    }
+    let (mut n, mut errs) = (0u64, Vec::new());
+    for (s, subj, payload) in targets {
+        if subj.is_empty() || s == 0 {
+            continue;
+        }
+        match js.publish(&subj, payload) {
+            Ok(_) => {
+                let _ = js.delete_message(connectors::DLQ_STREAM, s);
+                n += 1;
+            }
+            Err(e) => errs.push(format!("seq {s}: {e}")),
+        }
+    }
+    Ok(json!({"replayed": n, "errors": errs}))
+}
+
+/// Discard dead letters without replaying — by `seq`, by `unit`, or all.
+fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+    let js = dlq_js()?;
+    if seq.is_none() && unit.is_none() {
+        let r = js.purge_stream(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
+        return Ok(json!({"purged": r.purged}));
+    }
+    let mut n = 0u64;
+    if let Some(s) = seq {
+        js.delete_message(connectors::DLQ_STREAM, s).map_err(|e| e.to_string())?;
+        n = 1;
+    } else if let Some(u) = unit {
+        for env in dlq_list(100_000)? {
+            if env["unit"].as_str() == Some(u) {
+                if let Some(s) = env["seq"].as_u64() {
+                    if js.delete_message(connectors::DLQ_STREAM, s).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(json!({"purged": n}))
+}
+
 // ───────────────────────── http ─────────────────────────
 
 // ───────────────────────── MCP server ─────────────────────────
@@ -1829,6 +1946,9 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_describe", "description": "Describe a SAP function module's interface: every parameter's name, direction (import/export/changing/tables), type and length. Read this before sap_call.", "inputSchema": obj(json!({"func": {"type": "string"}}), vec!["func"])}),
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
+        json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -1975,6 +2095,20 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
                 op["tid"] = t.clone();
             }
             text(sap_rpc_request(root, &op)?.to_string())
+        }
+        "vejas_dlq" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            text(json!({"dead_letters": dlq_list(limit)?}).to_string())
+        }
+        "vejas_dlq_replay" => {
+            let seq = args.get("seq").and_then(|v| v.as_u64());
+            let unit = args.get("unit").and_then(|v| v.as_str());
+            text(dlq_replay(seq, unit)?.to_string())
+        }
+        "vejas_dlq_purge" => {
+            let seq = args.get("seq").and_then(|v| v.as_u64());
+            let unit = args.get("unit").and_then(|v| v.as_str());
+            text(dlq_purge(seq, unit)?.to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -2133,6 +2267,26 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/events") => {
             let flow = qparam(&url, "flow");
             respond(request, 200, events_json(flow.as_deref()), "application/json")
+        }
+        (tiny_http::Method::Get, "/dlq") => match dlq_list(200) {
+            Ok(l) => respond(request, 200, json!({"dead_letters": l}).to_string(), "application/json"),
+            Err(e) => respond(request, 500, e, "text/plain"),
+        },
+        (tiny_http::Method::Post, "/dlq/replay") => {
+            let body = read_body(&mut request);
+            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            match r {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/dlq/purge") => {
+            let body = read_body(&mut request);
+            let r = dlq_purge(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            match r {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
         }
         (tiny_http::Method::Get, "/drivers") => {
             let list: Vec<Value> = connectors::catalog()

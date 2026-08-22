@@ -54,16 +54,17 @@
                     cursor: pointer; white-space: nowrap; }
   .newflow button:disabled { opacity: .6; cursor: wait; }
   .hint { font-size: 12.5px; color: var(--muted); margin: 10px 0 0; }
-  /* Recent-events table: clamp it to the card so long payloads never overflow. */
-  #events table { width: 100%; table-layout: fixed; border-collapse: collapse; }
-  #events th, #events td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Recent-events + dead-letters tables: clamp to the card so long payloads
+     never overflow; the payload cell expands on click. */
+  #events table, #dlq table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+  #events th, #events td, #dlq th, #dlq td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #events th:nth-child(1), #events td:nth-child(1) { width: 78px; }   /* time */
   #events th:nth-child(2), #events td:nth-child(2) { width: 150px; }  /* flow */
   #events th:nth-child(3), #events td:nth-child(3) { width: 150px; }  /* event on */
-  /* emitted (4) + payload (5) share the rest */
-  #events td.payload { white-space: normal; }
-  #events td.payload summary { cursor: pointer; white-space: nowrap; overflow: hidden;
-                               text-overflow: ellipsis; display: block; color: var(--accent); }
+  #dlq th:nth-child(5), #dlq td:nth-child(5) { width: 150px; }        /* actions */
+  td.payload { white-space: normal; }
+  td.payload summary { cursor: pointer; white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis; display: block; color: var(--accent); }
   pre.payload-full { white-space: pre-wrap; word-break: break-word; overflow-x: auto;
                      margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
                      background: var(--card2, rgba(127,127,127,.08));
@@ -171,6 +172,12 @@
     <h2>Recent events</h2>
     <p class="sub">The last events processed — flows and connectors, live, newest first.</p>
     <div id="events"><span style="color:var(--muted)">No events yet — send one to a source subject.</span></div>
+  </div>
+
+  <div class="card" id="dlq-card" style="display:none">
+    <h2>Dead letters</h2>
+    <p class="sub">Poison messages parked instead of dropped (ADR-0015). Fix the cause (edit the literal above, shadow-replay it), then replay — or discard.</p>
+    <div id="dlq"></div>
   </div>
 
   <div class="card">
@@ -614,6 +621,31 @@ async function loadEvents() {
 }
 loadEvents();
 setInterval(loadEvents, 4000);
+
+async function dlqAction(path, body) { try { await post(path, body); toast('Done — reloaded'); await loadDlq(); } catch (e) { toast(e.message.slice(0,160), true); } }
+async function loadDlq() {
+  try {
+    const items = (await fetch('/dlq').then(r => r.json())).dead_letters || [];
+    const card = document.getElementById('dlq-card');
+    if (!items.length) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    const pretty = s => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } };
+    const rows = items.map(e => `<tr>
+      <td class="field"><code>${esc(String(e.unit || ''))}</code></td>
+      <td class="sample">${esc(e.original_subject || '')}</td>
+      <td class="sample" title="${esc(e.last_error || '')}">${esc(trunc(e.last_error || '', 44))}</td>
+      <td class="payload"><details><summary>${esc(trunc(e.payload || '', 40))}</summary><pre class="payload-full">${esc(pretty(e.payload || ''))}</pre></details></td>
+      <td style="white-space:nowrap"><button class="apply" onclick="dlqAction('/dlq/replay',{seq:${e.seq}})">Replay</button>
+          <button class="tool" onclick="dlqAction('/dlq/purge',{seq:${e.seq}})">Discard</button></td>
+    </tr>`).join('');
+    document.getElementById('dlq').innerHTML =
+      `<table class="events-t"><tr><th>unit</th><th>subject</th><th>error</th><th>payload</th><th></th></tr>${rows}</table>` +
+      `<div style="margin-top:10px"><button class="apply" onclick="dlqAction('/dlq/replay',{})">Replay all</button> ` +
+      `<button class="tool" onclick="dlqAction('/dlq/purge',{})">Discard all</button></div>`;
+  } catch {}
+}
+loadDlq();
+setInterval(loadDlq, 5000);
 
 $('#gen').onclick = async () => {
   const prompt = $('#prompt').value.trim();
