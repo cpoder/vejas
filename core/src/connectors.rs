@@ -197,7 +197,10 @@ impl Driver for HttpIn {
                     thread::spawn(move || handle_http_in(&name, &mut sock, &js, &root));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
+                    // Poll responsively (stop is re-checked each turn) without a
+                    // busy spin; keep-alive connections (below) reuse a socket, so
+                    // this only bounds NEW-connection accept latency.
+                    thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => eprintln!("[{}] accept: {e}", ctx.name),
             }
@@ -207,68 +210,90 @@ impl Driver for HttpIn {
 }
 
 fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
+    // TCP_NODELAY: without it, the small response write + the client's delayed
+    // ACK collide with Nagle for a ~40ms stall on every keep-alive request.
+    sock.set_nodelay(true).ok();
+    // The 5s read timeout doubles as the keep-alive idle-session end.
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let mut header_end = None;
+    // Keep-alive: serve successive requests on the same socket (HTTP/1.1) until
+    // the client closes or idles out — so a keep-alive client reuses one socket
+    // instead of reconnecting per request. Each iteration reads its OWN request
+    // (and its own Content-Length).
     loop {
-        match sock.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                    }
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut header_end = None;
+        let mut eof = false;
+        loop {
+            match sock.read(&mut tmp) {
+                Ok(0) => {
+                    eof = true;
+                    break;
                 }
-                if let Some(he) = header_end {
-                    let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
-                    if buf.len() >= he + clen {
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
+                        if buf.len() >= he + clen {
+                            break;
+                        }
+                    }
+                    if buf.len() > 1_048_576 {
                         break;
                     }
                 }
-                if buf.len() > 1_048_576 {
+                Err(_) => {
+                    eof = true;
                     break;
                 }
             }
-            Err(_) => break,
         }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.split("\r\n");
-    let mut parts = lines.next().unwrap_or("").split(' ');
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-    let body = header_end.map(|he| &buf[he.min(buf.len())..]).unwrap_or(&[]);
-    let reply = |sock: &mut std::net::TcpStream, code: &str, json: &str| {
+        if header_end.is_none() {
+            break; // no complete request (client closed or idled out)
+        }
+        let (code, json): (&str, String) = {
+            let text = String::from_utf8_lossy(&buf);
+            let mut parts = text.split("\r\n").next().unwrap_or("").split(' ');
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("");
+            let body = header_end.map(|he| &buf[he.min(buf.len())..]).unwrap_or(&[]);
+            if method == "GET" && path == "/healthz" {
+                ("200 OK", "{\"ok\":true}".to_string())
+            } else if method != "POST" || !path.starts_with("/ingest/") {
+                ("404 Not Found", "{\"error\":\"POST /ingest/<subject-suffix>\"}".to_string())
+            } else {
+                let suffix = path.trim_start_matches("/ingest/").trim_matches('/');
+                if suffix.is_empty() {
+                    ("400 Bad Request", "{\"error\":\"missing subject suffix\"}".to_string())
+                } else if serde_json::from_slice::<Value>(body).is_err() {
+                    ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string())
+                } else {
+                    let subject = format!("{subj_root}.{suffix}");
+                    match js.publish(&subject, body) {
+                        Ok(_) => {
+                            trace_pub(name, &subject, body);
+                            ("202 Accepted", format!("{{\"published\":\"{subject}\"}}"))
+                        }
+                        Err(e) => {
+                            trace_fail(name, &subject, format!("publish: {e}"));
+                            ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}"))
+                        }
+                    }
+                }
+            }
+        };
         let _ = write!(
             sock,
-            "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+            "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{json}",
             json.len()
         );
-    };
-    if method == "GET" && path == "/healthz" {
-        return reply(sock, "200 OK", "{\"ok\":true}");
-    }
-    if method != "POST" || !path.starts_with("/ingest/") {
-        return reply(sock, "404 Not Found", "{\"error\":\"POST /ingest/<subject-suffix>\"}");
-    }
-    let suffix = path.trim_start_matches("/ingest/").trim_matches('/');
-    if suffix.is_empty() {
-        return reply(sock, "400 Bad Request", "{\"error\":\"missing subject suffix\"}");
-    }
-    if serde_json::from_slice::<Value>(body).is_err() {
-        return reply(sock, "400 Bad Request", "{\"error\":\"body must be JSON\"}");
-    }
-    let subject = format!("{subj_root}.{suffix}");
-    match js.publish(&subject, body) {
-        Ok(_) => {
-            trace_pub(name, &subject, body);
-            reply(sock, "202 Accepted", &format!("{{\"published\":\"{subject}\"}}"))
-        }
-        Err(e) => {
-            trace_fail(name, &subject, format!("publish: {e}"));
-            reply(sock, "502 Bad Gateway", &format!("{{\"error\":\"{e}\"}}"))
+        if eof {
+            break; // client sent its last request, then closed
         }
     }
 }
