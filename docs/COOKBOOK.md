@@ -12,8 +12,13 @@ claude mcp add --transport http vejas http://localhost:8686/mcp   # or any MCP c
 
 Each recipe below is a **prompt you say to your agent**, the **file that
 lands**, and how to check it. The flows shown are real files from this repo.
-Prompts marked ✓ were exercised against a live runtime by a real agent;
-the others follow the same contract.
+
+**Every prompt marked ✓ was replayed on 2026-08-22 by a real agent
+(`claude -p`, MCP only, no repo access) against a fresh local runtime — and
+validated on the outcome**: the file landed, parsed, and behaved (fixtures
+run, API answered, tables corrected). Agents routinely landed *more* than
+the recipe shows: normalized inputs, DRY-RUN sinks with the `secret()` line
+ready, staleness envelopes — each choice argued in their report.
 
 ---
 
@@ -54,7 +59,7 @@ curl -X POST localhost:8787/ingest/helpdesk.tickets \
 # then watch the event and its emit in the panel, or: curl localhost:8686/events
 ```
 
-## 2 · Shop orders into the ERP
+## 2 · Shop orders into the ERP ✓
 
 > New shop orders arrive on `vx.shop.orders`. Map country names to ISO codes,
 > lowercase the customer email, turn `line_items` into ERP positions (sku,
@@ -96,7 +101,7 @@ WEBHOOK_URL = secret("slack/webhook")
 file, the panel, or `git diff` — agents are held to that contract by the
 generation loop itself (ADR-0008).
 
-## 5 · Bridge two SaaS — ServiceNow incidents into Jira
+## 5 · Bridge two SaaS — ServiceNow incidents into Jira ✓
 
 > Poll our ServiceNow for active incidents every 5 minutes (basic auth from
 > the vault under `servicenow/basic`). For every P1 incident, create a Jira
@@ -108,7 +113,7 @@ What lands: **two manifests and one flow** — `servicenow_incidents_poll`
 and shapes the Jira `fields` document, and `jira_create_issue` (http-out).
 Full recipes: [`docs/examples/connectors/`](examples/connectors/).
 
-## 6 · A flow that is an API
+## 6 · A flow that is an API ✓
 
 > Give me a REST endpoint POST /orders that validates the body, computes the
 > total in euros, and answers 201 with the enriched order — and document it.
@@ -125,7 +130,7 @@ It is served at `/api/orders`, and `GET /api/openapi.json` documents it —
 generated from the flows themselves. One file per verb composes a resource
 ([`docs/examples/rest-api/`](examples/rest-api/)).
 
-## 7 · Talk to SAP
+## 7 · Talk to SAP *(needs a live SAP — exercised in the recorded demo, not in the local pass)*
 
 > List the BAPIs matching BAPI_COMPANY* on our SAP, describe the first one,
 > and call it.
@@ -150,12 +155,15 @@ before/after diff of what would have been emitted. You approve; it promotes
 with `vejas_set_literal`. The bus was never touched during the rehearsal
 (ADR-0005).
 
-> The severity table is missing "bloquante" — it should page like a P1.
+> The severity table is missing "bloquante" — it should page like a P1. ✓
 
 Same loop, one table entry: replay, diff, promote. A domain expert can do
 this one **without any agent** — it is the panel's Apply → shadow-replay →
 Promote button path. The prompt and the panel are two doors to the same
-governed change.
+governed change. *(The validation pass ran exactly this prompt on real
+traffic: two silent `bloquante` tickets, then the correction, then the next
+`bloquante` alerted — and caught a live-reload regression on the way, fixed
+since. Validation that finds bugs is validation working.)*
 
 ---
 
