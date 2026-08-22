@@ -195,7 +195,7 @@ impl SecretStore for VaultStore {
             .rsplit_once('/')
             .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
-        // argv-safe: the token travels in the curl --config file, never argv
+        // argv-safe: the token rides in an in-memory ureq header, never on argv
         let headers = [("X-Vault-Token".to_string(), self.token.clone())];
         let (code, body) = crate::connectors::http_request("GET", &url, &headers, None)
             .map_err(|e| format!("vault: {e}"))?;

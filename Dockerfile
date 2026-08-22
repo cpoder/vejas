@@ -7,7 +7,11 @@ COPY core/ .
 RUN cargo build --release
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+# ca-certificates only: the runtime's HTTP (webhooks, oauth-poll, http-poll) goes
+# through the in-binary ureq/rustls client — no `curl` shell-out anymore, so it is
+# not installed. The connector crates under connectors/ that still use curl are
+# not built into this image (it ships only vejas-runtime).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY flows/ flows/

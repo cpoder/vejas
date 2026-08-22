@@ -134,7 +134,7 @@ pub fn humanize(e: &str) -> String {
         format!("authentication refused (invalid or expired secret?) — {e}")
     } else if e.contains("not set") || e.contains("not found (set env") || (e.contains("secret") && e.contains("not found")) {
         format!("missing secret — {e}")
-    } else if e.starts_with("curl:") || e.contains("Connection refused") || e.contains("Could not resolve") || e.contains("timed out") {
+    } else if e.starts_with("http:") || e.contains("Connection refused") || e.contains("Could not resolve") || e.contains("timed out") {
         format!("unreachable (network, URL, proxy?) — {e}")
     } else {
         e.to_string()
@@ -1540,11 +1540,11 @@ impl Driver for ExecRpc {
     }
 }
 
-// ───────────────────────── HTTP client (curl, argv-safe) ─────────────────────────
-// v0 keeps the dependency graph light (curl); a Rust HTTP client replaces this
-// later. Everything sensitive — the URL and the headers, Authorization above
-// all — travels in a 0600 `--config` file, NEVER in argv: /proc/<pid>/cmdline
-// is world-readable. The body streams over stdin.
+// ───────────────────────── HTTP client (ureq/rustls, in-binary) ─────────────────────────
+// A pure-Rust HTTP client compiled into the runtime — no `curl` shell-out, no
+// process-per-request, and nothing sensitive on argv (/proc/<pid>/cmdline is
+// world-readable): the URL and every header, Authorization above all, live only
+// in memory. This is what let `curl` leave the Docker image entirely.
 
 /// A pooled, blocking HTTP(S) agent shared by http-out / http-poll / oauth-poll,
 /// so connections stay alive across requests (no process-per-request). Pure-Rust
