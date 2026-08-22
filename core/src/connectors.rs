@@ -16,7 +16,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1386,84 +1386,50 @@ impl Driver for ExecRpc {
 // all — travels in a 0600 `--config` file, NEVER in argv: /proc/<pid>/cmdline
 // is world-readable. The body streams over stdin.
 
-static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// A value quoted for a curl config file.
-fn curl_quote(v: &str) -> String {
-    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+/// A pooled, blocking HTTP(S) agent shared by http-out / http-poll / oauth-poll,
+/// so connections stay alive across requests (no process-per-request). Pure-Rust
+/// TLS (rustls); credentials ride in the headers, in memory, never argv.
+static HTTP_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .user_agent("vejas")
+            .build()
+    })
 }
 
-/// One HTTP request through curl. Returns (status, body) — the caller decides
-/// what a given status means (401 → token refresh, etc.).
+/// One HTTP request. Returns (status, body) — the caller decides what a given
+/// status means (401 → token refresh, etc.), so 4xx/5xx are handed back, not
+/// errored.
 pub fn http_request(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut cfg = String::new();
-    cfg.push_str(&format!("url = {}\n", curl_quote(url)));
+    use std::io::Read as _;
+    let mut req = http_agent().request(method, url);
     for (k, v) in headers {
-        cfg.push_str(&format!("header = {}\n", curl_quote(&format!("{k}: {v}"))));
+        req = req.set(k, v);
     }
-    if body.is_some() {
-        cfg.push_str("data-binary = \"@-\"\n");
-    } else if method != "GET" {
-        cfg.push_str(&format!("request = {}\n", curl_quote(method)));
-    }
-    let path = std::env::temp_dir().join(format!(
-        "vejas-req-{}-{}",
-        std::process::id(),
-        REQ_SEQ.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut f| f.write_all(cfg.as_bytes()))
+    let resp = match body {
+        Some(b) => req.send_bytes(b),
+        None => req.call(),
+    };
+    let response = match resp {
+        Ok(r) => r,
+        // A non-2xx status is not an error here — return it to the caller.
+        Err(ureq::Error::Status(_code, r)) => r,
+        Err(ureq::Error::Transport(t)) => return Err(format!("http: {t}")),
+    };
+    let code = response.status();
+    let mut buf = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
-    let result = (|| {
-        let mut child = std::process::Command::new("curl")
-            .args(["-sS", "-m", "20", "-w", "\n%{http_code}", "--config"])
-            .arg(&path)
-            .stdin(if body.is_some() {
-                std::process::Stdio::piped()
-            } else {
-                std::process::Stdio::null()
-            })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        if let Some(b) = body {
-            child
-                .stdin
-                .take()
-                .ok_or("no stdin")?
-                .write_all(b)
-                .map_err(|e| e.to_string())?;
-        }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("curl: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        // split the "\n<code>" marker appended by --write-out
-        let stdout = out.stdout;
-        let pos = stdout
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .ok_or("curl: missing status marker")?;
-        let code: u16 = std::str::from_utf8(&stdout[pos + 1..])
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or("curl: bad status marker")?;
-        Ok((code, stdout[..pos].to_vec()))
-    })();
-    let _ = std::fs::remove_file(&path);
-    result
+    Ok((code, buf))
 }
 
 fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
@@ -1567,10 +1533,9 @@ mod tests {
     }
 
     #[test]
-    fn urlencode_and_curl_quote() {
+    fn urlencode_encodes_reserved() {
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(urlencode("p@ss wörd+/="), "p%40ss%20w%C3%B6rd%2B%2F%3D");
-        assert_eq!(curl_quote(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 
     #[test]
