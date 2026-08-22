@@ -12,13 +12,14 @@ RPCONNECT=/path/to/redpanda-connect \
 
 ## Same machine, same day (dev machine, 8 cores, WSL2)
 
-| | Vejas (pre-optimization) | Redpanda Connect 4.106 |
-|---|---|---|
-| Delivered rate | 65/s | 3 433/s |
-| e2e latency p50 | 859 ms | **1 ms** |
-| Cold start | **15 ms** | 391 ms |
-| RSS under load | **6–8 MB** | 202 MB |
-| Binary | **3.9 MB** | 338 MB |
+| | Vejas v0 | Vejas after #4+#3+#2 | Redpanda Connect 4.106 |
+|---|---|---|---|
+| Delivered rate | 65/s | 325/s *(ingest-bound: #1 open)* | 3 433/s |
+| Flow-hop rate (no HTTP) | 171/s | **8 110/s** | — |
+| e2e latency p50 | 859 ms | 109 ms *(the accept sleep)* | **1 ms** |
+| Cold start | 15 ms | **11 ms** | 391 ms |
+| RSS under load | **6–8 MB** | **6–8 MB** | 202 MB |
+| Binary | 3.9 MB | **4.9 MB** | 338 MB |
 
 **Read both columns honestly.** Vejas's throughput numbers are the four
 diagnosed v0 ceilings (`bench/README.md`), not a property of the design —

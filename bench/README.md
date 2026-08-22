@@ -25,14 +25,14 @@ runtime RSS and binary size — as JSON, from `bench/run.sh`. A dedicated
 
 ## Current numbers (dev machine, 8 cores, WSL2 — pre-optimization)
 
-| Metric | Value |
-|---|---|
-| Cold start | **13–15 ms** |
-| Runtime RSS under load | **6–8 MB** |
-| Binary size | **3.9 MB** |
-| Ingest rate (32 conns) | 321/s |
-| Delivered rate | 65/s |
-| End-to-end p50 (uncongested) | 859 ms |
+| Metric | v0 | after #4+#3 (`5cffb7b`) + #2 (`b34d9f3`) |
+|---|---|---|
+| Cold start | 13–15 ms | **11 ms** |
+| Runtime RSS under load | 6–8 MB | **6–8 MB** |
+| Binary size | 3.9 MB | 4.9 MB (rustls) |
+| Ingest rate (32 conns) | 321/s | 325/s — *the last ceiling, #1* |
+| Delivered | 65/s, backlog grows | **everything ingested is delivered in stride** |
+| End-to-end p50 | 859 ms (uncongested) | **109 ms** — the accept sleep now dominates |
 
 The footprint numbers are the thesis, measured. The throughput and latency
 numbers are **known ceilings of the v0 I/O paths, not of the interpreter** —
@@ -41,8 +41,9 @@ each one matches its cause exactly:
 1. **Ingest ≈ concurrency × 10/s** — `http-in` polls its non-blocking
    listener with a 100 ms sleep and closes after every request (no
    keep-alive). 32 × 10 = 320/s, measured 321-322/s. *Open.*
-2. **Delivered ≈ 65-73/s** — `http-out` spawns one curl process per message
-   (~15 ms each). *Open — now THE e2e ceiling since #4/#3 fell.*
+2. **curl-per-message** — *fixed* (`b34d9f3`): a pooled pure-Rust HTTP
+   client (ureq + rustls) shared by http-out/http-poll/oauth-poll;
+   ~30× on the sink leg, secrets move from temp files to memory.
 3. **Batch-fill wait** — *fixed with #4* (`no_wait` pulls, immediate
    delivery, anti-zombie invariant preserved).
 
@@ -54,10 +55,10 @@ quoted without the scenario and the machine.
 Publish straight onto the bus, run only the flow, count its emits with a
 plain subscription — no HTTP anywhere:
 
-| Metric | v0 | after the loop rework (`5cffb7b`) |
-|---|---|---|
-| Flow-hop rate | 171/s | **≥ 2 786/s** — now publisher-bound: the flow keeps pace with the sequential publisher, so this is a floor, not the ceiling |
-| Runtime RSS | 5.6 MB | 5.5 MB |
+| Metric | v0 | after `5cffb7b` | with parallel publishers (`PUBS=4`) |
+|---|---|---|---|
+| Flow-hop rate | 171/s | ≥ 2 786/s (publisher-bound) | **8 110/s** |
+| Runtime RSS | 5.6 MB | 5.5 MB | 6.2 MB |
 
 Finding **#4 (the structural one — fixed)**: ~5.8 ms per message was the
 per-message synchronous JetStream round-trips in the consumer loop. The

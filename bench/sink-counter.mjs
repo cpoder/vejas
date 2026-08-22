@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 
 let n = 0;
 let lat = [];        // ms, end-to-end (loadgen stamp -> sink arrival)
-const t0 = Date.now();
+let t0 = Date.now();  // reset with /reset so rates cover the measured window only
 
 const srv = createServer((req, res) => {
   if (req.method === 'POST') {
@@ -32,7 +32,7 @@ const srv = createServer((req, res) => {
     }));
     return;
   }
-  if (req.url === '/reset') { n = 0; lat = []; res.writeHead(200); res.end('ok'); return; }
+  if (req.url === '/reset') { n = 0; lat = []; t0 = Date.now(); res.writeHead(200); res.end('ok'); return; }
   res.writeHead(404); res.end();
 });
 srv.listen(9099, '127.0.0.1', () => console.log('sink on :9099'));
