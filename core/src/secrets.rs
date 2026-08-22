@@ -25,11 +25,22 @@ use serde_json::Value;
 /// value in a literal instead of a `secret()`. To keep them one definition, the
 /// panel HTML receives this pattern by serve-time substitution rather than
 /// hard-coding its own copy, and `vejas-runtime secret-pattern` prints it for the
-/// lint to read — no second source to drift. Matches KEY names, not values: a
-/// secret under a non-matching key (e.g. `AUTH`) slips both points alike (a
-/// stated, symmetric limit, ADR-0017). Keep it free of `"`/`\` so it injects
-/// verbatim into a JS double-quoted string.
-pub const SECRET_KEY_PATTERN: &str = "pass(wd|word)|secret|token|api[_-]?key";
+/// lint to read — no second source to drift.
+///
+/// This is profile **P4-dash**, chosen by Cyril on a labelled bench of 55 real
+/// keys (repo + agent-generated + the Reglyze deployment + env conventions),
+/// documented in ADR-0017. Measured subtleties, not guesses: `token` matches as a
+/// SUFFIX only — real tokens end in it (GITHUB_TOKEN, ACCESS_TOKEN), configs
+/// prefix (TOKEN_URL) or pluralise (MAX_TOKENS) it — and `_key$` is deliberately
+/// absent (it would mask JIRA_PROJECT_KEY, FRAMEWORK_KEY). The `[_-]` classes let
+/// it border on hyphens too, so HTTP header names match (X-Auth-Token, X-Api-Key,
+/// X-Token) while Content-Type / Accept / X-Request-Id pass. It matches KEY names,
+/// not values; the irreducible floor (PASSPHRASE, CREDENTIALS, BEARER,
+/// DATABASE_URL, SERVICE_ACCOUNT_JSON) is covered by the generation contract, not
+/// this regex. Keep it free of `"`/`\` so it injects verbatim into a JS
+/// double-quoted string.
+pub const SECRET_KEY_PATTERN: &str =
+    "pass(wd|word)|secret|(^|[_-])token$|api[_-]?key|^auth$|[_-]auth$|^auth[_-]|authorization|webhook_url";
 
 pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
