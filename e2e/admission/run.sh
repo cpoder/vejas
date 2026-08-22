@@ -60,6 +60,8 @@ PY
   cp "$MANIFEST" "$ROOT/connectors/$NAME.vjs"
   node "$DIR/mock.mjs" "$MOCK_P" > "$STORE/mock.log" 2>&1 &
   MOCK_PID=$!
+  # never race the mock: a cold CI runner starts node slower than the probe
+  for _ in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$MOCK_P/__count" && break; sleep 0.1; done
   # dummy secrets from overrides.json (env-store form)
   eval "$(python3 - "$DIR/overrides.json" << 'PY'
 import json, re, sys
