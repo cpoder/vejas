@@ -40,32 +40,32 @@ each one matches its cause exactly:
 
 1. **Ingest ≈ concurrency × 10/s** — `http-in` polls its non-blocking
    listener with a 100 ms sleep and closes after every request (no
-   keep-alive). 32 × 10 = 320/s, measured 321/s.
-2. **Delivered ≈ 65/s** — `http-out` spawns one curl process per message
-   (~15 ms each). The code's own comment plans a Rust HTTP client.
-3. **p50 ≈ 860 ms at low rate** — the pull loop's batch-fill wait (~700 ms
-   server expiry) before delivering an underfilled batch, paid twice (flow
-   hop + sink hop).
+   keep-alive). 32 × 10 = 320/s, measured 321-322/s. *Open.*
+2. **Delivered ≈ 65-73/s** — `http-out` spawns one curl process per message
+   (~15 ms each). *Open — now THE e2e ceiling since #4/#3 fell.*
+3. **Batch-fill wait** — *fixed with #4* (`no_wait` pulls, immediate
+   delivery, anti-zombie invariant preserved).
 
-These are the first three tickets the harness produced. Numbers here are
-updated by re-running `bench/run.sh` after each fix — never quoted without
-the scenario and the machine.
+Numbers here are updated by re-running the harness after each fix — never
+quoted without the scenario and the machine.
 
 ## The isolated flow hop (`bench/flow-only.sh`)
 
 Publish straight onto the bus, run only the flow, count its emits with a
 plain subscription — no HTTP anywhere:
 
-| Metric | Value |
-|---|---|
-| Flow-hop rate | **171/s** |
-| Runtime RSS | 5.6 MB |
+| Metric | v0 | after the loop rework (`5cffb7b`) |
+|---|---|---|
+| Flow-hop rate | 171/s | **≥ 2 786/s** — now publisher-bound: the flow keeps pace with the sequential publisher, so this is a floor, not the ceiling |
+| Runtime RSS | 5.6 MB | 5.5 MB |
 
-That is finding **#4, the structural one**: ~5.8 ms per message with no I/O
-in the path points at the per-message synchronous JetStream round-trips in
-the consumer loop (one publish-with-ack per emit, one ack per consumed
-message). Async/batched publishes and acks are the fix candidates — this is
-the ceiling the other three were hiding behind.
+Finding **#4 (the structural one — fixed)**: ~5.8 ms per message was the
+per-message synchronous JetStream round-trips in the consumer loop. The
+rework buffers emits and does **one flush per batch before acking that
+batch** (publish-before-ack preserved, at-least-once intact — 5 000-burst
+loss test: 0 lost, DLQ clean), with `no_wait` pulls killing the batch-fill
+wait (#3) at the same time. 16× on the isolated hop; the true ceiling needs
+a faster publisher to measure.
 
 ## Not measured yet
 
