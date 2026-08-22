@@ -25,10 +25,24 @@ CI admission job:
    purpose, subjects in/out, every secret path it expects, and the remote's
    pagination/rate notes when relevant.
 2. **The credential rule, linted** — any literal whose key matches the
-   panel's masking pattern (`pass(wd|word)|secret|token|api[_-]?key`) must be
-   a `secret()` reference. The lint fails the admission job on a literal
-   credential. (Same regex as the panel mask — one definition of
-   "credential-shaped", two enforcement points.)
+   credential pattern (`pass(wd|word)|secret|token|api[_-]?key`) must be a
+   `secret()` reference; the lint fails the admission job on a literal
+   credential. **Single-source requirement**: today that regex lives only in
+   the panel's JS (`isSecretKey`, panel.html) — duplicating it in a Rust
+   lint would create two definitions whose divergence is a security hole.
+   The decided mechanism: a `pub const SECRET_KEY_PATTERN` in `secrets.rs`
+   becomes the source of truth; the lint consumes it, and the runtime
+   injects it into the served panel (placeholder substitution in the
+   `include_str!`'d page). One definition, two consumers — the claim is
+   true only once that extraction lands, and the extraction is part of
+   implementing this ADR.
+
+   **Stated limit of the heuristic**: it matches key *names*, not values. A
+   credential under an unmatched key (`AUTH = "Bearer …"`, a raw
+   `Authorization` header value) slips the lint and the panel mask alike —
+   consistently, but silently. Widening the pattern with `auth` would catch
+   it at the cost of false positives (`author`, `oauth_url`); the current
+   decision is to keep the pattern as is and document the limit here.
 3. **A golden fixture** (`fixture.json`) — one real-shaped sample of what
    the connector publishes (source) or consumes (sink), envelope included
    when the driver adds one. This is what downstream flows are golden-tested
@@ -55,8 +69,15 @@ that fails admission is a draft, not a connector.
 - The six existing flat recipes (Slack, ServiceNow ×2, Jira ×2, Workday)
   migrate to directories and pass admission first; the flat `.vjs.example`
   form stays valid for *drafts* only.
-- CI grows one job (`admission`) — runtime boot + mock + probe per recipe;
-  bounded, parallelizable, no real credentials in CI ever.
+- CI grows one job (`admission`) — per recipe: a dedicated `nats-server`
+  (**with `-js`** — without it the probe dies on "no responders"), a
+  throwaway runtime on recipe-disjoint ports (parallelizable), dummy
+  secrets via the existing `EnvStore` (`secret("a/b")` ← env
+  `VEJAS_SECRET_A_B` — nothing to build), readiness by polling `/healthz`
+  (never a fixed sleep), teardown by captured PID or `pgrep -x` (never
+  `pkill -f` with a pattern the script itself contains). Measured ~3 s per
+  recipe, bounded, no real credentials in CI ever. The probe is the
+  existing `vejas_test_connector` (`{file} → {ok, detail}`).
 - The catalog's growth rate becomes measurable and honest — the number on
   the site is the number of directories that pass, nothing else.
 
