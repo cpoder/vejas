@@ -1,0 +1,15 @@
+{
+  "endpoint": "http://127.0.0.1:9200/api/now/table/incident?sysparm_limit=100",
+  "fetched_at": "2026-08-22T10:00:01Z",
+  "body": {
+    "result": [
+      {
+        "number": "INC0010023",
+        "short_description": "Email gateway unreachable",
+        "priority": "1",
+        "state": "2",
+        "sys_created_on": "2026-08-22 10:00:00"
+      }
+    ]
+  }
+}

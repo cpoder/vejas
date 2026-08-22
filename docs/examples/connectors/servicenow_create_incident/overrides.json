@@ -1,0 +1,8 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/api/now/table/incident"
+  },
+  "secrets": {
+    "servicenow/basic": "ZHVtbXk6ZHVtbXk="
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "short_description": "Payment API 5xx burst \u2014 auto-raised by monitoring",
+  "urgency": "2",
+  "impact": "2",
+  "category": "software"
+}

@@ -1,0 +1,9 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/api/now/table/incident?sysparm_limit=100",
+    "INTERVAL_SECS": 1
+  },
+  "secrets": {
+    "servicenow/basic": "ZHVtbXk6ZHVtbXk="
+  }
+}

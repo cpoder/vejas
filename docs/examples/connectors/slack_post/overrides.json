@@ -1,0 +1,8 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/api/chat.postMessage"
+  },
+  "secrets": {
+    "slack/bot_token": "xoxb-dummy"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/ccx/service/customreport2/TENANT/ISU_USER/Your_Report?format=json",
+    "INTERVAL_SECS": 1
+  },
+  "secrets": {
+    "workday/basic": "ZHVtbXk6ZHVtbXk="
+  }
+}

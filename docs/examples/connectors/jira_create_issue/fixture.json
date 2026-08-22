@@ -1,0 +1,11 @@
+{
+  "fields": {
+    "project": {
+      "key": "OPS"
+    },
+    "summary": "ServiceNow INC0010023 \u2014 Email gateway unreachable",
+    "issuetype": {
+      "name": "Task"
+    }
+  }
+}

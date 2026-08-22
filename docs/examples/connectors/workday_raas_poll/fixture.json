@@ -1,0 +1,13 @@
+{
+  "endpoint": "http://127.0.0.1:9200/ccx/service/customreport2/TENANT/ISU_USER/Your_Report?format=json",
+  "fetched_at": "2026-08-22T10:00:01Z",
+  "body": {
+    "Report_Entry": [
+      {
+        "Employee_ID": "100234",
+        "Worker": "Marie Dupont",
+        "Hire_Date": "2024-03-01"
+      }
+    ]
+  }
+}

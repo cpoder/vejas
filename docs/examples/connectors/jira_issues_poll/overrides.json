@@ -1,0 +1,9 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/rest/api/3/search?jql=updated%3E%3D-1d&maxResults=100",
+    "INTERVAL_SECS": 1
+  },
+  "secrets": {
+    "jira/basic": "ZHVtbXk6ZHVtbXk="
+  }
+}

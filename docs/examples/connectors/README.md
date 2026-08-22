@@ -42,3 +42,15 @@ secret and use `f"Basic {secret(\"…\")}"`.
   **not** validated against a live tenant here (no accounts) — set your
   credentials and they run on the socle that Reglyze's Microsoft Graph / EDR
   connectors already use in production.
+
+## Certified recipes (ADR-0017)
+
+Each directory here is a **certified** recipe: the manifest, a golden
+`fixture.json` (what it publishes or consumes), a `mock.mjs` stand-in for
+the remote, and `overrides.json` (which literals the admission job points at
+the mock, which dummy secrets it seeds). CI admits every recipe on every
+push: lint (credentials must be `secret()` — the pattern is single-sourced
+from the runtime), parse, boot against the mock, green probe, and the data
+actually flowing. Run locally: `e2e/admission/run.sh [name]`.
+
+A flat `.vjs.example` outside a directory is a draft, not a connector.

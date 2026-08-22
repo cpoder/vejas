@@ -1,0 +1,19 @@
+{
+  "endpoint": "http://127.0.0.1:9200/rest/api/3/search?jql=updated%3E%3D-1d&maxResults=100",
+  "fetched_at": "2026-08-22T10:00:01Z",
+  "body": {
+    "issues": [
+      {
+        "key": "OPS-12",
+        "fields": {
+          "summary": "Disk pressure on node-3",
+          "status": {
+            "name": "In Progress"
+          },
+          "updated": "2026-08-22T09:58:00.000+0000"
+        }
+      }
+    ],
+    "total": 1
+  }
+}
