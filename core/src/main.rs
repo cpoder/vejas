@@ -357,6 +357,13 @@ fn rollback_literal(
     }))
 }
 
+/// The panel HTML with the credential-mask pattern injected from its single
+/// definition (secrets::SECRET_KEY_PATTERN) — so the mask and the admission lint
+/// (ADR-0017) share one source and cannot drift.
+fn panel_html() -> String {
+    include_str!("panel.html").replace("{{SECRET_PATTERN}}", secrets::SECRET_KEY_PATTERN)
+}
+
 fn preview_of(v: &Value) -> String {
     let s = v.to_string();
     if s.chars().count() > 160 {
@@ -2429,7 +2436,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
             request,
             200,
-            include_str!("panel.html").to_string(),
+            panel_html(),
             "text/html; charset=utf-8",
         ),
         (tiny_http::Method::Get, "/healthz") => respond(request, 200, "ok".into(), "text/plain"),
@@ -2779,6 +2786,13 @@ fn main() {
     //   vejas-runtime vjs-check <file>
     //   vejas-runtime vjs-run <file> <fixture.json>
     let args: Vec<String> = env::args().collect();
+    // Print the single credential-mask pattern (secrets::SECRET_KEY_PATTERN) so
+    // the admission lint (ADR-0017) reads it without parsing source — one
+    // definition, shared by the panel mask and the lint.
+    if args.len() >= 2 && args[1] == "secret-pattern" {
+        println!("{}", secrets::SECRET_KEY_PATTERN);
+        return;
+    }
     if args.len() >= 3 && args[1] == "vjs-check" {
         match fs::read_to_string(&args[2]).map_err(|e| e.to_string()).and_then(|s| vjs::parse(&s).map(|_| ())) {
             Ok(()) => {

@@ -399,8 +399,11 @@ function mappingSection(card, file, entry, previewEntries, direct) {
   card.appendChild(table);
 }
 // A literal whose KEY names a credential is never shown in the clear (ADR-0008
-// spirit): the panel renders it masked, editing stays write-only.
-const isSecretKey = k => /pass(wd|word)|secret|token|api[_-]?key/i.test(String(k));
+// spirit): the panel renders it masked, editing stays write-only. The pattern is
+// injected at serve time from secrets::SECRET_KEY_PATTERN — one definition, so
+// the mask and the admission lint (ADR-0017) can never drift apart.
+const SECRET_KEY_PATTERN = "{{SECRET_PATTERN}}";
+const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(String(k));
 function maskInput(input) {
   input.type = 'password'; input.autocomplete = 'off';
   input.title = 'hidden — credential-named value, masked on screen';

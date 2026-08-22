@@ -18,6 +18,19 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+/// The single definition of "credential-shaped key name" (case-insensitive
+/// regex source). It has two enforcement points that MUST agree: the panel masks
+/// any input whose key matches (so a secret is never shown in the clear), and the
+/// connector admission lint (ADR-0017) fails a recipe that puts a matching key's
+/// value in a literal instead of a `secret()`. To keep them one definition, the
+/// panel HTML receives this pattern by serve-time substitution rather than
+/// hard-coding its own copy, and `vejas-runtime secret-pattern` prints it for the
+/// lint to read — no second source to drift. Matches KEY names, not values: a
+/// secret under a non-matching key (e.g. `AUTH`) slips both points alike (a
+/// stated, symmetric limit, ADR-0017). Keep it free of `"`/`\` so it injects
+/// verbatim into a JS double-quoted string.
+pub const SECRET_KEY_PATTERN: &str = "pass(wd|word)|secret|token|api[_-]?key";
+
 pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
     fn get(&self, reference: &str) -> Result<String, String>;
