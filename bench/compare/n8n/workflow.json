@@ -1,0 +1,80 @@
+{
+  "name": "bench",
+  "active": true,
+  "settings": {},
+  "nodes": [
+    {
+      "id": "w1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "bench-webhook-id",
+      "parameters": {
+        "path": "bench",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "c1",
+      "name": "Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const codes = {France:'FR',Germany:'DE',Italy:'IT',Portugal:'PT'};\nreturn items.map(({json}) => { const b = json.body ?? json;\n  return { json: {\n    order_ref: (String(b.id).split('#')[1]) ?? null,\n    customer_email: String(b.email).toLowerCase(),\n    total_eur: Number(b.total_price),\n    country: codes[b.shipping_address?.country] ?? b.shipping_address?.country,\n    positions: (b.line_items ?? []).map(l => ({sku: l.sku, qty: Number(l.quantity), unit_eur: Math.round(Number(l.unit_price_cents))/100 })),\n    t: b.t } };\n});"
+      }
+    },
+    {
+      "id": "h1",
+      "name": "Sink",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        400,
+        0
+      ],
+      "parameters": {
+        "url": "http://127.0.0.1:9099/hit",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map": {
+      "main": [
+        [
+          {
+            "node": "Sink",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "id": "benchwf001"
+}

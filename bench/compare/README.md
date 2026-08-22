@@ -8,20 +8,30 @@ scenario, several engines. Run:
 bench/run.sh 20 32                                   # Vejas
 RPCONNECT=/path/to/redpanda-connect \
   bench/compare/run-benthos.sh 20 32                 # Redpanda Connect (ex-Benthos)
+bench/compare/run-n8n.sh 20 32                       # n8n (official image, tuned)
 ```
 
 ## Same machine, same day (dev machine, 8 cores, WSL2)
 
-| | Vejas v0 | Vejas, all four fixes | Redpanda Connect 4.106 |
-|---|---|---|---|
-| Delivered, saturated | 65/s | **2 828/s** | 3 433/s |
-| Delivered, sustained | — | **1 701/s** (p50 18 ms, p99 59 ms) | — |
-| e2e latency p50 (uncongested) | 859 ms | **6 ms** (p99 7 ms) | 1 ms |
-| Flow-hop rate (no HTTP) | 171/s | **8 110/s** | — |
-| Cold start | 15 ms | **11–13 ms** | 391 ms |
-| RSS under load | **6–8 MB** | **6–8 MB** | 202 MB |
-| Binary | 3.9 MB | **4.9 MB** | 338 MB |
-| Persistence | every hop (JetStream) | **every hop (JetStream)** | in-flight only |
+| | Vejas v0 | Vejas, all four fixes | Redpanda Connect 4.106 | n8n 1.x (tuned) |
+|---|---|---|---|---|
+| Delivered, saturated | 65/s | **2 828/s** | 3 433/s | 12–15/s |
+| Delivered, sustained | — | **1 701/s** (p50 18 ms, p99 59 ms) | — | — |
+| e2e latency p50 (32 conns) | 859 ms | 18 ms sustained / **6 ms** uncongested | 1 ms | 2 350 ms |
+| Flow-hop rate (no HTTP) | 171/s | **8 110/s** (9 948/s over 10 flows) | — | — |
+| Cold start | 15 ms | **11–13 ms** | 391 ms | 7–17 s (container) |
+| RSS under load | **6–8 MB** | **6–8 MB** (49 MB at 50 flows) | 202 MB | 1.2–1.3 GB |
+| Distribution size | 3.9 MB binary | **4.9 MB binary / 201 MB image** | 338 MB binary | 372 MB image |
+| Persistence | every hop (JetStream) | **every hop (JetStream)** | in-flight only | per-execution DB (disabled for this run) |
+
+**n8n fairness notes.** Single instance from the official image, tuned per
+their production docs (execution persistence off — the untuned default did
+7/s). n8n's scaling answer is queue mode with a worker fleet plus Postgres
+and Redis; this table is single-node, one process per engine, which is the
+deployment Vejas targets with `docker compose up`. n8n's webhook responds
+before executing (like our 202-then-bus), so its latency is queue wait under
+32-connection pressure — at low rate its per-execution latency is ~150-400 ms.
+Cold start measured through its container, as officially distributed.
 
 **Read both columns honestly.** After the four fixes, Vejas delivers in the
 same order of magnitude as the category (2.8k vs 3.4k/s saturated, both
