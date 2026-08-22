@@ -230,9 +230,10 @@ fn replay_literal(
         match hydrated {
             Some(rows) if !rows.is_empty() => (
                 rows.into_iter()
-                    .map(|(subject, event)| {
+                    .map(|(seq, subject, event)| {
                         json!({
                             "ts": Value::Null,
+                            "seq": seq,
                             "subject": subject,
                             "preview": preview_of(&event),
                             "event": event,
@@ -284,6 +285,61 @@ fn replay_literal(
         "file": file, "name": name, "key": key, "value": value,
         "source": replay_source,
         "events": results.len(), "changed": changed_count, "results": results,
+    }))
+}
+
+/// Time-travel (ADR-0021): replay a window of REAL persisted traffic through both
+/// the current effective version and a whole CANDIDATE version, and return the
+/// side-by-side emit diff joined by the source message's stream sequence. This is
+/// `replay_literal` generalised from a literal patch to an arbitrary new source.
+/// The shadow invariant holds by construction — `vjs::run` collects emits, it
+/// never publishes, so nothing a candidate emits reaches a real subject.
+fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let unit = flow_proc_name(&path);
+    let pkg = pkg_of_path(&path);
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    // diff against the CURRENT EFFECTIVE version (a live overlay if one is valid)
+    let store = versions::open_store(&js);
+    let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
+    let current = vjs::parse(&current_src)?;
+    let candidate = vjs::parse(candidate_src)?;
+    let source_subj = current
+        .source
+        .clone()
+        .ok_or("flow has no bus source to replay")?;
+    let rows = connectors::hydrate_recent(&js, &stream, &source_subj, n)?;
+    let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
+        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        match vjs::run(prog, ev, &mut engine) {
+            Ok(ctx) => json!({
+                "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
+                "error": Value::Null,
+            }),
+            Err(e) => json!({ "emits": [], "error": e }),
+        }
+    };
+    let mut results = Vec::new();
+    let mut changed = 0;
+    for (seq, subject, event) in &rows {
+        let b = run_one(&current, event);
+        let a = run_one(&candidate, event);
+        let ch = b != a;
+        if ch {
+            changed += 1;
+        }
+        results.push(json!({
+            "seq": seq, "subject": subject, "preview": preview_of(event),
+            "before": b, "after": a, "changed": ch,
+        }));
+    }
+    Ok(json!({
+        "file": file, "flow": unit, "candidate_hash": versions::hash_content(candidate_src),
+        "events": results.len(), "changed": changed, "results": results,
     }))
 }
 
@@ -2321,6 +2377,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
+        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
         json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
@@ -2419,6 +2476,12 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let key = args["key"].as_str().unwrap_or("-");
             let n = args["n"].as_u64().unwrap_or(20) as usize;
             text(replay_literal(root, file, lname, key, &args["value"], n)?.to_string())
+        }
+        "vejas_time_travel" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let candidate = args["candidate"].as_str().ok_or("candidate required")?;
+            let n = args["n"].as_u64().unwrap_or(20) as usize;
+            text(time_travel(root, file, candidate, n)?.to_string())
         }
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
@@ -2905,6 +2968,18 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let key = body["key"].as_str().unwrap_or("-").to_string();
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match replay_literal(&root, &file, &name, &key, &body["value"], n) {
+                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/surface/timetravel") => {
+            // ADR-0021: replay a window of real traffic through a whole candidate
+            // version and diff it against the current effective version.
+            let body = read_body(&mut request);
+            let file = body["file"].as_str().unwrap_or("").to_string();
+            let candidate = body["candidate"].as_str().unwrap_or("").to_string();
+            let n = body["n"].as_u64().unwrap_or(20) as usize;
+            match time_travel(&root, &file, &candidate, n) {
                 Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }

@@ -485,7 +485,7 @@ pub fn hydrate_recent(
     stream: &str,
     subject: &str,
     n: usize,
-) -> Result<Vec<(String, serde_json::Value)>, String> {
+) -> Result<Vec<(u64, String, serde_json::Value)>, String> {
     let n = n.clamp(1, 5000);
     let last = js
         .stream_info(stream)
@@ -516,7 +516,7 @@ pub fn hydrate_recent(
             &nats::jetstream::PullSubscribeOptions::new().consumer_config(cfg),
         )
         .map_err(|e| e.to_string())?;
-    let mut ring: std::collections::VecDeque<(String, serde_json::Value)> =
+    let mut ring: std::collections::VecDeque<(u64, String, serde_json::Value)> =
         std::collections::VecDeque::with_capacity(n);
     let mut scanned = 0u64;
     loop {
@@ -527,7 +527,10 @@ pub fn hydrate_recent(
         for m in &batch {
             scanned += 1;
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data) {
-                ring.push_back((m.subject.clone(), v));
+                // the stream sequence is the intrinsic join key for time-travel /
+                // canary diffs (ADR-0021) — no per-flow key to invent.
+                let seq = m.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
+                ring.push_back((seq, m.subject.clone(), v));
                 while ring.len() > n {
                     ring.pop_front();
                 }
@@ -1066,7 +1069,7 @@ pub fn audit_recent(
     let subject = format!("{AUDIT_ROOT}.{}", dlq_unit_token(unit));
     Ok(hydrate_recent(js, AUDIT_STREAM, &subject, n)?
         .into_iter()
-        .map(|(_, v)| v)
+        .map(|(_, _, v)| v)
         .collect())
 }
 
