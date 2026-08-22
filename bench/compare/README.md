@@ -12,19 +12,23 @@ RPCONNECT=/path/to/redpanda-connect \
 
 ## Same machine, same day (dev machine, 8 cores, WSL2)
 
-| | Vejas v0 | Vejas after #4+#3+#2 | Redpanda Connect 4.106 |
+| | Vejas v0 | Vejas, all four fixes | Redpanda Connect 4.106 |
 |---|---|---|---|
-| Delivered rate | 65/s | 325/s *(ingest-bound: #1 open)* | 3 433/s |
+| Delivered, saturated | 65/s | **2 828/s** | 3 433/s |
+| Delivered, sustained | — | **1 701/s** (p50 18 ms, p99 59 ms) | — |
+| e2e latency p50 (uncongested) | 859 ms | **6 ms** (p99 7 ms) | 1 ms |
 | Flow-hop rate (no HTTP) | 171/s | **8 110/s** | — |
-| e2e latency p50 | 859 ms | 109 ms *(the accept sleep)* | **1 ms** |
-| Cold start | 15 ms | **11 ms** | 391 ms |
+| Cold start | 15 ms | **11–13 ms** | 391 ms |
 | RSS under load | **6–8 MB** | **6–8 MB** | 202 MB |
 | Binary | 3.9 MB | **4.9 MB** | 338 MB |
+| Persistence | every hop (JetStream) | **every hop (JetStream)** | in-flight only |
 
-**Read both columns honestly.** Vejas's throughput numbers are the four
-diagnosed v0 ceilings (`bench/README.md`), not a property of the design —
-the loop rework targets this table. The footprint numbers are structural:
-26× faster to start, ~30× less memory, ~87× smaller.
+**Read both columns honestly.** After the four fixes, Vejas delivers in the
+same order of magnitude as the category (2.8k vs 3.4k/s saturated, both
+sink-bound) while **persisting every hop**, starting ~30× faster, holding
+~25× less memory, in a ~70× smaller binary. The remaining latency gap
+(6 ms vs 1 ms) is the price of the stronger guarantee — two persisted
+JetStream hops sit in the path.
 
 **The guarantee is not the same.** This Redpanda Connect pipeline holds
 messages in flight only (input → processor → output, ack-chained): a crash

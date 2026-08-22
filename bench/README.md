@@ -25,22 +25,27 @@ runtime RSS and binary size — as JSON, from `bench/run.sh`. A dedicated
 
 ## Current numbers (dev machine, 8 cores, WSL2 — pre-optimization)
 
-| Metric | v0 | after #4+#3 (`5cffb7b`) + #2 (`b34d9f3`) |
+All four ceilings fell (#4+#3 `5cffb7b`, #2 `b34d9f3`, #1 `75fad83`):
+
+| Metric | v0 | all four fixes in |
 |---|---|---|
-| Cold start | 13–15 ms | **11 ms** |
+| Cold start | 13–15 ms | **11–13 ms** |
 | Runtime RSS under load | 6–8 MB | **6–8 MB** |
 | Binary size | 3.9 MB | 4.9 MB (rustls) |
-| Ingest rate (32 conns) | 321/s | 325/s — *the last ceiling, #1* |
-| Delivered | 65/s, backlog grows | **everything ingested is delivered in stride** |
-| End-to-end p50 | 859 ms (uncongested) | **109 ms** — the accept sleep now dominates |
+| e2e sustained (12 conns) | — | **1 701/s delivered, p50 18 ms, p99 59 ms** |
+| e2e saturated (32 conns) | 65/s delivered | 4 879/s ingest, **2 828/s delivered** (sink-bound, queue absorbs the rest) |
+| e2e latency, uncongested | p50 859 ms | **p50 6 ms, p99 7 ms** |
+| Isolated flow hop | 171/s | **8 110/s** |
+
+Every hop persisted in JetStream throughout — the guarantee never moved.
 
 The footprint numbers are the thesis, measured. The throughput and latency
 numbers are **known ceilings of the v0 I/O paths, not of the interpreter** —
 each one matches its cause exactly:
 
-1. **Ingest ≈ concurrency × 10/s** — `http-in` polls its non-blocking
-   listener with a 100 ms sleep and closes after every request (no
-   keep-alive). 32 × 10 = 320/s, measured 321-322/s. *Open.*
+1. **http-in accept poll + no keep-alive** — *fixed* (`75fad83`):
+   keep-alive loop + TCP_NODELAY (Nagle was the hidden half) + 5 ms accept
+   poll. Ingest 322/s → 4 879/s.
 2. **curl-per-message** — *fixed* (`b34d9f3`): a pooled pure-Rust HTTP
    client (ureq + rustls) shared by http-out/http-poll/oauth-poll;
    ~30× on the sink leg, secrets move from temp files to memory.
