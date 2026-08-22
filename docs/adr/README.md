@@ -25,6 +25,7 @@ the old one.
 | [0012](0012-deployment-topologies.md) | Deployment topologies: cells and outbound-only collectors | Accepted |
 | [0013](0013-control-plane-leafnodes.md) | Remote control plane over NATS leaf nodes | Accepted (partial) |
 | [0014](0014-sap-native-rust-nwrfc.md) | SAP connector: native Rust over the NW RFC SDK, no JVM | Accepted |
+| [0015](0015-dead-letter-queue.md) | Persistent dead-letter queue with operator replay | Accepted |
 
 ## Template
 
