@@ -1,7 +1,7 @@
 // Vejas runtime — all Rust, no Python.
 //
 // Executes VejasScript flows natively, runs the bundled connectors as threads,
-// and serves the panel. Layout (webMethods-style packages, hot-addable):
+// and serves the panel. Layout (hot-addable packages):
 //
 //   flows/*.vjs                  the "default" package
 //   services/*.vjs               composable services (invoke name(...))

@@ -44,8 +44,8 @@ it without touching code:
   (persistence, KV, object store). Two containers, one `docker compose up`.
   (ADR-0002)
 - **Language** — VejasScript: `source` in, `emit` out, `invoke` to compose
-  services (webMethods-style pipeline merge), transcoding tables and thresholds
-  as editable literals. Descended from [WmScript](https://github.com/cpoder/wmscript).
+  services (pipeline-merge composition), transcoding tables and thresholds
+  as editable literals.
 - **Packages** — group flows and services, hot-addable; cross-package calls go
   through `EXPORTS` (private by default) or the bus. (ADR-0003, ADR-0004)
 - **Connectors** — a typed Rust **driver SDK** (`Driver` trait, Source/Sink).

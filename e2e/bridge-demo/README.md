@@ -21,10 +21,10 @@ then open `http://localhost:8686/`.
 
 1. Put the four binaries where `BIN_DIR` points (default `/opt/vejas`):
    `vejas-runtime`, `nats-server`, `vejas-sap-rfc`, `vejas-salesforce`.
-2. SAP: the connectors register under an existing idle destination
-   (`SAP_PROGRAM_ID=WMETHODS_PROG` → the `WMETHODS_RFC` dest) so **no SAP config
-   is changed**. Override the `SAP_*` env if your system differs. The dev
-   license must be valid (renewed to 2026-11-21 on the NPL).
+2. SAP: export `SAP_PROGRAM_ID` (the program id of an idle registered RFC
+   destination — the server registers under it, so **no SAP config is
+   changed**) and `SAP_RFC_DEST` (that destination's name), plus your
+   `SAP_*` credentials. The dev license must be valid.
 3. Salesforce: refresh a token right before filming (it is ephemeral, ~2h):
    ```
    sf org display --verbose --target-org <you>

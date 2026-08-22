@@ -13,7 +13,7 @@ the old one.
 |---|---|---|
 | [0001](0001-vejascript-native-language.md) | VejasScript as the native flow language | Accepted |
 | [0002](0002-nats-only-infrastructure.md) | NATS JetStream as the only infrastructure dependency | Accepted |
-| [0003](0003-webmethods-packages.md) | webMethods-style packages | Accepted |
+| [0003](0003-package-model.md) | The package model | Accepted |
 | [0004](0004-service-composition-exports.md) | Service composition & EXPORTS visibility | Accepted |
 | [0005](0005-business-surface.md) | Business surface: literals, corrected in place | Accepted |
 | [0006](0006-runtime-is-mcp-server.md) | The runtime is its own MCP server; flow-as-tool | Accepted |

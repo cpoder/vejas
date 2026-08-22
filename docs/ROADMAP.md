@@ -16,7 +16,7 @@ platform before a single user touches it.
 
 ## Phase 1 — Composition, packages, MCP · DONE
 
-- Service composition, wM-style merge; `pkg:service` + EXPORTS private-by-default
+- Service composition, pipeline merge; `pkg:service` + EXPORTS private-by-default
   (ADR-0003, ADR-0004).
 - The runtime is its own MCP server; flow-as-tool (ADR-0006).
 - Golden-test runner + the language unit-test suite (ADR-0010); both have kept growing since.

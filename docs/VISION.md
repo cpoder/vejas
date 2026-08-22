@@ -6,7 +6,7 @@
 
 ## The thesis
 
-Visual integration designers (webMethods Flow, MuleSoft, Boomi, n8n, Zapier)
+Visual integration designers (MuleSoft, Boomi, n8n, Zapier)
 exist because developers were expensive and integration logic is 80% repetitive
 glue. The trade was always the same: give up code, get a canvas — and with it,
 proprietary formats you cannot diff, review, unit-test or leave.
@@ -64,7 +64,7 @@ business meaning**, safely, without a developer.
 
 - A **flow** is a NATS pull-consumer + the interpreter: `source "vx…"` in,
   `emit "vx…"` out. It runs inside the runtime, hot-reloads on edit.
-- A **service** is composable (`invoke name(args)`), webMethods-style: its
+- A **service** is composable (`invoke name(args)`), pipeline-merge style: its
   pipeline merges into the caller's.
 - The **business surface** is the literals in a flow (transcoding tables,
   thresholds, mappings). Extracted by AST, rendered in the panel, corrected in

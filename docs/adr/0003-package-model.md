@@ -1,4 +1,4 @@
-# 0003 — webMethods-style packages
+# 0003 — The package model
 
 - Status: Accepted
 - Date: 2026-08-19
@@ -8,7 +8,7 @@
 A platform must let you start small and grow without turning into a monolith.
 Users need a unit to group related flows and services, to enable/disable
 together, to hot-add, and (later) to distribute and set rights on. The
-webMethods Integration Server package model is a proven answer to exactly this.
+The classic integration-server package model is a proven answer to exactly this.
 
 ## Decision
 

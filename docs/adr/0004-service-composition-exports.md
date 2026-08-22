@@ -6,8 +6,8 @@
 ## Context
 
 Composition is essential: real integrations reuse logic (formatting,
-enrichment, notification). webMethods made this its core — `invoke` a service,
-its pipeline flows into yours. But webMethods also allowed any service to invoke
+enrichment, notification). Classic ESBs made this their core — `invoke` a service,
+its pipeline flows into yours. But they also allowed any service to invoke
 any other across the whole namespace, which produced the classic
 spaghetti-IS coupling where nothing can be changed safely.
 
@@ -37,7 +37,7 @@ We want the composition ergonomics without the coupling.
 
 ## Alternatives considered
 
-- **Global namespace, any-to-any invoke (classic webMethods):** best
+- **Global namespace, any-to-any invoke (the classic ESB way):** best
   ergonomics, worst coupling. Rejected as the failure mode we are avoiding.
 - **No cross-package invoke, bus only:** maximal decoupling but loses the
   synchronous-compose ergonomics that make services worth having. We keep both,

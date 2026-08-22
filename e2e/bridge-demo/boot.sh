@@ -26,14 +26,14 @@ cat > "$VEJAS_ROOT/connectors/sap_idoc_in.vjs" <<MAN
 driver "exec-stream-source"
 SUBJECT = "vx.sap.idoc"
 CMD = "$SAPRFC idoc-server"
-ENV = {LD_LIBRARY_PATH: "$LD", SAP_ASHOST: "${SAP_ASHOST:-localhost}", SAP_SYSNR: "${SAP_SYSNR:-00}", SAP_CLIENT: "${SAP_CLIENT:-001}", SAP_USER: "${SAP_USER:-DEVELOPER}", SAP_PASSWD: "${SAP_PASSWD:-Down1oad}", SAP_LANG: "EN", SAP_PROGRAM_ID: "${SAP_PROGRAM_ID:-WMETHODS_PROG}", SAP_GWHOST: "${SAP_GWHOST:-vhcalnplci}", SAP_GWSERV: "${SAP_GWSERV:-sapgw00}"}
+ENV = {LD_LIBRARY_PATH: "$LD", SAP_ASHOST: "${SAP_ASHOST:-localhost}", SAP_SYSNR: "${SAP_SYSNR:-00}", SAP_CLIENT: "${SAP_CLIENT:-001}", SAP_USER: "${SAP_USER:-DEVELOPER}", SAP_PASSWD: "${SAP_PASSWD:?set SAP_PASSWD}", SAP_LANG: "EN", SAP_PROGRAM_ID: "${SAP_PROGRAM_ID:?set SAP_PROGRAM_ID}", SAP_GWHOST: "${SAP_GWHOST:-vhcalnplci}", SAP_GWSERV: "${SAP_GWSERV:-sapgw00}"}
 RESTART_SECS = 5
 MAN
 cat > "$VEJAS_ROOT/connectors/sap_out.vjs" <<MAN
 driver "exec-sink"
 SUBJECT = "vx.sap.idoc.out"
 CMD = "$SAPRFC"
-ENV = {LD_LIBRARY_PATH: "$LD", SAP_ASHOST: "${SAP_ASHOST:-localhost}", SAP_SYSNR: "${SAP_SYSNR:-00}", SAP_CLIENT: "${SAP_CLIENT:-001}", SAP_USER: "${SAP_USER:-DEVELOPER}", SAP_PASSWD: "${SAP_PASSWD:-Down1oad}", SAP_LANG: "EN"}
+ENV = {LD_LIBRARY_PATH: "$LD", SAP_ASHOST: "${SAP_ASHOST:-localhost}", SAP_SYSNR: "${SAP_SYSNR:-00}", SAP_CLIENT: "${SAP_CLIENT:-001}", SAP_USER: "${SAP_USER:-DEVELOPER}", SAP_PASSWD: "${SAP_PASSWD:?set SAP_PASSWD}", SAP_LANG: "EN"}
 MAN
 cat > "$VEJAS_ROOT/connectors/sf_export.vjs" <<MAN
 driver "exec-stream-source"

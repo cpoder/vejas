@@ -2,9 +2,11 @@
 # Send a big inbound IDoc (10 account segments) into SAP, addressed to the
 # registered server's destination. Uses the SAP env exported by run.sh.
 set -u
+: "${SAP_RFC_DEST:?set SAP_RFC_DEST (the registered RFC destination name)}"
+: "${SAP_PASSWD:?set SAP_PASSWD}"
 LD="${LD_LIBRARY_PATH:-/usr/sap/NPL/D00/exe}"
 SAPRFC="${BIN_DIR:-/opt/vejas}/vejas-sap-rfc"
-J=$(python3 - <<'PY'
+J=$(python3 - <<PY
 import json
 abap=[
  "REPORT ZBRIDGE.",
@@ -21,7 +23,7 @@ abap=[
  "  CONDENSE nm.",
  "  wd-segnam = 'E1MARAM'. wd-sdata = nm. APPEND wd TO dat.",
  "ENDDO.",
- "CALL FUNCTION 'IDOC_INBOUND_ASYNCHRONOUS' DESTINATION 'WMETHODS_RFC'",
+ "CALL FUNCTION 'IDOC_INBOUND_ASYNCHRONOUS' DESTINATION '${SAP_RFC_DEST}'",
  "  TABLES idoc_control_rec_40 = ctl idoc_data_rec_40 = dat",
  "  EXCEPTIONS OTHERS = 1.",
  "WRITE: / 'SUBRC=', SY-SUBRC.",
@@ -30,5 +32,5 @@ print(json.dumps({"op":"call","func":"RFC_ABAP_INSTALL_AND_RUN","import":{"PROGR
 PY
 )
 printf '%s\n' "$J" | env SAP_ASHOST="${SAP_ASHOST:-localhost}" SAP_SYSNR="${SAP_SYSNR:-00}" \
-  SAP_CLIENT="${SAP_CLIENT:-001}" SAP_USER="${SAP_USER:-DEVELOPER}" SAP_PASSWD="${SAP_PASSWD:-Down1oad}" \
+  SAP_CLIENT="${SAP_CLIENT:-001}" SAP_USER="${SAP_USER:-DEVELOPER}" SAP_PASSWD="$SAP_PASSWD" \
   SAP_LANG=EN LD_LIBRARY_PATH="$LD" "$SAPRFC" 2>/dev/null

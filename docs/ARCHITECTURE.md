@@ -53,10 +53,9 @@ the durable consumers, and (later) KV/object state.
 
 ## VejasScript (`core/src/vjs.rs`)
 
-A Rust reimplementation of a practical subset of WmScript
-(github.com/cpoder/wmscript), interpreted in-process. See ADR-0001.
+A small flow language, interpreted in-process by the runtime. See ADR-0001.
 
-- **Pipeline model (webMethods):** the incoming event's top-level fields are the
+- **Pipeline model:** the incoming event's top-level fields are the
   variable space; `event` also holds the whole document.
 - **Statements:** the trigger directives `source "vx…"` (bus), `tool "…"` (MCP
   tool), `api "VERB /path"` (HTTP endpoint) and `driver "…"` (connector

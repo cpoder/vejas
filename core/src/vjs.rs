@@ -1,7 +1,7 @@
 // VejasScript — embedded interpreter.
 //
-// The native flow language of Vejas, descended from WmScript
-// (github.com/cpoder/wmscript) and reimplemented in Rust, in-process.
+// The native flow language of Vejas, a small flow language
+// interpreted in Rust, in-process.
 // Design goals, in order: readable on one screen, safely editable from the
 // dashboard (no imports, no I/O, no clock — the only side effects are `emit`
 // and `invoke`), statically analyzable (business surface, pipeline graph and
@@ -15,14 +15,14 @@
 //   for x in expr: ... end
 //   emit "vx.subject", expr
 //   invoke svc(k: v, ...)                   composition, MERGES the service's
-//                                           pipeline into the caller (wM-style)
+//                                           pipeline into the caller (pipeline merge)
 //   x = invoke svc(k: v, ...)               composition, captured as a document
 //   expressions: literals, {doc: exprs}, [arrays], f"strings {expr}",
 //     a.b.c paths, a?.b null-safe, x ?? y, == != < <= > >= in, and/or/not,
 //     + - * /, doc[key], orders[].id projection, orders[status == "active"],
 //     builtins: upper lower trim len str num split join replace round abs
 //
-// Pipeline model is webMethods': the incoming event's top-level fields ARE
+// Pipeline model: the incoming event's top-level fields ARE
 // the variable space (`event` also holds the whole document). An invoked
 // service starts with exactly its named arguments as pipeline and returns
 // its whole final pipeline.
@@ -1092,7 +1092,7 @@ fn to_display(v: &Value) -> String {
 
 /// Loads and caches composed services.
 ///
-/// Resolution (webMethods packages, with a stricter coupling rule):
+/// Resolution (package-scoped, with a strict coupling rule):
 ///   - `invoke fmt(...)`          -> <caller package>/services/fmt.vjs
 ///   - `invoke billing:fmt(...)`  -> packages/billing/services/fmt.vjs
 ///     (or the project root when the package is "default")

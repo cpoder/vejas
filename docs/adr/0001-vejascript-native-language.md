@@ -17,16 +17,16 @@ by **agents**, and a small constrained grammar is a better generation target
 than a general language — the agent cannot produce a whole class of errors it
 otherwise would.
 
-Cyril already built WmScript (github.com/cpoder/wmscript), a readable scripting
-language for webMethods Integration Server (ANTLR grammar, compiles to JVM
-bytecode). It is the right shape, wrong host.
+The author had already designed a readable scripting language for a
+proprietary ESB years earlier (ANTLR grammar, compiles to JVM bytecode).
+It is the right shape, wrong host.
 
 ## Decision
 
-Reimplement a practical subset of WmScript in Rust as **VejasScript**,
+Reimplement a practical subset of that language in Rust as **VejasScript**,
 interpreted **in-process** by the runtime. Files are `.vjs`, plain text, in the
 user's git repo. The only side effects are `emit` and `invoke`: no imports, no
-filesystem, no network, no clock. The webMethods pipeline model is kept: an
+filesystem, no network, no clock. The classic pipeline model is kept: an
 event's top-level fields are the variable space.
 
 ## Consequences
@@ -51,5 +51,5 @@ event's top-level fields are the variable space.
 - **A proprietary JSON/YAML flow format**: exactly the lock-in Vejas exists to
   reject.
 - **Embedding an existing scripting engine (Rhai, Lua):** general-purpose,
-  larger surface, and not the webMethods pipeline model the composition story
+  larger surface, and not the pipeline model the composition story
   depends on.
