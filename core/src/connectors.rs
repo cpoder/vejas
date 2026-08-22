@@ -1108,14 +1108,26 @@ fn run_sink(
                 return Ok(());
             }
             let preview = trace_preview(&msg.data);
+            let t0 = Instant::now();
+            let start_nanos = crate::metrics::now_nanos();
             match handler(&msg.data) {
                 Ok(response) => {
+                    crate::metrics::observe(&ctx.name, true, 0, t0.elapsed().as_secs_f64());
+                    crate::metrics::span(crate::metrics::Span {
+                        unit: ctx.name.clone(), subject: subject.to_string(), ok: true,
+                        error: None, start_nanos, end_nanos: crate::metrics::now_nanos(), emits: 0,
+                    });
                     crate::record_trace_full(
                         &ctx.name, subject, true, None, vec![], preview, None, response,
                     );
                     let _ = msg.ack();
                 }
                 Err(e) => {
+                    crate::metrics::observe(&ctx.name, false, 0, t0.elapsed().as_secs_f64());
+                    crate::metrics::span(crate::metrics::Span {
+                        unit: ctx.name.clone(), subject: subject.to_string(), ok: false,
+                        error: Some(e.clone()), start_nanos, end_nanos: crate::metrics::now_nanos(), emits: 0,
+                    });
                     // poison guard: give up after MAX_DELIVERIES attempts
                     let delivered =
                         msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
@@ -1124,6 +1136,7 @@ fn run_sink(
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
                         match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data) {
                             Ok(()) => {
+                                crate::metrics::inc_dead_letter(&ctx.name);
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);
                                 crate::record_trace_full(
                                     &ctx.name, subject, false,

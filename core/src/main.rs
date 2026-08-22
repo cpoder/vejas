@@ -2000,7 +2000,28 @@ fn publish_emits(emits: &[(String, Value)]) {
 
 /// Run an API flow on the request event; map its `respond` to (status, body).
 fn run_api_flow(root: &Path, file: &str, input: &Value) -> (u16, String) {
-    match run_flow_ctx(root, file, input) {
+    // Instrument the synchronous /api path like the bus hot path (ADR-0016
+    // follow-up): a run-time error is `ok:false`; a `respond 4xx/5xx` is a valid
+    // business outcome, so the flow still counts as processed.
+    let unit = guard_path(root, file)
+        .map(|p| flow_proc_name(&p))
+        .unwrap_or_else(|| file.to_string());
+    let t0 = Instant::now();
+    let start_nanos = metrics::now_nanos();
+    let result = run_flow_ctx(root, file, input);
+    let ok = result.is_ok();
+    let emits = result.as_ref().map(|c| c.emits.len() as u64).unwrap_or(0);
+    metrics::observe(&unit, ok, emits, t0.elapsed().as_secs_f64());
+    metrics::span(metrics::Span {
+        unit: unit.clone(),
+        subject: format!("api:{file}"),
+        ok,
+        error: result.as_ref().err().cloned(),
+        start_nanos,
+        end_nanos: metrics::now_nanos(),
+        emits,
+    });
+    match result {
         Ok(ctx) => {
             publish_emits(&ctx.emits);
             match ctx.response {

@@ -78,9 +78,12 @@ cryptographically random.
   traces and exposes metrics, and the honest "on the roadmap, not in the binary
   yet" disclaimer is retired.
 - The footprint story holds: no new heavy dependencies, RSS unchanged.
-- Metrics count the flow data plane (interpreter invocations) and the DLQ. Sink
-  drivers and the synchronous `/api` path are not yet histogrammed — a follow-up,
-  called out here rather than left for someone to discover by its absence.
+- Metrics count the flow data plane (interpreter invocations), the sink drivers,
+  the synchronous `/api` path, and the DLQ — every place a message is processed.
+  (Sink and `/api` histograms were the follow-up called out in the first cut of
+  this ADR; both now land, verified live.) On the `/api` path a run-time error is
+  `result="error"`; a `respond 4xx/5xx` is a valid business outcome and still
+  counts as processed.
 - `vejas_event_duration_seconds` measures in-process time only. It corroborates
   the bench finding that end-to-end latency is dominated by the persisted bus
   round-trip, not the interpreter (sub-millisecond in-process vs. single-digit-ms
