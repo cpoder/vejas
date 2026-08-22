@@ -1,6 +1,6 @@
 # 0021 — Versioning, canary, and time-travel
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-23
 
 ## Context
@@ -34,14 +34,20 @@ coordinate through the bus.
 
 ### A version is a content-addressed snapshot on the bus
 
-A **version** of a flow is a snapshot of its VejasScript source (and the services
-it invokes), content-addressed by a hash. Versions live in a JetStream KV bucket
+A **version** of a flow is a snapshot of **that flow's** VejasScript source,
+content-addressed by a hash. Versions live in a JetStream KV bucket
 `VEJAS_VERSIONS`, keyed by flow, newest value = the live version, history
-retained for rollback and audit. Git stays the durable source of truth for
-*deployed* versions (a commit is a version); the version bucket is the **live
-overlay** for changes made through the panel/MCP between deploys — the same
-git-plus-stream duality as the ADR-0018 audit trail, now carrying content, not
-just a record of it.
+retained (bounded, see Storage below) for rollback and audit. Git stays the
+durable source of truth for *deployed* versions (a commit is a version); the
+version bucket is the **live overlay** for changes made through the panel/MCP
+between deploys — the same git-plus-stream duality as the ADR-0018 audit trail,
+now carrying content, not just a record of it.
+
+**Scope, v1: the overlay carries only the flow, not the services it invokes.**
+Invoked services stay baseline-only (a service edit is GitOps). Snapshotting the
+service graph opens shared-service-version questions — two flows pinning two
+versions of the same service is hermetic but diverges from today's semantics — so
+hermetic per-version service pinning is an explicit follow-up, not v1.
 
 ### Cluster-wide promotion = every instance watches the version bucket
 
@@ -65,11 +71,36 @@ value on (re)connect (and can refresh on demand), so a dropped connection or a
 missed update self-heals to the KV's authoritative value. The KV is the truth;
 the watch is just how fast you hear about it.
 
-Reconciliation with git (baseline + overlay): on boot an instance loads the git
-working tree as the baseline, then applies any newer `VEJAS_VERSIONS` overlay on
-top. A GitOps deploy that lands the same change as a committed file supersedes the
-overlay (matched by content hash — the overlay is dropped once git carries it),
-so the two never fight and the repo remains the thing you take with you.
+### Git ↔ overlay: an overlay is valid only against the exact baseline it forked
+
+This is the crux (it was the open question; the review settled it). An overlay
+records the **parent baseline hash** — the git file's content hash at the moment
+of the promote. At reconciliation, per flow:
+
+- **Baseline unchanged** (same parent hash) → the overlay applies. This is the
+  steady state between deploys.
+- **Baseline advanced** (a deploy moved the git file B1 → B2) **or the flow was
+  git-deleted** → **git wins; the overlay is evicted, loudly.** An audit record is
+  written and the panel shows a banner: *"your live promote on X was superseded by
+  a deploy — the content is still in VEJAS_VERSIONS history, re-promotable on the
+  new baseline; diff here."* The content is never lost, but it never silently
+  overrides the deploy.
+
+Never the inverse. An overlay that silently masks a deploy is a deploy that does
+not deploy; a flow that lives on as an overlay after `git rm` is a ghost that
+breaks "take your code with you." Both are unacceptable, and this one rule closes
+both edge cases. The eviction is performed by a **single actor** — the first
+instance to detect the mismatch does a CAS delete on the key (first detector wins,
+one audit record, no thundering herd). And **v1 does not allow flow *creation* via
+overlay**: an overlay may only carry a flow that already exists in the baseline —
+creation is GitOps — because otherwise the delete semantics above become
+undecidable (is an absent baseline a deletion, or a not-yet-committed creation?).
+
+Follow-up softener (noted, not v1): when an overlay is a literal-bump (the
+ADR-0005 unification below), re-applying it on the advanced baseline is usually
+mechanical — `set_literal` replays cleanly if the literal still exists — so an
+"auto-rebase of literal-overlays" could avoid the eviction in the common case.
+v1 evicts loudly: simple and safe first, clever later.
 
 ### Time-travel and canary are one shadow engine, two traffic sources
 
@@ -88,11 +119,20 @@ traffic safe. A violation is a correctness bug, not a tuning knob.
   generalised to a time/seq range) and runs each event through *both* the live
   and the candidate version, returning the side-by-side emit diff. Nothing is
   published; the bus is untouched.
-- **Canary** binds a candidate version to a **shadow** ephemeral consumer on the
-  *live* source subject (deliver-new, read-only, never acked). Each live event is
-  run through the candidate; its emits are recorded and diffed against what the
-  live version emitted for the same event (already on the bus). The diff
-  accumulates over real traffic until an operator promotes or discards.
+- **Canary** is time-travel on the *tail* of the live stream: a **shadow**
+  ephemeral consumer follows the live source subject (deliver-new, read-only,
+  never acked), and each new event is run through **both** the live and the
+  candidate version in the shadow engine — exactly as time-travel does over a
+  historical window. The diff is therefore exact *by construction*, and the two
+  runs line up on the source message's **stream sequence** (intrinsic to
+  JetStream — no per-flow join key to invent; this is what answers "how do you
+  correlate?" below). We do **not** scrape the incumbent's real emits off the bus
+  to diff against — those aren't tagged to their source event and the trace ring
+  is per-instance in a cluster, so that correlation is fragile; re-running the
+  live version in shadow is both correct and uniform. The cost is 2× shadow
+  compute (bounded, acceptable); canary is then *literally* the same engine as
+  time-travel, zero special case. The diff accumulates over real traffic until an
+  operator promotes or discards.
 
 **Split vs. double — decided: double-consume shadow for v1 (review point b).**
 Two shapes were on the table. A *split* canary routes a real subset of traffic to
@@ -129,24 +169,21 @@ failed under the old rule, does it still fail under the new one?" has an answer 
 the envelope rather than in someone's memory. A DLQ replay is, in effect, a
 per-message time-travel across a version bump.
 
-## Open questions (for review before any build)
+## Decided in review
 
-1. **Version granularity: per-flow or whole-surface?** Per-flow is simpler and
-   matches the current durable-per-flow model, but a change spanning a flow and a
-   service it invokes is two promotes that should be atomic. A "change set"
-   (several flows promoted together, one version id) may be the right unit.
-   Leaning per-flow for v1 with a grouped-promote follow-up.
-2. **Git ↔ overlay reconciliation** is the genuinely hard part. Content-hash
-   matching (drop the overlay when git carries the same content) is the sketch;
-   the edge cases (an overlay for a flow git later deletes; a deploy that changes
-   an unrelated part of a file the overlay also touched) need care. This is where
-   review time is best spent.
-3. **Canary diff semantics.** Comparing candidate emits to live emits per event
-   needs a stable event key to line them up; the pollers' `fetched_at`
-   idempotency keys (ADR-0002) likely serve, but flows without one need a rule.
-4. **Storage bounds.** Snapshots in KV are small (one flow's source), but history
-   for rollback + canary recordings need a retention policy (like the DLQ's
-   bounded `max_msgs`).
+1. **Granularity: per-flow for v1**, with a grouped-promote ("change set": several
+   flows, one version id, promoted atomically) as a follow-up — matches the
+   durable-per-flow model today.
+2. **Git ↔ overlay:** resolved by the parent-baseline-hash rule above (overlay
+   valid only against its exact baseline; otherwise git wins and the overlay is
+   evicted loudly; no flow creation via overlay in v1).
+3. **Canary diff key:** the source message's **stream sequence** — intrinsic to
+   JetStream, no per-flow key to invent — because both versions run in the shadow
+   engine on the same event (see Canary above).
+4. **Storage bounds:** `VEJAS_VERSIONS` KV keeps a bounded history (**64 revisions
+   per flow key**) for rollback/audit; canary shadow recordings go to a bounded
+   stream (**`max_msgs` + `max_age`, DLQ-style**) so a long-running canary cannot
+   grow without limit. Both are safety caps, logged when they bite, never silent.
 
 ## Consequences
 
@@ -163,6 +200,12 @@ per-message time-travel across a version bump.
   disk." That is a real conceptual cost, mitigated by the git-baseline rule (disk
   is always the baseline; the overlay is explicit and audited) and by keeping it
   off entirely when `VEJAS_VERSIONS` is unused (single-instance, GitOps-only).
+- **ADR-0020 guard message updates when this ships.** Today the cluster-mode
+  write-refusal says "promote through git." Once the version path exists, that
+  message must point to it too — "promote through the panel (versions) or git" —
+  and `/surface/set` in a cluster routes to a version promote instead of a flat
+  refusal. Until then the refusal stands; the docs must not claim the version
+  path before it is built.
 
 ## Interactions
 
