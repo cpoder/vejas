@@ -308,7 +308,7 @@ fn promote_version(
     let js = nats::jetstream::new(nc);
     let store = versions::open_store(&js).ok_or("version store unavailable")?;
     // current effective source: a prior overlay if valid, else the baseline
-    let (current, _) = versions::resolve_source(Some(&store), &unit, &baseline);
+    let (current, _) = versions::resolve_source(Some(&store), &unit, &baseline, now_secs());
     let before = vjs::get_literal(&current, name, key).unwrap_or(Value::Null);
     let new_src = vjs::set_literal(&current, name, key, value)?;
     // overlays always fork from the GIT baseline, so a deploy that moves the
@@ -545,14 +545,31 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // file iff it forked from exactly this baseline; a stale overlay
             // (baseline advanced / flow git-deleted) is evicted here — git wins.
             let src = {
-                let vstore = nats::connect(&url)
-                    .ok()
-                    .map(nats::jetstream::new)
-                    .and_then(|js| versions::open_store(&js));
-                let (s, from_overlay) =
-                    versions::resolve_source(vstore.as_ref(), &handle.spec.name, &baseline);
-                if from_overlay {
-                    eprintln!("[vejas] {} on a promoted version (overlay)", handle.spec.name);
+                let vconn = nats::connect(&url).ok().map(nats::jetstream::new);
+                let vstore = vconn.as_ref().and_then(versions::open_store);
+                let (s, outcome) = versions::resolve_source(
+                    vstore.as_ref(),
+                    &handle.spec.name,
+                    &baseline,
+                    now_secs(),
+                );
+                match outcome {
+                    versions::Outcome::Overlay => {
+                        eprintln!("[vejas] {} on a promoted version (overlay)", handle.spec.name)
+                    }
+                    versions::Outcome::Evicted { parent, baseline: base_hash } => {
+                        // audit the eviction (ADR-0018) so it is in the trail, not
+                        // only the log — best-effort.
+                        if let Some(js) = &vconn {
+                            let record = json!({
+                                "ts": now_secs(), "actor": "eviction",
+                                "unit": handle.spec.name, "kind": "overlay-evicted",
+                                "parent": parent, "baseline": base_hash,
+                            });
+                            let _ = connectors::to_audit(js, &handle.spec.name, &record);
+                        }
+                    }
+                    versions::Outcome::Baseline => {}
                 }
                 s
             };
@@ -2644,6 +2661,12 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             "text/html; charset=utf-8",
         ),
         (tiny_http::Method::Get, "/healthz") => respond(request, 200, "ok".into(), "text/plain"),
+        (tiny_http::Method::Get, "/evictions") => respond(
+            request,
+            200,
+            json!({ "evictions": versions::recent_evictions() }).to_string(),
+            "application/json",
+        ),
         (tiny_http::Method::Get, "/metrics") => {
             // Prometheus exposition. Gauges (unit/kind/restarts) come live from
             // the supervision registry; counters & histograms from the metrics

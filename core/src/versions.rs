@@ -15,6 +15,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 const VERSIONS_BUCKET: &str = "VEJAS_VERSIONS";
 const VERSIONS_HISTORY: i64 = 64; // bounded rollback/audit history per flow (ADR-0021)
@@ -81,43 +82,78 @@ pub fn put_version(
         .map_err(|e| e.to_string())
 }
 
+/// What `resolve_source` did — so the caller can audit an eviction.
+pub enum Outcome {
+    Baseline,
+    Overlay,
+    Evicted { parent: String, baseline: String },
+}
+
+/// Recent overlay evictions, newest last, capped — the panel reads these to show
+/// a banner ("your live promote was superseded by a deploy"). In memory: an
+/// eviction is a transient operator signal, not durable state.
+static EVICTIONS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+
+fn note_eviction(flow: &str, parent: &str, baseline: &str, ts: u64) {
+    let mut v = EVICTIONS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+    v.push(serde_json::json!({
+        "flow": flow, "parent": parent, "baseline": baseline, "ts": ts,
+    }));
+    while v.len() > 50 {
+        v.remove(0);
+    }
+}
+
+/// The recent evictions, for the panel banner.
+pub fn recent_evictions() -> Vec<serde_json::Value> {
+    EVICTIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
 /// The EFFECTIVE source for a flow: the overlay if it is valid against the current
 /// baseline, else the baseline. A stale overlay (baseline advanced or flow gone)
-/// is evicted here — git wins, loudly (logged; an audit record is written by the
-/// caller which holds the audit stream). Returns (source, from_overlay).
+/// is evicted here — git wins, loudly (logged + noted for the panel; the caller
+/// also writes an ADR-0018 audit record on `Evicted`). Returns (source, outcome).
 pub fn resolve_source(
     store: Option<&nats::kv::Store>,
     flow: &str,
     baseline: &str,
-) -> (String, bool) {
+    ts: u64,
+) -> (String, Outcome) {
     let Some(store) = store else {
-        return (baseline.to_string(), false);
+        return (baseline.to_string(), Outcome::Baseline);
     };
     let Some(ov) = get_version(store, flow) else {
-        return (baseline.to_string(), false);
+        return (baseline.to_string(), Outcome::Baseline);
     };
-    let parent = ov["parent"].as_str().unwrap_or("");
-    if parent == hash_content(baseline) {
+    let parent = ov["parent"].as_str().unwrap_or("").to_string();
+    let base_hash = hash_content(baseline);
+    if parent == base_hash {
         // overlay forked from exactly this baseline → it applies
         let src = ov["source"].as_str().unwrap_or(baseline).to_string();
-        (src, true)
+        (src, Outcome::Overlay)
     } else {
         // baseline moved (a deploy) or the flow changed under it → git wins.
         // Evict the overlay loudly; the content stays in KV history, re-promotable.
         let _ = store.delete(&key_of(flow));
         eprintln!(
             "[vejas] overlay for {flow} EVICTED — superseded by a deploy \
-             (overlay parent {parent}, current baseline {}); git wins, \
-             content kept in VEJAS_VERSIONS history",
-            hash_content(baseline)
+             (overlay parent {parent}, current baseline {base_hash}); git wins, \
+             content kept in VEJAS_VERSIONS history"
         );
-        (baseline.to_string(), false)
+        note_eviction(flow, &parent, &base_hash, ts);
+        (
+            baseline.to_string(),
+            Outcome::Evicted { parent, baseline: base_hash },
+        )
     }
 }
 
-/// Was a flow's overlay evicted recently? The panel reads this to show a banner.
-/// Kept as a small in-memory set of flow names, appended by resolve_source's
-/// caller (so the eviction surfaces in the UI, not only the log).
+/// A flow name as its version KV key token — for the version watch to map a KV
+/// key back to a supervised unit.
 pub fn key_token(flow: &str) -> String {
     key_of(flow)
 }
