@@ -54,11 +54,18 @@
                     cursor: pointer; white-space: nowrap; }
   .newflow button:disabled { opacity: .6; cursor: wait; }
   .hint { font-size: 12.5px; color: var(--muted); margin: 10px 0 0; }
-  /* Recent-events payload: a compact one-line summary that expands on click. */
-  td.payload details { white-space: normal; }
-  td.payload summary { cursor: pointer; white-space: nowrap; color: var(--accent); }
+  /* Recent-events table: clamp it to the card so long payloads never overflow. */
+  #events table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+  #events th, #events td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #events th:nth-child(1), #events td:nth-child(1) { width: 78px; }   /* time */
+  #events th:nth-child(2), #events td:nth-child(2) { width: 150px; }  /* flow */
+  #events th:nth-child(3), #events td:nth-child(3) { width: 150px; }  /* event on */
+  /* emitted (4) + payload (5) share the rest */
+  #events td.payload { white-space: normal; }
+  #events td.payload summary { cursor: pointer; white-space: nowrap; overflow: hidden;
+                               text-overflow: ellipsis; display: block; color: var(--accent); }
   pre.payload-full { white-space: pre-wrap; word-break: break-word; overflow-x: auto;
-                     max-width: 560px; margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
+                     margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
                      background: var(--card2, rgba(127,127,127,.08));
                      font: 11px/1.5 ui-monospace, SFMono-Regular, monospace; color: var(--ink2); }
 
@@ -384,6 +391,13 @@ function mappingSection(card, file, entry, previewEntries, direct) {
   }
   card.appendChild(table);
 }
+// A literal whose KEY names a credential is never shown in the clear (ADR-0008
+// spirit): the panel renders it masked, editing stays write-only.
+const isSecretKey = k => /pass(wd|word)|secret|token|api[_-]?key/i.test(String(k));
+function maskInput(input) {
+  input.type = 'password'; input.autocomplete = 'off';
+  input.title = 'hidden — credential-named value, masked on screen';
+}
 function tableSection(card, file, entry, direct) {
   const sect = document.createElement('div');
   sect.className = 'sect'; sect.textContent = `${entry.name.toLowerCase()} — transcoding table`;
@@ -393,6 +407,7 @@ function tableSection(card, file, entry, direct) {
   for (const [k, v] of Object.entries(entry.value)) {
     const input = document.createElement('input');
     input.className = 'rule'; input.value = String(v);
+    if (isSecretKey(k)) maskInput(input);
     const tr = row(table, { label: k, input, arrow: '→',
       btn: applyBtn(() => tr, () => ({file, name: entry.name, key: k, value: parseConst(input.value)}), direct) });
     input.oninput = () => tr.classList.add('dirty');
@@ -413,6 +428,7 @@ function constsSection(card, file, entries, direct) {
     const input = document.createElement('input');
     input.className = 'rule';
     input.value = isList ? entry.value.join(', ') : String(entry.value);
+    if (isSecretKey(entry.name)) maskInput(input);
     input.oninput = () => box.classList.add('dirty');
     const parse = () => isList
       ? input.value.split(',').map(s => parseConst(s)).filter(v => v !== '')
