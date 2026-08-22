@@ -1,0 +1,10 @@
+# connector: stripe_events_poll — poll Stripe events (payments, refunds, disputes).
+# Auth: the secret is the restricted API key (rk_..., read-only on Events).
+# Stripe also does webhooks (http-in + signature check in the flow) — polling
+# is the zero-inbound-exposure option.
+driver "http-poll"
+URL = "https://api.stripe.com/v1/events?limit=100"
+SUBJECT = "vx.stripe.events"
+INTERVAL_SECS = 60
+HEADERS = {"Authorization": f"Bearer {secret("stripe/restricted_key")}"}
+ENVELOPE = true

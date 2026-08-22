@@ -1,0 +1,9 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/repos/OWNER/REPO/issues?state=open",
+    "INTERVAL_SECS": 1
+  },
+  "secrets": {
+    "github/issues_pat": "github_pat_dummy"
+  }
+}

@@ -1,0 +1,9 @@
+# connector: github_issues_poll — poll a repo's issues (GitHub REST v3).
+# Auth: fine-grained PAT, read-only Issues. 60s honors the rate limit at
+# repo scale.
+driver "http-poll"
+URL = "https://api.github.com/repos/OWNER/REPO/issues?state=open&per_page=100"
+SUBJECT = "vx.github.issues"
+INTERVAL_SECS = 60
+HEADERS = {"Authorization": f"Bearer {secret("github/issues_pat")}", "Accept": "application/vnd.github+json"}
+ENVELOPE = true

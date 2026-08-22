@@ -1,0 +1,7 @@
+# connector: discord_webhook_out — post messages to a Discord channel.
+# A flow emits {content: "..."} on SUBJECT; the webhook URL is the credential.
+# Teams/Slack-compatible pattern: same driver, different URL shape.
+driver "http-out"
+SUBJECT = "vx.discord.out"
+URL = secret("discord/webhook_url")
+TEST_BODY = {"content": "Vejas connector test"}

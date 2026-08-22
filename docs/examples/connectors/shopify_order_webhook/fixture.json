@@ -1,0 +1,13 @@
+{
+  "id": 5551234,
+  "email": "jane@acme.com",
+  "total_price": "347.00",
+  "currency": "EUR",
+  "line_items": [
+    {
+      "sku": "A-12",
+      "quantity": 2,
+      "price": "99.00"
+    }
+  ]
+}

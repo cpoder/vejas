@@ -1,0 +1,8 @@
+{
+  "event_action": "trigger",
+  "payload": {
+    "summary": "[P1] Panne totale \u2014 helpdesk",
+    "source": "vejas",
+    "severity": "critical"
+  }
+}

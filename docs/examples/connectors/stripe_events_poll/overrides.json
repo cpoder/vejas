@@ -1,0 +1,9 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/v1/events?limit=100",
+    "INTERVAL_SECS": 1
+  },
+  "secrets": {
+    "stripe/restricted_key": "rk_test_dummy"
+  }
+}

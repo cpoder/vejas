@@ -1,0 +1,8 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/v3/mail/send"
+  },
+  "secrets": {
+    "sendgrid/api_key": "SG.dummy"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "personalizations": [
+    {
+      "to": [
+        {
+          "email": "oncall@corp.fr"
+        }
+      ]
+    }
+  ],
+  "from": {
+    "email": "alerts@corp.fr"
+  },
+  "subject": "[P1] Panne totale",
+  "content": [
+    {
+      "type": "text/plain",
+      "value": "Ticket critique \u2014 voir le panel."
+    }
+  ]
+}

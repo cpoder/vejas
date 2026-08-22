@@ -1,0 +1,8 @@
+{
+  "literals": {
+    "URL": "http://127.0.0.1:{PORT}/v2/enqueue"
+  },
+  "secrets": {
+    "pagerduty/routing_key": "R0123456789"
+  }
+}

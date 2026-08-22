@@ -1,0 +1,8 @@
+# connector: sendgrid_email_out — send transactional email (SendGrid v3).
+# A flow emits a SendGrid mail object ({personalizations, from, subject,
+# content}) on SUBJECT. Works identically for Mailgun/Postmark: change URL.
+driver "http-out"
+SUBJECT = "vx.email.out"
+URL = "https://api.sendgrid.com/v3/mail/send"
+HEADERS = {"Authorization": f"Bearer {secret("sendgrid/api_key")}", "Content-Type": "application/json"}
+TEST_BODY = {"personalizations": [{"to": [{"email": "ops@example.com"}]}], "from": {"email": "vejas@example.com"}, "subject": "Vejas connector test", "content": [{"type": "text/plain", "value": "test"}]}

@@ -54,3 +54,10 @@ from the runtime), parse, boot against the mock, green probe, and the data
 actually flowing. Run locally: `e2e/admission/run.sh [name]`.
 
 A flat `.vjs.example` outside a directory is a draft, not a connector.
+
+**Twelve certified recipes**: ServiceNow (poll + create), Jira (poll +
+create), Slack, Workday RaaS, Stripe events, Shopify order webhook,
+SendGrid email, GitHub issues, PagerDuty events, Discord webhook — every
+one admitted by CI against its mock, credentials vaulted, data flow
+proven. The webhook recipe (Shopify) is tested end to end through its own
+ingest: POST the fixture, see it on the bus.

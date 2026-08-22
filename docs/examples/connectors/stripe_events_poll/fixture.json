@@ -1,0 +1,21 @@
+{
+  "endpoint": "http://127.0.0.1:9200/v1/events?limit=100",
+  "fetched_at": "2026-08-23T10:00:01Z",
+  "body": {
+    "object": "list",
+    "data": [
+      {
+        "id": "evt_1",
+        "type": "payment_intent.succeeded",
+        "data": {
+          "object": {
+            "id": "pi_1",
+            "amount": 34700,
+            "currency": "eur"
+          }
+        }
+      }
+    ],
+    "has_more": false
+  }
+}

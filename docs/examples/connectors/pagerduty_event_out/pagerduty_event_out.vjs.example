@@ -1,0 +1,8 @@
+# connector: pagerduty_event_out — trigger/resolve PagerDuty incidents
+# (Events API v2). A flow emits {routing_key: <ref>, event_action, payload:
+# {summary, source, severity}} — the routing key itself comes from the vault.
+driver "http-out"
+SUBJECT = "vx.pagerduty.out"
+URL = "https://events.pagerduty.com/v2/enqueue"
+HEADERS = {"Content-Type": "application/json", "X-Routing-Key": f"{secret("pagerduty/routing_key")}"}
+TEST_BODY = {"event_action": "trigger", "payload": {"summary": "Vejas connector test", "source": "vejas", "severity": "info"}}

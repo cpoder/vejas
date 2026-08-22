@@ -1,0 +1,5 @@
+# connector: shopify_order_webhook — receive Shopify order webhooks.
+# Shopify POSTs orders/create to /ingest/shopify.orders; verify the HMAC in a
+# flow (X-Shopify-Hmac-Sha256) before acting — the entry only publishes.
+driver "http-in"
+PORT = 8787

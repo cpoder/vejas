@@ -1,0 +1,16 @@
+{
+  "endpoint": "http://127.0.0.1:9200/repos/OWNER/REPO/issues?state=open",
+  "fetched_at": "2026-08-23T10:00:01Z",
+  "body": [
+    {
+      "number": 42,
+      "title": "Payment API 5xx burst",
+      "state": "open",
+      "labels": [
+        {
+          "name": "incident"
+        }
+      ]
+    }
+  ]
+}

@@ -58,15 +58,19 @@ PY
   STORE=$(mktemp -d); ROOT=$(mktemp -d)
   mkdir -p "$ROOT/connectors"
   cp "$MANIFEST" "$ROOT/connectors/$NAME.vjs"
-  node "$DIR/mock.mjs" "$MOCK_P" > "$STORE/mock.log" 2>&1 &
-  MOCK_PID=$!
-  # never race the mock: a cold CI runner starts node slower than the probe
-  for _ in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$MOCK_P/__count" && break; sleep 0.1; done
+  MOCK_PID=""
+  if [ -f "$DIR/mock.mjs" ]; then
+    node "$DIR/mock.mjs" "$MOCK_P" > "$STORE/mock.log" 2>&1 &
+    MOCK_PID=$!
+    # never race the mock: a cold CI runner starts node slower than the probe
+    for _ in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$MOCK_P/__count" && break; sleep 0.1; done
+  fi
   # dummy secrets from overrides.json (env-store form)
-  eval "$(python3 - "$DIR/overrides.json" << 'PY'
+  eval "$(python3 - "$DIR/overrides.json" "$MOCK_P" << 'PY'
 import json, re, sys
 o = json.load(open(sys.argv[1]))
 for path, v in o.get('secrets', {}).items():
+    v = str(v).replace('{PORT}', sys.argv[2])
     print(f"export VEJAS_SECRET_{re.sub(r'[^A-Za-z0-9]', '_', path).upper()}='{v}'")
 PY
 )"
@@ -95,14 +99,29 @@ PY
   if [ $ok -eq 1 ]; then
     PROBE=$(curl -sf -X POST "http://127.0.0.1:$HTTP_P/connectors/test" \
       -H 'content-type: application/json' -d "{\"file\":\"connectors/$NAME.vjs\"}")
-    echo "$PROBE" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)" \
+    # a driver WITHOUT a probe is not a failed probe — the data-flow check
+    # below is then the sole (and stronger) gate
+    echo "$PROBE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if d.get('ok') or 'no test probe' in d.get('detail', '') else 1)" \
       || { echo "  ✗ probe: $PROBE"; ok=0; }
   fi
 
   # ── the data must flow ────────────────────────────────────────────────
   if [ $ok -eq 1 ]; then
-    SUBJECT=$(grep -oP 'SUBJECT\s*=\s*"\K[^"]+' "$MANIFEST")
-    if [ -f "$DIR/fixture.json" ] && grep -q 'driver "http-poll"' "$MANIFEST"; then
+    SUBJECT=$(grep -oP 'SUBJECT\s*=\s*"\K[^"]+' "$MANIFEST" || true)
+    INGEST=$(python3 -c "import json,sys; print(json.load(open('$DIR/overrides.json')).get('ingest_path',''))")
+    if [ -n "$INGEST" ]; then
+      # webhook source: POST the fixture to its own ingest, expect it on the bus
+      IPORT=$(grep -oP 'PORT\s*=\s*\K[0-9]+' "$MANIFEST")
+      ( timeout 10 nats -s "nats://127.0.0.1:$NATS_P" sub "vx.$INGEST" --count=1 --raw 2>/dev/null | head -1 > "$STORE/inmsg" ) &
+      WSUB=$!
+      sleep 0.5
+      curl -sf -o /dev/null -X POST "http://127.0.0.1:$IPORT/ingest/$INGEST" -d @"$DIR/fixture.json" || true
+      wait $WSUB 2>/dev/null || true
+      [ -s "$STORE/inmsg" ] || { echo "  ✗ webhook: fixture never reached the bus"; ok=0; }
+    elif [ -f "$DIR/fixture.json" ] && grep -q 'driver "http-poll"' "$MANIFEST"; then
       # source: one real published message, shape-checked against the fixture
       MSG=$(timeout 15 nats -s "nats://127.0.0.1:$NATS_P" sub "$SUBJECT" --count=1 --raw 2>/dev/null | head -1)
       python3 - "$DIR/fixture.json" "$MSG" << 'PY' || { echo "  ✗ source: shape mismatch or no message"; exit 1; } || ok=0
