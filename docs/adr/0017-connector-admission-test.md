@@ -1,6 +1,6 @@
 # 0017 — The connector admission test
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-22
 
 ## Context
