@@ -286,6 +286,22 @@ fn replay_literal(
     }))
 }
 
+/// In cluster mode (`VEJAS_CLUSTER=1`), refuse any mutation of this instance's
+/// LOCAL files. A promote that lands on one instance while the others keep the old
+/// rule is the worst failure mode for the business-surface thesis (ADR-0020) — the
+/// expert believes they fixed the meaning while half the traffic disagrees. In a
+/// cluster, changes flow through GitOps. `/reload`, DLQ replay, and Vault-backed
+/// secret writes stay allowed (they are per-instance-safe or shared-store).
+fn cluster_write_guard() -> Result<(), String> {
+    if cluster::clustered() {
+        Err("clustered: this instance will not mutate its local files — \
+             promote through git (GitOps), see ADR-0020"
+            .into())
+    } else {
+        Ok(())
+    }
+}
+
 /// Append a promote to the audit trail (ADR-0018). Best-effort for LIVE promotes:
 /// a live promote that cannot reach VEJAS_AUDIT is logged but still applied — git
 /// remains the durable trail for repo-deployed changes, and blocking a correction
@@ -2247,6 +2263,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         "vejas_language" => text(LANGUAGE_VJS.to_string()),
         "vejas_events" => text(events_json(args["flow"].as_str())),
         "vejas_write_flow" => {
+            cluster_write_guard()?;
             let p = args["path"].as_str().ok_or("path required")?;
             let content = args["content"].as_str().ok_or("content required")?;
             let path = guard_path(root, p).ok_or("path not allowed")?;
@@ -2264,6 +2281,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"ok": true, "started": started, "stopped": stopped}).to_string())
         }
         "vejas_set_literal" => {
+            cluster_write_guard()?;
             let file = args["file"].as_str().ok_or("file required")?;
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
@@ -2277,6 +2295,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"ok": true}).to_string())
         }
         "vejas_rollback_literal" => {
+            cluster_write_guard()?;
             let file = args["file"].as_str().ok_or("file required")?;
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
@@ -2301,12 +2320,14 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"emits": emits}).to_string())
         }
         "vejas_new_flow" => {
+            cluster_write_guard()?;
             let prompt = args["prompt"].as_str().ok_or("prompt required")?;
             let res = generate_flow(root, prompt)?;
             let _ = reload(registry, root);
             text(res)
         }
         "vejas_new_connector" => {
+            cluster_write_guard()?;
             let prompt = args["prompt"].as_str().ok_or("prompt required")?;
             let res = generate_connector(root, prompt)?;
             let _ = reload(registry, root);
@@ -2325,6 +2346,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_secrets" => text(secrets_json(root)),
         "vejas_set_secret" => {
+            // A shared Vault backend is cluster-safe; a local FileStore is not
+            // (one instance's file only). Vault stays allowed, local refuses.
+            if cluster::clustered() && secrets::default_store().kind() != "vault" {
+                return Err("clustered: a local-file secret store would be written on \
+                    one instance only — use a shared Vault backend, see ADR-0020"
+                    .into());
+            }
             let r = args["ref"].as_str().ok_or("ref required")?;
             let v = args["value"].as_str().ok_or("value required")?;
             if v.is_empty() {
@@ -2338,6 +2366,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(probe_connector(root, file).to_string())
         }
         "vejas_provision" => {
+            cluster_write_guard()?;
             let template = args["template"].as_str().ok_or("template required")?;
             let slug = args["tenant_slug"].as_str().ok_or("tenant_slug required")?;
             let params = args["params"].as_object().cloned().unwrap_or_default();
@@ -2599,6 +2628,17 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             respond(request, 200, secrets_json(&root), "application/json")
         }
         (tiny_http::Method::Post, "/secrets/set") => {
+            // Vault (shared) is cluster-safe; a local FileStore is not.
+            if cluster::clustered() && secrets::default_store().kind() != "vault" {
+                return respond(
+                    request,
+                    409,
+                    "clustered: a local-file secret store would be written on one \
+                     instance only — use a shared Vault backend, see ADR-0020"
+                        .into(),
+                    "text/plain",
+                );
+            }
             let body = read_body(&mut request);
             let (Some(r), Some(v)) = (body["ref"].as_str(), body["value"].as_str()) else {
                 return respond(request, 400, "need ref+value".into(), "text/plain");
@@ -2624,6 +2664,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
         }
         (tiny_http::Method::Post, "/provision") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let (Some(template), Some(slug)) =
                 (body["template"].as_str(), body["tenant_slug"].as_str())
@@ -2670,6 +2713,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/file/set") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let (Some(pstr), Some(content)) =
                 (body["path"].as_str(), body["content"].as_str())
@@ -2713,6 +2759,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             )
         }
         (tiny_http::Method::Post, "/fixture/set") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let (Some(file), Some(content)) = (body["file"].as_str(), body["content"].as_str())
             else {
@@ -2745,6 +2794,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/surface/set") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             let name = body["name"].as_str().unwrap_or("").to_string();
@@ -2776,6 +2828,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/surface/rollback") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             let name = body["name"].as_str().unwrap_or("").to_string();
@@ -2789,6 +2844,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/flows/new") => {
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let prompt = body["prompt"].as_str().unwrap_or("").to_string();
             if prompt.trim().is_empty() {

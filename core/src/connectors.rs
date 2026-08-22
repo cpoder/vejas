@@ -1485,7 +1485,12 @@ impl Driver for ExecRpc {
         stdout.read_line(&mut ready).map_err(|e| e.to_string())?;
         eprintln!("[{}] exec-rpc: `{cmd}` serving {subject}", ctx.name);
 
-        let sub = nc.subscribe(&subject).map_err(|e| e.to_string())?;
+        // Queue group (not a plain subscribe) so N clustered instances share the
+        // requests — exactly one answers each, load-balanced (ADR-0020). Each
+        // instance keeps its own child process (e.g. its own SAP logon).
+        let sub = nc
+            .queue_subscribe(&subject, "vejas")
+            .map_err(|e| e.to_string())?;
         loop {
             if !ctx.alive() {
                 let _ = child.kill();

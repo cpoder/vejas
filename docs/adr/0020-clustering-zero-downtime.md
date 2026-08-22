@@ -167,10 +167,19 @@ leases. No gap, no loss — the bus is the only shared state.
   **30s default stays** for single-instance runs (safe for slow sinks that need
   the time) — a stated tradeoff, tuned per deployment, not changed globally.
 - **Lease TTL ~10s** matches the real pollers (`INTERVAL_SECS ≥ 60`), so a normal
-  failover loses at most one poll cycle's slack. For a fast timer (e.g. 1s) the
-  worst-case gap after a *crash* is the TTL — bounded and acceptable; a graceful
-  restart has no gap (the lease is released, not aged out). Documented so nobody
-  is surprised by a ~10s pause of a 1s timer after a hard kill.
+  failover loses at most one poll cycle's slack. The two handoff windows, both
+  measured on the bench (TTL=3s, a 1s timer):
+  - **graceful (SIGTERM / rolling restart) ≈ interval + retry** — the leaving
+    leader releases the lease, a stand-by's next `create` (retry 1s) picks it up,
+    plus the in-flight tick. Measured **2.6s**; there is *no* TTL term, the lease
+    is deleted not aged out.
+  - **crash (`kill -9`) ≈ TTL + retry + interval** — no release, so the value
+    must age out (TTL) before a stand-by acquires. Measured **5.9s** worst case.
+  The crash window is TTL-dominated, so the stand-by retry stays at 1s (no knob:
+  lowering it would not move the crash number and would only add config surface
+  for a sub-second handoff nobody has asked for; a real need would ship with its
+  use case). For a fast timer the crash gap is the TTL — bounded and documented,
+  so nobody is surprised by a ~10s pause of a 1s timer after a hard kill.
 
 ## Interactions
 
