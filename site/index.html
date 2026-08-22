@@ -91,11 +91,30 @@
   .codecard .cm{color:var(--code-dim); font-style:italic}
   .codecard .st{color:var(--code-str)}
   .codecard .kw{color:#B9C9C1; font-weight:500}
-  .codecard .lit{transition:background .25s, box-shadow .25s}
-  .codecard .alg{transition:opacity .25s}
-  .codecard.expert .alg{opacity:.28}
-  .codecard.expert .lit{background:rgba(239,193,104,.14); box-shadow:0 0 0 3px rgba(239,193,104,.14); border-radius:2px; color:var(--code-lit)}
-  .codecard.expert .lit .st{color:var(--code-lit)}
+  .codecard .lit{color:var(--code-lit)}
+  .codecard.expert pre{display:none}
+
+  /* the expert reading: the panel, not the code */
+  .surface{display:none; background:#EFF2EE; color:#22302A; padding:18px 20px 20px; min-height:472px}
+  .codecard.expert .surface{display:block}
+  .surface h4{font-family:"Instrument Sans", sans-serif; font-weight:600; font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:#5C6B63; margin:0 0 4px}
+  .surface .sname{font-family:"IBM Plex Mono", monospace; font-size:12px; color:#8A968F; margin-bottom:14px}
+  .sgroup{background:#FFFFFF; border:1px solid #D9DFDA; border-radius:5px; margin-bottom:12px; overflow:hidden}
+  .sgroup-title{display:flex; align-items:baseline; gap:10px; padding:9px 14px; border-bottom:1px solid #E4E9E4; font-size:13px; font-weight:600}
+  .sgroup-title .m{font-family:"IBM Plex Mono", monospace; font-weight:400; font-size:11.5px; color:#8A968F}
+  .srow{display:flex; align-items:center; padding:6.5px 14px; border-bottom:1px solid #EEF1EE; font-family:"IBM Plex Mono", monospace; font-size:13px}
+  .srow:last-child{border-bottom:0}
+  .srow .k{color:#44534B; flex:1}
+  .srow .arrow{color:#AEB8B1; padding:0 12px}
+  .srow .v{color:#22302A; background:#F4F6F3; border:1px solid #DDE3DD; border-radius:3px; padding:1px 9px}
+  .srow .v.edited{background:#FCF3DF; border-color:#E0BE7A; color:#7A5A10}
+  .srow .pencil{margin-left:10px; color:#B9C2BB; font-size:12px}
+  .sreplay{display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#FCF6E8; border:1px solid #E8CF9A; border-radius:5px; padding:10px 14px; font-size:12.5px; color:#6B5312}
+  .sreplay .chip{font-family:"IBM Plex Mono", monospace; font-size:11.5px; background:#FFFFFF; border:1px solid #E0CD9C; border-radius:3px; padding:2px 8px; white-space:nowrap}
+  .sreplay .fake{margin-left:auto; display:flex; gap:8px}
+  .sreplay .fakebtn{font-family:"Instrument Sans", sans-serif; font-size:12px; font-weight:600; border-radius:3px; padding:4px 12px}
+  .sreplay .fakebtn.go{background:#2F6B5C; color:#FFFFFF}
+  .sreplay .fakebtn.no{border:1px solid #C9B073; color:#6B5312}
   .codecaption{padding:12px 16px 14px; border-top:1px solid var(--panel-line); font-size:13.5px; color:#93A49B}
   .codecaption b{color:#C4D2CA; font-weight:500}
 
@@ -231,6 +250,28 @@ positions = []
         customer_email: customer_email, total_eur: total_eur,
         country: country, positions: positions}
 <span class="kw">end</span></span></code></pre>
+      <div class="surface" aria-label="The business surface of order_sync, as the panel renders it">
+        <h4>Business surface</h4>
+        <p class="sname">order_sync — as rendered by the panel, from the AST</p>
+        <div class="sgroup">
+          <div class="sgroup-title">Country codes <span class="m">lookup · COUNTRY_CODES</span></div>
+          <div class="srow"><span class="k">France</span><span class="arrow">→</span><span class="v">FR</span><span class="pencil">✎</span></div>
+          <div class="srow"><span class="k">Germany</span><span class="arrow">→</span><span class="v">DE</span><span class="pencil">✎</span></div>
+          <div class="srow"><span class="k">Italy</span><span class="arrow">→</span><span class="v">IT</span><span class="pencil">✎</span></div>
+          <div class="srow"><span class="k">Portugal</span><span class="arrow">→</span><span class="v">PT</span><span class="pencil">✎</span></div>
+        </div>
+        <div class="sgroup">
+          <div class="sgroup-title">Constants</div>
+          <div class="srow"><span class="k">MIN_TOTAL_EUR</span><span class="arrow">=</span><span class="v edited">50</span><span class="pencil">✎</span></div>
+          <div class="srow"><span class="k">ERP_QUEUE</span><span class="arrow">=</span><span class="v">vx.erp.orders.upsert</span><span class="pencil">✎</span></div>
+        </div>
+        <div class="sreplay">
+          <span>Shadow-replay, last 20 real events:</span>
+          <span class="chip">before · 20 emits</span>
+          <span class="chip">after · 18 emits</span>
+          <span class="fake" aria-hidden="true"><span class="fakebtn go">Promote</span><span class="fakebtn no">Discard</span></span>
+        </div>
+      </div>
       <div class="codecaption" id="codecaption">
         <b>Written by an agent from one sentence.</b> Plain text in your git repo —
         diffed, reviewed, unit-tested like any other code.
@@ -400,7 +441,7 @@ positions = []
     var bE = document.getElementById('view-expert');
     var caps = {
       agent: '<b>Written by an agent from one sentence.</b> Plain text in your git repo — diffed, reviewed, unit-tested like any other code.',
-      expert: '<b>The business surface: literals, extracted from the AST.</b> A domain expert edits the table or the threshold in the panel; the change is shadow-replayed on the last real events before it lands.'
+      expert: '<b>The same file, rendered by the panel for a domain expert.</b> They edit the table or the threshold in place — never the code — and the change is shadow-replayed on the last real events before it lands.'
     };
     function set(mode){
       card.classList.toggle('expert', mode === 'expert');
