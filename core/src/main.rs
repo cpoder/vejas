@@ -285,6 +285,78 @@ fn replay_literal(
     }))
 }
 
+/// Append a promote to the audit trail (ADR-0018). Best-effort for LIVE promotes:
+/// a live promote that cannot reach VEJAS_AUDIT is logged but still applied — git
+/// remains the durable trail for repo-deployed changes, and blocking a correction
+/// because the audit stream is unreachable would be the wrong trade. Records
+/// file, name, key, before → after, actor, ts.
+fn record_promote(
+    root: &Path,
+    file: &str,
+    name: &str,
+    key: &str,
+    before: &Value,
+    after: &Value,
+    actor: &str,
+) {
+    let Some(path) = guard_path(root, file) else { return };
+    let unit = flow_proc_name(&path);
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let Ok(nc) = nats::connect(&url) else {
+        eprintln!(
+            "[vejas] audit: NATS unreachable — live promote of {name} not recorded \
+             (git remains the trail for committed changes)"
+        );
+        return;
+    };
+    let js = nats::jetstream::new(nc);
+    let record = json!({
+        "ts": now_secs(), "actor": actor, "unit": unit,
+        "file": file, "name": name, "key": key,
+        "before": before, "after": after,
+    });
+    if let Err(e) = connectors::to_audit(&js, &unit, &record) {
+        eprintln!("[vejas] audit: promote of {name} not recorded: {e}");
+    }
+}
+
+/// Roll a literal back to the value it held before its most recent promote
+/// (ADR-0018). Rollback is itself a promote — to the recorded previous value —
+/// so it is forward-only (never rewrites the trail), reuses the same write +
+/// reload + audit path, and can be previewed with the same shadow-replay rail.
+/// The caller reloads after this returns. Writes the file; returns what it did.
+fn rollback_literal(
+    root: &Path,
+    file: &str,
+    name: &str,
+    key: &str,
+    actor: &str,
+) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let unit = flow_proc_name(&path);
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let records = connectors::audit_recent(&js, &unit, 500)?;
+    // newest first: the most recent promote of exactly this literal
+    let target = records
+        .iter()
+        .rev()
+        .find(|r| r["name"] == name && r["key"] == key)
+        .ok_or("no audit record to roll back for this literal")?;
+    let restore = target["before"].clone();
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let current = vjs::get_literal(&src, name, key).unwrap_or(Value::Null);
+    let new_src = vjs::set_literal(&src, name, key, &restore)?;
+    fs::write(&path, new_src).map_err(|e| e.to_string())?;
+    record_promote(root, file, name, key, &current, &restore, actor);
+    Ok(json!({
+        "ok": true, "file": file, "name": name, "key": key,
+        "restored": restore, "was": current,
+        "rolled_back_promote_ts": target["ts"], "actor": actor,
+    }))
+}
+
 fn preview_of(v: &Value) -> String {
     let s = v.to_string();
     if s.chars().count() > 160 {
@@ -2036,6 +2108,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
         json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
@@ -2107,10 +2180,20 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let key = args["key"].as_str().unwrap_or("-");
             let path = guard_path(root, file).ok_or("path not allowed")?;
             let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            let before = vjs::get_literal(&src, lname, key).unwrap_or(Value::Null);
             let new_src = vjs::set_literal(&src, lname, key, &args["value"])?;
             fs::write(&path, new_src).map_err(|e| e.to_string())?;
+            record_promote(root, file, lname, key, &before, &args["value"], "mcp");
             let _ = reload(registry, root);
             text(json!({"ok": true}).to_string())
+        }
+        "vejas_rollback_literal" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let lname = args["name"].as_str().ok_or("name required")?;
+            let key = args["key"].as_str().unwrap_or("-");
+            let out = rollback_literal(root, file, lname, key, "rollback:mcp")?;
+            let _ = reload(registry, root);
+            text(out.to_string())
         }
         "vejas_replay_literal" => {
             let file = args["file"].as_str().ok_or("file required")?;
@@ -2576,11 +2659,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(s) => s,
                 Err(e) => return respond(request, 500, e.to_string(), "text/plain"),
             };
+            let before = vjs::get_literal(&src, &name, &key).unwrap_or(Value::Null);
             match vjs::set_literal(&src, &name, &key, &value) {
                 Ok(new_src) => {
                     if let Err(e) = fs::write(&p, new_src) {
                         return respond(request, 500, e.to_string(), "text/plain");
                     }
+                    record_promote(&root, &file, &name, &key, &before, &value, "panel");
                     let _ = reload(&registry, &root);
                     respond(
                         request,
@@ -2588,6 +2673,19 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         json!({"ok": true, "file": file, "name": name, "key": key}).to_string(),
                         "application/json",
                     )
+                }
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/surface/rollback") => {
+            let body = read_body(&mut request);
+            let file = body["file"].as_str().unwrap_or("").to_string();
+            let name = body["name"].as_str().unwrap_or("").to_string();
+            let key = body["key"].as_str().unwrap_or("-").to_string();
+            match rollback_literal(&root, &file, &name, &key, "rollback:panel") {
+                Ok(out) => {
+                    let _ = reload(&registry, &root);
+                    respond(request, 200, out.to_string(), "application/json")
                 }
                 Err(e) => respond(request, 422, e, "text/plain"),
             }

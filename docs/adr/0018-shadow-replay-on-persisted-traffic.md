@@ -1,6 +1,6 @@
 # 0018 — Shadow-replay on persisted traffic (and the promote audit trail)
 
-- Status: Accepted (hydration); Proposed (audit trail + rollback)
+- Status: Accepted
 - Date: 2026-08-22
 
 ## Context
@@ -54,38 +54,38 @@ ring), replay → `source: jetstream`, 30 events, the right subset changed; a se
 replay still sees 30 (nothing consumed); a fresh event still flows through the
 live durable; the ephemeral consumers are reaped (no leak).
 
-**A promote audit trail (Proposed — open questions below).** Hydration makes
+**A promote audit trail + rollback (Accepted, implemented).** Hydration makes
 *preview* honest; the other half of operator credibility is *history*: every
-promote (`set_literal`) recorded as an append-only, auditable fact — file, name,
-key, before → after, when, and by whom — so "who changed this threshold and to
-what" has an answer, and so a promote can be **rolled back** to its previous
-value. The shape is deferred to the questions below rather than guessed.
+promote (`set_literal`) is recorded as an append-only, auditable fact — file,
+name, key, before → after, when, and by whom — so "who changed this threshold and
+to what" has an answer, and so a promote can be **rolled back**. The three policy
+calls below were arbitrated (Cyril, 2026-08-22) and built accordingly.
 
-## Open questions (for arbitration — audit trail + rollback)
+1. **Where the trail lives — both git and a stream.** Repo-deployed changes are
+   audited by git itself (the commit that changed the literal *is* the record).
+   **Live** promotes (panel `POST /surface/set`, MCP `vejas_set_literal`) — which
+   have no commit — are appended to a dedicated JetStream stream **`VEJAS_AUDIT`**
+   on the sibling root `vxaudit.<unit>`, exactly mirroring the DLQ (ADR-0015): its
+   own root so no `max_age` on the hot stream can touch it, Limits retention, a
+   generous oldest-discard cap (`AUDIT_MAX_MSGS`) that is a safety bound, never a
+   routine truncation. The record: `{ts, actor, unit, file, name, key, before,
+   after}`. The live write is **best-effort** — a promote is not blocked when
+   `VEJAS_AUDIT` is unreachable (git is the durable backstop for committed
+   changes), but the failure is logged loudly, never swallowed.
 
-1. **Where does the trail live?** Options: (a) a dedicated JetStream stream
-   (`VEJAS_AUDIT`, sibling root like the DLQ's `vxdlq`, ADR-0015) — consistent
-   with "NATS is the only dependency", replicated, survives restarts; (b) a file
-   in the flows git repo — the change is already a git-tracked edit, so the trail
-   could be git itself (the commit that changed the literal *is* the audit
-   record). (b) is almost free and already exists if promotes flow through
-   GitOps; (a) is needed when promotes are applied live (panel/MCP) without a
-   commit. Likely **both**: git is the trail for repo-deployed changes, the stream
-   captures live promotes that have not yet been committed.
+2. **The actor is the channel.** The record's `actor` names where the promote came
+   from — `panel`, `mcp`, `rollback:panel`, `rollback:mcp` — since MCP carries no
+   human identity today. When a surface gains real user identity, it rides in the
+   same field; the channel is the honest floor, not a placeholder.
 
-2. **Who is the "actor" in an agentic system?** A promote can come from a human in
-   the panel, an agent over MCP, or a GitOps deploy. The trail must name which,
-   and carry the agent/human identity the surface actually has (MCP has no user
-   identity today). This is a policy call, not a code detail.
-
-3. **What does rollback *mean*?** Two clean semantics: (a) rollback = a new
-   promote that sets the literal back to the recorded previous value (forward-only
-   history, symmetric with promote, itself audited) — never rewrites the past; or
-   (b) rollback = `git revert` when the trail is git. (a) generalises to live
-   promotes; (b) is the honest answer when the source of truth is the repo.
-   Recommendation: **(a)** — rollback is just a promote with a known target value,
-   so it reuses the shadow-replay rail (preview the rollback before applying it)
-   and the same audit record, with no special path.
+3. **Rollback is a forward-only promote to the recorded previous value.** It reads
+   the most recent `VEJAS_AUDIT` record for the literal, sets it back to that
+   record's `before`, and writes a **new** audit record (`actor: rollback:*`,
+   `before` = current, `after` = restored). It never rewrites the trail, reuses
+   the same write + hot-reload + audit path with no special case, and can be
+   previewed first with the same shadow-replay rail. Rolling back a rollback walks
+   the history back one more step — verified. Surfaced as `vejas_rollback_literal`
+   (MCP) and `POST /surface/rollback`.
 
 ## Consequences
 
@@ -99,5 +99,9 @@ value. The shape is deferred to the questions below rather than guessed.
 - `source: trace-ring` in a response is a signal, not just metadata: it means the
   stream had nothing (fresh flow, or NATS down) and the diff is only as good as
   the ring — surface it, never hide it.
-- Once the audit trail lands, rollback (semantics (a)) composes with this rail for
-  free: it is a promote to a recorded value, previewed the same way.
+- Rollback composes with this rail for free: it is a promote to a recorded value,
+  previewed the same way and audited the same way.
+- The trail covers what git cannot see — promotes applied *live* between deploys.
+  A live promote that never gets committed is still on the record in `VEJAS_AUDIT`;
+  one that is later committed appears in both, which is a reconciliation surface,
+  not a contradiction (same before → after, two witnesses).

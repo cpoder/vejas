@@ -1617,6 +1617,20 @@ fn builtin(name: &str, args: &[Value]) -> Result<Value, String> {
 
 /// Rewrite one surface literal in place (whole constant with key "-", or one
 /// entry of a top-level doc literal). The result must re-parse.
+/// The current value of a business-surface literal — the whole constant when
+/// `key` is empty/"-", or one table entry. Returns None if the literal or key is
+/// absent. Used to capture the `before` value for the promote audit trail
+/// (ADR-0018) and to recover the previous value on rollback.
+pub fn get_literal(src: &str, name: &str, key: &str) -> Option<Value> {
+    let prog = parse(src).ok()?;
+    let entry = prog.surface.iter().find(|e| e.name == name)?;
+    if key.is_empty() || key == "-" {
+        Some(entry.value.clone())
+    } else {
+        entry.value.get(key).cloned()
+    }
+}
+
 pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Result<String, String> {
     let prog = parse(src)?;
     let entry = prog
