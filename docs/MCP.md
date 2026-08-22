@@ -4,6 +4,8 @@ The runtime is its own MCP server: JSON-RPC 2.0 over `POST /mcp`. Point any
 agent at it (`http://<host>:8686/mcp`) and the whole platform is drivable —
 inspect, edit, generate, run — with no side channel.
 
+Prompt-to-flow recipes — what to say and what lands: [COOKBOOK.md](COOKBOOK.md).
+
 ## Platform tools
 
 | Tool | Does |
