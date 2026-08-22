@@ -1,0 +1,33 @@
+# The same scenario as bench/run.sh, on Redpanda Connect (ex-Benthos):
+# HTTP in -> the same mapping work (lookup + fallback, lowercase, numeric
+# conversions, a per-line projection) -> HTTP out to the same counting sink.
+# NOTE the guarantee difference, documented in compare/README.md: this
+# pipeline holds messages in flight only — Vejas persists every hop in
+# JetStream (durable, crash-safe).
+http:
+  enabled: false
+
+input:
+  http_server:
+    address: 127.0.0.1:8791
+    path: /ingest
+
+pipeline:
+  processors:
+    - mapping: |
+        let codes = {"France":"FR","Germany":"DE","Italy":"IT","Portugal":"PT"}
+        root.order_ref = this.id.split("#").index(1)
+        root.customer_email = this.email.lowercase()
+        root.total_eur = this.total_price.number()
+        root.country = $codes.get(this.shipping_address.country) | this.shipping_address.country
+        root.positions = this.line_items.map_each(l -> {
+          "sku": l.sku,
+          "qty": l.quantity.number(),
+          "unit_eur": ((l.unit_price_cents.number() / 100) * 100).round() / 100,
+        })
+        root.t = this.t
+
+output:
+  http_client:
+    url: http://127.0.0.1:9099/hit
+    verb: POST
