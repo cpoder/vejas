@@ -430,6 +430,22 @@ impl Driver for HttpPoll {
 /// `fetch()` parks forever on an idle subject: a stopped flow's thread stayed
 /// wedged in `recv()`, reported "running", and processed one more message
 /// before dying (the zombie-consumer trap caught while rehearsing the demo).
+/// Consumer ack-wait (redelivery latency): a message not acked within this window
+/// redelivers (at-least-once, ADR-0002). `VEJAS_ACK_WAIT_SECS` tunes it; unset (or
+/// ≤0) keeps `Duration::ZERO`, which JetStream reads as its 30s default — the
+/// historical behaviour. Lower it to make transient failures retry sooner (and to
+/// let the transport tests exercise redelivery + the poison→DLQ cap at CI speed).
+/// A positive value is floored at 1s: JetStream rejects a sub-second ack-wait
+/// (the consumer would silently fail to create), so we never pass one through.
+pub fn ack_wait() -> Duration {
+    std::env::var("VEJAS_ACK_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&s| s > 0.0)
+        .map(|s| Duration::from_secs_f64(s.max(1.0)))
+        .unwrap_or_default()
+}
+
 pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
     // no_wait: the server returns IMMEDIATELY with whatever is available (up to
     // `batch`) instead of holding the request until the batch fills — so a single
@@ -1071,6 +1087,7 @@ fn run_sink(
         nats::jetstream::ConsumerConfig {
             durable_name: Some(durable.clone()),
             filter_subject: subject.to_string(),
+            ack_wait: ack_wait(),
             ..Default::default()
         },
     );

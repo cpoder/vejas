@@ -61,8 +61,10 @@ vault, from `docker compose`.
   approvals, audit, SSO).
 - `vjs-test` as the CI gate — built (`.github/workflows/ci.yml`: unit +
   golden + parse-check of every script and example + image build).
-  Transport-level tests (redelivery, ordering, reconnection) beyond the
-  language golden cases: still to do.
+  Transport-level tests (ordering, redelivery + poison→DLQ cap, no-loss under
+  `kill -9`, reconnection, anti-zombie shutdown) — **built**
+  (`e2e/transport/run.sh`, in CI), asserting the at-least-once / publish-before-
+  ack / anti-zombie invariants (ADR-0002) against a live nats+runtime.
 
 ## Phase 5 — Operator credibility · NEXT
 

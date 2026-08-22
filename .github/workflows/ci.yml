@@ -60,3 +60,5 @@ jobs:
           unzip -q nc.zip && sudo mv nats-*-linux-amd64/nats /usr/local/bin/
       - name: Connector admission (ADR-0017)
         run: e2e/admission/run.sh
+      - name: Transport invariants (ROADMAP Phase 4)
+        run: e2e/transport/run.sh

@@ -527,6 +527,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     durable_name: Some(durable.clone()),
                     deliver_subject: None,
                     filter_subject: source.clone(),
+                    ack_wait: connectors::ack_wait(),
                     ..Default::default()
                 },
             );
