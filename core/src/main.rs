@@ -1185,8 +1185,7 @@ fn rules_json(root: &Path, file: &str) -> Result<String, String> {
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
-    let surface: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
-    let rules = vjs::flow_rules(&prog, &src, &surface);
+    let rules = vjs::flow_rules(&prog, &src, &prog.surface);
     Ok(json!({"file": file, "rules": rules}).to_string())
 }
 

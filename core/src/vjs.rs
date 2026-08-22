@@ -458,16 +458,32 @@ fn render_guard(cond: &Expr, surface: &[String]) -> Option<(String, Vec<String>)
     None
 }
 
+/// Resolve an emit subject to a concrete string IFF it is statically known: a
+/// string literal, or a Var naming a surface string constant (already in the
+/// business surface, so resolvable without loss). None otherwise (dynamic).
+fn resolve_subject(subject: &Expr, surface: &[SurfaceEntry]) -> Option<String> {
+    match subject {
+        Expr::Lit(Value::String(s)) => Some(s.clone()),
+        Expr::Var(name) => surface
+            .iter()
+            .find(|e| &e.name == name)
+            .and_then(|e| e.value.as_str().map(|s| s.to_string())),
+        _ => None,
+    }
+}
+
 /// The action a projectable arm performs: its emit subjects (and `respond`),
-/// rendered only when each is a literal subject and the body has no nested
-/// control flow. None means the body is not a simple action → the arm is RAW.
-fn render_action(body: &[Stmt]) -> Option<Vec<String>> {
+/// rendered only when each subject is statically resolvable (a literal or a
+/// surface string constant) and the body has no nested control flow. Pure
+/// assignments before the emit are internal plumbing and allowed. None means the
+/// body is not a simple action → the arm is RAW.
+fn render_action(body: &[Stmt], surface: &[SurfaceEntry]) -> Option<Vec<String>> {
     let mut acts = Vec::new();
     for st in body {
         match st {
-            Stmt::Emit(subject, _) => match subject {
-                Expr::Lit(Value::String(s)) => acts.push(format!("→ {s}")),
-                _ => return None, // dynamic subject: not exactly renderable
+            Stmt::Emit(subject, _) => match resolve_subject(subject, surface) {
+                Some(s) => acts.push(format!("→ {s}")),
+                None => return None, // dynamic subject: not exactly renderable
             },
             Stmt::Respond(status, _) => acts.push(match status {
                 Expr::Lit(v) => format!("respond {v}"),
@@ -487,16 +503,19 @@ fn render_action(body: &[Stmt]) -> Option<Vec<String>> {
 }
 
 /// Project a flow's top-level `if/elif/else` arms into rule views (ADR-0019).
-/// `src` is the flow source (for the verbatim RAW slice); `surface` is the set of
-/// business-surface literal names (the inline-editable ones).
-pub fn flow_rules(prog: &Program, src: &str, surface: &[String]) -> Vec<Value> {
+/// `src` is the flow source (for the verbatim RAW slice); `surface` is the flow's
+/// business-surface entries — their names drive the inline-editable condition
+/// literals, and their string values let an emit subject held in a constant
+/// (`emit OUT, …`) resolve statically instead of falling to RAW.
+pub fn flow_rules(prog: &Program, src: &str, surface: &[SurfaceEntry]) -> Vec<Value> {
+    let names: Vec<String> = surface.iter().map(|e| e.name.clone()).collect();
     let mut rules = Vec::new();
     for st in &prog.stmts {
         let Stmt::If(arms, otherwise) = st else { continue };
         for (i, (cond, span, body)) in arms.iter().enumerate() {
             let kind = if i == 0 { "if" } else { "elif" };
             let raw = src.get(span.0..span.1).map(|s| s.trim()).unwrap_or("");
-            match (render_guard(cond, surface), render_action(body)) {
+            match (render_guard(cond, &names), render_action(body, surface)) {
                 (Some((when, literals)), Some(then)) => rules.push(json!({
                     "kind": kind, "projectable": true,
                     "when": when, "then": then, "literals": literals,
@@ -507,7 +526,7 @@ pub fn flow_rules(prog: &Program, src: &str, surface: &[String]) -> Vec<Value> {
             }
         }
         if let Some(body) = otherwise {
-            match render_action(body) {
+            match render_action(body, surface) {
                 Some(then) => rules.push(json!({
                     "kind": "else", "projectable": true,
                     "when": Value::Null, "then": then, "literals": [],
@@ -1835,8 +1854,7 @@ mod tests {
                      emit \"vx.orders.reject\", { id: event.id }\n\
                    end\n";
         let prog = parse(src).unwrap();
-        let surface: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
-        let rules = flow_rules(&prog, src, &surface);
+        let rules = flow_rules(&prog, src, &prog.surface);
         assert_eq!(rules.len(), 3);
         // arm 1: a single comparison against a surface literal → projectable
         assert_eq!(rules[0]["projectable"], true);
@@ -1850,6 +1868,27 @@ mod tests {
         assert_eq!(rules[2]["kind"], "else");
         assert_eq!(rules[2]["projectable"], true);
         assert_eq!(rules[2]["then"][0], "→ vx.orders.reject");
+    }
+
+    #[test]
+    fn rules_resolve_emit_subject_from_surface_constant() {
+        // The showcase flows emit to a subject held in a surface constant
+        // (`emit OUT, …`). That is statically resolvable, so the arm must
+        // project, not fall to RAW (the peer's edge case).
+        let src = "source \"vx.orders.in\"\n\
+                   MIN_TOTAL_EUR = 1000\n\
+                   OUT = \"vx.bench.out\"\n\
+                   if event.total >= MIN_TOTAL_EUR:\n\
+                     tag = \"big\"\n\
+                     emit OUT, { id: event.id, tag: tag }\n\
+                   end\n";
+        let prog = parse(src).unwrap();
+        let rules = flow_rules(&prog, src, &prog.surface);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["projectable"], true, "constant subject must project");
+        // resolved to the constant's value, and a pure assign before the emit is fine
+        assert_eq!(rules[0]["then"][0], "→ vx.bench.out");
+        assert_eq!(rules[0]["literals"][0], "MIN_TOTAL_EUR");
     }
     fn one_emit(src: &str, event: Value) -> Value {
         let emits = eval_flow(src, event).expect("run");
