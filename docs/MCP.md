@@ -20,10 +20,14 @@ inspect, edit, generate, run — with no side channel.
 | `vejas_run_flow` | run any flow on a supplied input, return emits (bus untouched) |
 | `vejas_events` | the last events the flows processed (subject, ok/error, emits, preview) |
 | `vejas_new_flow` | agent writes a new VejasScript flow from a prompt; it lands running |
+| `vejas_new_connector` | agent writes a new connector manifest from a prompt (picks a driver, uses `secret()`); it lands running |
 | `vejas_reload` | rescan flows/packages |
+| `vejas_drivers` | the connector driver catalog (name, kind, description) |
+| `vejas_secrets` | declared secret references + resolve status — never values |
 | `vejas_set_secret` | write one secret value (write-only) and restart its users |
 | `vejas_test_connector` | probe one connector instance end to end — plain-words verdict |
 | `vejas_provision` | instantiate a tenant package from a template — returns created files, started units, and the secret refs left to write |
+| `sap_list` · `sap_describe` · `sap_call` · `sap_send_idoc` | live SAP introspection, BAPI/RFC calls and IDoc sends, bridged to a running `exec-rpc` SAP connector (ADR-0014) |
 
 `vejas_new_flow` and `vejas_new_connector` shell out to an agent CLI
 (`VEJAS_AGENT_CMD`, default `claude`) and are advertised **only where one
@@ -50,8 +54,16 @@ emit "vx.classify.result", {severity: severity}
 
 `tools/list` now includes `flow_classify_ticket`; calling it runs the flow on
 the arguments and returns its emits. The MCP surface grows as you write flows —
-no server code to touch. The same declaration is what a future `/api/<name>`
-HTTP endpoint will expose.
+no server code to touch.
+
+## Flow-as-API
+
+The HTTP twin of flow-as-tool: a flow that declares `api "VERB /path"` (e.g.
+`api "GET /orders/{id}"`) is served synchronously under `/api` — the request's
+JSON body, `{path params}` and `query` become the event, `respond status,
+{…}` is the response, and `GET /api/openapi.json` describes the whole API
+(generated, OpenAPI 3.0). A REST resource is a set of flows, one per verb:
+`docs/examples/rest-api`.
 
 ## Connectors over MCP
 
@@ -65,15 +77,15 @@ PORT = 8787
 ```
 
 Write one with `vejas_write_flow` (any `.vjs` path), tune its config with
-`vejas_set_literal`, and it hot-starts on reload — same tools as flows. Drivers
-today: `http-in` (webhook), `timer` (interval), `http-poll` (poll), `slack-out`
-and `http-out` (sinks). See ADR-0007.
+`vejas_set_literal`, and it hot-starts on reload — same tools as flows.
 
 Or describe it: `vejas_new_connector` asks the agent to pick a driver, write the
 config, and use `secret("…")` for any credential — it lands running (like
 `vejas_new_flow` for flows). Drivers today: `http-in` (webhook), `timer`
-(interval), `http-poll` (poll), `slack-out` / `http-out` (sinks), `exec-source` /
-`exec-sink` (any-language over stdio). See ADR-0007, ADR-0011.
+(interval), `http-poll` / `oauth-poll` (poll), `slack-out` / `http-out` (sinks),
+`exec-source` / `exec-sink` (any-language over stdio), `exec-stream-source`
+(long-lived streaming program) and `exec-rpc` (request/reply into an external
+program — how the `sap_*` tools reach SAP). See ADR-0007, ADR-0011, ADR-0014.
 
 ## Secrets over MCP
 

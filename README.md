@@ -10,7 +10,9 @@ means*. The whole platform is drivable over MCP.
 Vėjas is the old Baltic god of the wind. Wind moves things without anyone
 drawing the route.
 
-**Status: design & demo stage.** Start here: [VISION](docs/VISION.md) ·
+**Status: young, but real** — the first production deployment runs today,
+collecting NIS2 compliance evidence across four EU countries; interfaces still
+move fast. Start here: [VISION](docs/VISION.md) ·
 [ARCHITECTURE](docs/ARCHITECTURE.md) · [ROADMAP](docs/ROADMAP.md) ·
 [ADRs](docs/adr/) · [MCP](docs/MCP.md). The bet, long-form:
 [MANIFESTO.md](MANIFESTO.md).
@@ -38,12 +40,17 @@ it without touching code:
 - **Packages** — group flows and services, hot-addable; cross-package calls go
   through `EXPORTS` (private by default) or the bus. (ADR-0003, ADR-0004)
 - **Connectors** — a typed Rust **driver SDK** (`Driver` trait, Source/Sink).
-  Bundled drivers: `http-in`, `timer`, `http-poll`, `slack-out`, `http-out`,
-  plus `exec-source`/`exec-sink`, which wrap a program in **any language** over
-  stdio (this is how a native vendor SDK like SAP JCo is bridged, never via
-  FFI). An instance is a declarative `.vjs` manifest, hot-addable, and an agent
-  can write one from a prompt. The subject convention stays the whole interface,
-  so an out-of-process connector is first-class. (ADR-0007, ADR-0011)
+  Bundled drivers: `http-in`, `timer`, `http-poll`, `oauth-poll` (a generic
+  OAuth2 REST poller that stands in for much of a SaaS catalog), `slack-out`,
+  `http-out`, plus the exec bridges (`exec-source`/`exec-sink`/
+  `exec-stream-source`/`exec-rpc`), which wrap a program in **any language**
+  over stdio, isolated by process. That is how the **SAP connector** ships:
+  native Rust over the official `libsapnwrfc` C library — BAPI/RFC calls,
+  IDocs in and out over tRFC, no JVM (ADR-0014) — and the **Salesforce**
+  connector (OAuth2 + Bulk API 2.0, streaming). An instance is a declarative
+  `.vjs` manifest, hot-addable, and an agent can write one from a prompt. The
+  subject convention stays the whole interface, so an out-of-process connector
+  is first-class. (ADR-0007, ADR-0011, ADR-0014)
 - **Secrets** — `secret("path/key")` resolves from a Vault (HashiCorp KV v2; an
   env backend for dev) at run time. A secret is never a literal, so it never
   lands in git, the panel, or the business surface. (ADR-0008)
@@ -52,8 +59,10 @@ it without touching code:
   the business surface (rendered from literals in the code). A correction is
   **shadow-replayed on the flow's last real events** — before/after diff, then
   promote or discard. You never click to draw a flow. (ADR-0005)
-- **MCP** — the runtime is its own MCP server; a flow that declares `tool "…"`
-  becomes a first-class MCP tool. The platform grows its own tool surface as you
+- **MCP & API** — the runtime is its own MCP server; a flow that declares
+  `tool "…"` becomes a first-class MCP tool, and one that declares
+  `api "VERB /path"` becomes a synchronous HTTP endpoint with an auto-generated
+  OpenAPI document. The platform grows its own tool and API surface as you
   write flows. (ADR-0006, [docs/MCP.md](docs/MCP.md))
 
 ## Quickstart

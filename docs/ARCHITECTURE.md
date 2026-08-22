@@ -1,6 +1,6 @@
 # Vejas — Architecture
 
-This describes the system **as built** (Phase 0–1). Target-state components not
+This describes the system **as built**. Target-state components not
 yet implemented are marked _(planned)_ and specified in the ADRs and ROADMAP.
 
 ## Repository layout
@@ -10,8 +10,13 @@ core/                     the runtime (Rust, one binary)
   Cargo.toml
   src/main.rs             supervision, HTTP surface, panel, MCP server, CLI
   src/vjs.rs              VejasScript: lexer, parser, interpreter, editing, tests
-  src/connectors.rs       native bundled connectors (http-in, slack-out)
+  src/connectors.rs       the driver SDK + bundled drivers (sources, sinks, exec bridges)
+  src/control.rs          the remote-control channel (leaf-node collectors, ADR-0013)
+  src/secrets.rs          the SecretStore trait + Vault/File/Env backends
   src/panel.html          the dashboard (embedded at compile time)
+connectors/*.vjs          bundled connector instances (declarative manifests)
+connectors/sap-rfc/       SAP connector: its own crate, run as an exec process (ADR-0014)
+connectors/salesforce/    Salesforce connector (OAuth2 + Bulk API 2.0), same model
 flows/*.vjs               the "default" package's flows
 flows/fixtures/*.json     one sample input per flow (name-matched)
 services/*.vjs            composable services (default package)
@@ -53,8 +58,11 @@ A Rust reimplementation of a practical subset of WmScript
 
 - **Pipeline model (webMethods):** the incoming event's top-level fields are the
   variable space; `event` also holds the whole document.
-- **Statements:** `source`, `tool`, `NAME = <literal>`, assignment (`a.b = …`),
-  `if/elif/else/end`, `for … in … end`, `emit subject, expr`, `invoke svc(args)`.
+- **Statements:** the trigger directives `source "vx…"` (bus), `tool "…"` (MCP
+  tool), `api "VERB /path"` (HTTP endpoint) and `driver "…"` (connector
+  manifest); `NAME = <literal>`, assignment (`a.b = …`), `if/elif/else/end`,
+  `for … in … end`, `emit subject, expr`, `respond status, expr` (the
+  synchronous answer of an `api` flow), `invoke svc(args)`.
 - **Expressions:** literals, `{doc: …}`, `[arrays]`, f-strings, dotted paths,
   `?.` null-safe, `??` coalesce, comparisons + `in`, `and/or/not`, `+ - * /`
   (with array concatenation), indexing, `xs[].field` projection, `xs[cond]`
@@ -116,6 +124,8 @@ recent traffic the change applies directly.
 | `POST /surface/set` | rewrite one literal in place |
 | `POST /flows/new` | agent writes a new flow from a prompt |
 | `POST /reload` | rescan; start new, stop removed, restart changed |
+| `/api/<path>` | flows declaring `api "VERB /path"`, served synchronously (`respond`) |
+| `GET /api/openapi.json` | auto-generated OpenAPI 3.0 for every `api` flow |
 | `POST /mcp` | JSON-RPC 2.0 MCP server (see `MCP.md`) |
 
 MCP tools include `vejas_drivers` (connector driver catalog), `vejas_secrets`
@@ -131,19 +141,26 @@ publish-only) stays exposed.
 ## MCP server (ADR-0006)
 
 `POST /mcp` speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`,
-`ping`, batches). Ten platform tools drive the whole system; any flow/service
-declaring `tool "…"` becomes a first-class MCP tool whose call runs the flow on
-the arguments and returns its emits. Details and the tool table: `MCP.md`.
+`ping`, batches). The `vejas_*` platform tools drive the whole system (the
+`sap_*` family joins them when an `exec-rpc` SAP connector is running); any
+flow/service declaring `tool "…"` becomes a first-class MCP tool whose call
+runs the flow on the arguments and returns its emits, and the same file gains
+an HTTP endpoint by declaring `api "VERB /path"`. Details and the tool table:
+`MCP.md`.
 
 ## Connectors (ADR-0007)
 
 A connector is a native Rust **driver** + a declarative **instance manifest**.
 Drivers implement `connectors::Driver` (`kind()`, `about()`, `run(ctx)`) in two
 families — Source (pushes onto the bus) and Sink (consumes it); Source kinds are
-`webhook` / `interval` / `poll` (queue/stream drivers are future). Shipped:
+`webhook` / `interval` / `poll` / `exec` / `stream`, plus a third `rpc` family
+(request/reply into an external program). Shipped:
 `http-in`, `timer`, `http-poll`, `oauth-poll` (generic OAuth2 client-credentials
-REST poller: token cache, Bearer, cursor pagination, one `{endpoint, fetched_at,
-body}` message per page), `slack-out`, `http-out`. The HTTP-speaking drivers
+REST poller: token cache, Bearer, cursor pagination, client-side `EXPAND`, one
+`{endpoint, fetched_at, body}` message per page), `slack-out`, `http-out`, and
+the exec bridges — `exec-source` / `exec-sink` (any-language over stdio),
+`exec-stream-source` (a long-lived streaming program, e.g. SAP IDoc inbound),
+`exec-rpc` (request/reply into an external program, e.g. `sap_call`). The HTTP-speaking drivers
 accept an optional `HEADERS` doc (values via `secret()`), and every HTTP call
 goes through an argv-safe curl wrapper: URL and headers travel in a 0600
 `--config` file, never in argv, because `/proc/<pid>/cmdline` is world-readable.
@@ -180,8 +197,8 @@ tool — references only.
 
 ```
 docker compose up                         # nats + vejas, nothing else
-cargo test --manifest-path core/Cargo.toml # 16 language unit tests
-vejas-runtime vjs-test tests/vjs           # 19 golden end-to-end cases
+cargo test --manifest-path core/Cargo.toml # the language unit tests
+vejas-runtime vjs-test tests/vjs           # the golden end-to-end cases
 vejas-runtime vjs-check <file.vjs>         # parse-check one script
 vejas-runtime vjs-run <file.vjs> <in.json> # run one script on an input
 ```

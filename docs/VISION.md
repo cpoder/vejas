@@ -92,9 +92,10 @@ business meaning**, safely, without a developer.
 
 ## The roadmap in one line
 
-Language + runtime + composition + packages + business surface + MCP are built
-(see `ROADMAP.md` Phase 0–1). Next: a connector SDK (webhook/poll/queue/push
-sources, sinks), a secrets Vault, connector-by-prompt, flow-as-API, and a panel
-that administers all of it — each an increment, validated live, never a
-big-bang. The discipline: distribution and a real deployable demo before the
-next feature.
+Language + runtime + composition + packages + business surface + MCP + the
+connector SDK (with SAP and Salesforce riding the exec bridges) + secrets +
+flow-as-API + the admin panel + a v1 remote control plane are built (see
+`ROADMAP.md`, Phases 0–4). Next: operator credibility — persistent dead
+letters, OpenTelemetry/metrics, full shadow-replay, published benchmarks —
+each an increment, validated live, never a big-bang. The discipline:
+distribution and a real deployable demo before the next feature.

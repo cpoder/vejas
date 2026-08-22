@@ -19,61 +19,78 @@ platform before a single user touches it.
 - Service composition, wM-style merge; `pkg:service` + EXPORTS private-by-default
   (ADR-0003, ADR-0004).
 - The runtime is its own MCP server; flow-as-tool (ADR-0006).
-- Golden-test runner + 19 cases; 15 language unit tests (ADR-0010).
+- Golden-test runner + the language unit-test suite (ADR-0010); both have kept growing since.
 
-## Phase 2 — Connectors & secrets · NEXT
+## Phase 2 — Connectors & secrets · DONE
 
-The increment that makes the demo **actually deployable** (a real webhook, a
-real secret, a real sink). Do this before anything else.
+1. **Connector SDK** (ADR-0007): the `Driver` trait, Source/Sink families,
+   declarative `.vjs` instance manifests, supervision like flows. Bundled
+   drivers from `http-in` to the generic `oauth-poll`, plus the exec bridges
+   (any-language over stdio, ADR-0011) — including `exec-stream-source` and
+   `exec-rpc`, which carry the **SAP connector** (native Rust over
+   `libsapnwrfc`, ADR-0014) and the **Salesforce connector** (Bulk API 2.0).
+2. **Secrets/Vault** (ADR-0008): `SecretStore` trait (Vault / file / env),
+   `secret("path")` builtin, fail-closed, write-only from the panel; the panel
+   shows references and resolve status, never values.
+3. **Connector-by-prompt**: `vejas_new_connector` + `POST /connectors/new`.
 
-1. **Connector SDK** (ADR-0007): `Connector` trait, `Source`/`Sink`; source
-   trigger kinds webhook / poll / queue / push; connector = package with a
-   manifest. Port `http-in`/`slack-out` onto the trait as the first two.
-2. **Secrets/Vault** (ADR-0008): `SecretStore` trait (Vault default, dev
-   backend), `secret("path")` builtin, panel shows references not values.
-3. **Connector-by-prompt** (built): `vejas_new_connector` MCP tool + POST
-   /connectors/new — the ADR-0006 generation loop retargeted to the driver
-   catalog; the agent picks a driver, writes config, and uses secret() for
-   credentials.
+Exit criterion met: a real webhook → flow → sink with the credential in a
+vault, from `docker compose`.
 
-Exit criterion: a Stripe webhook → a flow → a Slack post, with the signing key
-in Vault, deployed from `docker compose` — recordable for a Show HN.
+## Phase 3 — Surfaces & administration · DONE (first pass)
 
-## Phase 3 — Surfaces & administration
-
-- **Flow-as-API**: `GET/POST /api/<name>` backed by the same `tool "…"`
-  declaration (ADR-0006).
-- **Panel administration**: connectors (with secret references, never values),
-  the live MCP tool list, and a real-time monitor — assembled on existing
-  endpoints.
+- **Flow-as-API** — built: `api "VERB /path"` + `respond`, served under
+  `/api`, OpenAPI generated at `/api/openapi.json` (ADR-0006).
+- **Panel administration** — built: connector cards (status, last error, test
+  probe), secrets card (references + resolve status, write-only set), trace
+  feed with sink responses.
 - **Shadow-replay & approval** (ADR-0005) — built (lite): propose a correction
   → replay the last real events from the trace ring → before/after diff →
   promote or discard (panel + MCP). Later: JetStream-hydrated history,
   audit trail, one-click rollback.
 
-## Phase 4 — Distribution & durability
+## Phase 4 — Distribution & durability · IN PROGRESS
 
+- **Remote control plane** for outbound-only collectors (ADR-0013,
+  `CONTROL.md`) — **v1 built**: NATS leaf-node uplink, closed command
+  allowlist, status push, dual audit. v2 (content changes as locally-approved
+  proposals — the ADR-0005 loop applied to fleet management) is specified,
+  not built.
 - Package/connector distribution as git repos; the seam toward a marketplace
   (ADR-0003) — a candidate monetization surface (the paid panel: collaboration,
   approvals, audit, SSO).
-- **Remote control plane** for outbound-only collectors (ADR-0013,
-  `CONTROL.md`): NATS leaf-node uplink, closed command allowlist, content
-  changes as locally-approved proposals (the ADR-0005 loop applied to fleet
-  management), full audit both sides.
-- `vjs-test` as the CI gate; transport-level tests (redelivery, ordering,
-  reconnection) beyond the language golden cases.
+- `vjs-test` as the CI gate — built (`.github/workflows/ci.yml`: unit +
+  golden + parse-check of every script and example + image build).
+  Transport-level tests (redelivery, ordering, reconnection) beyond the
+  language golden cases: still to do.
+
+## Phase 5 — Operator credibility · NEXT
+
+What turns "nice project" into "I can run this in production":
+
+1. **Persistent dead letters**: a poisoned message stops being dropped — it
+   lands on a dedicated DLQ stream with a death envelope (subject, unit,
+   attempts, last error, payload), visible in the panel, re-injected
+   explicitly after the fix. The sister loop of ADR-0005.
+2. **Real observability**: OpenTelemetry traces + a Prometheus `/metrics`
+   endpoint. (The manifesto stops claiming this until it ships.)
+3. **Full shadow-replay** (ADR-0005): JetStream-hydrated history, audit trail,
+   one-click rollback.
+4. **Published, reproducible benchmarks**: throughput, memory, image size,
+   cold start — against the incumbents, same scenario.
 
 ## Cross-cutting, ongoing
 
-- Keep README/MANIFESTO aligned with VejasScript (no stale Python).
+- Keep README/MANIFESTO aligned with what is actually built — no promise the
+  code cannot keep.
 - Purge Python-era JetStream durable consumers.
-- Register `vejas.io` / `vejas.dev`; create the GitHub repo; publish the
-  manifesto only when the Phase 2 demo is real.
+- Publish: `vejas.dev` (canonical) / `vejas.io` are registered and the repo
+  exists; the public flip ships with the recorded demo, not before.
 
 ## How to pick up this project (for another agent)
 
 Read `VISION.md`, then `ARCHITECTURE.md`, then the ADRs in order. The code is
-`core/src/{vjs,main,connectors}.rs` (~3k lines). Run `cargo test
+`core/src/{vjs,main,connectors,secrets,control}.rs` (~7k lines, plus the SAP and Salesforce connector crates under `connectors/`). Run `cargo test
 --manifest-path core/Cargo.toml` and `vejas-runtime vjs-test tests/vjs` to see
 the contract. Everything the platform can do is reachable over `POST /mcp`
 (`docs/MCP.md`). Do not add a transform without the ADR-0010 admission test;
