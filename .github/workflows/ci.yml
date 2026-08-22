@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Language unit tests
+        run: cargo test --manifest-path core/Cargo.toml
+
+      - name: Build the runtime
+        run: cargo build --release --manifest-path core/Cargo.toml
+
+      - name: Golden end-to-end cases
+        run: core/target/release/vejas-runtime vjs-test tests/vjs
+
+      # Every script in the repo — bundled flows/services/connectors AND every
+      # example (.vjs and .vjs.example, nested dirs included) — must parse.
+      # Examples are contract, not dead documentation.
+      - name: Parse-check every script and example
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            out=$(core/target/release/vejas-runtime vjs-check "$f" 2>&1) || true
+            if [ "$out" != "ok" ]; then
+              echo "FAIL $f: $out"
+              fail=1
+            fi
+          done < <(find flows services connectors packages docs/examples \
+                     \( -name '*.vjs' -o -name '*.vjs.example' \) \
+                     -not -path '*/target/*')
+          exit $fail
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker image builds
+        run: docker build -t vejas:ci .
