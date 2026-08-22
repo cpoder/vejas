@@ -193,6 +193,21 @@ leases. No gap, no loss — the bus is the only shared state.
   a JetStream window through the candidate). It builds directly on this taxonomy,
   which is why this ADR lands first.
 
+## Future refinements (noted, not built)
+
+- **A fifth regime: competing-safe *by the remote*.** Some singletons are only
+  singletons because *we* serialise them; the remote can fan out. The SAP gateway
+  load-balances N servers registered on the *same* Program ID — so
+  `idoc-server` (exec-stream-source) could one day register N instances and let
+  SAP distribute the IDocs, moving it from singleton to a remote-coordinated
+  competing group. Not built: enable it only if a real IDoc volume demands it,
+  and only per-driver where the remote genuinely supports it.
+- **When a singleton becomes the bottleneck, partition — don't un-singleton it.**
+  The doctrinal answer to "one poller can't keep up" is several manifests that
+  split the domain (each polling its slice, each holding its own lease), not one
+  instance racing another on the same source. Same shape the future CEP work will
+  use. Keeps the exactly-once-per-slice guarantee while scaling out.
+
 ## Rejected
 
 - **A sticky coordinator / external quorum (Zookeeper, etcd, consistent-hash
