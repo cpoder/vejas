@@ -269,11 +269,15 @@ fn now_secs() -> u64 {
 }
 
 fn mtime_of(path: &Path) -> u64 {
+    // Nanoseconds, not seconds: `vejas_set_literal` writes the file and calls
+    // reload() in the same wall-clock second, so a second-granularity stamp
+    // collides and reload's `old_mtime != spec.mtime` guard misses the change —
+    // the live flow keeps running the pre-promote surface (ADR-0005 no-op).
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -376,6 +380,23 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let prog = vjs::parse(&src)?;
             let Some(source) = prog.source.clone() else {
+                // An api-only / tool-only flow has no bus source: it is served
+                // synchronously by the HTTP/API and MCP routers, not consumed
+                // here. Park the supervisor (no consumer) instead of crash-
+                // looping on the missing `source` — only a flow that is neither
+                // is genuinely malformed.
+                if prog.api.is_some() || prog.tool.is_some() {
+                    let how = if prog.api.is_some() { "api" } else { "tool" };
+                    set_state(&handle, |st| {
+                        st.status = format!("serving ({how})");
+                        st.started_at = Some(now_secs());
+                        st.last_error = None;
+                    });
+                    while RUNNING.load(Ordering::SeqCst) && !handle.stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    return Ok(());
+                }
                 return Err("no `source` declaration".into());
             };
             let nc = nats::connect(&url).map_err(|e| e.to_string())?;
