@@ -25,17 +25,25 @@ runtime RSS and binary size — as JSON, from `bench/run.sh`. A dedicated
 
 ## Current numbers (dev machine, 8 cores, WSL2 — pre-optimization)
 
-All four ceilings fell (#4+#3 `5cffb7b`, #2 `b34d9f3`, #1 `75fad83`):
+All five ceilings fell (#4+#3 `5cffb7b`, #2 `b34d9f3`, #1 `75fad83`,
+#5 `d5c45d7`…`5bf3a7c`):
 
-| Metric | v0 | all four fixes in |
+| Metric | v0 | all five fixes in |
 |---|---|---|
 | Cold start | 13–15 ms | **11–13 ms** |
 | Runtime RSS under load | 6–8 MB | **6–8 MB** |
 | Binary size | 3.9 MB | 4.9 MB (rustls) |
-| e2e sustained (12 conns) | — | **1 701/s delivered, p50 18 ms, p99 59 ms** |
-| e2e saturated (32 conns) | 65/s delivered | 4 879/s ingest, **2 828/s delivered** (sink-bound, queue absorbs the rest) |
-| e2e latency, uncongested | p50 859 ms | **p50 6 ms, p99 7 ms** |
+| e2e sustained, paced ~1 900/s (`bench/paced.sh 2000 15`) | — | **p50 14 ms, p99 36 ms**, 20 000/20 000 |
+| e2e saturated (32 conns) | 65/s delivered | ~4 900/s ingest, **~2 650/s delivered** (sink-bound, queue absorbs the rest) |
+| e2e latency, uncongested (`bench/paced.sh 20 15`) | p50 859 ms | **p50 2 ms, p99 3 ms** |
+| MQTT broker loopback, QoS 1 both ways (`bench/broker-mqtt.sh 5000`) | — | **2 285 rt/s**, 5 000/5 000 |
 | Isolated flow hop | 171/s | **8 110/s** |
+
+The old "sustained (12 conns) 1 701/s, p50 18 ms" row died with ceiling #5:
+that operating point was the flusher floor throttling each connection to
+~140 req/s — with the floor gone, `bench/run.sh` saturates the pipeline at
+any concurrency, so steady-state latency is now measured **paced**
+(`bench/paced.sh`, fixed event rate below the sink bound).
 
 Every hop persisted in JetStream throughout — the guarantee never moved.
 
@@ -51,6 +59,17 @@ each one matches its cause exactly:
    ~30× on the sink leg, secrets move from temp files to memory.
 3. **Batch-fill wait** — *fixed with #4* (`no_wait` pulls, immediate
    delivery, anti-zombie invariant preserved).
+5. **The nats-crate 5 ms flusher floor** — *fixed*
+   (`d5c45d7`…`5bf3a7c`): the sync `nats` client rate-limits writer
+   flushes to one per 5 ms (`MIN_FLUSH_BETWEEN`, hard-coded), so every
+   *sequential* JetStream pub-ack — a request/reply — was capped at
+   ~200/s. Surfaced by the MQTT loopback bench (js.publish p50 5.1 ms,
+   dead on the tick, isolated by per-step instrumentation).
+   `publish_confirmed()` re-does the request with a direct caller-thread
+   flush — same at-least-once contract, no new dependency — and is wired
+   at the four sequential publishers: mqtt-in, MQ source, http-in ingest,
+   exec-stream (kcat). Ingest request p50 5.2 → 0.8 ms; MQTT loopback
+   8 → 2 285 rt/s; uncongested e2e p50 6 → 2 ms.
 
 Numbers here are updated by re-running the harness after each fix — never
 quoted without the scenario and the machine.

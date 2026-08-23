@@ -29,10 +29,10 @@ end-to-end test ([the script](e2e/bridge-film.mjs)) — the video cannot lie.
 **Measured, not claimed** — reproducible on an 8-core dev machine
 ([methodology and comparisons](bench/)): cold start **11 ms**, **6–8 MB**
 RSS under load (49 MB with fifty live flows), **4.9 MB** binary / **201 MB**
-image, end-to-end p50 **6 ms** uncongested / 1 701/s sustained with **every
-hop persisted** in JetStream, **2 285/s** through a real MQTT broker and
-back (QoS 1 both ways, PUBACK-gated). Same order of magnitude as engines
-that persist nothing, in ~25× less memory.
+image, end-to-end p50 **2 ms** uncongested / p50 14 ms at a paced 1 900/s
+sustained with **every hop persisted** in JetStream, **2 285/s** through a
+real MQTT broker and back (QoS 1 both ways, PUBACK-gated). Same order of
+magnitude as engines that persist nothing, in ~25× less memory.
 
 ![Prompt-to-flow and the pipeline, derived from the code itself](docs/screenshots/panel-top.png)
 

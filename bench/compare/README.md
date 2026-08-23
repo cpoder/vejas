@@ -13,11 +13,11 @@ bench/compare/run-n8n.sh 20 32                       # n8n (official image, tune
 
 ## Same machine, same day (dev machine, 8 cores, WSL2)
 
-| | Vejas v0 | Vejas, all four fixes | Redpanda Connect 4.106 | n8n 1.x (tuned) |
+| | Vejas v0 | Vejas, all five fixes | Redpanda Connect 4.106 | n8n 1.x (tuned) |
 |---|---|---|---|---|
-| Delivered, saturated | 65/s | **2 828/s** | 3 433/s | 12–15/s |
-| Delivered, sustained | — | **1 701/s** (p50 18 ms, p99 59 ms) | — | — |
-| e2e latency p50 (32 conns) | 859 ms | 18 ms sustained / **6 ms** uncongested | 1 ms | 2 350 ms |
+| Delivered, saturated | 65/s | **~2 650/s** | 3 433/s | 12–15/s |
+| Delivered, paced sustained | — | **~1 900/s** (p50 14 ms, p99 36 ms) | — | — |
+| e2e latency p50 | 859 ms | 14 ms sustained / **2 ms** uncongested | 1 ms | 2 350 ms |
 | Flow-hop rate (no HTTP) | 171/s | **8 110/s** (9 948/s over 10 flows) | — | — |
 | Cold start | 15 ms | **11–13 ms** | 391 ms | 7–17 s (container) |
 | RSS under load | **6–8 MB** | **6–8 MB** (49 MB at 50 flows) | 202 MB | 1.2–1.3 GB |
@@ -33,11 +33,11 @@ before executing (like our 202-then-bus), so its latency is queue wait under
 32-connection pressure — at low rate its per-execution latency is ~150-400 ms.
 Cold start measured through its container, as officially distributed.
 
-**Read both columns honestly.** After the four fixes, Vejas delivers in the
-same order of magnitude as the category (2.8k vs 3.4k/s saturated, both
+**Read both columns honestly.** After the five fixes, Vejas delivers in the
+same order of magnitude as the category (~2.7k vs 3.4k/s saturated, both
 sink-bound) while **persisting every hop**, starting ~30× faster, holding
 ~25× less memory, in a ~70× smaller binary. The remaining latency gap
-(6 ms vs 1 ms) is the price of the stronger guarantee — two persisted
+(2 ms vs 1 ms) is the price of the stronger guarantee — two persisted
 JetStream hops sit in the path.
 
 **The guarantee is not the same.** This Redpanda Connect pipeline holds
