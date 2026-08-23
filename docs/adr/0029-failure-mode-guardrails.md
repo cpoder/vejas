@@ -46,7 +46,8 @@ or architecture instead of the result.
 Before distribution, every dependency that could orphan the project is
 resolved **in writing**: personal/legal encumbrances of the founder,
 licence and governance posture of load-bearing dependencies (NATS, the MCP
-spec). Watch them quarterly afterward.
+spec — and the agent tooling the R1 cadence budget assumes, whose access
+and cost are load-bearing too). Watch them quarterly afterward.
 **Tripwire:** a licence, governance or stewardship change announcement in
 a load-bearing dependency → assessed within two weeks, in an ADR if
 consequential.
@@ -72,19 +73,27 @@ a public status note; silence is the failure, not the pause.
 
 ### R6 — The window is reviewed, not assumed *(vs timing death)*
 
-Quarterly: what did the funded players ship toward governed agent-written
-integration? The positioning is re-derived from that review, not from the
-original thesis.
-**Tripwire:** a major player ships governed agent-authored changes →
-positioning reassessed within two weeks.
+Quarterly, two lenses: **the competitors** (what did the funded players
+ship toward governed agent-written integration?) and **the regulatory
+window the thesis stands on** (AI Act enforcement practice, sector rules
+such as NIS2): the "provable governance" positioning is worth exactly what
+buyers are *required* to demand. The positioning is re-derived from that
+review, not from the original thesis.
+**Tripwires:** a major player ships governed agent-authored changes →
+positioning reassessed within two weeks; an enforcement change or
+exemption that touches the human-in-the-loop requirement → the thesis
+itself reassessed within two weeks.
 
 ### R7 — Trust is pre-earned *(vs the broken-trust death)*
 
 An external security review of the write-capable surfaces (panel, /mcp,
 exec drivers) before distribution. Every public claim stays reproducible
-(the existing house rule). Security reports get a public response within
-48 hours.
-**Tripwire:** any CVE-class report → 48h acknowledged, publicly.
+(the existing house rule) — **documented examples included**: a guide
+whose commands silently diverge from master is the same erosion in slow
+motion. Security reports get a public response within 48 hours.
+**Tripwires:** any CVE-class report → 48h acknowledged, publicly; a
+documented example that no longer runs against master → fixed with the
+change that broke it.
 
 ## Consequences
 
