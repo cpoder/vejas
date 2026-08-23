@@ -13,3 +13,14 @@ semantics the fake models (MQGET syncpoint / MQCMIT / MQBACK behavior on
 YOUR qmgr version), channel auth + TLS for your channel, and one end-to-end
 message each way. Upgrade path: an ibmcom/mq Developer-container CI leg if
 real usage warrants it (noted in ADR-0023, not built).
+
+## Verified against a real queue manager (out of band)
+2026-08-23, against the free MQ Developer container (icr.io/ibm-messaging/mq,
+QM1): source drained real MQPUTs to the bus in order (CURDEPTH 5→0), sink
+landed bus messages as real MQPUTs (contents read back with amqsget), and
+the backout invariant held live — with the bus down, thousands of real
+MQGET→MQBACK cycles lost nothing; the message reached the bus the moment it
+recovered. Found (and fixed forward): password auth needs MQCSP (recent
+images default CHCKCLNT(REQUIRED)); repeated-MQBACK needs a backoff.
+Packaging: the redistributable client needs its full directory structure —
+lib64 alone segfaults inside libmqic.

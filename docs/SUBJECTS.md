@@ -36,6 +36,12 @@ hot-addable). No subprocess, no Python. Drivers today:
   publish (await pub-ack) → MQCMIT, and the mirror for the sink. Hand-declared
   MQI FFI, `dlopen` of the MQ client at runtime — builds with no MQ present.
   Configured by env (`VEJAS_MQ_*`, see the recipe), not by a manifest.
+- **amqp source/sink** (standalone binary, `connectors/amqp`) — RabbitMQ /
+  AMQP 0-9-1 as a first-class citizen (ADR-0026): pure Rust, sync, no tokio,
+  TLS via rustls over amiquip's mio loop (no OpenSSL). Source acks AMQP only
+  after the bus pub-ack; sink acks the bus only after the publisher confirm.
+  Configured by env (`VEJAS_AMQP_*`, see the recipe). Certified against a
+  real RabbitMQ in CI.
 - **exec-source** / **exec-sink** — bridge an external program in ANY language over stdio (source prints JSON on stdout; sink reads JSON on stdin). The hot-add path for new connector types without recompiling the core or loading native libs (ADR-0011).
 
 An **external connector** in any language is still a first-class citizen: it is

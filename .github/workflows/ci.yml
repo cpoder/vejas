@@ -60,6 +60,8 @@ jobs:
           unzip -q nc.zip && sudo mv nats-*-linux-amd64/nats /usr/local/bin/
       - name: Credential-pattern profile (ADR-0017 decision pin)
         run: e2e/admission/pattern-bench.py
+      - name: Build the AMQP connector (real-broker certification needs the binary)
+        run: cargo build --release --manifest-path connectors/amqp/Cargo.toml
       - name: Connector admission (ADR-0017)
         run: e2e/admission/run.sh
       - name: Transport invariants (ROADMAP Phase 4)

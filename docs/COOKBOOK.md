@@ -169,6 +169,29 @@ default *because order* (a lease on the bus, ADR-0020); set
 `VEJAS_MQ_COMPETING=1` when throughput outranks global order — MQGET is
 destructive, so competing instances never duplicate.
 
+## 9 · RabbitMQ, certified against the real thing ✓
+
+> Consume the `orders` queue on our RabbitMQ (TLS, credentials from the
+> vault) and put every message on the bus as `vx.amqp.orders.in`.
+
+Like IBM MQ, a **first-class standalone binary** (`connectors/amqp`) — pure
+Rust, synchronous, no tokio, and TLS through rustls (no OpenSSL anywhere).
+The at-least-once contract is the platform's, spoken in AMQP: the source
+acks RabbitMQ only after the bus pub-ack; the sink acks the bus only after
+the publisher confirm. The agent fills the env recipe
+([`docs/examples/connectors/amqp_source/`](examples/connectors/amqp_source/)):
+
+```
+VEJAS_AMQP_URL="${AMQP_URL:?from your secret store}"   # amqps://… for TLS
+VEJAS_AMQP_MODE=source
+VEJAS_AMQP_QUEUE=orders
+VEJAS_AMQP_SUBJECT=vx.amqp.orders.in
+```
+
+Unlike the brokers CI cannot host, these recipes are certified **against a
+real RabbitMQ container on every CI run** — the message goes through the
+actual broker and back.
+
 ## Governed mode — the agent proposes, the human approves ✓
 
 > From here on, no agent lands a change directly. Everything goes through

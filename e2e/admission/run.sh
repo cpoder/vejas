@@ -51,10 +51,30 @@ print(','.join(bad))
 PY
 )
     if [ -n "$LINT" ]; then echo "  ✗ lint: literal credential(s) in env file: $LINT"; fail=1; continue; fi
-    if [ -f "$DIR/EXCEPTION.md" ]; then
+    # real-broker certification for a standalone binary: the recipe owns the
+    # whole check (dataflow.sh boots the binary itself against the staged
+    # broker + nats). Otherwise a stated exception is required.
+    if [ -x "$DIR/dataflow.sh" ]; then
+      STORE=$(mktemp -d); BROKER_P=$((9400 + i))
+      if [ -f "$DIR/broker.sh" ]; then
+        "$DIR/broker.sh" start "$BROKER_P" > "$STORE/broker.log" 2>&1 \
+          || { echo "  ✗ broker: failed to start ($(tail -1 "$STORE/broker.log"))"; fail=1; rm -rf "$STORE"; continue; }
+      fi
+      nats-server -js -sd "$STORE" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 &
+      NATS_PID=$!
+      sleep 0.5
+      ok=1
+      HTTP_P="$HTTP_P" NATS_P="$NATS_P" BROKER_P="$BROKER_P" DIR="$DIR" \
+        "$DIR/dataflow.sh" > "$STORE/dataflow.log" 2>&1 \
+        || { echo "  ✗ dataflow: $(tail -1 "$STORE/dataflow.log")"; ok=0; }
+      kill "$NATS_PID" 2>/dev/null
+      [ -f "$DIR/broker.sh" ] && "$DIR/broker.sh" stop "$BROKER_P" 2>/dev/null
+      rm -rf "$STORE"
+      if [ $ok -eq 1 ]; then echo "  ✓ admitted (real broker)"; else fail=1; fi
+    elif [ -f "$DIR/EXCEPTION.md" ]; then
       echo "  ✓ admitted (stated exception: $(head -1 "$DIR/EXCEPTION.md" | sed 's/^#* *//'))"
     else
-      echo "  ✗ standalone-binary recipe: EXCEPTION.md required (no in-runtime probe exists)"
+      echo "  ✗ standalone-binary recipe: dataflow.sh (real-broker check) or EXCEPTION.md required"
       fail=1
     fi
     continue
