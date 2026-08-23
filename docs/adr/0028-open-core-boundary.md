@@ -28,7 +28,17 @@ CISO, or a platform team** — the features bought to *organize and control*
 usage across people and sites, not to *use* the product.
 
 The line is predictable in both directions: anyone can tell which side a
-future feature lands on before it is built, and so can we.
+future feature lands on before it is built, and so can we. The line is
+always drawn by the *nature of control* a capability grants, never by a
+quantity ("at scale", "more than N") — a threshold is a renegotiation in
+disguise.
+
+**Precedence with rule 1:** for anything *already shipped* that the buyer
+line would classify as enterprise (the `vejas_provision` primitive, the
+CONTROL v1 fleet channel), rule 1 wins — it stays open. The buyer line
+governs what gets *built next*, never the already-delivered. Concretely:
+the CONTROL channel remains open; the industrialized fleet *console* on
+top of it is the enterprise product.
 
 ### The boundary, applied
 
@@ -39,7 +49,7 @@ future feature lands on before it is built, and so can we.
 | Clustering, versioning / time-travel / canary | Approval policies: N approvers, role separation, workflows |
 | Governed mode, single approver | Compliance & audit export (SIEM feeds, reports) |
 | DLQ, replay, golden traffic, observability | Fleet console: multi-site CONTROL, industrialized |
-| Everything on master today | Tenant provisioning at scale · support / SLA |
+| Everything on master today (incl. the `vejas_provision` primitive and the CONTROL v1 channel) | Managed multi-tenant control: mass lifecycle, per-tenant isolation, quotas, per-tenant RBAC · support / SLA |
 
 ### Three rules that make the line credible
 
@@ -51,8 +61,19 @@ future feature lands on before it is built, and so can we.
    certified catalog is the moat; a paywalled connector kills both.
 3. **The core license never changes.** Apache-2.0, in perpetuity, stated in
    the README as a commitment — the standing differentiator against the
-   fair-code relicensing pattern. Consequence: no CLA (inbound = outbound
-   Apache-2.0 suffices); contributions ride a DCO.
+   fair-code relicensing pattern. The **no-CLA policy is the mechanism**
+   that makes this structural rather than promised: without a CLA, even we
+   cannot relicense contributed code — "forever" holds because it is out of
+   our own hands. Contributions ride a DCO. (Apache-2.0 already lets
+   enterprise code incorporate core code with attribution — no CLA is
+   needed for that, and copyleft is what would break it, which is one more
+   reason the core is not AGPL.)
+
+A governance corollary of the line: a community PR that implements an
+enterprise-side capability *in the free core* (e.g. contributed RBAC) is
+declined politely, citing this ADR — the boundary must hold from below as
+well as from above. The reverse never happens: nothing is removed from
+core to make room for a paid version of it (rule 1).
 
 ### Mechanics
 
