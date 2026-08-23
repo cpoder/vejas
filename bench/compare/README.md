@@ -21,7 +21,7 @@ bench/compare/run-n8n.sh 20 32                       # n8n (official image, tune
 | Flow-hop rate (no HTTP) | 171/s | **8 110/s** (9 948/s over 10 flows) | — | — |
 | Cold start | 15 ms | **11–13 ms** | 391 ms | 7–17 s (container) |
 | RSS under load | **6–8 MB** | **6–8 MB** (49 MB at 50 flows) | 202 MB | 1.2–1.3 GB |
-| Distribution size | 3.9 MB binary | **4.9 MB binary / 201 MB image** | 338 MB binary | 372 MB image |
+| Distribution size | 3.9 MB binary | **6.2 MB binary / 201 MB image** | 338 MB binary | 372 MB image |
 | Persistence | every hop (JetStream) | **every hop (JetStream)** | in-flight only | per-execution DB (disabled for this run) |
 
 **n8n fairness notes.** Single instance from the official image, tuned per

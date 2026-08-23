@@ -32,7 +32,7 @@ All five ceilings fell (#4+#3 `5cffb7b`, #2 `b34d9f3`, #1 `75fad83`,
 |---|---|---|
 | Cold start | 13–15 ms | **11–13 ms** |
 | Runtime RSS under load | 6–8 MB | **6–8 MB** |
-| Binary size | 3.9 MB | 4.9 MB (rustls) |
+| Binary size | 3.9 MB | 6.2 MB (rustls) |
 | e2e sustained, paced ~1 900/s (`bench/paced.sh 2000 15`) | — | **p50 14 ms, p99 36 ms**, 20 000/20 000 |
 | e2e saturated (32 conns) | 65/s delivered | ~4 900/s ingest, **~2 650/s delivered** (sink-bound, queue absorbs the rest) |
 | e2e latency, uncongested (`bench/paced.sh 20 15`) | p50 859 ms | **p50 2 ms, p99 3 ms** |
