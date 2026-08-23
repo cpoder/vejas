@@ -1,0 +1,4 @@
+{
+  "ingest_path": "orders.created",
+  "denied_path": "slack.out"
+}

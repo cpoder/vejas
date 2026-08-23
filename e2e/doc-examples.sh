@@ -128,6 +128,23 @@ echo "$M" | grep -q '^vejas_up 1' && echo "$M" | grep -q 'vejas_units' \
 curl -sf http://127.0.0.1:8740/events | python3 -c 'import json,sys; json.load(sys.stdin)' \
   && ok "/events answers JSON" || ko "/events" "guides/observability.md"
 
+say "guides/expose-an-api — ALLOW locks the ingest port (ADR-0029 F2)"
+# a scoped http-in on its own port: in-list 202, out-of-list 403
+cat > "$R/connectors/scoped_in.vjs" << 'VJS'
+driver "http-in"
+PORT = 8789
+ALLOW = ["orders"]
+VJS
+curl -sf -o /dev/null -X POST http://127.0.0.1:8740/reload 2>/dev/null || true
+for _ in $(seq 60); do
+  IN=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8789/ingest/orders.created -d '{}')
+  [ "$IN" = "202" ] && break; sleep 0.2
+done
+OUT=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8789/ingest/slack.out -d '{}')
+{ [ "$IN" = "202" ] && [ "$OUT" = "403" ]; } \
+  && ok "ALLOW: in-list 202, out-of-list 403" \
+  || ko "ALLOW gate (in=$IN out=$OUT)" "guides/expose-an-api.md"
+
 say "guides/dlq-replay — the DLQ surface answers"
 curl -sf http://127.0.0.1:8740/dlq | python3 -c 'import json,sys; json.load(sys.stdin)' \
   && ok "GET /dlq answers JSON" || ko "GET /dlq" "guides/dlq-replay.md"

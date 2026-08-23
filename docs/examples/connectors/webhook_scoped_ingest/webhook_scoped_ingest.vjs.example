@@ -1,0 +1,12 @@
+# connector: webhook_scoped_ingest — an http-in webhook locked to its subjects.
+# The /ingest port is UNAUTHENTICATED by design (it only publishes onto the
+# bus). Without ALLOW, any caller can publish to any vx.* subject — including
+# a sink's subject, triggering an outbound side effect with no flow in
+# between (ADR-0029 R7, finding F2). ALLOW is defence in depth: only the
+# listed subject suffixes are accepted; everything else gets 403. Set it
+# whenever the port is reachable by anyone but the operator.
+# Match is by subject segment: "orders" allows "orders" and "orders.created",
+# not "orders_secret" or "slack.out".
+driver "http-in"
+PORT = 8787
+ALLOW = ["orders"]

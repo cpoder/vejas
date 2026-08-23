@@ -24,6 +24,24 @@ answers `202` only after JetStream confirmed the write — the caller's
 success means *persisted*, not *processed*. Flows consume from there with
 the full delivery contract (redelivery, DLQ).
 
+**Lock the port to its subjects.** The `/ingest` port is unauthenticated by
+design — it only publishes. Without a limit, any caller can publish to any
+`vx.*` subject, a sink's subject included, triggering an outbound side
+effect with no flow in between. Set `ALLOW` to the subject suffixes this
+webhook is for:
+
+```
+driver "http-in"
+PORT = 8787
+ALLOW = ["shop"]          # shop, shop.orders, shop.refunds … — 403 for anything else
+```
+
+Match is by subject segment: `"shop"` allows `shop` and `shop.orders`, not
+`shop_internal`. Absent, the port stays open to any `vx.*` (backward
+compatible) — set it whenever the port is reachable by anyone but the
+operator (ADR-0029). It is defence in depth, not authentication: put the
+port behind your ingress trust boundary as you would any webhook.
+
 ## Sync: a flow that is an API
 
 ```

@@ -198,6 +198,12 @@ sys.exit(0 if d.get('ok') or 'no test probe' in d.get('detail', '') else 1)" \
       curl -sf -o /dev/null -X POST "http://127.0.0.1:$IPORT/ingest/$INGEST" -d @"$DIR/fixture.json" || true
       wait $WSUB 2>/dev/null || true
       [ -s "$STORE/inmsg" ] || { echo "  ✗ webhook: fixture never reached the bus"; ok=0; }
+      # if the recipe locks the port with ALLOW, a subject outside it must 403
+      DENIED=$(python3 -c "import json,sys; print(json.load(open('$DIR/overrides.json')).get('denied_path',''))")
+      if [ -n "$DENIED" ]; then
+        DCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$IPORT/ingest/$DENIED" -d @"$DIR/fixture.json")
+        [ "$DCODE" = "403" ] || { echo "  ✗ ALLOW: out-of-list subject '$DENIED' not refused (got $DCODE)"; ok=0; }
+      fi
     elif [ -f "$DIR/fixture.json" ] && grep -q 'driver "http-poll"' "$MANIFEST"; then
       # source: one real published message, shape-checked against the fixture
       MSG=$(timeout 15 nats -s "nats://127.0.0.1:$NATS_P" sub "$SUBJECT" --count=1 --raw 2>/dev/null | head -1)
