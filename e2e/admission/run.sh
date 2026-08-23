@@ -69,8 +69,13 @@ PY
     continue
   fi
 
-  # ── stage: mock + throwaway root + dummy secrets ──────────────────────
+  # ── stage: broker (real) + mock + throwaway root + dummy secrets ──────
   STORE=$(mktemp -d); ROOT=$(mktemp -d)
+  BROKER_P=$((9400 + i))
+  if [ -f "$DIR/broker.sh" ]; then
+    "$DIR/broker.sh" start "$BROKER_P" > "$STORE/broker.log" 2>&1 \
+      || { echo "  ✗ broker: failed to start ($(tail -1 "$STORE/broker.log"))"; fail=1; rm -rf "$STORE" "$ROOT"; continue; }
+  fi
   mkdir -p "$ROOT/connectors"
   cp "$MANIFEST" "$ROOT/connectors/$NAME.vjs"
   MOCK_PID=""
@@ -81,11 +86,11 @@ PY
     for _ in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$MOCK_P/__count" && break; sleep 0.1; done
   fi
   # dummy secrets from overrides.json (env-store form)
-  eval "$(python3 - "$DIR/overrides.json" "$MOCK_P" << 'PY'
+  eval "$(python3 - "$DIR/overrides.json" "$MOCK_P" "$BROKER_P" << 'PY'
 import json, re, sys
 o = json.load(open(sys.argv[1]))
 for path, v in o.get('secrets', {}).items():
-    v = str(v).replace('{PORT}', sys.argv[2])
+    v = str(v).replace('{PORT}', sys.argv[2]).replace('{BROKER_PORT}', sys.argv[3] if len(sys.argv) > 3 else '')
     print(f"export VEJAS_SECRET_{re.sub(r'[^A-Za-z0-9]', '_', path).upper()}='{v}'")
 PY
 )"
@@ -98,11 +103,12 @@ PY
   for _ in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$HTTP_P/healthz" && break; sleep 0.1; done
 
   # ── point the manifest at the mock through the product's write path ───
-  python3 - "$DIR/overrides.json" "$MOCK_P" "$NAME" "$HTTP_P" << 'PY' || ok=0
+  python3 - "$DIR/overrides.json" "$MOCK_P" "$NAME" "$HTTP_P" "$BROKER_P" << 'PY' || ok=0
 import json, sys, urllib.request
 o = json.load(open(sys.argv[1])); port, name, http = sys.argv[2], sys.argv[3], sys.argv[4]
+broker = sys.argv[5] if len(sys.argv) > 5 else ''
 for k, v in o.get('literals', {}).items():
-    if isinstance(v, str): v = v.replace('{PORT}', port)
+    if isinstance(v, str): v = v.replace('{PORT}', port).replace('{BROKER_PORT}', broker)
     body = json.dumps({"file": f"connectors/{name}.vjs", "name": k, "key": "-", "value": v}).encode()
     r = urllib.request.urlopen(urllib.request.Request(
         f"http://127.0.0.1:{http}/surface/set", body, {'content-type': 'application/json'}), timeout=10)
@@ -158,6 +164,7 @@ PY
   fi
 
   kill "$RT_PID" "$NATS_PID" "$MOCK_PID" 2>/dev/null
+  [ -f "$DIR/broker.sh" ] && "$DIR/broker.sh" stop "$BROKER_P" 2>/dev/null
   rm -rf "$STORE" "$ROOT"
   if [ $ok -eq 1 ]; then echo "  ✓ admitted"; else fail=1; fi
 done
