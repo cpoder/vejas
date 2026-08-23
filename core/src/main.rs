@@ -585,6 +585,20 @@ fn emit_proposal_event(js: &nats::jetstream::JetStream, transition: &str, propos
 /// The distinct approval credential (ADR-0024). A shared VEJAS_TOKEN is what the
 /// agent already holds for /mcp, so approve/reject require their OWN token —
 /// otherwise governance is decorative.
+/// Constant-time string comparison for credentials — no early return on the first
+/// differing byte, so a token/approval-token check leaks no timing side-channel
+/// (ADR-0029 R7). Length mismatch folds into the accumulator, not a short-circuit.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = (a.len() ^ b.len()) as u64;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        diff |= (x ^ y) as u64;
+    }
+    diff == 0
+}
+
 fn approval_token() -> Option<String> {
     env::var("VEJAS_APPROVAL_TOKEN").ok().filter(|t| !t.is_empty())
 }
@@ -1861,12 +1875,30 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
     if let Ok(stripped) = Path::new(rel).strip_prefix(root) {
         rel = stripped.to_str()?;
     }
-    let p = root.join(rel);
     let ok_dir = ["flows", "services", "connectors", "packages"]
         .iter()
         .any(|d| rel.starts_with(d));
     let ok_ext = rel.ends_with(".vjs") || rel.ends_with(".json");
-    if ok_dir && ok_ext {
+    if !(ok_dir && ok_ext) {
+        return None;
+    }
+    let p = root.join(rel);
+    // Symlink defense: the string checks above stop `..`, absolute escapes and
+    // wrong extensions, but a symlink whose NAME ends `.vjs`/`.json` and sits in
+    // an allowed dir would still pass them, and fs::read/write would follow it —
+    // an arbitrary host-file read/write (e.g. flows/x.vjs → /etc/passwd or the
+    // secrets file). So resolve symlinks and require the real target to stay under
+    // the real root; reject anything that escapes. An existing path is
+    // canonicalized whole (catches a symlinked FILE); a not-yet-existing path (a
+    // new file being written) has its PARENT canonicalized (catches a symlinked
+    // directory in the chain). We return the original `p` — callers only fs-read/
+    // write it — so no caller's path form changes; the check is the guard.
+    let canon_root = root.canonicalize().ok()?;
+    let resolved = match p.canonicalize() {
+        Ok(c) => c,
+        Err(_) => p.parent()?.canonicalize().ok()?.join(p.file_name()?),
+    };
+    if resolved.starts_with(&canon_root) {
         Some(p)
     } else {
         None
@@ -3142,7 +3174,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         && h.value
                             .as_str()
                             .strip_prefix("Bearer ")
-                            .map(|t| t == token)
+                            .map(|t| ct_eq(t, &token))
                             .unwrap_or(false)
                 });
                 if !authorized {
@@ -3205,7 +3237,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 }
                 Some(tok) => {
                     let ok = request.headers().iter().any(|h| {
-                        h.field.equiv("x-approval-token") && h.value.as_str() == tok
+                        h.field.equiv("x-approval-token") && ct_eq(h.value.as_str(), &tok)
                     });
                     if !ok {
                         return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
@@ -3973,15 +4005,38 @@ mod tests {
 
     #[test]
     fn guard_path_accepts_absolute_only_under_root() {
-        let root = Path::new("/srv/vejas");
-        assert!(guard_path(root, "flows/x.vjs").is_some());
-        assert_eq!(
-            guard_path(root, "/srv/vejas/flows/x.vjs"),
-            guard_path(root, "flows/x.vjs"),
-        );
-        assert!(guard_path(root, "/etc/passwd").is_none());
-        assert!(guard_path(root, "/srv/vejas/core/x.vjs").is_none());
-        assert!(guard_path(root, "flows/../core/x.vjs").is_none());
+        // Real temp root — the symlink defense resolves paths, so it needs real
+        // files, not a string-only fake root.
+        let root = std::env::temp_dir().join(format!("vejas-gp-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(root.join("flows").join("x.vjs"), "source \"vx.a\"\n").unwrap();
+
+        // legit file, relative and absolute-under-root (panel round-trip)
+        assert!(guard_path(&root, "flows/x.vjs").is_some());
+        assert!(guard_path(&root, root.join("flows/x.vjs").to_str().unwrap()).is_some());
+        // a not-yet-existing file under an allowed dir (a write) is allowed
+        assert!(guard_path(&root, "flows/new.vjs").is_some());
+        // string escapes still rejected
+        assert!(guard_path(&root, "/etc/passwd").is_none());
+        assert!(guard_path(&root, "flows/../secrets.json").is_none());
+
+        // F1: a symlink that ESCAPES root is rejected (arbitrary read/write hole)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = std::env::temp_dir().join(format!("vejas-gp-out-{}", std::process::id()));
+            std::fs::write(&outside, "SECRET").unwrap();
+            symlink(&outside, root.join("flows").join("evil.vjs")).unwrap();
+            assert!(
+                guard_path(&root, "flows/evil.vjs").is_none(),
+                "a symlink escaping root must be refused (F1)"
+            );
+            // a symlink that stays WITHIN root is harmless and allowed
+            symlink(root.join("flows").join("x.vjs"), root.join("flows").join("inner.vjs")).unwrap();
+            assert!(guard_path(&root, "flows/inner.vjs").is_some());
+            let _ = std::fs::remove_file(&outside);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
