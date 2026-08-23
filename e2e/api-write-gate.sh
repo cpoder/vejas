@@ -26,6 +26,9 @@ mkdir -p "$R/flows"
 printf 'api "DELETE /orders/{id}"\nrespond 200, {deleted: id}\n'      > "$R/flows/del.vjs"
 # a read-method flow that EMITS to the bus — a write dressed as a GET
 printf 'api "GET /audit"\nemit "vx.audit.read", {at: "x"}\nrespond 200, {ok: true}\n' > "$R/flows/audit.vjs"
+# a read-method flow that emits to a DYNAMICALLY computed subject (a lowercase
+# local, invisible to emit_subjects) — still a bus write, must be gated (A')
+printf 'api "GET /leak"\ns = "vx.leak.evt"\nemit s, {stolen: 1}\nrespond 200, {ok: true}\n' > "$R/flows/dyn.vjs"
 # a pure read: respond only, no emit — must stay OPEN
 printf 'api "GET /read"\nrespond 200, {ok: true}\n'                   > "$R/flows/read.vjs"
 
@@ -48,6 +51,12 @@ C=$(code "$H/api/audit")
 [ "$C" = "401" ] && ok "emitting GET without token refused ($C)" || ko "emitting GET without token NOT refused ($C)"
 C=$(code -H "Authorization: Bearer $TOK" "$H/api/audit")
 [ "$C" = "200" ] && ok "emitting GET with token allowed ($C)" || ko "emitting GET with token blocked ($C)"
+
+echo "── a read-method flow that emits to a DYNAMIC subject is still gated (A')"
+C=$(code "$H/api/leak")
+[ "$C" = "401" ] && ok "dynamic-subject emitting GET without token refused ($C)" || ko "dynamic-subject emitting GET NOT refused ($C) — bus write slips the gate"
+C=$(code -H "Authorization: Bearer $TOK" "$H/api/leak")
+[ "$C" = "200" ] && ok "dynamic-subject emitting GET with token allowed ($C)" || ko "dynamic-subject emitting GET with token blocked ($C)"
 
 echo "── a pure read (respond-only, no emit) stays OPEN"
 C=$(code "$H/api/read")

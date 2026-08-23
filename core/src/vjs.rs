@@ -1215,6 +1215,29 @@ fn collect_static(
     }
 }
 
+impl Program {
+    /// Does this flow contain ANY `emit` — including one to a dynamically computed
+    /// subject? `emit_subjects` lists only STATICALLY resolvable subjects (a string
+    /// literal or a surface constant), so it is NOT a "does this write the bus"
+    /// signal: a flow that emits to `f"vx.out.{x}"` or a lowercase local has an
+    /// EMPTY emit_subjects yet publishes at runtime. The write gate must gate on
+    /// this (any emit at all), not on emit_subjects (Finding A').
+    pub fn has_emit(&self) -> bool {
+        fn walk(stmts: &[Stmt]) -> bool {
+            stmts.iter().any(|s| match s {
+                Stmt::Emit(_, _) => true,
+                Stmt::If(arms, otherwise) => {
+                    arms.iter().any(|(_, _, b)| walk(b))
+                        || otherwise.as_deref().map(walk).unwrap_or(false)
+                }
+                Stmt::For(_, _, b) => walk(b),
+                _ => false,
+            })
+        }
+        walk(&self.stmts)
+    }
+}
+
 pub fn parse(src: &str) -> Result<Program, String> {
     let toks = lex(src)?;
     let mut p = Parser { toks: &toks, i: 0, src };

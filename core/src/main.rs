@@ -2737,14 +2737,15 @@ fn publish_emits(emits: &[(String, Value)]) {
 
 /// Run an API flow on the request event; map its `respond` to (status, body).
 /// Does the /api flow at `file` emit to the bus? Used to gate read-method routes
-/// that write (Finding A, volet-2). Static over-approximation via the parser's
-/// `emit_subjects`: any `emit` in the flow — even one on a conditional arm — makes
-/// the route a potential bus writer, so it must pass the write gate.
+/// that write (Finding A, volet-2). Uses `Program::has_emit` — ANY emit, including
+/// one to a dynamically computed subject — NOT `emit_subjects`, which lists only
+/// statically resolvable subjects and so misses `emit f"vx.{x}"` (Finding A': that
+/// gap let a dynamic-subject emitting GET publish to the bus unauthenticated).
 fn flow_emits(root: &Path, file: &str) -> bool {
     guard_path(root, file)
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|src| vjs::parse(&src).ok())
-        .map(|prog| !prog.emit_subjects.is_empty())
+        .map(|prog| prog.has_emit())
         .unwrap_or(false)
 }
 
@@ -4134,8 +4135,20 @@ mod tests {
             "api \"GET /thing\"\nrespond 200, {ok: true}\n",
         )
         .unwrap();
+        // Finding A': a DYNAMIC subject (lowercase local, invisible to
+        // emit_subjects) still emits at runtime → must be detected as a bus write.
+        std::fs::write(
+            root.join("flows").join("dyn.vjs"),
+            "api \"GET /thing\"\ns = \"vx.leak\"\nemit s, {x: 1}\nrespond 200, {ok: true}\n",
+        )
+        .unwrap();
         assert!(flow_emits(&root, "flows/audit.vjs"), "an emitting flow is a bus writer");
         assert!(!flow_emits(&root, "flows/read.vjs"), "a respond-only flow is a pure read");
+        // the dynamic-subject emitter has an EMPTY emit_subjects yet MUST gate
+        let dyn_src = std::fs::read_to_string(root.join("flows").join("dyn.vjs")).unwrap();
+        let dyn_prog = vjs::parse(&dyn_src).unwrap();
+        assert!(dyn_prog.emit_subjects.is_empty(), "dynamic subject is invisible to emit_subjects");
+        assert!(flow_emits(&root, "flows/dyn.vjs"), "a dynamic-subject emit is still a bus write (A')");
         // a path escaping root resolves to no flow → treated as non-emitting (the
         // top-level method gate and guard_path already bar it from running).
         assert!(!flow_emits(&root, "/etc/passwd"));
