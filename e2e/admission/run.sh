@@ -54,6 +54,13 @@ PY
   if [ -n "$LINT" ]; then echo "  ✗ lint: literal credential(s): $LINT"; fail=1; continue; fi
   "$BIN" vjs-check "$MANIFEST" > /dev/null || { echo "  ✗ parse"; fail=1; continue; }
 
+  # a certified dir ships COMPLETE in one commit: admission material or a
+  # stated exception — a half-recipe fails with a verdict, not a traceback
+  if [ ! -f "$DIR/overrides.json" ] && [ ! -f "$DIR/EXCEPTION.md" ]; then
+    echo "  ✗ incomplete recipe: missing overrides.json (or EXCEPTION.md) — ship the dir admission-complete in one commit"
+    fail=1; continue
+  fi
+
   # ── stated exception (ADR-0017): remote not meaningfully mockable ─────
   # Lint + parse are still enforced above; the exception file says what was
   # verified instead, and its first line is printed so it is never silent.
