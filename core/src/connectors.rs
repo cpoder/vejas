@@ -1487,6 +1487,15 @@ impl Driver for ExecStreamSource {
         let offset_field = ctx.config.str("OFFSET_FIELD").unwrap_or_else(|| "offset".into());
         let offset_start = ctx.config.str("OFFSET_START").unwrap_or_else(|| "end".into());
         let offset_store = offset_kv.as_ref().and_then(|_| open_offset_store(&js));
+        // Offset commit CADENCE (keeps the KV put out of the per-record hot path).
+        // A KV put is itself a throttled request/reply, so committing per record
+        // re-caps the stream at ~200/s even with the publish path lifted. Commit
+        // every OFFSET_COMMIT_MS (default 100ms) and once more when the child
+        // drains/exits: publish-before-commit still holds (an offset is committed
+        // only for a record already on the bus), the crash duplicate window just
+        // widens to one interval — exactly a Kafka consumer's auto-commit-interval.
+        let commit_every =
+            Duration::from_millis(ctx.config.u64_or("OFFSET_COMMIT_MS", 100).max(1));
         eprintln!("[{}] exec-stream-source: `{cmd}` -> {subject} (streaming)", ctx.name);
 
         while ctx.alive() {
@@ -1525,10 +1534,25 @@ impl Driver for ExecStreamSource {
                 }
             });
 
+            // per-run offset state: advanced in memory per record, flushed to KV on
+            // the cadence below and at drain (never per record).
+            let mut pending: Option<String> = None;
+            let mut committed: Option<String> = None;
+            let mut last_commit = Instant::now();
             loop {
                 if !ctx.alive() {
                     let _ = child.kill();
                     break;
+                }
+                // cadence-based offset commit — keeps the KV put out of the per-record path
+                if last_commit.elapsed() >= commit_every {
+                    if let (Some(store), Some(key)) = (&offset_store, &offset_kv) {
+                        if pending.is_some() && pending != committed {
+                            offset_put(store, key, pending.as_ref().unwrap());
+                            committed = pending.clone();
+                        }
+                    }
+                    last_commit = Instant::now();
                 }
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(line) => {
@@ -1540,13 +1564,15 @@ impl Driver for ExecStreamSource {
                             match publish_confirmed(&nc, &subject, line.as_bytes(), Duration::from_secs(5)) {
                                 Ok(_) => {
                                     trace_pub(&ctx.name, &subject, line.as_bytes());
-                                    // publish-before-commit: store next offset only
-                                    // after the record is on the bus (at-least-once).
-                                    if let (Some(store), Some(key)) = (&offset_store, &offset_kv) {
+                                    // publish-before-commit: advance the offset in
+                                    // MEMORY only after the record is on the bus; the
+                                    // cadence loop (above) writes it to KV. No KV put
+                                    // in the per-record path.
+                                    if offset_store.is_some() {
                                         if let Some(off) =
                                             rec.get(&offset_field).and_then(|x| x.as_i64())
                                         {
-                                            offset_put(store, key, &(off + 1).to_string());
+                                            pending = Some((off + 1).to_string());
                                         }
                                     }
                                 }
@@ -1560,6 +1586,13 @@ impl Driver for ExecStreamSource {
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break, // child stdout closed
+                }
+            }
+            // drain/exit: flush the last published offset so a restart resumes
+            // correctly — never lose acked progress.
+            if let (Some(store), Some(key)) = (&offset_store, &offset_kv) {
+                if pending.is_some() && pending != committed {
+                    offset_put(store, key, pending.as_ref().unwrap());
                 }
             }
 
