@@ -45,7 +45,8 @@ Editing one entry is a promote:
 - Panel: change the card → **Apply**.
 - API: `POST /surface/set`; agent: `vejas_set_literal`.
 
-It hot-reloads the flow — no restart, no deploy. And you don't do it blind:
+It hot-reloads that flow — the one unit picks up the new value, no process
+restart and no deploy. And you don't do it blind:
 Apply previews the change against real traffic first (shadow-replay), so you
 see *what would have differed* before you commit. That whole safety story —
 preview, promote, roll back, canary — is [change safely](change-safely.md).
