@@ -19,7 +19,10 @@ QM1): source drained real MQPUTs to the bus in order (CURDEPTH 5→0), sink
 landed bus messages as real MQPUTs (contents read back with amqsget), and
 the backout invariant held live — with the bus down, thousands of real
 MQGET→MQBACK cycles lost nothing; the message reached the bus the moment it
-recovered. Found (and fixed forward): password auth needs MQCSP (recent
-images default CHCKCLNT(REQUIRED)); repeated-MQBACK needs a backoff.
-Packaging: the redistributable client needs its full directory structure —
-lib64 alone segfaults inside libmqic.
+recovered. Found and fixed, then re-verified live: password auth via MQCSP
+(MQCNO v5 — the layout needs ConnectionId before SecurityParms; verified
+end to end against CHCKCLNT(REQUIRED): valid password connects and drains,
+wrong password and no-credentials both fail clean with 2035), and a
+progressive backoff on repeated MQBACK. Packaging: the redistributable
+client needs its full directory structure — lib64 alone segfaults inside
+libmqic.

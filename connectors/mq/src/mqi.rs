@@ -89,6 +89,7 @@ struct Mqcno {
     ConnTag: [u8; 128],            // v3 (MQBYTE128)
     SSLConfigPtr: *mut c_void,     // v4 (MQPTR)
     SSLConfigOffset: MqLong,       // v4
+    ConnectionId: [u8; 24],        // v5 (MQBYTE24, OUTPUT) — sits BEFORE SecurityParms
     SecurityParmsOffset: MqLong,   // v5
     SecurityParmsPtr: *mut c_void, // v5 (MQPTR → MQCSP)
 }
@@ -103,6 +104,7 @@ impl Default for Mqcno {
             ConnTag: [0; 128],
             SSLConfigPtr: std::ptr::null_mut(),
             SSLConfigOffset: 0,
+            ConnectionId: [0; 24],
             SecurityParmsOffset: 0,
             SecurityParmsPtr: std::ptr::null_mut(),
         }
@@ -606,7 +608,7 @@ mod layout {
         assert_eq!(std::mem::size_of::<Mqmd>(), 324, "MQMD_LENGTH_1");
         assert_eq!(std::mem::size_of::<Mqgmo>(), 72, "MQGMO_LENGTH_1");
         assert_eq!(std::mem::size_of::<Mqpmo>(), 128, "MQPMO_LENGTH_1");
-        assert_eq!(std::mem::size_of::<Mqcno>(), 176, "MQCNO_LENGTH_5 (64-bit)");
+        assert_eq!(std::mem::size_of::<Mqcno>(), 200, "MQCNO_LENGTH_5 (64-bit)");
         assert_eq!(std::mem::size_of::<Mqcsp>(), 56, "MQCSP_LENGTH_1 (64-bit)");
     }
 }
