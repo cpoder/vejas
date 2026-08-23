@@ -34,7 +34,7 @@ the old one.
 | [0021](0021-versioning-canary-timetravel.md) | Versioning, canary & time-travel (cluster-wide promotion) | Accepted |
 | [0022](0022-kafka-connector-exec-bridge.md) | Kafka connector: exec-bridge over kcat (offsets in our KV) | Accepted |
 | [0023](0023-ibm-mq-transactional-connector.md) | IBM MQ: first-class transactional connector (destructive get, syncpoint) | Accepted |
-| [0024](0024-proposal-queue.md) | The proposal queue: governed change, from agents and the fleet | Proposed |
+| [0024](0024-proposal-queue.md) | The proposal queue: governed change, from agents and the fleet | Accepted |
 | [0025](0025-mqtt-hand-rolled-sync-client.md) | MQTT: hand-rolled sync client (3.1.1, QoS 0/1, in-binary) | Proposed |
 
 ## Template

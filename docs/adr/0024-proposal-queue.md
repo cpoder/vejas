@@ -1,6 +1,6 @@
 # 0024 — The proposal queue: governed change, from agents and the fleet
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-23
 
 ## Context
