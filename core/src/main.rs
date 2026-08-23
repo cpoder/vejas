@@ -618,6 +618,32 @@ fn approval_token() -> Option<String> {
     env::var("VEJAS_APPROVAL_TOKEN").ok().filter(|t| !t.is_empty())
 }
 
+/// The optional write credential. When set (and non-empty), the mutating surface
+/// requires `Authorization: Bearer <it>`; None = writes are open (dev default).
+fn write_token() -> Option<String> {
+    env::var("VEJAS_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+/// Does the request carry a valid `Authorization: Bearer <token>`? Constant-time.
+fn bearer_authorized(request: &tiny_http::Request, token: &str) -> bool {
+    request.headers().iter().any(|h| {
+        h.field.equiv("authorization")
+            && h.value
+                .as_str()
+                .strip_prefix("Bearer ")
+                .map(|t| ct_eq(t, token))
+                .unwrap_or(false)
+    })
+}
+
+/// GET/HEAD are reads (left open by the write gate); every other verb is a
+/// mutation. The one exception — a read-method /api flow that emits — is a bus
+/// write and is gated in the /api branch, not here (Finding A: gate on "writes",
+/// not on the POST verb; `api "DELETE /x"` and an emitting `api "GET /x"` mutate).
+fn is_read_method(m: &tiny_http::Method) -> bool {
+    matches!(m, tiny_http::Method::Get | tiny_http::Method::Head)
+}
+
 /// Submit a proposal (ADR-0024): an agent proposes a mutation, pinned to the
 /// baseline its evidence saw. `payload` must carry `file`.
 fn submit_proposal(
@@ -2710,6 +2736,18 @@ fn publish_emits(emits: &[(String, Value)]) {
 }
 
 /// Run an API flow on the request event; map its `respond` to (status, body).
+/// Does the /api flow at `file` emit to the bus? Used to gate read-method routes
+/// that write (Finding A, volet-2). Static over-approximation via the parser's
+/// `emit_subjects`: any `emit` in the flow — even one on a conditional arm — makes
+/// the route a potential bus writer, so it must pass the write gate.
+fn flow_emits(root: &Path, file: &str) -> bool {
+    guard_path(root, file)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|src| vjs::parse(&src).ok())
+        .map(|prog| !prog.emit_subjects.is_empty())
+        .unwrap_or(false)
+}
+
 fn run_api_flow(root: &Path, file: &str, input: &Value) -> (u16, String) {
     // Instrument the synchronous /api path like the bus hot path (ADR-0016
     // follow-up): a run-time error is `ok:false`; a `respond 4xx/5xx` is a valid
@@ -3178,29 +3216,23 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     let method = request.method().clone();
     let url = request.url().to_string();
     let path_only = url.split('?').next().unwrap_or("").to_string();
-    // Optional write protection: when VEJAS_TOKEN is set, every POST (the
-    // whole mutating surface, /mcp included) requires `Authorization: Bearer
-    // <token>`. Reads stay open — they expose no secret values by design.
-    if method == tiny_http::Method::Post {
-        if let Ok(token) = env::var("VEJAS_TOKEN") {
-            if !token.is_empty() {
-                let authorized = request.headers().iter().any(|h| {
-                    h.field.equiv("authorization")
-                        && h.value
-                            .as_str()
-                            .strip_prefix("Bearer ")
-                            .map(|t| ct_eq(t, &token))
-                            .unwrap_or(false)
-                });
-                if !authorized {
-                    return respond(
-                        request,
-                        401,
-                        "unauthorized: set Authorization: Bearer <VEJAS_TOKEN>".into(),
-                        "text/plain",
-                    );
-                }
-            }
+    // Optional write protection: when VEJAS_TOKEN is set, every MUTATING request
+    // requires `Authorization: Bearer <token>`. A mutation is any non-read method
+    // — POST (the whole built-in surface, /mcp included), and PUT/PATCH/DELETE on
+    // the /api flow surface. GET/HEAD are reads and stay open (they expose no
+    // secret values by design) — with ONE exception handled in the /api branch: a
+    // read-method flow that emits to the bus is itself a write, and is gated there.
+    // (Finding A: the earlier gate keyed on the POST verb, so `api "DELETE /x"` and
+    // an emitting `api "GET /x"` slipped past — a bus write with no token.)
+    let wtoken = write_token();
+    if let Some(tok) = &wtoken {
+        if !is_read_method(&method) && !bearer_authorized(&request, tok) {
+            return respond(
+                request,
+                401,
+                "unauthorized: set Authorization: Bearer <VEJAS_TOKEN>".into(),
+                "text/plain",
+            );
         }
     }
     // Who to attribute a mutation to in the audit (ADR-0030) — the proxy-supplied
@@ -3214,6 +3246,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         let m = method_str(&method);
         return match match_api_route(&root, &m, rel) {
             Some((file, params)) => {
+                // Finding A (volet-2): a read-method route that emits is a bus
+                // write — gate it like a mutation. A pure read-only `respond` flow
+                // (no emit) stays open, as does an emitting read once authorized.
+                if let Some(tok) = &wtoken {
+                    if is_read_method(&method)
+                        && flow_emits(&root, &file)
+                        && !bearer_authorized(&request, tok)
+                    {
+                        return respond(
+                            request,
+                            401,
+                            "unauthorized: this endpoint writes to the bus; set Authorization: Bearer <VEJAS_TOKEN>".into(),
+                            "text/plain",
+                        );
+                    }
+                }
                 let body = read_body(&mut request);
                 let mut ev = match body {
                     Value::Object(o) => o,
@@ -4054,6 +4102,43 @@ mod tests {
             assert!(guard_path(&root, "flows/inner.vjs").is_some());
             let _ = std::fs::remove_file(&outside);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_gate_classifies_methods() {
+        use tiny_http::Method;
+        // reads stay open …
+        assert!(is_read_method(&Method::Get));
+        assert!(is_read_method(&Method::Head));
+        // … every other verb is a mutation → gated (Finding A: not just POST).
+        assert!(!is_read_method(&Method::Post));
+        assert!(!is_read_method(&Method::Put));
+        assert!(!is_read_method(&Method::Patch));
+        assert!(!is_read_method(&Method::Delete));
+    }
+
+    #[test]
+    fn flow_emits_detects_bus_writers() {
+        // Finding A (volet-2): a read-method /api flow that emits is a bus writer
+        // and must be gated; a pure respond-only read is not.
+        let root = std::env::temp_dir().join(format!("vejas-emits-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("audit.vjs"),
+            "api \"GET /thing\"\nemit \"vx.audit.read\", {who: \"x\"}\nrespond 200, {ok: true}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("flows").join("read.vjs"),
+            "api \"GET /thing\"\nrespond 200, {ok: true}\n",
+        )
+        .unwrap();
+        assert!(flow_emits(&root, "flows/audit.vjs"), "an emitting flow is a bus writer");
+        assert!(!flow_emits(&root, "flows/read.vjs"), "a respond-only flow is a pure read");
+        // a path escaping root resolves to no flow → treated as non-emitting (the
+        // top-level method gate and guard_path already bar it from running).
+        assert!(!flow_emits(&root, "/etc/passwd"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
