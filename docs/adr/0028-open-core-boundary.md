@@ -1,7 +1,6 @@
 # 0028 — The open-core boundary
 
-- Status: Proposed (the final accept is the founder's — this records the
-  reasoning and the line)
+- Status: Accepted (founder, 2026-08-23, after cross-review)
 - Date: 2026-08-23
 
 ## Context
