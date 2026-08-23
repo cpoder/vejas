@@ -1216,25 +1216,59 @@ fn collect_static(
 }
 
 impl Program {
-    /// Does this flow contain ANY `emit` — including one to a dynamically computed
-    /// subject? `emit_subjects` lists only STATICALLY resolvable subjects (a string
-    /// literal or a surface constant), so it is NOT a "does this write the bus"
-    /// signal: a flow that emits to `f"vx.out.{x}"` or a lowercase local has an
-    /// EMPTY emit_subjects yet publishes at runtime. The write gate must gate on
-    /// this (any emit at all), not on emit_subjects (Finding A').
-    pub fn has_emit(&self) -> bool {
-        fn walk(stmts: &[Stmt]) -> bool {
-            stmts.iter().any(|s| match s {
-                Stmt::Emit(_, _) => true,
-                Stmt::If(arms, otherwise) => {
-                    arms.iter().any(|(_, _, b)| walk(b))
-                        || otherwise.as_deref().map(walk).unwrap_or(false)
-                }
-                Stmt::For(_, _, b) => walk(b),
-                _ => false,
-            })
+    /// Does this flow write to the bus — directly via `emit`, or INDIRECTLY via a
+    /// service `invoke` (a service can `emit`, and its emits are appended to this
+    /// flow's at runtime)? This is the "is it a pure read?" test the write gate
+    /// needs: a read-method /api route may run unauthenticated ONLY if it neither
+    /// emits nor invokes ANYWHERE.
+    ///
+    /// It must be a full AST visitor, not `emit_subjects`/`invokes`: both are
+    /// static-resolution lists (for the panel/graph) and UNDER-approximate — a
+    /// dynamic emit subject (Finding A') and an `invoke` nested in a subexpression
+    /// (Finding A'') are invisible to them. Conservative over-approximation: ANY
+    /// emit or ANY invoke, wherever it sits, counts. A read flow that invokes a
+    /// pure-formatting service is gated too (fail-closed — the operator adds the
+    /// token); resolving invoked services transitively to un-gate those is a later
+    /// refinement. Exhaustive matches (no `_`) so a new Stmt/Expr variant fails to
+    /// compile here rather than silently escaping the gate.
+    pub fn writes_bus(&self) -> bool {
+        stmts_write_bus(&self.stmts)
+    }
+}
+
+fn stmts_write_bus(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Emit(_, _) => true,               // a direct bus write
+        Stmt::InvokeMerge(_, _) => true,        // a service invoke — the service may emit
+        Stmt::Assign(_, e) => expr_writes_bus(e),
+        Stmt::Respond(status, body) => expr_writes_bus(status) || expr_writes_bus(body),
+        Stmt::If(arms, otherwise) => {
+            arms.iter().any(|(cond, _, body)| expr_writes_bus(cond) || stmts_write_bus(body))
+                || otherwise.as_deref().map(stmts_write_bus).unwrap_or(false)
         }
-        walk(&self.stmts)
+        Stmt::For(_, iter, body) => expr_writes_bus(iter) || stmts_write_bus(body),
+    })
+}
+
+/// True if evaluating `e` could invoke a service (which may emit). `Invoke` in any
+/// position — an arg, a dict value, an f-string hole, a condition — counts.
+fn expr_writes_bus(e: &Expr) -> bool {
+    match e {
+        Expr::Invoke(_, _) => true,
+        Expr::Lit(_) | Expr::Var(_) => false,
+        Expr::FString(parts) => parts.iter().any(|p| match p {
+            FStringPart::Expr(e) => expr_writes_bus(e),
+            FStringPart::Lit(_) => false,
+        }),
+        Expr::Doc(pairs) => pairs.iter().any(|(_, e)| expr_writes_bus(e)),
+        Expr::Array(es) => es.iter().any(expr_writes_bus),
+        Expr::Field(b, _, _) => expr_writes_bus(b),
+        Expr::Index(a, b) => expr_writes_bus(a) || expr_writes_bus(b),
+        Expr::Projection(b) => expr_writes_bus(b),
+        Expr::Filter(a, b) => expr_writes_bus(a) || expr_writes_bus(b),
+        Expr::Call(_, args) => args.iter().any(expr_writes_bus),
+        Expr::Unary(_, b) => expr_writes_bus(b),
+        Expr::Bin(_, a, b) => expr_writes_bus(a) || expr_writes_bus(b),
     }
 }
 

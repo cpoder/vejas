@@ -2736,16 +2736,17 @@ fn publish_emits(emits: &[(String, Value)]) {
 }
 
 /// Run an API flow on the request event; map its `respond` to (status, body).
-/// Does the /api flow at `file` emit to the bus? Used to gate read-method routes
-/// that write (Finding A, volet-2). Uses `Program::has_emit` — ANY emit, including
-/// one to a dynamically computed subject — NOT `emit_subjects`, which lists only
-/// statically resolvable subjects and so misses `emit f"vx.{x}"` (Finding A': that
-/// gap let a dynamic-subject emitting GET publish to the bus unauthenticated).
-fn flow_emits(root: &Path, file: &str) -> bool {
+/// Does the /api flow at `file` write to the bus (an `emit`, or an `invoke` of a
+/// service that may emit)? Used to gate read-method routes that write (Finding A,
+/// volet-2). Uses the full AST visitor `Program::writes_bus` — NOT `emit_subjects`
+/// or `invokes`, which list only statically resolvable targets and so miss a
+/// dynamic emit subject (A') or an `invoke` nested in a subexpression (A''); either
+/// gap let a read-method flow publish to the bus unauthenticated.
+fn flow_writes_bus(root: &Path, file: &str) -> bool {
     guard_path(root, file)
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|src| vjs::parse(&src).ok())
-        .map(|prog| prog.has_emit())
+        .map(|prog| prog.writes_bus())
         .unwrap_or(false)
 }
 
@@ -3247,12 +3248,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         let m = method_str(&method);
         return match match_api_route(&root, &m, rel) {
             Some((file, params)) => {
-                // Finding A (volet-2): a read-method route that emits is a bus
-                // write — gate it like a mutation. A pure read-only `respond` flow
-                // (no emit) stays open, as does an emitting read once authorized.
+                // Finding A (volet-2, +A'/A''): a read-method route that writes the
+                // bus — via emit OR a service invoke — is a mutation; gate it. A
+                // pure read-only flow (no emit, no invoke) stays open, as does a
+                // writing read once authorized.
                 if let Some(tok) = &wtoken {
                     if is_read_method(&method)
-                        && flow_emits(&root, &file)
+                        && flow_writes_bus(&root, &file)
                         && !bearer_authorized(&request, tok)
                     {
                         return respond(
@@ -4132,37 +4134,39 @@ mod tests {
 
     #[test]
     fn flow_emits_detects_bus_writers() {
-        // Finding A (volet-2): a read-method /api flow that emits is a bus writer
-        // and must be gated; a pure respond-only read is not.
+        // Finding A (volet-2) + A'/A'': a read-method /api flow that writes the bus
+        // — directly (emit) or via a service invoke — must be gated; a pure
+        // respond-only read is not.
         let root = std::env::temp_dir().join(format!("vejas-emits-{}", std::process::id()));
         std::fs::create_dir_all(root.join("flows")).unwrap();
-        std::fs::write(
-            root.join("flows").join("audit.vjs"),
-            "api \"GET /thing\"\nemit \"vx.audit.read\", {who: \"x\"}\nrespond 200, {ok: true}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("flows").join("read.vjs"),
-            "api \"GET /thing\"\nrespond 200, {ok: true}\n",
-        )
-        .unwrap();
-        // Finding A': a DYNAMIC subject (lowercase local, invisible to
-        // emit_subjects) still emits at runtime → must be detected as a bus write.
-        std::fs::write(
-            root.join("flows").join("dyn.vjs"),
-            "api \"GET /thing\"\ns = \"vx.leak\"\nemit s, {x: 1}\nrespond 200, {ok: true}\n",
-        )
-        .unwrap();
-        assert!(flow_emits(&root, "flows/audit.vjs"), "an emitting flow is a bus writer");
-        assert!(!flow_emits(&root, "flows/read.vjs"), "a respond-only flow is a pure read");
-        // the dynamic-subject emitter has an EMPTY emit_subjects yet MUST gate
-        let dyn_src = std::fs::read_to_string(root.join("flows").join("dyn.vjs")).unwrap();
-        let dyn_prog = vjs::parse(&dyn_src).unwrap();
+        let w = |name: &str, body: &str| std::fs::write(root.join("flows").join(name), body).unwrap();
+        w("audit.vjs", "api \"GET /thing\"\nemit \"vx.audit.read\", {who: \"x\"}\nrespond 200, {ok: true}\n");
+        w("read.vjs", "api \"GET /thing\"\nrespond 200, {ok: true}\n");
+        // A': a DYNAMIC subject (lowercase local, invisible to emit_subjects).
+        w("dyn.vjs", "api \"GET /thing\"\ns = \"vx.leak\"\nemit s, {x: 1}\nrespond 200, {ok: true}\n");
+        // A'': invoke of a service (which may emit) — statement-level, in a respond
+        // arg, and nested in a dict value. All are invisible to emit_subjects and
+        // (for the nested one) to prog.invokes, yet all can write the bus.
+        w("inv_stmt.vjs", "api \"GET /thing\"\ninvoke notify(m: 1)\nrespond 200, {ok: true}\n");
+        w("inv_respond.vjs", "api \"GET /thing\"\nrespond 200, invoke notify(m: 1)\n");
+        w("inv_nested.vjs", "api \"GET /thing\"\nx = {a: invoke notify(m: 1)}\nrespond 200, {ok: true}\n");
+
+        assert!(flow_writes_bus(&root, "flows/audit.vjs"), "a literal emit writes the bus");
+        assert!(!flow_writes_bus(&root, "flows/read.vjs"), "a respond-only flow is a pure read");
+        // the dynamic-subject emitter has an EMPTY emit_subjects yet MUST gate (A')
+        let dyn_prog = vjs::parse(&std::fs::read_to_string(root.join("flows").join("dyn.vjs")).unwrap()).unwrap();
         assert!(dyn_prog.emit_subjects.is_empty(), "dynamic subject is invisible to emit_subjects");
-        assert!(flow_emits(&root, "flows/dyn.vjs"), "a dynamic-subject emit is still a bus write (A')");
+        assert!(flow_writes_bus(&root, "flows/dyn.vjs"), "a dynamic-subject emit still writes the bus (A')");
+        // invoke in any position writes the bus (A''); the nested case is invisible
+        // even to prog.invokes (statement-level static list).
+        assert!(flow_writes_bus(&root, "flows/inv_stmt.vjs"), "a statement invoke can emit (A'')");
+        assert!(flow_writes_bus(&root, "flows/inv_respond.vjs"), "an invoke in a respond arg can emit (A'')");
+        let nested = vjs::parse(&std::fs::read_to_string(root.join("flows").join("inv_nested.vjs")).unwrap()).unwrap();
+        assert!(nested.invokes.is_empty(), "a nested invoke is invisible to prog.invokes");
+        assert!(flow_writes_bus(&root, "flows/inv_nested.vjs"), "an invoke nested in a value can emit (A'')");
         // a path escaping root resolves to no flow → treated as non-emitting (the
         // top-level method gate and guard_path already bar it from running).
-        assert!(!flow_emits(&root, "/etc/passwd"));
+        assert!(!flow_writes_bus(&root, "/etc/passwd"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

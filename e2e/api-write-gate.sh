@@ -29,6 +29,12 @@ printf 'api "GET /audit"\nemit "vx.audit.read", {at: "x"}\nrespond 200, {ok: tru
 # a read-method flow that emits to a DYNAMICALLY computed subject (a lowercase
 # local, invisible to emit_subjects) — still a bus write, must be gated (A')
 printf 'api "GET /leak"\ns = "vx.leak.evt"\nemit s, {stolen: 1}\nrespond 200, {ok: true}\n' > "$R/flows/dyn.vjs"
+# a read-method flow whose bus write is INDIRECT — via a service invoke (the
+# service emits). No direct emit in the flow, so emit_subjects/has_emit miss it;
+# must still be gated (A''). The service is real so the with-token run succeeds.
+mkdir -p "$R/services"
+printf 'emit "vx.notified", {got: m}\n'                              > "$R/services/notify.vjs"
+printf 'api "GET /viainvoke"\ninvoke notify(m: 1)\nrespond 200, {ok: true}\n' > "$R/flows/inv.vjs"
 # a pure read: respond only, no emit — must stay OPEN
 printf 'api "GET /read"\nrespond 200, {ok: true}\n'                   > "$R/flows/read.vjs"
 
@@ -57,6 +63,12 @@ C=$(code "$H/api/leak")
 [ "$C" = "401" ] && ok "dynamic-subject emitting GET without token refused ($C)" || ko "dynamic-subject emitting GET NOT refused ($C) — bus write slips the gate"
 C=$(code -H "Authorization: Bearer $TOK" "$H/api/leak")
 [ "$C" = "200" ] && ok "dynamic-subject emitting GET with token allowed ($C)" || ko "dynamic-subject emitting GET with token blocked ($C)"
+
+echo "── a read-method flow that writes the bus via a service INVOKE is gated (A'')"
+C=$(code "$H/api/viainvoke")
+[ "$C" = "401" ] && ok "invoke-mediated bus write without token refused ($C)" || ko "invoke-mediated bus write NOT refused ($C) — indirect write slips the gate"
+C=$(code -H "Authorization: Bearer $TOK" "$H/api/viainvoke")
+[ "$C" = "200" ] && ok "invoke-mediated write with token allowed ($C)" || ko "invoke-mediated write with token blocked ($C)"
 
 echo "── a pure read (respond-only, no emit) stays OPEN"
 C=$(code "$H/api/read")
