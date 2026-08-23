@@ -1,6 +1,6 @@
 # 0026 — AMQP 0-9-1 (RabbitMQ): a sync connector on amiquip
 
-- Status: Proposed (spike — prototype in `connectors/amqp/`)
+- Status: Accepted (built — `connectors/amqp/`, verified vs a real RabbitMQ)
 - Date: 2026-08-23
 
 ## Context
@@ -86,11 +86,45 @@ adapter for amqps:// before certifying a production recipe.
   and the graceful-failure paths; the amiquip-vs-live-RabbitMQ behaviour is
   certified out-of-band with a RabbitMQ container.
 
+## Build outcome (2026-08-23) — verified against a real RabbitMQ
+
+Cyril's directive ("rabbitmq installs fine in a container, test with it") lifted the
+spike's testability caveat. The connector was promoted to a full build and verified
+against a real `rabbitmq:3-alpine` (plaintext 5672 + a self-signed TLS listener on
+5671), in three increments:
+
+1. **publish_confirmed + durable declare** — the source is a sequential
+   consume→publish→ack loop, so it hit the nats 5ms flusher floor (spike measured
+   186/s); routed through the direct-flush `bus_publish_confirmed` helper (named to
+   avoid `AmqpSink::publish_confirmed`, the broker confirm). A real bug the fake
+   tests could not show: `pull_subscribe_with_options` only BINDS an existing
+   durable, so the standalone sink must `add_consumer` first (idempotent, on a
+   configurable `VEJAS_STREAM`). Verified: full loopback bus → sink (publisher
+   confirm) → RabbitMQ → source (ack after pub-ack) → bus, 25/25, no loss/dup.
+2. **rustls TLS (Q1 resolved)** — amqps:// works with NO openssl-sys: a mio-0.6
+   `TcpStream` wrapped in a rustls `StreamOwned`, `Evented` delegated to the inner
+   socket (`tls.rs`), fed to `insecure_open_stream`. rustls 0.22 is already in the
+   tree via nats (ring), so zero new crypto weight. The worry was whether the lazy
+   rustls handshake drives through amiquip's mio loop (WouldBlock mid-handshake) —
+   it does: verified against the 5671 listener, the handshake completes and a full
+   loopback flows 15/15 end-to-end over TLS.
+3. **singleton lease** — the source takes a JetStream KV lease (reused from the MQ
+   connector, `amqp_source_<queue>` namespace); `VEJAS_AMQP_COMPETING=1` opts out.
+   Verified: mutual exclusion + CAS fencing vs real NATS KV, acquire on start /
+   release on shutdown.
+
+Config: `VEJAS_AMQP_MODE` source|sink, `VEJAS_AMQP_URL` (amqp:// or amqps://),
+`VEJAS_AMQP_QUEUE`, `VEJAS_AMQP_SUBJECT`, `VEJAS_AMQP_ROUTING_KEY` (sink),
+`VEJAS_AMQP_DURABLE` (sink), `VEJAS_STREAM`, `VEJAS_AMQP_COMPETING` (source),
+`VEJAS_AMQP_TLS_CA` / `VEJAS_AMQP_TLS_SERVER_NAME` (amqps). Real-broker certification
+in CI (a lightweight RabbitMQ container, like mosquitto for MQTT) is the peer's lane.
+
 ## Open questions (for review / the build)
 
-1. The rustls-`IoStream` adapter — confirm the `Evented` delegation drives amiquip's
-   mio loop correctly through a TLS handshake (WouldBlock during handshake is the
-   fiddly bit). Prototype it against a TLS RabbitMQ before the production recipe.
+1. ~~The rustls-`IoStream` adapter — confirm the `Evented` delegation drives
+   amiquip's mio loop correctly through a TLS handshake.~~ **RESOLVED** (see Build
+   outcome): verified against a real TLS RabbitMQ — handshake completes, 15/15
+   loopback over TLS, no openssl-sys.
 2. Publisher-confirm batching — confirm-per-message is simplest and matches the
    ack-per-message pull; if throughput needs it, confirm in batches and ack the bus
    batch only after the batch confirm. Measure on the bench first.
