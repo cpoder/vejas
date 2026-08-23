@@ -3730,6 +3730,17 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/connectors/new") => {
+            // Governed mode + cluster guard, exactly like /flows/new: a connector
+            // is generated and HOT-STARTED (and can be an exec driver — arbitrary
+            // CMD), so a direct create must be refused and routed to a proposal.
+            // (Finding B: this path was missing both guards while its twin had them,
+            // giving an agent a governance bypass and an RCE with no human approval.)
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let prompt = body["prompt"].as_str().unwrap_or("").to_string();
             if prompt.trim().is_empty() {

@@ -74,6 +74,8 @@ jobs:
         run: e2e/security-traversal.sh
       - name: Write gate holds across verbs (ADR-0029 R7 — Finding A regression)
         run: e2e/api-write-gate.sh
+      - name: Governed mode gates every write (ADR-0024/R7 — Finding B regression)
+        run: e2e/governed-gate.sh
       - name: Docs book builds (broken includes fail here, not on deploy)
         run: |
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz
