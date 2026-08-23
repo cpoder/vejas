@@ -41,6 +41,15 @@ pressure-test.
   it. Probe for routes that bypass the gate (path normalization, casing,
   trailing slashes, the dynamic `/proposals/…` prefix). Confirm no GET leaks a
   secret value or a token.
+- **Reads are public by design.** Even with `VEJAS_TOKEN` set, GET routes
+  (`/file`, `/surface`, `/rules`, `/graph`, `/topology`, `/events`,
+  `/metrics`, `/dlq`) stay open: they expose the integration **logic** — flow
+  source, the business surface, the pipeline — but **never a secret value**
+  (`/secrets` returns status only, verified; and since the symlink fix in S3,
+  `/file` cannot read outside the root). If that logic is itself sensitive,
+  the write-API port belongs on a trusted network or behind the operator's own
+  auth. Gating reads as well — which requires the panel to carry the token — is
+  a deferred product decision, not a runtime bug.
 
 ### S2 — Governed mode (the approval gate)
 
@@ -70,9 +79,16 @@ pressure-test.
   secrets in their **environment, never on argv**.
 - **How to test:** confirm there is no path that turns runtime *input* (an
   event body, an HTTP param, a proposal payload) into a `CMD` string or a
-  new manifest without passing the write gate. Inspect `guard_path` for
-  traversal (`..`, absolute paths, symlinks). Confirm `secret()` values never
-  appear in `/proc/<pid>/cmdline` for exec children.
+  new manifest without passing the write gate. `guard_path` **contains
+  traversal** — `..`, absolute escapes, wrong extensions, **and symlinks**: the
+  resolved path is canonicalized and required to stay under
+  `root.canonicalize()`, so a `*.vjs` symlink to `/etc/passwd` or the secrets
+  file is refused (regression-tested in `e2e/security-traversal.sh`). Residual
+  and out of scope for a static-attacker model: a TOCTOU race that swaps a
+  symlink *between* the check and the read needs an active racing process, not
+  a statically planted link (e.g. from a merged recipe PR) — the practical hole
+  is closed. Confirm `secret()` values never appear in `/proc/<pid>/cmdline`
+  for exec children.
 
 ### S4 — Secrets
 
@@ -93,15 +109,21 @@ pressure-test.
 
 - **Threat:** the one deliberately unauthenticated surface is used to do more
   than publish an event.
-- **Claimed invariant:** `http-in` **only** publishes a JSON body to
-  `vx.<suffix>` on its own port and answers `202` after the JetStream pub-ack.
-  It cannot mutate config, read secrets, or reach the write API. Non-JSON is
-  rejected; the subject is derived from the path, not from privileged input.
-- **How to test:** confirm no `http-in` request can reach a mutation route or
-  a secret; fuzz the subject suffix for injection into subject space
-  (`.`, `>`, `*`, traversal) that could publish outside the intended prefix;
-  confirm body-size / malformed-JSON handling; confirm it shares no port with
-  the write API.
+- **Claimed invariant:** `http-in` cannot mutate config, read secrets, or reach
+  the write API (a separate port); it publishes a JSON body to `vx.<suffix>`
+  and answers `202` after the pub-ack; non-JSON is rejected. **Honest bound:**
+  the suffix is caller-controlled, so it can publish to *any* `vx.*` subject —
+  **including one a sink consumes** (a Slack post, an MQPUT). The blast radius
+  is therefore "inject any bus event," not "publish to a source only." The
+  optional `ALLOW` list restricts the surface to declared suffixes/prefixes
+  (recommended, defence in depth); without it the port is any unauthenticated
+  webhook — it belongs behind the operator's ingress / trust boundary.
+- **How to test:** confirm `http-in` reaches no mutation route or secret;
+  with `ALLOW` set, confirm a suffix outside it is refused (`403`) and a
+  permitted one still publishes (`e2e` covers this); without `ALLOW`, confirm
+  the honest bound above is documented, not surprising; fuzz the suffix for
+  injection into subject space (`.`, `>`, `*`, traversal) beyond the intended
+  prefix; confirm it shares no port with the write API.
 
 ### S6 — The control plane (`vxc.*`, provision / CONTROL)
 
@@ -147,8 +169,11 @@ even when the assumptions hold** is a bug to fix before distribution.
 - Exec drivers are RCE for whoever can author a manifest — that actor is the
   operator, by definition. The audit's job is to prove *runtime input* cannot
   become an authored manifest (S3), not to remove the escape hatch.
-- `http-in` is unauthenticated — its blast radius is bounded to "publish one
-  event" (S5); the audit's job is to prove that bound is tight.
+- `http-in` is unauthenticated — its blast radius is "inject any bus event,
+  including one a sink consumes" (S5, honest bound). `ALLOW` tightens it to the
+  operator's declared subjects; the port otherwise belongs behind the
+  operator's ingress. The audit's job is to prove nothing worse than bus
+  injection is reachable, and that `ALLOW` holds when set.
 
 ## A passing audit
 

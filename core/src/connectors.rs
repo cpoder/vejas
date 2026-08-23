@@ -188,7 +188,7 @@ impl Driver for HttpIn {
         "source:webhook"
     }
     fn about(&self) -> &'static str {
-        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT."
+        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT, ALLOW (optional list of permitted subject suffixes/prefixes — this port is unauthenticated, so restrict it to your ingest subjects; without ALLOW any vx.* subject is reachable)."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let port = ctx.config.u64_or("PORT", 8787) as u16;
@@ -196,9 +196,24 @@ impl Driver for HttpIn {
         // measured: /ingest p50 5.2ms→0.77ms, no throughput regression at conc=32);
         // _js keeps the stream ensured.
         let (_js, nc) = ctx.jetstream_and_conn()?;
+        // Optional ALLOW: the subjects this unauthenticated surface may publish to.
+        // Absent = any suffix (compat); set = only these (defence in depth, ADR-0029
+        // R7 F2 — recommended when the port is reachable by anyone but the operator).
+        let allow: Arc<Vec<String>> = Arc::new(
+            ctx.config
+                .value("ALLOW")
+                .and_then(|v| v.as_array().cloned())
+                .map(|a| a.into_iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+        );
         let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).ok();
-        eprintln!("[{}] http-in on :{port}, publishing under {}.*", ctx.name, ctx.subj_root);
+        eprintln!(
+            "[{}] http-in on :{port}, publishing under {}.*{}",
+            ctx.name,
+            ctx.subj_root,
+            if allow.is_empty() { String::new() } else { format!(" (ALLOW {:?})", allow) }
+        );
         for s in listener.incoming() {
             if !ctx.alive() {
                 break;
@@ -208,7 +223,8 @@ impl Driver for HttpIn {
                     let nc = nc.clone();
                     let root = ctx.subj_root.clone();
                     let name = ctx.name.clone();
-                    thread::spawn(move || handle_http_in(&name, &mut sock, &nc, &root));
+                    let allow = allow.clone();
+                    thread::spawn(move || handle_http_in(&name, &mut sock, &nc, &root, &allow));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Poll responsively (stop is re-checked each turn) without a
@@ -223,7 +239,21 @@ impl Driver for HttpIn {
     }
 }
 
-fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, nc: &nats::Connection, subj_root: &str) {
+/// A request suffix is permitted if it exactly matches an ALLOW entry or sits
+/// under it as a subject-segment prefix (entry "shop" allows "shop.orders").
+fn suffix_allowed(suffix: &str, allow: &[String]) -> bool {
+    allow
+        .iter()
+        .any(|e| suffix == e || suffix.starts_with(&format!("{e}.")))
+}
+
+fn handle_http_in(
+    name: &str,
+    sock: &mut std::net::TcpStream,
+    nc: &nats::Connection,
+    subj_root: &str,
+    allow: &[String],
+) {
     // TCP_NODELAY: without it, the small response write + the client's delayed
     // ACK collide with Nagle for a ~40ms stall on every keep-alive request.
     sock.set_nodelay(true).ok();
@@ -286,6 +316,11 @@ fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, nc: &nats::Connect
                     ("400 Bad Request", "{\"error\":\"missing subject suffix\"}".to_string())
                 } else if serde_json::from_slice::<Value>(body).is_err() {
                     ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string())
+                } else if !allow.is_empty() && !suffix_allowed(suffix, allow) {
+                    // ALLOW set: this unauthenticated surface may only publish to the
+                    // declared subjects (defence in depth — without ALLOW a caller can
+                    // inject any vx.* event, a SINK subject included; ADR-0029 R7 F2).
+                    ("403 Forbidden", format!("{{\"error\":\"subject {suffix:?} not permitted by ALLOW\"}}"))
                 } else {
                     let subject = format!("{subj_root}.{suffix}");
                     match publish_confirmed(nc, &subject, body, Duration::from_secs(5)) {
@@ -2131,6 +2166,17 @@ mod tests {
         bad.insert("EXPAND".into(), json!([{"name": "ua", "list": "/users"}]));
         assert!(parse_expands(&Config(bad)).is_err());
         assert!(parse_expands(&Config::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn http_in_allow_matching() {
+        let allow = vec!["shop.orders".to_string(), "helpdesk".to_string()];
+        assert!(suffix_allowed("shop.orders", &allow)); // exact
+        assert!(suffix_allowed("shop.orders.eu", &allow)); // segment prefix
+        assert!(suffix_allowed("helpdesk.tickets", &allow)); // segment prefix
+        assert!(!suffix_allowed("slack.out", &allow)); // the F2 sink-injection case
+        assert!(!suffix_allowed("shop", &allow)); // a prefix of an entry is NOT under it
+        assert!(!suffix_allowed("shop.ordersX", &allow)); // segment boundary respected
     }
 
     #[test]
