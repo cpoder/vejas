@@ -13,19 +13,25 @@
 //! loudly** — never the inverse (a silent overlay masking a deploy, or a ghost
 //! flow after `git rm`).
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 const VERSIONS_BUCKET: &str = "VEJAS_VERSIONS";
 const VERSIONS_HISTORY: i64 = 64; // bounded rollback/audit history per flow (ADR-0021)
 
 /// Content hash of a flow's source — the version id and the baseline fingerprint.
-/// A 64-bit non-cryptographic hash is enough to detect "did this content change".
+/// FNV-1a (64-bit), a FIXED algorithm: `DefaultHasher` is explicitly "not to be
+/// relied upon over releases", so during a rolling deploy (mixed binary versions)
+/// two instances could hash the same baseline differently → spurious overlay
+/// evictions / proposal expiries. A stable hash is required for the cluster
+/// comparisons this feeds (ADR-0021/0024). Non-cryptographic is fine: we only
+/// need "did this content change", not collision resistance.
 pub fn hash_content(s: &str) -> String {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{hash:016x}")
 }
 
 /// A flow name as a KV key token (KV keys disallow the same characters as subjects).
