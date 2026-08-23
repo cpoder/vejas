@@ -135,6 +135,7 @@ fn run_source(
     alive: impl Fn() -> bool,
 ) -> Result<(), String> {
     eprintln!("[vejas-mq] source: MQ → {subject} (get→publish→commit)");
+    let mut fails: u32 = 0;
     while alive() {
         let got = broker
             .get_syncpoint(wait)
@@ -145,11 +146,23 @@ fn run_source(
                 // JetStream pub-ack received (message is durable on the bus) →
                 // safe to remove it from MQ.
                 broker.commit().map_err(|e| format!("commit after publish: {e}"))?;
+                fails = 0;
             }
             Err(e) => {
                 // bus not confirmed → leave the message on the queue.
                 eprintln!("[vejas-mq] publish failed ({e}); MQBACK, will re-get");
                 broker.backout().map_err(|e| format!("backout: {e}"))?;
+                // Progressive backoff: without it, a bus outage spins get→publish-
+                // fail→MQBACK at ~600/s, hammering the queue manager. Back off 100ms
+                // doubling to 5s, reset on the next success. Sleep in short ticks so
+                // a stop is still noticed promptly.
+                fails = fails.saturating_add(1);
+                let backoff_ms = (50u64 << fails.min(7)).min(5000);
+                let mut slept = 0u64;
+                while slept < backoff_ms && alive() {
+                    std::thread::sleep(Duration::from_millis(50));
+                    slept += 50;
+                }
             }
         }
     }
@@ -272,6 +285,18 @@ fn main() {
             .and_then(|mut q| run_source(&mut q, &nc, &cfg.subject, cfg.wait, source_alive))
     } else {
         // durable pull consumer, competing-safe by its own durable (SUBJECTS.md).
+        // pull_subscribe_with_options only BINDS an existing durable — the runtime
+        // owns the stream, but a standalone connector must declare the consumer
+        // first (idempotent), or binding 404s. VEJAS_STREAM names the stream.
+        let stream = env_or("VEJAS_STREAM", "VEJAS");
+        let _ = js.add_consumer(
+            &stream,
+            nats::jetstream::ConsumerConfig {
+                durable_name: Some(cfg.durable.clone()),
+                filter_subject: cfg.subject.clone(),
+                ..Default::default()
+            },
+        );
         let sub = js
             .pull_subscribe_with_options(
                 &cfg.subject,
