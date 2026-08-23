@@ -154,6 +154,22 @@
   .run details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 4px; }
   .run .err { color: var(--err); }
 
+  /* approval queue (ADR-0024) */
+  .prop { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 8px 0;
+          background: var(--wash); }
+  .prop-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+               flex-wrap: wrap; font-size: 13.5px; color: var(--ink); }
+  .prop-head code { font: 12px var(--mono); color: var(--accent); }
+  .prop-meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .prop-noev { margin: 8px 0 2px; font-size: 12.5px; font-weight: 650; color: var(--err);
+               background: rgba(201,42,42,.09); border: 1px solid var(--err); border-radius: 8px;
+               padding: 7px 10px; }
+  .prop-ev { margin: 8px 0 2px; }
+  .prop-ev summary { cursor: pointer; color: var(--ink2); font-size: 12.5px; }
+  .prop-history { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+                  font-size: 12.5px; color: var(--muted); line-height: 1.8; }
+  .prop-history code { font: 11.5px var(--mono); color: var(--ink2); }
+
   textarea.editor { width: 100%; min-height: 220px; font: 13px/1.55 var(--mono);
     border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
     color: var(--ink); padding: 12px 14px; resize: vertical; }
@@ -219,6 +235,17 @@
     <h2>Dead letters</h2>
     <p class="sub">Poison messages parked instead of dropped (ADR-0015). Fix the cause (edit the literal above, shadow-replay it), then replay — or discard.</p>
     <div id="dlq"></div>
+  </div>
+
+  <div class="card" id="proposals-card" style="display:none">
+    <h2>Approval queue <span class="badge" title="Governed-change mode (ADR-0024): agents propose, a human approves.">governed</span></h2>
+    <p class="sub">An agent proposes a change; you decide what it should mean. Approving executes it (a set_literal promotes, hot-reloaded). Approve/Reject need the approval token — distinct from the agent's, so the agent that proposed cannot approve itself.</p>
+    <div style="margin:8px 0">
+      <input type="password" id="approval-token" class="rule" style="max-width:300px" autocomplete="off"
+             placeholder="approval token (VEJAS_APPROVAL_TOKEN)">
+      <span class="hint">held in this tab only, never stored</span>
+    </div>
+    <div id="proposals"></div>
   </div>
 
   <div class="card">
@@ -901,6 +928,77 @@ async function loadDlq() {
 }
 loadDlq();
 setInterval(loadDlq, 5000);
+
+/* ---------- approval queue (ADR-0024) ---------- */
+// What a proposal would change, in one human line — keyed on its kind.
+function proposalChange(p) {
+  const pl = p.payload || {};
+  if (p.kind === 'set_literal' || p.kind === 'version') {
+    const target = `${esc(pl.file || '?')} › ${esc(pl.name || '?')}` + (pl.key && pl.key !== '-' ? '.' + esc(pl.key) : '');
+    return `<code>${target}</code> <span class="arrow">→</span> <code>${esc(trunc(pl.value, 48))}</code>`;
+  }
+  return `<code>${esc(p.kind)}</code> ${esc(trunc(JSON.stringify(pl), 60))}`;
+}
+// Evidence is the whole point of the queue — show it, and if there is none say so
+// LOUD (approving blind is a decision the operator should make on purpose).
+function evidenceBlock(p) {
+  const e = p.evidence;
+  const empty = e == null || (typeof e === 'object' && !Array.isArray(e) && Object.keys(e).length === 0)
+                || (Array.isArray(e) && !e.length) || e === '';
+  if (empty) {
+    return `<div class="prop-noev">⚠ No evidence attached — approving this is a blind change.</div>`;
+  }
+  const pretty = (() => { try { return JSON.stringify(e, null, 2); } catch { return String(e); } })();
+  const oneLine = typeof e === 'object' ? Object.entries(e).map(([k,v]) => `${k}: ${trunc(v, 40)}`).join(' · ') : String(e);
+  return `<details class="prop-ev"><summary>evidence — ${esc(trunc(oneLine, 80))}</summary><pre class="payload-full">${esc(pretty)}</pre></details>`;
+}
+const PROP_STATUS_COLOR = { pending: 'var(--accent)', approved: 'var(--ok)', rejected: 'var(--muted)', expired: 'var(--err)' };
+async function decideProposal(id, action) {
+  const tok = ($('#approval-token').value || '').trim();
+  if (!tok) return toast('Enter the approval token first', true);
+  try {
+    const res = await fetch('/proposals/' + encodeURIComponent(id) + '/' + action, {
+      method: 'POST', headers: { 'X-Approval-Token': tok } });
+    if (!res.ok) throw new Error(await res.text());
+    toast(action === 'approve' ? 'Approved — change applied, flow reloaded' : 'Rejected');
+    await loadProposals();
+    if (action === 'approve') await load();
+  } catch (e) { toast(e.message.slice(0, 160), true); }
+}
+async function loadProposals() {
+  try {
+    const all = (await fetch('/proposals').then(r => r.json())).proposals || [];
+    const card = document.getElementById('proposals-card');
+    if (!all.length) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    const pending = all.filter(p => p.status === 'pending');
+    const decided = all.filter(p => p.status !== 'pending').slice(0, 6);
+    const ago = ts => { const s = Math.max(0, Math.floor(Date.now()/1000) - (ts||0));
+      return s < 60 ? s+'s' : s < 3600 ? Math.floor(s/60)+'m' : Math.floor(s/3600)+'h'; };
+    const pendingHtml = pending.length ? pending.map(p => `
+      <div class="prop">
+        <div class="prop-head">
+          <span>${proposalChange(p)}</span>
+          <span class="prop-meta">by <code>${esc(p.author || '?')}</code> · ${ago(p.created_at)} ago</span>
+        </div>
+        ${evidenceBlock(p)}
+        <div class="toolbar">
+          <button class="apply" style="background:var(--accent);border-color:var(--accent);color:var(--accent-ink)"
+                  onclick="decideProposal('${esc(p.id)}','approve')">Approve</button>
+          <button class="tool" onclick="decideProposal('${esc(p.id)}','reject')">Reject</button>
+        </div>
+      </div>`).join('')
+      : '<span style="color:var(--muted)">No proposals awaiting a decision.</span>';
+    const decidedHtml = decided.length ? `<div class="prop-history">` + decided.map(p => {
+      const c = PROP_STATUS_COLOR[p.status] || 'var(--muted)';
+      return `<div>· ${proposalChange(p)} — <span style="color:${c}">${esc(p.status)}</span>` +
+             (p.decided_by ? ` by <code>${esc(p.decided_by)}</code>` : '') + `</div>`;
+    }).join('') + `</div>` : '';
+    document.getElementById('proposals').innerHTML = pendingHtml + decidedHtml;
+  } catch {}
+}
+loadProposals();
+setInterval(loadProposals, 5000);
 
 // Overlay-eviction banner (ADR-0021): a live promote superseded by a git deploy.
 async function loadEvictions() {
