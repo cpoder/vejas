@@ -64,3 +64,5 @@ jobs:
         run: e2e/admission/run.sh
       - name: Transport invariants (ROADMAP Phase 4)
         run: e2e/transport/run.sh
+      - name: Offset-resume invariant (ADR-0022, kill -9 mid-stream)
+        run: e2e/offset-resume.sh
