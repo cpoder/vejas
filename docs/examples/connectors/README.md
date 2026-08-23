@@ -55,9 +55,13 @@ actually flowing. Run locally: `e2e/admission/run.sh [name]`.
 
 A flat `.vjs.example` outside a directory is a draft, not a connector.
 
-**Twelve certified recipes**: ServiceNow (poll + create), Jira (poll +
+**Fourteen certified recipes**: ServiceNow (poll + create), Jira (poll +
 create), Slack, Workday RaaS, Stripe events, Shopify order webhook,
 SendGrid email, GitHub issues, PagerDuty events, Discord webhook — every
 one admitted by CI against its mock, credentials vaulted, data flow
-proven. The webhook recipe (Shopify) is tested end to end through its own
+proven — plus **Kafka source and sink** (exec-bridge over kcat, ADR-0022),
+admitted under a **stated exception**: a meaningful broker mock would be a
+broker, so CI enforces lint + parse and the offset-resume mechanism's own
+test, and the exception file says exactly what to verify against a dev
+broker. The webhook recipe (Shopify) is tested end to end through its own
 ingest: POST the fixture, see it on the bus.

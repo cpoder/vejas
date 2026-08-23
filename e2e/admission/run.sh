@@ -54,6 +54,14 @@ PY
   if [ -n "$LINT" ]; then echo "  ✗ lint: literal credential(s): $LINT"; fail=1; continue; fi
   "$BIN" vjs-check "$MANIFEST" > /dev/null || { echo "  ✗ parse"; fail=1; continue; }
 
+  # ── stated exception (ADR-0017): remote not meaningfully mockable ─────
+  # Lint + parse are still enforced above; the exception file says what was
+  # verified instead, and its first line is printed so it is never silent.
+  if [ -f "$DIR/EXCEPTION.md" ]; then
+    echo "  ✓ admitted (stated exception: $(head -1 "$DIR/EXCEPTION.md" | sed 's/^#* *//'))"
+    continue
+  fi
+
   # ── stage: mock + throwaway root + dummy secrets ──────────────────────
   STORE=$(mktemp -d); ROOT=$(mktemp -d)
   mkdir -p "$ROOT/connectors"
