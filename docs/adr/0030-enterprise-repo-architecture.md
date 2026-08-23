@@ -52,32 +52,53 @@ may hit `/proposals/approve`) and forwards only what passes, stamped with the
 core token. This is the standard enterprise-auth layering and needs **zero core
 change** — the core keeps its one-token primitive.
 
+**RBAC grain, stated honestly.** The proxy can enforce RBAC by anything the
+documented request carries — file, package, endpoint, subject, and the literal's
+*shape* from `GET /surface` (table / scalar / list). It **cannot** see *business*
+category — "may edit thresholds, not output routes" lives in the expert's head,
+not in `{file, name, key}`. So **RBAC v1 is coarse**: by file / package /
+endpoint / subject — 100% inspectable, zero new seam, and enough for most.
+Per-business-category RBAC is a *later* increment with its own public-safe seam
+(a readable `@surface-class` tag on literals that `GET /surface` exposes, mapped
+class→role), added the day a design partner asks — not assumed free via the proxy
+now.
+
 **N-approver policy** rides the same seam: the core's *single approve* is the
 primitive; the proxy/console holds the policy — a proposal is forwarded to the
 core's approve endpoint only once N distinct authenticated approver identities
 have signed off. Governed mode (ADR-0024) stays the mechanism; the enterprise
 layer is the workflow on top.
 
-### Candidate public-safe seam additions (added when a feature needs them)
+### The one seam act 5 needs up front: a generic actor header
 
-Some enterprise features want a *little* more from a seam. Anything added lands
-in the **public** core, stays useful open, and is added only when the feature
-needs it — never a closed appendage:
+The proxy forwards every request stamped with the single core token, so without
+more, the core — and therefore `VEJAS_AUDIT` and the SIEM export — sees every
+mutation as "the proxy did it." Attribution to a *user* is impossible. That
+blinds **two of the four attachments** (SIEM export, and the RBAC audit "who
+edited this threshold"), not just N-approver — so this seam is not just-in-time;
+it lands **with the authproxy, in increment 1**:
 
-- An optional **actor identity** on the approve endpoint, so the audit records
-  *who* approved (the proxy supplies it after authenticating). Useful to an
-  open single operator naming themselves; required by N-approver.
+- An optional **`X-Vejas-Actor`** header that *every* mutating endpoint records
+  in the audit when present (the proxy sets it after authenticating). Absent,
+  behaviour is unchanged — the current fixed `panel`/`mcp` actor. It is useful
+  even open (a solo operator names themselves) and is what makes the audit trail
+  real once identities exist. Not a hook: a header the audit already writes just
+  learns to read.
 
-If a future need cannot be met by a public-safe seam, that is the signal to
-re-examine the boundary in an ADR — not to add closed code.
+Every *other* seam is added just-in-time, lands in the **public** core, stays
+useful open, and is never a closed appendage. If a future need cannot be met by
+a public-safe seam, that is the signal to re-examine the boundary in an ADR — not
+to add closed code.
 
 ### Sequencing (R4: early and sellable)
 
 Build order follows the graveyard rule "the enterprise tier must exist early
-and sellable, not late and polished": **`vejas-authproxy` (SSO + basic RBAC)
-first** — SSO is the first thing an enterprise buyer asks for and is sellable
-on its own. Then the fleet console, N-approver, and SIEM export, each an
-increment that a design partner can pull.
+and sellable, not late and polished": **increment 1 = `vejas-authproxy` (SSO +
+coarse RBAC), paired with the public `X-Vejas-Actor` seam in the core** — SSO is
+the first thing an enterprise buyer asks for and is sellable on its own, and the
+actor seam ships with it so the audit is attributable from day one. Then the
+fleet console, N-approver, and SIEM export, each an increment that a design
+partner can pull.
 
 ## Consequences
 
