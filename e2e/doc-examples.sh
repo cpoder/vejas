@@ -100,14 +100,18 @@ assert any("ALERT_LEVELS" in json.dumps(r) for r in rs), rs' \
   || ko "/rules shape" "guides/rules-view.md"
 
 say "guides/change-safely — /surface/set edits one literal"
-# NOTE: editing an EXISTING key is the documented contract today; ADDING a
-# key is requested as a core feature (N1-legitimate) — when it lands, add
-# the "bloquante" assertion back and restore the stronger docs wording.
 curl -sf -o /dev/null -X POST http://127.0.0.1:8740/surface/set -H 'content-type: application/json' \
   -d '{"file":"flows/helpdesk_ticket_alerts.vjs","name":"SEVERITY_CODES","key":"haute","value":"P1"}' \
   && grep -q '"haute": "P1"' "$R/flows/helpdesk_ticket_alerts.vjs" \
-  && ok "the edit landed span-exact in the file" \
-  || ko "/surface/set" "guides/change-safely.md + concepts/business-surface.md"
+  && ok "editing an existing key lands span-exact in the file" \
+  || ko "/surface/set edit" "guides/change-safely.md + concepts/business-surface.md"
+# Adding a NEW key to an existing table is a data extension (N1) — the demo
+# gesture ("bloquante" → P1), no agent needed. It inserts span-exact and parses.
+curl -sf -o /dev/null -X POST http://127.0.0.1:8740/surface/set -H 'content-type: application/json' \
+  -d '{"file":"flows/helpdesk_ticket_alerts.vjs","name":"SEVERITY_CODES","key":"bloquante","value":"P1"}' \
+  && grep -q '"bloquante": "P1"' "$R/flows/helpdesk_ticket_alerts.vjs" \
+  && ok "adding a new table row lands span-exact in the file" \
+  || ko "/surface/set add-key" "guides/rules-view.md + concepts/business-surface.md"
 
 say "guides/observability — /metrics, /events, /healthz"
 M=$(curl -sf http://127.0.0.1:8740/metrics)

@@ -1798,33 +1798,65 @@ pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Resul
         .iter()
         .find(|e| e.name == name)
         .ok_or_else(|| format!("no literal assignment {name:?}"))?;
-    let (start, end) = if key.is_empty() || key == "-" {
-        entry.value_span
+    let span = if key.is_empty() || key == "-" {
+        Some(entry.value_span)
     } else {
         entry
             .entry_spans
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, span)| *span)
-            .ok_or_else(|| format!("{name} has no key {key:?}"))?
     };
-    // spans end at the NEXT token's start; trim only trailing whitespace so
-    // we replace exactly the literal's own text (separators are next tokens,
-    // therefore already excluded)
-    let mut end = end.min(src.len());
-    while end > start {
-        let c = src.as_bytes()[end - 1] as char;
-        if c == ' ' || c == '\t' || c == '\r' {
-            end -= 1;
-        } else {
-            break;
+    if let Some((start, end)) = span {
+        // Replace an existing value (whole constant, or one table entry).
+        // spans end at the NEXT token's start; trim only trailing whitespace so
+        // we replace exactly the literal's own text (separators are next tokens,
+        // therefore already excluded)
+        let mut end = end.min(src.len());
+        while end > start {
+            let c = src.as_bytes()[end - 1] as char;
+            if c == ' ' || c == '\t' || c == '\r' {
+                end -= 1;
+            } else {
+                break;
+            }
         }
+        let rendered = serde_json::to_string(new_value).map_err(|e| e.to_string())?;
+        let mut out = String::with_capacity(src.len() + rendered.len());
+        out.push_str(&src[..start]);
+        out.push_str(&rendered);
+        out.push_str(&src[end..]);
+        parse(&out)?;
+        return Ok(out);
     }
-    let rendered = serde_json::to_string(new_value).map_err(|e| e.to_string())?;
-    let mut out = String::with_capacity(src.len() + rendered.len());
-    out.push_str(&src[..start]);
-    out.push_str(&rendered);
-    out.push_str(&src[end..]);
+    // The key does not exist yet. Adding an entry to an existing table is a
+    // DATA extension (N1, ADR-0019) — a new transcoding row, not a structural
+    // change — so the expert does it from the panel without an agent. Only a
+    // dict/table can gain a key; a constant or list cannot.
+    let (vstart, vend) = entry.value_span;
+    let vend = vend.min(src.len());
+    let val_text = src[vstart..vend].trim_end();
+    let parsed: Value = serde_json::from_str(val_text)
+        .map_err(|_| format!("{name} has no key {key:?} and is not an editable table"))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| format!("{name} has no key {key:?} and is not a table — cannot add a key"))?;
+    let close = vstart
+        + val_text
+            .rfind('}')
+            .ok_or_else(|| format!("{name}: malformed table literal"))?;
+    let k = serde_json::to_string(&Value::String(key.to_string())).unwrap();
+    let v = serde_json::to_string(new_value).map_err(|e| e.to_string())?;
+    // span-exact insert before the closing brace; no leading comma into an empty {}
+    let insertion = if obj.is_empty() {
+        format!("{k}: {v}")
+    } else {
+        format!(", {k}: {v}")
+    };
+    let mut out = String::with_capacity(src.len() + insertion.len());
+    out.push_str(&src[..close]);
+    out.push_str(&insertion);
+    out.push_str(&src[close..]);
     parse(&out)?;
     Ok(out)
 }
@@ -2058,7 +2090,16 @@ mod tests {
         // and the result still runs
         let emits = eval_flow(&s3, json!({})).unwrap();
         assert_eq!(emits[0].1["n"], 999);
-        assert!(set_literal(src, "T", "absent", &json!("x")).is_err());
+        // Adding a NEW key to an existing table is a data extension (N1): it
+        // inserts span-exact and still parses/runs.
+        let s4 = set_literal(&s2, "T", "bloquante", &json!("P1")).unwrap();
+        assert!(s4.contains("\"bloquante\": \"P1\""));
+        assert!(s4.contains("\"haute\": \"P9\"")); // existing entries intact
+        eval_flow(&s4, json!({})).unwrap();
+        // …but only a table can gain a key — a constant or a list cannot, and a
+        // missing literal is still an error.
+        assert!(set_literal(src, "N", "bloquante", &json!("x")).is_err());
+        assert!(set_literal(src, "L", "bloquante", &json!("x")).is_err());
         assert!(set_literal(src, "NOPE", "-", &json!(1)).is_err());
     }
 
