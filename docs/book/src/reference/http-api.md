@@ -5,6 +5,14 @@ and MCP. With `VEJAS_TOKEN` set, every mutating route requires
 `Authorization: Bearer <token>`. In governed mode (ADR-0024) mutating routes
 answer with a didactic refusal pointing at the proposal queue.
 
+## Request headers
+
+| Header | On | Purpose |
+|---|---|---|
+| `Authorization: Bearer <token>` | every mutating route | Write protection, when `VEJAS_TOKEN` is set. |
+| `X-Approval-Token: <token>` | `/proposals/{id}/approve\|reject` | The human approval credential, distinct from `VEJAS_TOKEN` (ADR-0024). |
+| `X-Vejas-Actor: <id>` | any mutating route | *Optional.* Records **who** made the change in the audit trail; absent, the actor is `panel`. The enterprise auth proxy sets it after authenticating a user (ADR-0030) — useful open too, for a single operator naming themselves. Trimmed, capped at 128 chars. |
+
 ## Health & introspection
 
 | Route | Purpose |
