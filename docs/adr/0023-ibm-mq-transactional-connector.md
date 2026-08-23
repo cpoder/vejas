@@ -158,12 +158,15 @@ queue manager (does MQGET-under-syncpoint / MQCMIT behave as the fake models)
 need the free **MQ Developer** container and are certified out-of-band, not in the
 per-commit CI. What was verified above is what a build machine without MQ can prove.
 
-**Known follow-up (next increment):** the **singleton lease** (ADR-0020, "singleton
-by default BECAUSE order") is not yet enforced in the binary — `VEJAS_MQ_COMPETING`
-documents the mode and the default is intended to be ordered/single-getter, but
-until the lease is wired the operator runs one source instance to preserve order.
-A destructive MQGET is competing-*safe* (no duplication) regardless; only order is
-at stake, exactly as the concurrency section states.
+**Singleton lease — done.** The source takes a JetStream KV lease (`lease.rs`, the
+same create/CAS-renew/delete/TTL mechanism as the core runtime, reimplemented in
+the binary since it owns its own NATS client): exactly one instance gets, so the
+queue's order survives onto the bus. `VEJAS_MQ_COMPETING=1` skips the lease (N
+getters, throughput over order — a destructive MQGET is competing-*safe*, only
+order is traded). If the lease is fenced or ages out under a stall the renewal
+thread flags it and the source stops getting. Verified against real NATS KV: mutual
+exclusion (a second acquire is blocked until release) and CAS fencing (a stale
+revision cannot renew over a newer holder).
 
 ## Rejected
 

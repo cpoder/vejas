@@ -17,6 +17,7 @@
 //! broker with fault injection; real-queue-manager certification is the declared
 //! CI exception (ADR-0023, like SAP/ADR-0017).
 
+mod lease;
 mod mqi;
 
 use mqi::{Broker, MqMessage, MqiQueue};
@@ -210,8 +211,28 @@ fn main() {
     let js = nats::jetstream::new(nc.clone());
 
     let result = if cfg.mode == "source" {
+        // Singleton by default (ADR-0023, "because order"): take the lease so one
+        // instance gets. COMPETING skips it; no KV → run unleased (single instance).
+        let held = if cfg.competing {
+            None
+        } else if let Some(store) = lease::open_store(&js) {
+            let key = lease::source_key(&cfg.queue);
+            match lease::acquire_blocking(&store, &key, alive) {
+                Some(l) => Some(l),
+                None => {
+                    // asked to stop while standing by for the lease — clean exit.
+                    eprintln!("[vejas-mq] stopped before acquiring the lease");
+                    return;
+                }
+            }
+        } else {
+            eprintln!("[vejas-mq] no JetStream KV for the lease — running unleased (single instance)");
+            None
+        };
+        // stop getting if the lease is lost (fenced / aged out) as well as on signal
+        let source_alive = || alive() && held.as_ref().map_or(true, |l| !l.lost());
         MqiQueue::open(&cfg.qmgr, &cfg.queue, false)
-            .and_then(|mut q| run_source(&mut q, &js, &cfg.subject, cfg.wait, alive))
+            .and_then(|mut q| run_source(&mut q, &js, &cfg.subject, cfg.wait, source_alive))
     } else {
         // durable pull consumer, competing-safe by its own durable (SUBJECTS.md).
         let sub = js
