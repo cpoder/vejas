@@ -175,6 +175,34 @@ traffic: two silent `bloquante` tickets, then the correction, then the next
 fixed and re-validated live: two consecutive promotes, each visible in the
 next event within seconds. Validation that finds bugs is validation working.)*
 
+## Change a whole version, safely ✓
+
+> Here is the fix for the helpdesk flow: escalate the new "bloquante"
+> priority and add an `escalated` field to the alert. Test it against
+> yesterday's real traffic first, then watch it against live traffic —
+> nothing ships until I say so.
+
+The agent's path, every step governed:
+
+1. It writes the **candidate** version (a full flow, never deployed).
+2. `vejas_time_travel` — the candidate replays a window of **historical
+   real traffic** side by side with the live version; the diff comes back
+   joined per event (`seq`, before/after emits). Nothing is published — the
+   shadow invariant is structural, not a setting.
+3. `vejas_canary_start` — the candidate now shadow-follows **live**
+   traffic; `vejas_canary_status` shows the accumulating diff
+   (`{events, changed}`). Still zero real emits. A promote or deploy that
+   changes the baseline under the canary stops it with a reason — never a
+   silently stale diff.
+4. On your word: **promote**. In a cluster, that publishes a version every
+   instance converges on — measured at 60 ms, lossless mid-burst — with an
+   audit record (actor, from-hash → to-hash). Rollback is a promote to any
+   previous version, forward-only, previewable the same way.
+
+And the loop closes underneath: a dead letter's envelope carries the
+**version** that killed the message — replay it after the fix and the
+transition is on record (ADR-0021).
+
 ---
 
 *The generation contract behind every recipe: the agent must read

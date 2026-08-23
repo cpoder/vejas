@@ -83,6 +83,11 @@ it without touching code:
   the business surface (rendered from literals in the code). A correction is
   **shadow-replayed on the flow's last real events** — before/after diff, then
   promote or discard. You never click to draw a flow. (ADR-0005)
+- **Versioning** — a candidate version of a flow replays **yesterday's
+  real traffic** (time-travel) or shadow-follows **live** traffic (canary),
+  diffed side by side per event; unproven code never emits for real. Promote
+  publishes the version cluster-wide (measured: 60 ms, lossless), audited,
+  rollback included. (ADR-0021)
 - **MCP & API** — the runtime is its own MCP server; a flow that declares
   `tool "…"` becomes a first-class MCP tool, and one that declares
   `api "VERB /path"` becomes a synchronous HTTP endpoint with an auto-generated
