@@ -55,5 +55,15 @@ C=$(code "$H/api/read")
 C=$(code "$H/healthz")
 [ "$C" = "200" ] && ok "built-in read (/healthz) open ($C)" || ko "built-in read blocked ($C)"
 
+echo "── fail-closed: an unknown/exotic verb is gated BEFORE routing"
+C=$(code -X PURGE "$H/api/read")
+[ "$C" = "401" ] && ok "exotic verb (PURGE) without token → 401 (fail-closed)" || ko "exotic verb NOT gated ($C)"
+
+echo "── HEAD never executes a flow → no bus write via HEAD"
+# HEAD does not match a GET route, so the emitting flow never runs (404, not an
+# unauthenticated emit). More restrictive than strict HTTP, deliberately so.
+C=$(code -I "$H/api/audit")
+[ "$C" = "404" ] && ok "HEAD on GET route → 404, flow not executed (no emit)" || ko "HEAD on GET route unexpected ($C)"
+
 [ $fail -eq 0 ] && echo "WRITE GATE HOLDS" || echo "WRITE GATE REGRESSION — do not ship"
 exit $fail
