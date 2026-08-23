@@ -10,9 +10,9 @@ means*. The whole platform is drivable over MCP.
 Vėjas is the old Baltic god of the wind. Wind moves things without anyone
 drawing the route.
 
-**Status: young, but real** — it's early — two production customers so far — but
-real: it collects NIS2 supplier-compliance evidence across eight EU countries
-today. Interfaces still move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
+**Status: young, but real** — two production customers so far, collecting NIS2
+supplier-compliance evidence across eight EU countries today. Interfaces still
+move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
 [COOKBOOK](docs/COOKBOOK.md) · [VISION](docs/VISION.md) ·
 [ARCHITECTURE](docs/ARCHITECTURE.md) · [ROADMAP](docs/ROADMAP.md) ·
 [ADRs](docs/adr/). The bet, long-form:
