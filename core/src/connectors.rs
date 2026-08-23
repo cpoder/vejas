@@ -1477,7 +1477,9 @@ impl Driver for ExecStreamSource {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let env = ctx.config.env_vars();
         let restart = ctx.config.u64_or("RESTART_SECS", 2).max(1);
-        let js = ctx.jetstream()?;
+        // js for the offset KV store; nc for publish_confirmed (this streams stdout
+        // line-by-line sequentially — the exact ~200/s flusher-floor case).
+        let (js, nc) = ctx.jetstream_and_conn()?;
         // Optional offset resume: when OFFSET_KV is set, hand the child the last
         // committed offset as $OFFSET at (re)start (e.g. `kcat -o $OFFSET`) and
         // commit each record's OFFSET_FIELD after publishing it.
@@ -1535,7 +1537,7 @@ impl Driver for ExecStreamSource {
                             continue;
                         }
                         if let Ok(rec) = serde_json::from_str::<Value>(line) {
-                            match js.publish(&subject, line.as_bytes()) {
+                            match publish_confirmed(&nc, &subject, line.as_bytes(), Duration::from_secs(5)) {
                                 Ok(_) => {
                                     trace_pub(&ctx.name, &subject, line.as_bytes());
                                     // publish-before-commit: store next offset only
