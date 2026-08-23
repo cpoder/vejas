@@ -27,7 +27,7 @@ Read a script file (.vjs) or fixture (.json).
 
 ## `vejas_write_flow`
 
-Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.
+Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/`<pkg>`/flows|services|fixtures.
 
 ## `vejas_set_literal`
 
@@ -99,7 +99,7 @@ Synchronously test one connector instance: evaluate its manifest with the real s
 
 ## `vejas_provision`
 
-Instantiate a tenant package from a template (templates/<name>/, ${param} substitution, every file parse-checked, hot-started). Returns created files, started units and the secret references left to write. Refuses an existing package unless force (which overwrites template-rendered files).
+Instantiate a tenant package from a template (templates/`<name>`/, ${param} substitution, every file parse-checked, hot-started). Returns created files, started units and the secret references left to write. Refuses an existing package unless force (which overwrites template-rendered files).
 
 ## `vejas_dlq`
 
