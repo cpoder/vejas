@@ -57,7 +57,7 @@ pub fn clustered() -> bool {
 pub fn is_singleton(kind: &str) -> bool {
     matches!(
         kind,
-        "source:interval" | "source:poll" | "source:exec" | "source:stream"
+        "source:interval" | "source:poll" | "source:exec" | "source:stream" | "source:mqtt"
     )
 }
 

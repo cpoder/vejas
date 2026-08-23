@@ -28,6 +28,7 @@ mod cluster;
 mod connectors;
 mod control;
 mod metrics;
+mod mqtt;
 mod secrets;
 mod versions;
 mod vjs;
