@@ -32,3 +32,4 @@ to "why is it built this way", and the moat a rewrite would have to re-earn.
 - [ADR-0026 — 0026 — AMQP 0-9-1 (RabbitMQ): a sync connector on amiquip](https://github.com/cpoder/vejas/blob/master/docs/adr/0026-amqp-connector-amiquip-spike.md)
 - [ADR-0027 — 0027 — Apache Pulsar: spike, and a deliberate defer](https://github.com/cpoder/vejas/blob/master/docs/adr/0027-pulsar-connector-spike.md)
 - [ADR-0028 — 0028 — The open-core boundary](https://github.com/cpoder/vejas/blob/master/docs/adr/0028-open-core-boundary.md)
+- [ADR-0029 — 0029 — The failure-mode guardrails](https://github.com/cpoder/vejas/blob/master/docs/adr/0029-failure-mode-guardrails.md)
