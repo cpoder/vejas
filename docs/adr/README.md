@@ -33,6 +33,7 @@ the old one.
 | [0020](0020-clustering-zero-downtime.md) | Clustering & zero-downtime: competing durables + KV singleton leases | Accepted |
 | [0021](0021-versioning-canary-timetravel.md) | Versioning, canary & time-travel (cluster-wide promotion) | Accepted |
 | [0022](0022-kafka-connector-exec-bridge.md) | Kafka connector: exec-bridge over kcat (offsets in our KV) | Accepted |
+| [0023](0023-ibm-mq-transactional-connector.md) | IBM MQ: first-class transactional connector (destructive get, syncpoint) | Proposed |
 
 ## Template
 
