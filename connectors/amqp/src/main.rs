@@ -71,9 +71,48 @@ pub trait AmqpSink {
 }
 
 // ───────────────────────── loops ─────────────────────────
+/// Publish to a JetStream subject and wait for the pub-ack, flushing DIRECTLY past
+/// nats 0.25's 5ms flusher floor (client.rs MIN_FLUSH_BETWEEN) — that floor caps
+/// every sequential pub-ack at ~200/s, and the AMQP source is a sequential
+/// consume→publish→ack loop (the spike measured 186/s, dead on the floor). Faithful
+/// re-impl of the crate's request path incl. the no-responders guard + a direct
+/// flush; Ok still means a real pub-ack (persisted), so the ack-after-bus-publish
+/// ordering is unchanged. (Named bus_* to avoid the AmqpSink::publish_confirmed
+/// method, which is the RabbitMQ *broker* confirm.)
+fn bus_publish_confirmed(
+    nc: &nats::Connection,
+    subject: &str,
+    payload: &[u8],
+    wait: Duration,
+) -> Result<(), String> {
+    let reply = nc.new_inbox();
+    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
+    nc.publish_request(subject, &reply, payload)
+        .map_err(|e| e.to_string())?;
+    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
+    let msg = sub
+        .next_timeout(wait)
+        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
+    if msg.is_no_responders() {
+        return Err("no JetStream responder for the subject (stream missing?)".into());
+    }
+    let ack: serde_json::Value =
+        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
+    if let Some(err) = ack.get("error") {
+        return Err(format!("JetStream rejected the publish: {err}"));
+    }
+    if ack.get("stream").is_none() {
+        return Err(format!(
+            "unexpected pub-ack (no stream): {}",
+            String::from_utf8_lossy(&msg.data)
+        ));
+    }
+    Ok(())
+}
+
 fn run_source(
     src: &mut dyn AmqpSource,
-    js: &nats::jetstream::JetStream,
+    nc: &nats::Connection,
     subject: &str,
     wait: Duration,
     alive: impl Fn() -> bool,
@@ -81,7 +120,7 @@ fn run_source(
     eprintln!("[vejas-amqp] source: AMQP → {subject} (consume→publish→ack)");
     while alive() {
         let Some(msg) = src.recv(wait)? else { continue };
-        match js.publish(subject, &msg.body) {
+        match bus_publish_confirmed(nc, subject, &msg.body, Duration::from_secs(5)) {
             Ok(_) => src.ack(msg.tag)?, // bus durable → ack the broker
             Err(e) => {
                 eprintln!("[vejas-amqp] publish failed ({e}); nack+requeue");
@@ -200,6 +239,7 @@ fn main() {
     };
     let nats_url = env_or("NATS_URL", "127.0.0.1:4222");
     let durable = env_or("VEJAS_AMQP_DURABLE", "vejas_amqp");
+    let stream = env_or("VEJAS_STREAM", "VEJAS");
     let wait = Duration::from_secs(env("VEJAS_AMQP_WAIT_SECS").and_then(|s| s.parse().ok()).unwrap_or(3));
 
     let nc = match nats::connect(&nats_url) {
@@ -228,9 +268,9 @@ fn main() {
     };
 
     let result = if mode == "source" {
-        run_source_amqp(&channel, &js, &queue, &subject, wait)
+        run_source_amqp(&channel, &nc, &queue, &subject, wait)
     } else {
-        run_sink_amqp(&channel, &js, &subject, &durable, &routing_key)
+        run_sink_amqp(&channel, &js, &stream, &subject, &durable, &routing_key)
     };
     match result {
         Ok(()) => eprintln!("[vejas-amqp] stopped cleanly"),
@@ -244,7 +284,7 @@ fn main() {
 
 fn run_source_amqp(
     channel: &Channel,
-    js: &nats::jetstream::JetStream,
+    nc: &nats::Connection,
     queue: &str,
     subject: &str,
     wait: Duration,
@@ -257,12 +297,13 @@ fn run_source_amqp(
         .basic_consume(queue, ConsumerOptions::default())
         .map_err(|e| e.to_string())?;
     let mut src = AmqpConsumer { consumer, pending: HashMap::new() };
-    run_source(&mut src, js, subject, wait, alive)
+    run_source(&mut src, nc, subject, wait, alive)
 }
 
 fn run_sink_amqp(
     channel: &Channel,
     js: &nats::jetstream::JetStream,
+    stream: &str,
     subject: &str,
     durable: &str,
     routing_key: &str,
@@ -270,6 +311,17 @@ fn run_sink_amqp(
     channel.enable_publisher_confirms().map_err(|e| e.to_string())?;
     let confirms = channel.listen_for_publisher_confirms().map_err(|e| e.to_string())?;
     let exchange = Exchange::direct(channel);
+    // Bind (creating if absent) the durable pull consumer on the stream — the
+    // runtime owns the stream, but pull_subscribe_with_options only BINDS an
+    // existing durable, so a standalone connector must declare it first (idempotent).
+    let _ = js.add_consumer(
+        stream,
+        nats::jetstream::ConsumerConfig {
+            durable_name: Some(durable.to_string()),
+            filter_subject: subject.to_string(),
+            ..Default::default()
+        },
+    );
     let sub = js
         .pull_subscribe_with_options(
             subject,
