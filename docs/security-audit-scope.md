@@ -104,6 +104,17 @@ pressure-test.
   set a secret and confirm `GET /secrets` shows status only, never the value;
   inspect argv and env of every spawned process; attempt to store a credential
   as a plain literal and confirm refusal.
+- **Honest bound (found this pass — S4-1).** `secret()` protects the **store**:
+  no endpoint returns a stored secret, and secrets are references, never
+  literals. But a flow *author* can copy a resolved secret onto the **data
+  path** — `k = secret("x"); emit "vx.out", {t: k}` (or `respond`) — and the
+  raw-payload read surfaces then display it: the `/events` ring, DLQ envelopes,
+  `/topology` `last_error`, and the control-plane `status`/`events` forwarded to
+  the hub. This is author misuse, not a store leak, and the key-shaped panel
+  mask does not catch it (the emitted key isn't credential-shaped). Rule:
+  **`secret()` is for the auth path — never emit, respond, or log a resolved
+  secret.** Mitigation: this rule documented now; a load-time lint that warns
+  when a `secret()` value flows into an `emit`/`respond` is planned.
 
 ### S5 — `http-in` (unauthenticated ingestion)
 
@@ -140,6 +151,11 @@ pressure-test.
   subscribe/publish across a tenant's `vxc.<other>` pin; scan control traffic
   for secret material; fuzz provision slugs/params for injection and path
   traversal; confirm the leaf-node creds are the revocation mechanism.
+- **Re-export note.** The control channel adds no secret of its own — `status`
+  is refs + resolve-status, `audit` is metadata — but it re-exports data-plane
+  fields (`last_error`, event previews) which are raw payloads, so a secret a
+  flow wrongly puts on the data path (S4-1) surfaces here too, not only on
+  `/events`.
 
 ### S7 — The bus (NATS / JetStream)
 
@@ -184,9 +200,10 @@ distributed (ADR-0029 R7).
 
 ## Already found and fixed this session (auditor orientation)
 
-An internal adversarial pass ran before this external audit. Do not spend
-time re-deriving these — they are fixed and regression-tested; instead, try
-to *break the fix* and look for siblings the pass missed:
+Two internal adversarial passes ran before this external audit (the second a
+three-way pass that re-attacked the first's fixes). Do not spend time
+re-deriving these — they are fixed and regression-tested; instead, try to
+*break the fix* and look for siblings the passes missed:
 
 - **F1 — path traversal via symlink (CRITICAL, fixed).** `guard_path`
   blocked `..` but not symlinks; a link under `flows/` to `/etc/passwd` or
@@ -200,6 +217,33 @@ to *break the fix* and look for siblings the pass missed:
 - **F2 — http-in published to any `vx.*` (fixed, defence in depth).**
   Optional `ALLOW` on the `http-in` connector restricts the subject
   suffixes; out-of-list → 403. Absent = any suffix (compat), documented.
+- **A — the write gate keyed on the POST verb, not mutation (HIGH, fixed).**
+  The bearer gate covered `POST` only; `PUT`/`PATCH`/`DELETE` and a read-method
+  flow that emits wrote the bus unauthenticated. Fixed: the gate keys on
+  *mutation* — every non-read method is gated, and a read-method flow that
+  writes the bus is gated too. `e2e/api-write-gate.sh` in CI (exotic verb →
+  `401` fail-closed; `HEAD` on an emitting flow → `404`).
+- **A' — a dynamic emit subject escaped the read-method gate (HIGH, fixed).**
+  The check used `emit_subjects`, which lists only statically resolvable
+  subjects; a flow emitting to `f"vx.{x}"` or a lowercase local had an empty
+  list and gated open. Fixed: gate on *any* emit, not the resolved-subject list.
+- **A'' — an emit reached via `invoke` escaped the gate (HIGH, fixed).** A
+  read-method flow whose only bus write is a service `invoke` (the service
+  emits, and its emits are appended to the caller's at runtime) still gated
+  open — the emit check did not follow invokes, and `invoke` nests in any
+  subexpression. Fixed: `Program::writes_bus()` is a full-AST visitor — true on
+  any `emit` or any `invoke`, wherever it sits — with **no `_` arm**, so a new
+  `Stmt`/`Expr` variant fails to compile rather than silently escaping the
+  gate. **Break it:** is there a bus-writing or side-effecting construct other
+  than `emit`/`invoke`? The fix assumes every builtin is pure.
+- **B — governed-mode bypass on `/connectors/new` (HIGH, fixed).** With
+  `VEJAS_REQUIRE_APPROVAL=1`, `/connectors/new` lacked the approval + cluster
+  guards its twin `/flows/new` had — an agent could create and hot-start a
+  connector (an exec driver = arbitrary `CMD`) with no human approval:
+  governance bypass **and** RCE. Fixed to mirror `/flows/new`;
+  `e2e/governed-gate.sh` in CI. Sibling-checked: the HTTP twin, all mutating
+  MCP tools, and `/provision` are gated; `dlq/replay`, `dlq/purge` and
+  `connectors/test` are operational (write-token, not approval) by design.
 
 ## Known minor points to confirm or harden (not blockers)
 
@@ -211,8 +255,15 @@ to *break the fix* and look for siblings the pass missed:
   credential-shaped values using `SECRET_KEY_PATTERN`, but `GET /surface`
   returns raw literal values; the real protection is the model itself
   (secrets are `secret()` references, never literal values — enforced by the
-  admission lint). Confirm no path lets a resolved secret value reach a read
-  endpoint; the mask is cosmetic, not the boundary.
+  admission lint). **Confirmed this pass (S4-1):** no endpoint returns a
+  *stored* secret, but a flow that **emits/responds** a resolved secret routes
+  it onto the data path, where the raw-payload read surfaces display it (see the
+  S4 honest bound) — author-routed, not a store leak. The mask is cosmetic, not
+  the boundary; the fix is the S4 rule plus the planned lint.
+- **M3 — `guard_path` dir check is a prefix, not a path segment.**
+  `flowsevil/x.vjs` satisfies `starts_with("flows")`; the file stays under
+  `root` (and unscanned, so inert), so this is not a traversal — a path-segment
+  match would read cleaner. Hardening, not a bug.
 
 ## Method note
 
