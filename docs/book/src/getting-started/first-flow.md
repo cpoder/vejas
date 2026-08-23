@@ -28,8 +28,9 @@ Three things to notice:
 
 - **The business lives in UPPERCASE literals.** `SEVERITY_CODES` and
   `ALERT_LEVELS` appear in the panel as editable tables — a domain expert
-  adds `"bloquante": "P1"` without reading a line of code, and the flow
-  restarts itself (ADR-0005).
+  corrects `"haute"` to `"P1"` without reading a line of code, and the flow
+  restarts itself (ADR-0005). Adding a *new* row is one sentence to the
+  agent.
 - **The language is pure.** No I/O, no clock, no network in a flow — input
   event in, emits out. That is what makes replay, time-travel and canary
   structurally safe later.
