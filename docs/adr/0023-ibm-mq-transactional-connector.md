@@ -46,7 +46,9 @@ where it belongs.
   3). Honest at-least-once note: a crash between `MQCMIT` and the NATS ack
   redelivers the bus message → a **duplicate `MQPUT`**. That is the standard
   contract; the mitigation, documented in the recipe, is to carry an idempotency
-  key in `MQMD.MsgId` so a downstream consumer dedups.
+  key in an MQMD field (`CorrelId` by convention — `MsgId` is usually the queue
+  manager's; and it is 24 binary bytes, so a key is hashed to fit) so a downstream
+  consumer dedups. See open question 3.
 
 ### The client, and the real verification point
 
@@ -63,13 +65,31 @@ different broker approach but a **hand-declared FFI on `libmqm-sys`** — the ex
 move the SAP connector already made (~30 lines of `#[repr(C)]` FFI without
 headers, ADR-0014). A young crate is therefore not a blocker; it is a precedent.
 
+### Source concurrency: singleton by default, BECAUSE order
+
+A destructive `MQGET` is the *original* competing-consumers case: two getters
+never receive the same message. So unlike Kafka or a poller, the MQ source could
+be **competing-safe** — N getters, each its own syncpoint — scaling and failing
+over with no lease at all. The one thing N concurrent getters lose is **order**:
+messages interleave across getters, and the queue's FIFO does not survive onto the
+bus — and our transport test T1 (ADR-0020 bench) asserts per-subject FIFO.
+
+The decision, and the reason is written so a reviewer need not ask: **singleton by
+default, because order.** The source takes the singleton lease (ADR-0020) so one
+getter preserves the queue's order onto the bus. A `COMPETING = true` mode is
+offered as an **explicit** option — N getters, no lease, throughput over order —
+for the deployments that genuinely value drain rate over ordering and whose
+downstream does not depend on it. Default is ordered; competing is a choice you
+make on purpose, with the trade stated in the recipe.
+
 ### Supervision
 
 Reuse the existing exec mechanics — restart-with-backoff and the singleton lease
 (ADR-0020) — with a "the child owns its NATS connection" flag rather than a new
-supervisor kind, if it fits cleanly; the source is a singleton (one getter), the
-sink is competing-safe by its own durable. Implementation detail, settled at
-build time.
+supervisor kind, if it fits cleanly. One classification caveat: the connector must
+show up correctly in the topology/graph (as an external/first-class source, not a
+mislabeled `exec-source`) — verify the panel rendering. The sink is competing-safe
+by its own durable. Implementation detail, settled at build time.
 
 ## Consequences
 
@@ -93,8 +113,11 @@ build time.
    before committing to the crate; hand-FFI fallback ready either way.
 2. Whether the "child owns its NATS" supervision is a flag on the exec driver or a
    thin new kind — settle at build, keep it minimal.
-3. The sink dedup key: is `MQMD.MsgId` always available/settable through `mqi`, or
-   do we carry the key in a message property? Recipe-level, but flag it.
+3. The sink dedup key. `MQMD.MsgId` is **24 binary bytes**, so an idempotency key
+   must be hashed/truncated to fit — and the MQ app-level convention is often
+   `CorrelId` rather than `MsgId` (the queue manager usually owns `MsgId`). Spike
+   which `mqi` exposes cleanly (likely `CorrelId`) and document the choice; carry
+   the key in a message property if neither is settable.
 
 ## Rejected
 
