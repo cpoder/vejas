@@ -55,7 +55,7 @@ actually flowing. Run locally: `e2e/admission/run.sh [name]`.
 
 A flat `.vjs.example` outside a directory is a draft, not a connector.
 
-**Sixteen certified recipes**: ServiceNow (poll + create), Jira (poll +
+**Eighteen certified recipes**: ServiceNow (poll + create), Jira (poll +
 create), Slack, Workday RaaS, Stripe events, Shopify order webhook,
 SendGrid email, GitHub issues, PagerDuty events, Discord webhook — every
 one admitted by CI against its mock, credentials vaulted, data flow
@@ -63,9 +63,12 @@ proven — plus **MQTT source and sink** (the hand-rolled in-binary client,
 ADR-0025) — certified against a **real mosquitto** in CI (the recipe ships
 its own `broker.sh` and `dataflow.sh`: publish into the broker, see it on
 the bus, and back) — and **Kafka source and sink** (exec-bridge over kcat,
-ADR-0022),
-admitted under a **stated exception**: a meaningful broker mock would be a
-broker, so CI enforces lint + parse and the offset-resume mechanism's own
-test, and the exception file says exactly what to verify against a dev
+ADR-0022) and **IBM MQ source and sink** (the first-class transactional
+binary, ADR-0023; an `.env.example` instead of a manifest — same credential
+lint, enforced on env keys),
+both admitted under a **stated exception**: a meaningful broker mock would
+be a broker, so CI enforces the lint (+ parse and the offset-resume
+mechanism's own test for Kafka; the crate's fault-injection invariant tests
+for MQ), and the exception file says exactly what to verify against a dev
 broker. The webhook recipe (Shopify) is tested end to end through its own
 ingest: POST the fixture, see it on the bus.

@@ -142,6 +142,65 @@ tools. Flows then productionize what the agent explored by hand
 
 ---
 
+## 8 · IBM MQ, transactionally *(mechanics CI-proven against a fake broker; needs a live queue manager for the last mile — ADR-0023)*
+
+> Consume DEV.QUEUE.1 on queue manager QM1 and put every message on the bus
+> as `vx.mq.orders.in`. Nothing may ever be lost, even if we crash mid-way.
+
+What lands is not a manifest — IBM MQ is a **first-class standalone binary**
+(`connectors/mq`), because the no-loss guarantee is an *ordering* of calls
+that must live in one process: MQGET under syncpoint → bus publish (await
+the JetStream pub-ack) → MQCMIT. Crash anywhere before the commit and the
+queue manager re-delivers: at-least-once, the qmgr is the durable cursor.
+The agent fills the env recipe instead
+([`docs/examples/connectors/mq_source/`](examples/connectors/mq_source/)):
+
+```
+MQSERVER="DEV.APP.SVRCONN/TCP/mq.example.com(1414)"
+VEJAS_MQ_MODE=source
+VEJAS_MQ_QMGR=QM1
+VEJAS_MQ_QUEUE=DEV.QUEUE.1
+VEJAS_MQ_SUBJECT=vx.mq.orders.in
+```
+
+The mirror (`mq_sink`) delivers a bus subject into a queue, with an optional
+JSON field riding MQMD CorrelId for consumer-side dedup. Singleton by
+default *because order* (a lease on the bus, ADR-0020); set
+`VEJAS_MQ_COMPETING=1` when throughput outranks global order — MQGET is
+destructive, so competing instances never duplicate.
+
+## Governed mode — the agent proposes, the human approves ✓
+
+> From here on, no agent lands a change directly. Everything goes through
+> me.
+
+Two env vars make governance a product step instead of a convention
+(ADR-0024): `VEJAS_REQUIRE_APPROVAL=1`, and `VEJAS_APPROVAL_TOKEN` — a
+credential **distinct from the agent's** `VEJAS_TOKEN`, so holding the MCP
+key never implies holding the approve key. Then, validated live:
+
+1. Any direct write — agent tool or `POST /surface/set` — answers with the
+   didactic refusal: *"approval required: submit a proposal (vejas_propose,
+   or the panel) — a human approves it"*.
+2. The agent calls `vejas_propose` (`kind: set_literal` or `kind: version`),
+   attaching the evidence it gathered — time-travel results, canary stats.
+   The proposal lands `pending`, pinned to the current baseline hash; if a
+   deploy or promote moves the baseline first, it **expires loudly** rather
+   than landing on a base the evidence never saw.
+3. The queue is one list for everyone — `GET /proposals`, the panel card, or
+   the agent's read-only `vejas_proposals`. The panel shows the evidence
+   next to Approve, and flags **"no evidence"** loudly when absent.
+4. A human approves in the panel or with the token —
+   `POST /proposals/{id}/approve` (or `/reject`) with `X-Approval-Token`.
+   Without the header: 401. On approve, the existing paths execute — a
+   `version` proposal promotes cluster-wide through ADR-0021 — and the audit
+   record carries the proposal id.
+
+Every transition emits on `vx.proposals.events` — so "notify on-call when a
+proposal is pending" is just a flow, routed to Slack or PagerDuty with the
+connectors above. No notification subsystem; the platform routes its own
+governance.
+
 ## Correcting meaning, in plain words
 
 The other half of the thesis: corrections go through the same conversation.

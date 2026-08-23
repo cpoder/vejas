@@ -54,15 +54,26 @@ TOTAL_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 GOT=$(wc -l < "$S/arr")
 RSS_KB=$(ps -o rss= -p $RT_PID | tr -d ' ')
 
-python3 - "$N" "$GOT" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" << 'PY'
+python3 - "$N" "$GOT" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" "$S/arr" << 'PY'
 import json, sys
 n, got, pub, total, rss = map(int, sys.argv[1:6])
+# true drain rate = arrivals over their own span, never over a timeout window
+# (dividing by the 180s capture timeout once read as "8 rt/s" — an artifact)
+arr = [float(l) for l in open(sys.argv[6])]
+span = arr[-1] - arr[0] if len(arr) > 1 else 0
 print(json.dumps({
   "chain": "bus -> mqtt-out (QoS1) -> mosquitto -> mqtt-in (QoS1) -> bus",
   "published": n, "completed_roundtrip": got,
-  "integrity": "ok" if got >= n else f"CAPTURE-TIMEOUT at {got}/{n} (rate too low — nothing lost, the durable holds the rest)",
+  # a shortfall here is REAL LOSS, broker-side: mqtt-out got its PUBACKs (so
+  # the bus acked), then the broker dropped the overflow of the subscriber's
+  # queue (mosquitto max_queued_messages defaults to 1000). The durable holds
+  # nothing for those — say so.
+  "integrity": "ok" if got >= n else
+      f"BROKER-SIDE LOSS: {got}/{n} delivered — the sink outran the source's "
+      f"drain and mosquitto dropped the queue overflow (max_queued_messages, "
+      f"default 1000); nothing recoverable bus-side",
   "publish_ms": pub, "done_ms": total,
-  "roundtrip_rate_per_s": round(got / (total / 1000)) if got else 0,
+  "roundtrip_rate_per_s": round(got / span) if span else 0,
   "runtime_rss_mb": round(rss / 1024, 1),
 }, indent=2))
 PY

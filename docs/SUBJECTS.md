@@ -31,6 +31,11 @@ hot-addable). No subprocess, no Python. Drivers today:
   at-least-once natively: the source holds the broker's PUBACK until the bus
   publish is confirmed; the sink acks the bus only after the broker's PUBACK.
   TLS / QoS 2 / MQTT 5 → the mosquitto exec-bridge escape hatch.
+- **mq source/sink** (standalone binary, `connectors/mq`) — IBM MQ as a
+  first-class transactional citizen (ADR-0023): MQGET under syncpoint → bus
+  publish (await pub-ack) → MQCMIT, and the mirror for the sink. Hand-declared
+  MQI FFI, `dlopen` of the MQ client at runtime — builds with no MQ present.
+  Configured by env (`VEJAS_MQ_*`, see the recipe), not by a manifest.
 - **exec-source** / **exec-sink** — bridge an external program in ANY language over stdio (source prints JSON on stdout; sink reads JSON on stdin). The hot-add path for new connector types without recompiling the core or loading native libs (ADR-0011).
 
 An **external connector** in any language is still a first-class citizen: it is

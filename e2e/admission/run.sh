@@ -29,6 +29,37 @@ for NAME in "${RECIPES[@]}"; do
   NATS_P=$((4300 + i)); HTTP_P=$((8700 + i)); MOCK_P=$((9200 + i))
   echo "── $NAME"
 
+  # ── standalone-binary recipe (ADR-0023 shape): env-file config, no .vjs ──
+  # First-class connector binaries (IBM MQ) are configured by environment, not
+  # by a runtime manifest. Same credential rule, same verdicts: a credential-
+  # shaped env key must reference the deployment's secret machinery (the
+  # ${VAR:?} required-env form), never carry an inline literal. No in-runtime
+  # probe exists for a standalone binary, so a stated exception is REQUIRED.
+  if [ ! -f "$MANIFEST" ] && [ -f "$DIR/$NAME.env.example" ]; then
+    LINT=$(python3 - "$DIR/$NAME.env.example" "$PAT" << 'PY'
+import re, sys
+pat = sys.argv[2]
+bad = []
+for line in open(sys.argv[1]):
+    m = re.match(r'\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)$', line)
+    if not m or not re.search(pat, m.group(1), re.I):
+        continue
+    val = m.group(2).split('#')[0].strip().strip('"').strip("'")
+    if val and not re.match(r'^\$\{[A-Z0-9_]+(:\?[^}]*)?\}$', val):
+        bad.append(m.group(1))
+print(','.join(bad))
+PY
+)
+    if [ -n "$LINT" ]; then echo "  ✗ lint: literal credential(s) in env file: $LINT"; fail=1; continue; fi
+    if [ -f "$DIR/EXCEPTION.md" ]; then
+      echo "  ✓ admitted (stated exception: $(head -1 "$DIR/EXCEPTION.md" | sed 's/^#* *//'))"
+    else
+      echo "  ✗ standalone-binary recipe: EXCEPTION.md required (no in-runtime probe exists)"
+      fail=1
+    fi
+    continue
+  fi
+
   # ── lint: credential-shaped keys must be secret() ─────────────────────
   LINT=$(python3 - "$MANIFEST" "$PAT" << 'PY'
 import re, sys
