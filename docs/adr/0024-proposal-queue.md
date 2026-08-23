@@ -25,7 +25,11 @@ fleet proposals into one mechanism, on the bus.
 
 A **proposal** is `{id, kind, payload, author, created_at, baseline,
 evidence, status}` in a `VEJAS_PROPOSALS` JetStream KV bucket (bounded
-history) — cluster-visible by construction, like versions and leases. Kinds
+history) — cluster-visible by construction, like versions and leases. The
+KV is the **live queue** (transient, watchable, mutated on transition) and
+nothing more: the durable record of who approved what is the ADR-0018
+audit trail — a proposal aging out of the bounded KV history never takes
+the proof of its approval with it. KV = queue, audit = memory. Kinds
 v1: `set_literal`, `version` (a candidate flow version — the flagship),
 `package_update` (fleet). `author` is the **channel** (`mcp`, `ctl:<hub>`,
 `panel`), never a claimed identity (the CONTROL.md rule: the human behind a
@@ -53,20 +57,44 @@ A `version` proposal carries what the agent proved: time-travel results
 to the Approve button — and shows **"no evidence"** loudly when absent. The
 generation contract (tool descriptions) makes attaching evidence the norm.
 
-### The governance knob
+### The governance knob — gated on the write, not the door
 
-`VEJAS_REQUIRE_APPROVAL=1`: mutating MCP tools answer "submit a proposal
-instead" (didactic, like the cluster guard); the panel — already human —
-is unaffected. Default off: dev deployments keep direct-write freedom. The
-ADR-0020 cluster guard message gains "or submit a proposal".
+`VEJAS_REQUIRE_APPROVAL=1` gates **every mutating path** — the MCP tools
+AND the raw HTTP endpoints (`/surface/set`, `/file/set`, promote, …) —
+answering "submit a proposal instead". Gating only the MCP door would be
+decorative: an agent with HTTP access simply walks through the other one.
+
+**Approval requires a credential the agent does not hold.** `VEJAS_TOKEN`
+is not it — the agent uses that very bearer to reach `/mcp`. Approve and
+reject therefore require a **distinct** `VEJAS_APPROVAL_TOKEN` (set
+alongside REQUIRE_APPROVAL; the panel prompts for it once and holds it in
+the operator's browser). Two credentials, two roles: the machine writes
+proposals, the human writes approvals. Without the distinct token,
+REQUIRE_APPROVAL refuses to start — a governance mode with a shared key
+is a governance mode in name only.
+
+**Approve re-verifies at execution (TOCTOU).** The approve action
+atomically re-checks the proposal's `baseline` hash against the current
+effective source at the moment it executes — a race between "baseline
+moved" and "human clicked" resolves to `expired`, never to landing a
+change the evidence never saw.
+
+Default off: dev deployments keep direct-write freedom. The ADR-0020
+cluster guard message gains "or submit a proposal".
 
 ### Staleness reuses the baseline rule
 
-A proposal records the `baseline` (content hash) it was made against —
-the same rule as overlay eviction and canary auto-stop (ADR-0021): if the
-baseline moves (deploy, another promote) before approval, the proposal
-**auto-expires, loudly** (status `expired`, audited, re-proposable). Never
-an approval that lands on a base the evidence never saw.
+A proposal records the `baseline` it was made against — the hash of the
+**effective source the evidence actually saw** (overlay-or-baseline via
+`resolve_source`, ADR-0021), not merely the git file: a promote landing
+under the proposal expires it exactly like a deploy does. Same rule as
+overlay eviction and canary auto-stop: baseline moves → **auto-expire,
+loudly** (status `expired`, audited, re-proposable) — plus the atomic
+re-check at approve time above. Prerequisite shared with ADR-0021: the
+content hash must be **stable across binary versions** (a std
+`DefaultHasher` may change between releases — rolling deploys would
+mass-expire spuriously); the hash function is fixed (FNV-1a), a one-time
+KV eviction at the changeover being the accepted cost.
 
 ### Notifications are flows
 
