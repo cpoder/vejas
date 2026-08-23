@@ -585,6 +585,21 @@ fn emit_proposal_event(js: &nats::jetstream::JetStream, transition: &str, propos
 /// The distinct approval credential (ADR-0024). A shared VEJAS_TOKEN is what the
 /// agent already holds for /mcp, so approve/reject require their OWN token —
 /// otherwise governance is decorative.
+/// The actor to attribute a mutation to in the audit trail (ADR-0030): the
+/// `X-Vejas-Actor` header when present (the enterprise auth proxy sets it to the
+/// authenticated user, so the single core token does not collapse every action
+/// into one identity for SIEM export and the RBAC audit), else the default. Useful
+/// even open — a solo operator can name themselves.
+fn header_actor(request: &tiny_http::Request, default: &str) -> String {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("x-vejas-actor"))
+        .map(|h| h.value.as_str().trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Constant-time string comparison for credentials — no early return on the first
 /// differing byte, so a token/approval-token check leaks no timing side-channel
 /// (ADR-0029 R7). Length mismatch folds into the accumulator, not a short-circuit.
@@ -3188,6 +3203,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
     }
+    // Who to attribute a mutation to in the audit (ADR-0030) — the proxy-supplied
+    // X-Vejas-Actor, else "panel". Extracted once; the immutable borrow ends here.
+    let actor = header_actor(&request, "panel");
     // ── HTTP API surface: flows declared `api "VERB /path"`, served under /api/ ──
     if path_only == "/api/openapi.json" {
         return respond(request, 200, openapi_json(&root).to_string(), "application/json");
@@ -3244,7 +3262,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                     }
                 }
             }
-            return match decide_proposal(&registry, &root, id, approve, "panel") {
+            return match decide_proposal(&registry, &root, id, approve, &actor) {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             };
@@ -3591,7 +3609,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let value = body["value"].clone();
             // In a cluster, a promote is a cluster-wide VERSION, not a local write.
             if cluster::clustered() {
-                return match promote_version(&root, &file, &name, &key, &value, "panel") {
+                return match promote_version(&root, &file, &name, &key, &value, &actor) {
                     Ok(out) => respond(request, 200, out.to_string(), "application/json"),
                     Err(e) => respond(request, 422, e, "text/plain"),
                 };
@@ -3609,7 +3627,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                     if let Err(e) = fs::write(&p, new_src) {
                         return respond(request, 500, e.to_string(), "text/plain");
                     }
-                    record_promote(&root, &file, &name, &key, &before, &value, "panel");
+                    record_promote(&root, &file, &name, &key, &before, &value, &actor);
                     let _ = reload(&registry, &root);
                     respond(
                         request,
@@ -3632,7 +3650,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let file = body["file"].as_str().unwrap_or("").to_string();
             let name = body["name"].as_str().unwrap_or("").to_string();
             let key = body["key"].as_str().unwrap_or("-").to_string();
-            match rollback_literal(&root, &file, &name, &key, "rollback:panel") {
+            match rollback_literal(&root, &file, &name, &key, &format!("rollback:{actor}")) {
                 Ok(out) => {
                     let _ = reload(&registry, &root);
                     respond(request, 200, out.to_string(), "application/json")
