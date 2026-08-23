@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 BIN="core/target/release/vejas-runtime"
 [ -x "$BIN" ] || { echo "build first" >&2; exit 1; }
 S=$(mktemp -d); R=$(mktemp -d)
-trap 'kill $RT $NP 2>/dev/null || true; rm -rf "$S" "$R"' EXIT
+trap 'kill $RT $NP 2>/dev/null; wait $RT $NP 2>/dev/null; rm -rf "$S" "$R"' EXIT
 fail=0
 say() { echo "── $1"; }
 ko() { echo "  ✗ $1 (docs page: $2)"; fail=1; }
@@ -53,7 +53,12 @@ NATS_URL=nats://127.0.0.1:4270 VEJAS_ROOT="$R" \
   VEJAS_HTTP_ADDR=127.0.0.1:8740 "$BIN" > "$S/rt.log" 2>&1 &
 RT=$!
 until curl -sf -o /dev/null http://127.0.0.1:8740/healthz; do sleep 0.1; done
-sleep 2
+# the http-in connector binds its port AFTER the runtime is healthy — poll the
+# webhook itself, not just healthz (a 202 warmup proves it is listening)
+for _ in $(seq 100); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8787/ingest/__warmup -d '{}')" = "202" ] && break
+  sleep 0.1
+done
 
 say "guides/expose-an-api — sync API flow"
 BODY=$(curl -sf http://127.0.0.1:8740/api/orders/42)
@@ -69,19 +74,21 @@ say "guides/expose-an-api — async ingestion (202 after pub-ack)"
 CAP=$!
 sleep 0.5
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8787/ingest/helpdesk.tickets \
-  -d '{"priority":"critique","subject":"SAP down","requester":{"email":"Jane@ACME.com"}}')
+  -d '{"priority":"inconnue","subject":"SAP down","requester":{"email":"Jane@ACME.com"}}')
 wait $CAP 2>/dev/null
 [ "$CODE" = "202" ] && [ -s "$S/ing" ] \
   && ok "POST /ingest → 202 and the event is on the bus" \
   || ko "ingest contract (got HTTP $CODE)" "guides/expose-an-api.md + getting-started/first-flow.md"
 
 say "getting-started/first-flow — the flow transforms as documented"
-( timeout 10 nats -s nats://127.0.0.1:4270 sub vx.slack.out --count=1 --raw > "$S/alert" 2>/dev/null ) &
+# match by CONTENT, not by position — other emits may share the subject
+( timeout 10 nats -s nats://127.0.0.1:4270 sub vx.slack.out --count=5 --raw > "$S/alert" 2>/dev/null ) &
 CAP=$!
 sleep 0.5
 curl -sf -o /dev/null -X POST http://127.0.0.1:8787/ingest/helpdesk.tickets \
   -d '{"priority":"haute","subject":"Printer on fire","requester":{"email":"Bob@ACME.com"}}'
-wait $CAP 2>/dev/null
+for _ in $(seq 40); do grep -q 'Printer on fire' "$S/alert" 2>/dev/null && break; sleep 0.25; done
+kill $CAP 2>/dev/null
 grep -q '\[P2\] Printer on fire — bob@acme.com' "$S/alert" \
   && ok "transcoding + lower() + f-string emit as shown" \
   || ko "first-flow emit differs from the docs ($(cat "$S/alert" 2>/dev/null))" "getting-started/first-flow.md"
