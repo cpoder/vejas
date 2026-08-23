@@ -29,6 +29,7 @@ mod connectors;
 mod control;
 mod metrics;
 mod mqtt;
+mod proposals;
 mod secrets;
 mod versions;
 mod vjs;
@@ -553,6 +554,195 @@ fn promote_version(
     versions::put_version(&store, &unit, &new_src, &parent, actor, now_secs())?;
     record_promote(root, file, name, key, &before, value, actor);
     Ok(json!({"ok": true, "versioned": true, "flow": unit, "parent": parent}))
+}
+
+// ───────────────────────── proposal queue (ADR-0024) ─────────────────────────
+
+/// The current effective-source hash of a flow file — the baseline a proposal is
+/// pinned to (the overlay-or-baseline the evidence saw, ADR-0021/0024).
+fn effective_source_hash(
+    js: &nats::jetstream::JetStream,
+    root: &Path,
+    file: &str,
+) -> Result<String, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let unit = flow_proc_name(&path);
+    let store = versions::open_store(js);
+    let (src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
+    Ok(versions::hash_content(&src))
+}
+
+/// Emit a proposal transition on the bus so a notification flow can route it
+/// (Slack/PagerDuty/email) — the platform dogfoods its own connectors (ADR-0024).
+fn emit_proposal_event(js: &nats::jetstream::JetStream, transition: &str, proposal: &Value) {
+    let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    let subject = format!("{subj_root}.proposals.events");
+    let ev = json!({"transition": transition, "ts": now_secs(), "proposal": proposal});
+    let _ = js.publish(&subject, serde_json::to_vec(&ev).unwrap_or_default());
+}
+
+/// The distinct approval credential (ADR-0024). A shared VEJAS_TOKEN is what the
+/// agent already holds for /mcp, so approve/reject require their OWN token —
+/// otherwise governance is decorative.
+fn approval_token() -> Option<String> {
+    env::var("VEJAS_APPROVAL_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+/// Submit a proposal (ADR-0024): an agent proposes a mutation, pinned to the
+/// baseline its evidence saw. `payload` must carry `file`.
+fn submit_proposal(
+    root: &Path,
+    kind: &str,
+    payload: Value,
+    author: &str,
+    evidence: Value,
+) -> Result<Value, String> {
+    if kind != "set_literal" && kind != "version" {
+        return Err("kind must be set_literal or version".into());
+    }
+    let file = payload["file"].as_str().ok_or("payload.file required")?.to_string();
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let baseline = effective_source_hash(&js, root, &file)?;
+    let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
+    let id = proposals::new_id(now_secs());
+    let rec = proposals::submit(&store, &id, kind, payload, author, &baseline, evidence, now_secs())?;
+    emit_proposal_event(&js, "submitted", &rec);
+    Ok(rec)
+}
+
+/// List proposals, auto-expiring pending ones whose baseline has moved (a deploy
+/// or another promote) — loudly (status expired, audited, an event) so the queue
+/// never shows an approvable change the evidence never saw (ADR-0024).
+fn reconcile_and_list(root: &Path) -> Result<Vec<Value>, String> {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
+    let mut out = Vec::new();
+    for p in proposals::list(&store) {
+        let mut p = p;
+        if p["status"] == "pending" {
+            if let Some(file) = p["payload"]["file"].as_str() {
+                let current = effective_source_hash(&js, root, file).unwrap_or_default();
+                if !current.is_empty() && current != p["baseline"].as_str().unwrap_or("") {
+                    let id = p["id"].as_str().unwrap_or("").to_string();
+                    if let Ok(updated) = proposals::set_status(&store, &id, "expired", None, now_secs()) {
+                        let _ = connectors::to_audit(&js, "proposals", &json!({
+                            "ts": now_secs(), "actor": "expiry", "kind": "proposal-expired",
+                            "proposal": id, "baseline_was": p["baseline"], "baseline_now": current,
+                        }));
+                        emit_proposal_event(&js, "expired", &updated);
+                        p = updated;
+                    }
+                }
+            }
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// Execute an approved proposal through the EXISTING paths (a set_literal or a
+/// whole-version promote), cluster-aware. The caller has already re-verified the
+/// baseline (TOCTOU).
+fn apply_approved(
+    registry: &Registry,
+    root: &Path,
+    proposal: &Value,
+    actor: &str,
+) -> Result<Value, String> {
+    let kind = proposal["kind"].as_str().unwrap_or("");
+    let payload = &proposal["payload"];
+    let file = payload["file"].as_str().ok_or("payload.file")?;
+    match kind {
+        "set_literal" => {
+            let name = payload["name"].as_str().ok_or("payload.name")?;
+            let key = payload["key"].as_str().unwrap_or("-");
+            let value = &payload["value"];
+            if cluster::clustered() {
+                promote_version(root, file, name, key, value, actor)
+            } else {
+                let path = guard_path(root, file).ok_or("path not allowed")?;
+                let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let before = vjs::get_literal(&src, name, key).unwrap_or(Value::Null);
+                let new_src = vjs::set_literal(&src, name, key, value)?;
+                fs::write(&path, new_src).map_err(|e| e.to_string())?;
+                record_promote(root, file, name, key, &before, value, actor);
+                let _ = reload(registry, root);
+                Ok(json!({"ok": true, "file": file, "name": name, "key": key}))
+            }
+        }
+        "version" => {
+            let candidate = payload["candidate"].as_str().ok_or("payload.candidate")?;
+            vjs::parse(candidate)?; // reject a malformed candidate before writing
+            let path = guard_path(root, file).ok_or("path not allowed")?;
+            let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            let unit = flow_proc_name(&path);
+            let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+            let js = nats::jetstream::new(nc);
+            if cluster::clustered() {
+                let store = versions::open_store(&js).ok_or("version store unavailable")?;
+                let parent = versions::hash_content(&baseline);
+                versions::put_version(&store, &unit, candidate, &parent, actor, now_secs())?;
+                Ok(json!({"ok": true, "versioned": true, "flow": unit}))
+            } else {
+                fs::write(&path, candidate).map_err(|e| e.to_string())?;
+                let _ = reload(registry, root);
+                Ok(json!({"ok": true, "file": file, "written": true}))
+            }
+        }
+        other => Err(format!("unknown proposal kind {other:?}")),
+    }
+}
+
+/// Approve or reject a proposal (ADR-0024). Approve re-verifies the baseline at
+/// execution (TOCTOU) — a race with a deploy/promote resolves to `expired`, never
+/// to landing a change the evidence never saw — then runs it through the existing
+/// paths, audits with the proposal id, and records the transition. `decided_by`
+/// is the approval channel.
+fn decide_proposal(
+    registry: &Registry,
+    root: &Path,
+    id: &str,
+    approve: bool,
+    decided_by: &str,
+) -> Result<Value, String> {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
+    let proposal = proposals::get(&store, id).ok_or("proposal not found")?;
+    if proposal["status"] != "pending" {
+        return Err(format!("proposal already {}", proposal["status"]));
+    }
+    if !approve {
+        let updated = proposals::set_status(&store, id, "rejected", Some(decided_by), now_secs())?;
+        let _ = connectors::to_audit(&js, "proposals", &json!({
+            "ts": now_secs(), "actor": decided_by, "kind": "proposal-rejected", "proposal": id,
+        }));
+        emit_proposal_event(&js, "rejected", &updated);
+        return Ok(updated);
+    }
+    // TOCTOU: the baseline must not have moved since the evidence was gathered.
+    let file = proposal["payload"]["file"].as_str().ok_or("payload.file")?;
+    let current = effective_source_hash(&js, root, file)?;
+    if current != proposal["baseline"].as_str().unwrap_or("") {
+        let updated = proposals::set_status(&store, id, "expired", None, now_secs())?;
+        emit_proposal_event(&js, "expired", &updated);
+        return Err("baseline changed since the proposal was made — expired, re-propose".into());
+    }
+    let result = apply_approved(registry, root, &proposal, decided_by)?;
+    let _ = connectors::to_audit(&js, "proposals", &json!({
+        "ts": now_secs(), "actor": decided_by, "kind": "proposal-approved",
+        "proposal": id, "applied": result,
+    }));
+    let updated = proposals::set_status(&store, id, "approved", Some(decided_by), now_secs())?;
+    emit_proposal_event(&js, "approved", &updated);
+    Ok(json!({"ok": true, "proposal": updated, "applied": result}))
 }
 
 /// In cluster mode (`VEJAS_CLUSTER=1`), refuse any mutation of this instance's
@@ -2609,6 +2799,8 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_canary_start", "description": "Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candidate version against the current effective version as events arrive, accumulating a diff. Read-only (shadow — no real emit). Refuses if a canary is already running for the flow. Auto-stops if the live version changes under it (reason in status).", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}}), vec!["file", "candidate"])}),
         json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_canary_stop", "description": "Stop a running canary for a flow (its shadow consumer exits; the last diff stays readable).", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_propose", "description": "Submit a governed change PROPOSAL for a human to approve in the panel (ADR-0024) — you can propose but never approve. kind='set_literal' (payload {file, name, key, value}) or kind='version' (payload {file, candidate: whole source}). Attach `evidence` you gathered (vejas_time_travel results, vejas_canary stats) — the panel shows it next to Approve, and flags 'no evidence' loudly. The proposal is pinned to the current baseline and auto-expires if a deploy/promote moves it. Returns the stored proposal (id, status:pending).", "inputSchema": obj(json!({"kind": {"type": "string"}, "payload": {"type": "object"}, "evidence": {"type": "object"}}), vec!["kind", "payload"])}),
+        json!({"name": "vejas_proposals", "description": "List the proposal queue with status (pending/approved/rejected/expired) and evidence. Read-only. Approve/reject are human panel actions, not tools.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
@@ -2727,6 +2919,13 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let file = args["file"].as_str().ok_or("file required")?;
             text(canary_stop(root, file)?.to_string())
         }
+        "vejas_propose" => {
+            let kind = args["kind"].as_str().ok_or("kind required")?;
+            let payload = args["payload"].clone();
+            let evidence = args.get("evidence").cloned().unwrap_or(Value::Null);
+            text(submit_proposal(root, kind, payload, "mcp", evidence)?.to_string())
+        }
+        "vejas_proposals" => text(json!({"proposals": reconcile_and_list(root)?}).to_string()),
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
             text(preview_json(root, file)?)
@@ -2960,7 +3159,45 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         };
     }
 
+    // Proposal approve/reject (ADR-0024): dynamic /proposals/{id}/{approve|reject},
+    // gated by the DISTINCT approval credential the agent does not hold.
+    if method == tiny_http::Method::Post {
+        if let Some(rest) = path_only.strip_prefix("/proposals/") {
+            let Some((id, action)) = rest.rsplit_once('/') else {
+                return respond(request, 400, "use /proposals/{id}/approve|reject".into(), "text/plain");
+            };
+            let approve = match action {
+                "approve" => true,
+                "reject" => false,
+                _ => return respond(request, 400, "action must be approve or reject".into(), "text/plain"),
+            };
+            match approval_token() {
+                None => {
+                    return respond(request, 403,
+                        "approval requires VEJAS_APPROVAL_TOKEN (a credential distinct from the agent's VEJAS_TOKEN)".into(),
+                        "text/plain");
+                }
+                Some(tok) => {
+                    let ok = request.headers().iter().any(|h| {
+                        h.field.equiv("x-approval-token") && h.value.as_str() == tok
+                    });
+                    if !ok {
+                        return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
+                    }
+                }
+            }
+            return match decide_proposal(&registry, &root, id, approve, "panel") {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            };
+        }
+    }
+
     match (method, path_only.as_str()) {
+        (tiny_http::Method::Get, "/proposals") => match reconcile_and_list(&root) {
+            Ok(list) => respond(request, 200, json!({"proposals": list}).to_string(), "application/json"),
+            Err(e) => respond(request, 500, e, "text/plain"),
+        },
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
             request,
             200,
