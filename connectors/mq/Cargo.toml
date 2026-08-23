@@ -1,0 +1,29 @@
+[package]
+name = "vejas-mq"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vejas IBM MQ connector: a first-class bus citizen (ADR-0023). Owns both the MQ transaction and its own NATS client, so MQGET→publish→MQCMIT commit ordering lives in one place. Hand-declared MQI FFI, dlopen'd at runtime."
+
+# NOT a member of the runtime workspace, and — unlike the SAP/Salesforce exec
+# children — this one holds its OWN NATS client (ADR-0023): a destructive MQGET
+# under syncpoint may only MQCMIT *after* the bus publish is confirmed, and a
+# stdout-only child cannot know the bus confirmed. So it needs `nats` directly.
+#
+# The IBM MQ C client (libmqic_r.so) is dlopen'd at RUNTIME (like libsapnwrfc,
+# ADR-0014) — there is NO build-time MQ dependency, so this crate builds anywhere.
+# Only *running* needs the client, installed where an MQ recipe runs. Point it with
+# VEJAS_MQ_LIB (default libmqic_r.so on the loader path) and connect as a client
+# via the standard MQSERVER / CCDT environment (no MQCD struct needed).
+
+[dependencies]
+nats = "0.25"
+serde_json = "1"
+
+[[bin]]
+name = "vejas-mq"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true

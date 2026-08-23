@@ -1,6 +1,6 @@
 # 0023 — IBM MQ: a first-class transactional connector, not an exec-bridge
 
-- Status: Proposed
+- Status: Accepted (built — `connectors/mq/`)
 - Date: 2026-08-23
 
 ## Context
@@ -118,6 +118,52 @@ by its own durable. Implementation detail, settled at build time.
    `CorrelId` rather than `MsgId` (the queue manager usually owns `MsgId`). Spike
    which `mqi` exposes cleanly (likely `CorrelId`) and document the choice; carry
    the key in a message property if neither is settable.
+
+## Build outcome (2026-08-23) — `connectors/mq/`
+
+Built as a standalone crate (like `sap-rfc`), NOT in the runtime workspace, holding
+its own `nats` client. The open questions, settled:
+
+1. **MQI binding** — went straight to the **hand-declared FFI** fallback, not the
+   `mqi`/`libmqm-sys` crate: `dlopen("libmqic_r.so")` at runtime (`VEJAS_MQ_LIB`
+   overrides), the eight MQI calls (MQCONNX/MQOPEN/MQGET/MQPUT/MQCMIT/MQBACK/
+   MQCLOSE/MQDISC) and the five v1 descriptors (MQCNO/MQOD/MQMD/MQGMO/MQPMO) as
+   `#[repr(C)]`. No build-time MQ dependency — the crate builds with no MQ present.
+   `MQGMO_SYNCPOINT` on the get and `MQPMO_SYNCPOINT` on the put; MQCMIT/MQBACK
+   exposed cleanly, which was the verification the crate choice hinged on.
+2. **Supervision** — not an exec-driver flag but a **standalone binary that owns
+   its NATS client**, which is what the transactional ordering requires. It shows
+   up as a first-class external source/sink (its own process), not a mislabeled
+   exec-source.
+3. **Dedup key** — **CorrelId**, per the app-level convention. An idempotency key
+   named by `VEJAS_MQ_DEDUP_FIELD` (a top-level JSON field) is folded to the 24
+   binary bytes by `correlid_from_key` (FNV-1a over three offset domains). MsgId is
+   left to the queue manager (`MQPMO_NEW_MSG_ID`).
+
+**Verified without a live queue manager:**
+- The transactional invariants the ADR rests on, against an in-memory fake broker
+  with fault injection: no-loss on crash-before-`MQCMIT` (the message is re-got),
+  consume-only-after-commit, put-invisible-until-commit / discarded-on-backout,
+  and commit-failure-leaves-the-bus-message-for-redelivery.
+- The FFI layout: `size_of` each descriptor equals its `cmqc.h` `MQ*_LENGTH_1`
+  (324 / 72 / 128 / 168 / 12) — a `#[repr(C)]` padding bug would corrupt memory
+  against a real QM, so this is the layout proof the ADR promised.
+- End-to-end source wiring on real NATS (fake broker → bus): messages land on the
+  subject, in order, each committed only after its JetStream pub-ack.
+- Graceful failure: missing config → exit 2; MQ client absent → a clear dlopen
+  error, not a crash.
+
+**Declared CI exception (ADR-0017, SAP-style):** the MQI *semantics* against a real
+queue manager (does MQGET-under-syncpoint / MQCMIT behave as the fake models)
+need the free **MQ Developer** container and are certified out-of-band, not in the
+per-commit CI. What was verified above is what a build machine without MQ can prove.
+
+**Known follow-up (next increment):** the **singleton lease** (ADR-0020, "singleton
+by default BECAUSE order") is not yet enforced in the binary — `VEJAS_MQ_COMPETING`
+documents the mode and the default is intended to be ordered/single-getter, but
+until the lease is wired the operator runs one source instance to preserve order.
+A destructive MQGET is competing-*safe* (no duplication) regardless; only order is
+at stake, exactly as the concurrency section states.
 
 ## Rejected
 
