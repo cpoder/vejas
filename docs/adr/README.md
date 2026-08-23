@@ -32,6 +32,7 @@ the old one.
 | [0019](0019-rules-view-read-only-projection.md) | Rules-view: read-only rule projection (N1/N2/N3 doctrine) | Accepted |
 | [0020](0020-clustering-zero-downtime.md) | Clustering & zero-downtime: competing durables + KV singleton leases | Accepted |
 | [0021](0021-versioning-canary-timetravel.md) | Versioning, canary & time-travel (cluster-wide promotion) | Accepted |
+| [0022](0022-kafka-connector-exec-bridge.md) | Kafka connector: exec-bridge over kcat (offsets in our KV) | Accepted |
 
 ## Template
 

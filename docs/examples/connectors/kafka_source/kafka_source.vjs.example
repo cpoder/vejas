@@ -1,0 +1,29 @@
+# connector: kafka_source — consume a Kafka topic onto the bus (ADR-0022).
+# An exec-bridge over `kcat`: the full auth matrix (TLS, SASL PLAIN/SCRAM,
+# Kerberos, OAUTHBEARER) rides librdkafka IN THE CHILD, never in our binary.
+# Offsets live in OUR JetStream KV (OFFSET_KV) — publish-before-commit,
+# at-least-once — and the singleton lease (ADR-0020) keeps exactly one consumer.
+# To scale past one, partition: one manifest per partition range, each its own
+# OFFSET_KV. Subjects in: (none) · out: vx.kafka.orders.in · secrets:
+# kafka/username, kafka/password.
+#
+# Needs `kcat` on the host (apt/brew: kafkacat/kcat) — a documented dependency of
+# THIS connector, not of the base image. Exotic feature? Change CMD; the core is
+# untouched (ADR-0011).
+driver "exec-stream-source"
+
+# `-C` consume, `-u` unbuffered (stream line-by-line), `-J` one JSON object per
+# message (carries `offset`), `-o $OFFSET` resume point injected by the driver
+# from OFFSET_KV. `-e` is intentionally ABSENT so it follows the topic tail.
+CMD = "kcat -C -u -q -b broker-1.example.com:9093,broker-2.example.com:9093 -t orders -o $OFFSET -J -X security.protocol=SASL_SSL -X sasl.mechanisms=SCRAM-SHA-256 -X sasl.username=$KAFKA_USER -X sasl.password=$KAFKA_PASS"
+
+SUBJECT = "kafka.orders.in"
+
+# offset resume in our KV: read at (re)start → $OFFSET, commit each record's
+# `offset` after it is on the bus. First run starts at the topic beginning.
+OFFSET_KV = "kafka_orders"
+OFFSET_FIELD = "offset"
+OFFSET_START = "beginning"
+
+# credentials to the child's environment only — never on argv (ADR-0008)
+ENV = {"KAFKA_USER": secret("kafka/username"), "KAFKA_PASS": secret("kafka/password")}

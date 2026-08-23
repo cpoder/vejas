@@ -1,0 +1,19 @@
+# connector: kafka_sink — produce bus messages to a Kafka topic (ADR-0022).
+# An exec-bridge over `kcat -P`: each message on SUBJECT is piped to the child's
+# stdin and produced. The full auth matrix rides librdkafka in the child. A sink
+# is a durable pull consumer, so it is competing-safe — N instances share the
+# load for free (ADR-0020), no lease needed. Subjects in: vx.kafka.orders.out ·
+# out: (Kafka) · secrets: kafka/username, kafka/password.
+#
+# Needs `kcat` on the host. Exotic feature? Change CMD; the core is untouched.
+# High produce volume wants a batching wrapper (kcat reads many stdin lines per
+# invocation) — see ADR-0022.
+driver "exec-sink"
+
+# `-P` produce; the message body arrives on stdin, one record produced to the
+# topic. `-X …` carries the same auth as the source.
+CMD = "kcat -P -b broker-1.example.com:9093,broker-2.example.com:9093 -t orders.enriched -X security.protocol=SASL_SSL -X sasl.mechanisms=SCRAM-SHA-256 -X sasl.username=$KAFKA_USER -X sasl.password=$KAFKA_PASS"
+
+SUBJECT = "kafka.orders.out"
+
+ENV = {"KAFKA_USER": secret("kafka/username"), "KAFKA_PASS": secret("kafka/password")}

@@ -1031,6 +1031,41 @@ pub fn to_dlq(
     js.publish(&dlq_subject, body).map(|_| ()).map_err(|e| e.to_string())
 }
 
+// ───────────────────────── exec-source offset resume (ADR-0011/0021) ─────────────────────────
+//
+// A generic resumption seam for exec stream sources whose remote has an offset
+// (Kafka via kcat, above all): the driver reads the last committed offset from a
+// KV bucket at (re)start and hands it to the child as `$OFFSET`, and commits each
+// record's offset AFTER publishing it to the bus (publish-before-commit, so a
+// crash re-consumes from the last committed offset — at-least-once, our model,
+// not the remote's opaque consumer-group rebalancing).
+
+pub const OFFSET_BUCKET: &str = "VEJAS_OFFSETS";
+
+pub fn open_offset_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
+    let cfg = nats::kv::Config {
+        bucket: OFFSET_BUCKET.to_string(),
+        history: 1,
+        ..Default::default()
+    };
+    js.create_key_value(&cfg)
+        .or_else(|_| js.key_value(OFFSET_BUCKET))
+        .ok()
+}
+
+pub fn offset_get(store: &nats::kv::Store, key: &str) -> Option<String> {
+    store
+        .get(key)
+        .ok()
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn offset_put(store: &nats::kv::Store, key: &str, value: &str) {
+    let _ = store.put(key, value.as_bytes());
+}
+
 // ───────────────────────── promote audit trail (ADR-0018) ─────────────────────────
 
 pub const AUDIT_STREAM: &str = "VEJAS_AUDIT";
@@ -1359,7 +1394,7 @@ impl Driver for ExecStreamSource {
         "source:stream"
     }
     fn about(&self) -> &'static str {
-        "Runs CMD as a long-running process and publishes each JSON line it streams on stdout to SUBJECT — line by line, with back-pressure (a bounded internal buffer; when the bus is slow the child's stdout blocks, so a burst can't overrun memory). For push sources like SAP IDoc inbound and Salesforce Bulk 2.0. ENV = {\"KEY\": secret(\"…\")} is handed to the child's environment (secrets never touch argv). On child exit it restarts after RESTART_SECS. Config: CMD, SUBJECT, ENV (optional), RESTART_SECS (optional, default 2)."
+        "Runs CMD as a long-running process and publishes each JSON line it streams on stdout to SUBJECT — line by line, with back-pressure (a bounded internal buffer; when the bus is slow the child's stdout blocks, so a burst can't overrun memory). For push sources like SAP IDoc inbound, Salesforce Bulk 2.0, and Kafka (wrap kcat). ENV = {\"KEY\": secret(\"…\")} is handed to the child's environment (secrets never touch argv). On child exit it restarts after RESTART_SECS. Optional offset RESUME (Kafka etc.): set OFFSET_KV to a key and the driver hands the child the last committed offset as $OFFSET at (re)start and commits each record's OFFSET_FIELD (default \"offset\") after publishing it — publish-before-commit, at-least-once, resume in OUR JetStream KV; OFFSET_START (default \"end\") is used on the first run. Config: CMD, SUBJECT, ENV (optional), RESTART_SECS (optional, default 2), OFFSET_KV/OFFSET_FIELD/OFFSET_START (optional)."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         use std::io::{BufRead, BufReader};
@@ -1371,16 +1406,30 @@ impl Driver for ExecStreamSource {
         let env = ctx.config.env_vars();
         let restart = ctx.config.u64_or("RESTART_SECS", 2).max(1);
         let js = ctx.jetstream()?;
+        // Optional offset resume: when OFFSET_KV is set, hand the child the last
+        // committed offset as $OFFSET at (re)start (e.g. `kcat -o $OFFSET`) and
+        // commit each record's OFFSET_FIELD after publishing it.
+        let offset_kv = ctx.config.str("OFFSET_KV");
+        let offset_field = ctx.config.str("OFFSET_FIELD").unwrap_or_else(|| "offset".into());
+        let offset_start = ctx.config.str("OFFSET_START").unwrap_or_else(|| "end".into());
+        let offset_store = offset_kv.as_ref().and_then(|_| open_offset_store(&js));
         eprintln!("[{}] exec-stream-source: `{cmd}` -> {subject} (streaming)", ctx.name);
 
         while ctx.alive() {
+            // resume from the last committed offset (or OFFSET_START on first run)
+            let mut run_env = env.clone();
+            if let (Some(store), Some(key)) = (&offset_store, &offset_kv) {
+                let start = offset_get(store, key).unwrap_or_else(|| offset_start.clone());
+                eprintln!("[{}] resuming at OFFSET={start}", ctx.name);
+                run_env.push(("OFFSET".to_string(), start));
+            }
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit()) // child status/errors flow to our logs
-                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .envs(run_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .spawn()
                 .map_err(|e| e.to_string())?;
             let stdout = child.stdout.take().ok_or("no child stdout")?;
@@ -1413,9 +1462,20 @@ impl Driver for ExecStreamSource {
                         if line.is_empty() {
                             continue;
                         }
-                        if serde_json::from_str::<Value>(line).is_ok() {
+                        if let Ok(rec) = serde_json::from_str::<Value>(line) {
                             match js.publish(&subject, line.as_bytes()) {
-                                Ok(_) => trace_pub(&ctx.name, &subject, line.as_bytes()),
+                                Ok(_) => {
+                                    trace_pub(&ctx.name, &subject, line.as_bytes());
+                                    // publish-before-commit: store next offset only
+                                    // after the record is on the bus (at-least-once).
+                                    if let (Some(store), Some(key)) = (&offset_store, &offset_kv) {
+                                        if let Some(off) =
+                                            rec.get(&offset_field).and_then(|x| x.as_i64())
+                                        {
+                                            offset_put(store, key, &(off + 1).to_string());
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     trace_fail(&ctx.name, &subject, format!("publish: {e}"))
                                 }
