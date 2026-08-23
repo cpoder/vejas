@@ -8,3 +8,4 @@
 .DS_Store
 e2e/film-out/
 /connectors/mq/target/
+/connectors/amqp/target/
