@@ -999,6 +999,7 @@ fn epoch_secs() -> u64 {
 
 /// Park one poison message in the DLQ as a death envelope. Returns Ok only when
 /// JetStream has stored it — the caller must ack the original only on Ok.
+#[allow(clippy::too_many_arguments)]
 pub fn to_dlq(
     js: &nats::jetstream::JetStream,
     unit: &str,
@@ -1006,6 +1007,7 @@ pub fn to_dlq(
     attempts: i64,
     last_error: &str,
     payload: &[u8],
+    version: &str,
 ) -> Result<(), String> {
     ensure_dlq_stream(js);
     let now = epoch_secs();
@@ -1016,6 +1018,10 @@ pub fn to_dlq(
         "first_seen": now,
         "dead_at": now,
         "last_error": last_error,
+        // The version (content hash) that failed this message (ADR-0021). Empty
+        // for unversioned units. So a replay after a promote to v2 is legible:
+        // "this died under v1 — does it still fail under the current version?"
+        "version": version,
         // Raw text of the original message — replayed verbatim, so JSON and
         // non-JSON alike re-inject faithfully; the panel pretty-prints it if JSON.
         "payload": String::from_utf8_lossy(payload),
@@ -1137,7 +1143,7 @@ fn run_sink(
                     if delivered >= crate::MAX_DELIVERIES {
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
-                        match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data) {
+                        match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "") {
                             Ok(()) => {
                                 crate::metrics::inc_dead_letter(&ctx.name);
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);

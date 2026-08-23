@@ -809,6 +809,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 s
             };
             let prog = vjs::parse(&src)?;
+            // the version (content hash of the effective source) this flow runs —
+            // tags any message it dead-letters (ADR-0021).
+            let flow_version = versions::hash_content(&src);
             let Some(source) = prog.source.clone() else {
                 // An api-only / tool-only flow has no bus source: it is served
                 // synchronously by the HTTP/API and MCP routers, not consumed
@@ -893,7 +896,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
                             metrics::observe(&handle.spec.name, false, 0, 0.0);
-                            match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data) {
+                            match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version) {
                                 Ok(()) => {
                                     metrics::inc_dead_letter(&handle.spec.name);
                                     record_trace(&handle.spec.name, &msg.subject, false,
@@ -967,7 +970,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let delivered =
                                 msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
                             if delivered >= MAX_DELIVERIES {
-                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data) {
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version) {
                                     Ok(()) => {
                                         metrics::inc_dead_letter(&handle.spec.name);
                                         record_trace(&handle.spec.name, &msg.subject, false,
