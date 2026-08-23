@@ -90,14 +90,22 @@ impl Ctx {
         self.running.load(Ordering::SeqCst)
     }
     fn jetstream(&self) -> Result<nats::jetstream::JetStream, String> {
+        Ok(self.jetstream_and_conn()?.0)
+    }
+    /// Like `jetstream()`, but also returns the raw `Connection` (a cheap clone —
+    /// `Connection` is `Arc` inside) so a driver can use `publish_confirmed`, which
+    /// needs the connection to flush directly past the 5ms flusher floor.
+    fn jetstream_and_conn(
+        &self,
+    ) -> Result<(nats::jetstream::JetStream, nats::Connection), String> {
         let nc = nats::connect(&self.nats_url).map_err(|e| e.to_string())?;
-        let js = nats::jetstream::new(nc);
+        let js = nats::jetstream::new(nc.clone());
         let _ = js.add_stream(&nats::jetstream::StreamConfig {
             name: self.stream.clone(),
             subjects: vec![format!("{}.>", self.subj_root)],
             ..Default::default()
         });
-        Ok(js)
+        Ok((js, nc))
     }
     /// Full subject from a config value that may be a bare suffix or a vx.* path.
     fn subject(&self, raw: &str) -> String {
@@ -483,6 +491,52 @@ pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::
         )
         .map_err(|e| e.to_string())?;
     Ok(iter.map_while(|m| m.ok()).collect())
+}
+
+/// Publish to a JetStream subject and wait for the pub-ack, flushing the write
+/// DIRECTLY in this thread rather than via the shared flusher.
+///
+/// `nats` 0.25's flusher thread imposes a hard-coded 5ms floor between flushes
+/// (`client.rs` `MIN_FLUSH_BETWEEN`, a never-done `TODO(dlc)`). Since a JetStream
+/// pub-ack is a request/reply, EVERY sequential `js.publish` is capped at ~200/s by
+/// that floor — the ceiling the MQTT loopback bench surfaced (js.publish p50
+/// ≈5.1ms, dead on the tick). `Connection::flush()` does a direct writer flush +
+/// PING/PONG in the calling thread, bypassing the floor, which lifts sequential
+/// publish to ~1-2k/s. This reimplements `request_with_headers_or_timeout` (nats
+/// `lib.rs`) verbatim — inbox, buffered publish-with-reply, the **no-responders
+/// guard** — and only adds the direct flush, so the at-least-once contract is
+/// unchanged: a returned Ok still means the message was persisted (a real pub-ack
+/// with a `stream`/`seq`), never a mis-read of a 503 or an error ack.
+pub fn publish_confirmed(
+    nc: &nats::Connection,
+    subject: &str,
+    payload: &[u8],
+    wait: Duration,
+) -> Result<(), String> {
+    let reply = nc.new_inbox();
+    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
+    nc.publish_request(subject, &reply, payload)
+        .map_err(|e| e.to_string())?;
+    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
+    let msg = sub
+        .next_timeout(wait)
+        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
+    if msg.is_no_responders() {
+        return Err("no JetStream responder for the subject (stream missing?)".into());
+    }
+    // ApiResponse<PublishAck>: an "error" key = rejected; a "stream" key = persisted.
+    let ack: serde_json::Value =
+        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
+    if let Some(err) = ack.get("error") {
+        return Err(format!("JetStream rejected the publish: {err}"));
+    }
+    if ack.get("stream").is_none() {
+        return Err(format!(
+            "unexpected pub-ack (no stream): {}",
+            String::from_utf8_lossy(&msg.data)
+        ));
+    }
+    Ok(())
 }
 
 /// Hydrate up to `n` recent REAL events for `subject` from the persisted stream,
@@ -1628,7 +1682,9 @@ impl Driver for MqttIn {
         let client_id = mqtt_client_id(ctx);
         let user = ctx.config.str("USERNAME");
         let pass = ctx.config.str("PASSWORD");
-        let js = ctx.jetstream()?;
+        // nc for publish_confirmed (direct flush past the 5ms flusher floor — the
+        // MQTT-loopback ceiling); _js keeps the stream ensured.
+        let (_js, nc) = ctx.jetstream_and_conn()?;
         while ctx.alive() {
             let attempt = (|| -> Result<(), String> {
                 let mut client = mqtt_connect(
@@ -1643,7 +1699,8 @@ impl Driver for MqttIn {
                             // publish-before-ack: bus first (await JetStream pub-ack),
                             // THEN PUBACK — a crash before the bus write re-delivers
                             // from the broker (ADR-0025).
-                            js.publish(&subject, &payload).map_err(|e| format!("bus publish: {e}"))?;
+                            publish_confirmed(&nc, &subject, &payload, Duration::from_secs(5))
+                                .map_err(|e| format!("bus publish: {e}"))?;
                             trace_pub(&ctx.name, &subject, &payload);
                             if pq > 0 {
                                 client.puback(pid)?;
@@ -2049,6 +2106,56 @@ mod tests {
         // non-string values are ignored, string ones pass through
         assert_eq!(cfg.headers(), vec![("Authorization".to_string(), "Bearer x".to_string())]);
         assert!(Config::default().headers().is_empty());
+    }
+
+    /// Verifies `publish_confirmed` clears the nats flusher throttle AND keeps the
+    /// at-least-once contract: messages actually persist, and a subject with no
+    /// stream errors (never a false Ok). Needs a live NATS on 127.0.0.1:4222;
+    /// excluded from CI. Run:
+    /// `cargo test publish_confirmed_beats_throttle -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn publish_confirmed_beats_throttle_and_persists() {
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
+        let nc = nats::connect(&url).expect("connect");
+        let js = nats::jetstream::new(nc.clone());
+        let pid = std::process::id();
+        let stream = format!("PBFAST_{pid}");
+        let subject = format!("pbfast.{pid}.in");
+        let _ = js.delete_stream(&stream);
+        js.add_stream(nats::jetstream::StreamConfig {
+            name: stream.clone(),
+            subjects: vec![format!("pbfast.{pid}.>")],
+            ..Default::default()
+        })
+        .expect("add_stream");
+
+        const N: usize = 200;
+        // (A) baseline: throttled js.publish
+        let t = Instant::now();
+        for _ in 0..N {
+            js.publish(&subject, b"x").expect("js.publish");
+        }
+        let base = N as f64 / t.elapsed().as_secs_f64();
+        // (B) direct-flush publish_confirmed
+        let t = Instant::now();
+        for _ in 0..N {
+            publish_confirmed(&nc, &subject, b"x", Duration::from_secs(5)).expect("confirmed");
+        }
+        let fast = N as f64 / t.elapsed().as_secs_f64();
+        eprintln!("[pbfast] js.publish={base:.0}/s  publish_confirmed={fast:.0}/s  ({:.1}x)", fast / base);
+        assert!(fast > base * 2.0, "direct flush should clear the 5ms floor (got {fast:.0} vs {base:.0}/s)");
+
+        // (C) durability: all 2N messages actually landed on the stream
+        let msgs = js.stream_info(&stream).expect("info").state.messages;
+        assert!(msgs >= (2 * N) as u64, "every confirmed publish persisted (have {msgs})");
+
+        // (D) no-responders guard: a subject with no stream must ERROR, not false-Ok
+        let orphan = format!("orphan.{pid}.no.stream");
+        let r = publish_confirmed(&nc, &orphan, b"x", Duration::from_secs(1));
+        assert!(r.is_err(), "publish to a stream-less subject must error, got {r:?}");
+
+        let _ = js.delete_stream(&stream);
     }
 
     /// Latency probe for `fetch_round` — the shared pull loop every sink/flow runs.
