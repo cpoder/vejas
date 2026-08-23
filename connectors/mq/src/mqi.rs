@@ -35,6 +35,10 @@ pub const MQRC_TRUNCATED_MSG_FAILED: MqLong = 2080;
 
 // Struct versions.
 const MQCNO_VERSION_1: MqLong = 1;
+const MQCNO_VERSION_5: MqLong = 5;
+const MQCSP_VERSION_1: MqLong = 1;
+const MQCSP_AUTH_NONE: MqLong = 0;
+const MQCSP_AUTH_USER_ID_AND_PWD: MqLong = 1;
 const MQOD_VERSION_1: MqLong = 1;
 const MQMD_VERSION_1: MqLong = 1;
 const MQGMO_VERSION_1: MqLong = 1;
@@ -70,15 +74,74 @@ const MQFMT_NONE: &[u8; 8] = b"        ";
 // Every char array is fixed-size and space-padded per MQI convention. Layouts are
 // the v1 shapes; field order and widths are the ABI contract — do not reorder.
 
+// The v5 layout (fields through SecurityParmsPtr) so we can point at an MQCSP for
+// user/password auth. The struct is physically v5-sized, but `Version` governs what
+// the queue manager reads: it stays 1 (v1 behaviour) unless credentials are set, in
+// which case it becomes 5 and SecurityParmsPtr is honoured. Field order/width is the
+// cmqc.h ABI — do not reorder (verified by the size assertion below).
 #[repr(C)]
 struct Mqcno {
-    StrucId: [c_char; 4],  // "CNO "
-    Version: MqLong,       // 1
-    Options: MqLong,       // MQCNO_NONE
+    StrucId: [c_char; 4],          // "CNO "
+    Version: MqLong,               // 1, or 5 when SecurityParmsPtr is set
+    Options: MqLong,               // MQCNO_NONE
+    ClientConnOffset: MqLong,      // v2
+    ClientConnPtr: *mut c_void,    // v2 (MQPTR)
+    ConnTag: [u8; 128],            // v3 (MQBYTE128)
+    SSLConfigPtr: *mut c_void,     // v4 (MQPTR)
+    SSLConfigOffset: MqLong,       // v4
+    SecurityParmsOffset: MqLong,   // v5
+    SecurityParmsPtr: *mut c_void, // v5 (MQPTR → MQCSP)
 }
 impl Default for Mqcno {
     fn default() -> Self {
-        Mqcno { StrucId: cc(b"CNO "), Version: MQCNO_VERSION_1, Options: MQCNO_NONE }
+        Mqcno {
+            StrucId: cc(b"CNO "),
+            Version: MQCNO_VERSION_1,
+            Options: MQCNO_NONE,
+            ClientConnOffset: 0,
+            ClientConnPtr: std::ptr::null_mut(),
+            ConnTag: [0; 128],
+            SSLConfigPtr: std::ptr::null_mut(),
+            SSLConfigOffset: 0,
+            SecurityParmsOffset: 0,
+            SecurityParmsPtr: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Connection Security Parameters — carries the user id and password for MQCONNX
+/// authentication (most enterprise queue managers set CHCKCLNT(REQUIRED)). The
+/// strings are passed by pointer+length (not null-terminated); the buffers must
+/// outlive the MQCONNX call.
+#[repr(C)]
+struct Mqcsp {
+    StrucId: [c_char; 4],           // "CSP "
+    Version: MqLong,                // 1
+    AuthenticationType: MqLong,     // MQCSP_AUTH_USER_ID_AND_PWD
+    Reserved1: [u8; 4],
+    CSPUserIdPtr: *mut c_void,      // MQPTR
+    CSPUserIdOffset: MqLong,
+    CSPUserIdLength: MqLong,
+    Reserved2: [u8; 8],
+    CSPPasswordPtr: *mut c_void,    // MQPTR
+    CSPPasswordOffset: MqLong,
+    CSPPasswordLength: MqLong,
+}
+impl Default for Mqcsp {
+    fn default() -> Self {
+        Mqcsp {
+            StrucId: cc(b"CSP "),
+            Version: MQCSP_VERSION_1,
+            AuthenticationType: MQCSP_AUTH_NONE,
+            Reserved1: [0; 4],
+            CSPUserIdPtr: std::ptr::null_mut(),
+            CSPUserIdOffset: 0,
+            CSPUserIdLength: 0,
+            Reserved2: [0; 8],
+            CSPPasswordPtr: std::ptr::null_mut(),
+            CSPPasswordOffset: 0,
+            CSPPasswordLength: 0,
+        }
     }
 }
 
@@ -396,6 +459,31 @@ impl MqiQueue {
         let mut hconn: MqHconn = -1;
         let (mut cc, mut rc): (MqLong, MqLong) = (0, 0);
         let mut cno = Mqcno::default();
+        // user/password auth (MQCSP) when VEJAS_MQ_USER/VEJAS_MQ_PASSWORD are set —
+        // enterprise QMs run CHCKCLNT(REQUIRED). The buffers and the MQCSP must
+        // outlive the MQCONNX call below (they do — same scope).
+        let user = std::env::var("VEJAS_MQ_USER").ok().filter(|s| !s.is_empty());
+        let pass = std::env::var("VEJAS_MQ_PASSWORD").ok().filter(|s| !s.is_empty());
+        // Fixed, zero-padded buffers (MQ_USER_ID / MQ_CSP_PASSWORD max lengths) —
+        // like the IBM sample's char[] rather than an exact-length slice. The
+        // client's password protection can read the buffer beyond the declared
+        // length, so slack + NUL padding matters (an exact-length Vec yields 2139).
+        let mut ubuf = [0u8; 64];
+        let mut pbuf = [0u8; 256];
+        let mut csp = Mqcsp::default();
+        if let (Some(u), Some(p)) = (&user, &pass) {
+            let ul = u.len().min(ubuf.len());
+            let pl = p.len().min(pbuf.len());
+            ubuf[..ul].copy_from_slice(&u.as_bytes()[..ul]);
+            pbuf[..pl].copy_from_slice(&p.as_bytes()[..pl]);
+            csp.AuthenticationType = MQCSP_AUTH_USER_ID_AND_PWD;
+            csp.CSPUserIdPtr = ubuf.as_ptr() as *mut c_void;
+            csp.CSPUserIdLength = ul as MqLong;
+            csp.CSPPasswordPtr = pbuf.as_ptr() as *mut c_void;
+            csp.CSPPasswordLength = pl as MqLong;
+            cno.Version = MQCNO_VERSION_5;
+            cno.SecurityParmsPtr = (&mut csp) as *mut Mqcsp as *mut c_void;
+        }
         let mut qmgr_c = [b' ' as c_char; 48];
         for (i, b) in qmgr.bytes().take(48).enumerate() {
             qmgr_c[i] = b as c_char;
@@ -511,12 +599,15 @@ mod layout {
     // corrupt memory against a real queue manager. This is the layout verification
     // the ADR promised, done without a live QM.
     #[test]
-    fn descriptor_lengths_match_cmqc_v1() {
-        assert_eq!(std::mem::size_of::<Mqcno>(), 12, "MQCNO_LENGTH_1");
+    fn descriptor_lengths_match_cmqc() {
+        // MQOD/MQMD/MQGMO/MQPMO are the v1 shapes; MQCNO is physically v5 and MQCSP
+        // v1 — 64-bit lengths (8-byte MQPTR). A mismatch = a padding/order bug.
         assert_eq!(std::mem::size_of::<Mqod>(), 168, "MQOD_LENGTH_1");
         assert_eq!(std::mem::size_of::<Mqmd>(), 324, "MQMD_LENGTH_1");
         assert_eq!(std::mem::size_of::<Mqgmo>(), 72, "MQGMO_LENGTH_1");
         assert_eq!(std::mem::size_of::<Mqpmo>(), 128, "MQPMO_LENGTH_1");
+        assert_eq!(std::mem::size_of::<Mqcno>(), 176, "MQCNO_LENGTH_5 (64-bit)");
+        assert_eq!(std::mem::size_of::<Mqcsp>(), 56, "MQCSP_LENGTH_1 (64-bit)");
     }
 }
 
