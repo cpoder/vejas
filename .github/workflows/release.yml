@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write      # create the GitHub Release, upload assets
+  packages: write      # push the container image to ghcr
+
+jobs:
+  binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the release binary
+        run: cargo build --release --manifest-path core/Cargo.toml
+      - name: Stage the artifact
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          install -m755 core/target/release/vejas-runtime "vejas-runtime-$V-linux-x86_64"
+          sha256sum "vejas-runtime-$V-linux-x86_64" > "vejas-runtime-$V-linux-x86_64.sha256"
+      - name: Extract the changelog section
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          awk -v v="$V" '/^## \[/{if(p)exit} $0 ~ "\\[" v "\\]"{p=1} p' CHANGELOG.md > RELEASE_NOTES.md
+          [ -s RELEASE_NOTES.md ] || echo "Release $GITHUB_REF_NAME" > RELEASE_NOTES.md
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            vejas-runtime-*-linux-x86_64
+            vejas-runtime-*-linux-x86_64.sha256
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/cpoder/vejas:${{ github.ref_name }}
+            ghcr.io/cpoder/vejas:latest
