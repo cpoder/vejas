@@ -745,12 +745,31 @@ fn decide_proposal(
     Ok(json!({"ok": true, "proposal": updated, "applied": result}))
 }
 
+/// Governed-change mode (ADR-0024): when `VEJAS_REQUIRE_APPROVAL=1`, a direct
+/// mutation is refused — the caller submits a proposal a human approves instead.
+/// Gates EVERY mutating path (MCP tools AND raw HTTP), not just the MCP door: an
+/// agent with HTTP access would otherwise walk through the other one.
+fn require_approval() -> bool {
+    env::var("VEJAS_REQUIRE_APPROVAL")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+fn approval_gate() -> Result<(), String> {
+    if require_approval() {
+        Err("approval required: submit a proposal (vejas_propose, or the panel) — \
+             a human approves it, see ADR-0024"
+            .into())
+    } else {
+        Ok(())
+    }
+}
+
 /// In cluster mode (`VEJAS_CLUSTER=1`), refuse any mutation of this instance's
 /// LOCAL files. A promote that lands on one instance while the others keep the old
 /// rule is the worst failure mode for the business-surface thesis (ADR-0020) — the
 /// expert believes they fixed the meaning while half the traffic disagrees. In a
-/// cluster, changes flow through GitOps. `/reload`, DLQ replay, and Vault-backed
-/// secret writes stay allowed (they are per-instance-safe or shared-store).
+/// cluster, changes flow through GitOps or a proposal. `/reload`, DLQ replay, and
+/// Vault-backed secret writes stay allowed (they are per-instance-safe or shared).
 fn cluster_write_guard() -> Result<(), String> {
     if cluster::clustered() {
         Err("clustered: this instance will not mutate its local files — \
@@ -2850,6 +2869,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         "vejas_language" => text(LANGUAGE_VJS.to_string()),
         "vejas_events" => text(events_json(args["flow"].as_str())),
         "vejas_write_flow" => {
+            approval_gate()?;
             cluster_write_guard()?;
             let p = args["path"].as_str().ok_or("path required")?;
             let content = args["content"].as_str().ok_or("content required")?;
@@ -2868,6 +2888,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"ok": true, "started": started, "stopped": stopped}).to_string())
         }
         "vejas_set_literal" => {
+            approval_gate()?;
             let file = args["file"].as_str().ok_or("file required")?;
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
@@ -2885,6 +2906,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"ok": true}).to_string())
         }
         "vejas_rollback_literal" => {
+            approval_gate()?;
             cluster_write_guard()?;
             let file = args["file"].as_str().ok_or("file required")?;
             let lname = args["name"].as_str().ok_or("name required")?;
@@ -2936,6 +2958,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"emits": emits}).to_string())
         }
         "vejas_new_flow" => {
+            approval_gate()?;
             cluster_write_guard()?;
             let prompt = args["prompt"].as_str().ok_or("prompt required")?;
             let res = generate_flow(root, prompt)?;
@@ -2943,6 +2966,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(res)
         }
         "vejas_new_connector" => {
+            approval_gate()?;
             cluster_write_guard()?;
             let prompt = args["prompt"].as_str().ok_or("prompt required")?;
             let res = generate_connector(root, prompt)?;
@@ -2962,6 +2986,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_secrets" => text(secrets_json(root)),
         "vejas_set_secret" => {
+            approval_gate()?;
             // A shared Vault backend is cluster-safe; a local FileStore is not
             // (one instance's file only). Vault stays allowed, local refuses.
             if cluster::clustered() && secrets::default_store().kind() != "vault" {
@@ -2982,6 +3007,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(probe_connector(root, file).to_string())
         }
         "vejas_provision" => {
+            approval_gate()?;
             cluster_write_guard()?;
             let template = args["template"].as_str().ok_or("template required")?;
             let slug = args["tenant_slug"].as_str().ok_or("tenant_slug required")?;
@@ -3260,6 +3286,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Post, "/events/golden") => {
             // Curate a golden test from a real event (candidate 4.4). Writes a
             // repo file, so cluster mode refuses it (golden tests go via git).
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3302,6 +3331,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             respond(request, 200, secrets_json(&root), "application/json")
         }
         (tiny_http::Method::Post, "/secrets/set") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             // Vault (shared) is cluster-safe; a local FileStore is not.
             if cluster::clustered() && secrets::default_store().kind() != "vault" {
                 return respond(
@@ -3338,6 +3370,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
         }
         (tiny_http::Method::Post, "/provision") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3387,6 +3422,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/file/set") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3433,6 +3471,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             )
         }
         (tiny_http::Method::Post, "/fixture/set") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3508,6 +3549,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/surface/set") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             let name = body["name"].as_str().unwrap_or("").to_string();
@@ -3546,6 +3590,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/surface/rollback") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3562,6 +3609,9 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Post, "/flows/new") => {
+            if let Err(e) = approval_gate() {
+                return respond(request, 409, e, "text/plain");
+            }
             if let Err(e) = cluster_write_guard() {
                 return respond(request, 409, e, "text/plain");
             }
@@ -3771,6 +3821,24 @@ fn main() {
     let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
     let addr = env::var("VEJAS_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8686".into());
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Governed-change mode (ADR-0024): refuse to boot without the DISTINCT approval
+    // credential. A governance mode whose approve door shares the agent's VEJAS_TOKEN
+    // is a governance mode in name only — the agent that proposes could also approve.
+    if require_approval() && approval_token().is_none() {
+        eprintln!(
+            "[vejas] VEJAS_REQUIRE_APPROVAL is set but VEJAS_APPROVAL_TOKEN is not — \
+             refusing to start: the approval credential MUST be distinct from the \
+             agent's VEJAS_TOKEN (ADR-0024). Set VEJAS_APPROVAL_TOKEN and restart."
+        );
+        std::process::exit(1);
+    }
+    if require_approval() {
+        eprintln!(
+            "[vejas] governed-change mode — direct mutations refused; agents submit \
+             proposals, a human approves with VEJAS_APPROVAL_TOKEN (ADR-0024)"
+        );
+    }
 
     // Traces to an OTLP collector iff OTEL_EXPORTER_OTLP_ENDPOINT is set; metrics
     // are always scrapeable at GET /metrics. No-op (no thread) when unset.
