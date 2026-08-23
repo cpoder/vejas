@@ -10,6 +10,13 @@ amiquip = { version = "0.4", default-features = false }
 crossbeam-channel = "0.5"
 nats = "0.25"
 serde_json = "1"
+# Pure-Rust TLS for amqps:// — rustls (already in the tree via nats, ring provider;
+# no openssl-sys) wrapped over amiquip's mio-0.6 stream via a small Evented adapter
+# (ADR-0026 Q1). This is the whole point of NOT using amiquip's native-tls default.
+rustls = "0.22"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+mio = "0.6"
 
 [[bin]]
 name = "vejas-amqp"

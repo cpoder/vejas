@@ -15,10 +15,15 @@
 //! path. The transactional ordering is exercised against a fake below with fault
 //! injection; real-RabbitMQ certification is the declared CI exception (ADR-0017).
 
+mod tls;
+
 use amiquip::{
-    Channel, Confirm, Connection, Consumer, ConsumerMessage, ConsumerOptions, Exchange, Publish,
-    QueueDeclareOptions,
+    Auth, Channel, Confirm, Connection, ConnectionOptions, ConnectionTuning, Consumer,
+    ConsumerMessage, ConsumerOptions, Exchange, Publish, QueueDeclareOptions,
 };
+
+// Present our rustls-over-mio stream to amiquip as a pollable byte stream (ADR-0026).
+impl amiquip::IoStream for tls::RustlsMioStream {}
 use std::collections::HashMap;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,8 +256,14 @@ fn main() {
     };
     let js = nats::jetstream::new(nc.clone());
 
-    // plaintext connect (spike); production TLS = rustls-over-IoStream (ADR-0026).
-    let mut conn = match Connection::insecure_open(&url) {
+    // amqps:// → pure-Rust rustls over amiquip's mio stream (ADR-0026 Q1); amqp://
+    // → plaintext. Both avoid amiquip's native-tls (openssl-sys) default.
+    let opened = if url.starts_with("amqps://") {
+        open_tls(&url)
+    } else {
+        Connection::insecure_open(&url).map_err(|e| e.to_string())
+    };
+    let mut conn = match opened {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[vejas-amqp] cannot open AMQP at {url}: {e}");
@@ -330,6 +341,36 @@ fn run_sink_amqp(
         .map_err(|e| e.to_string())?;
     let mut sink = AmqpPublisher { exchange, confirms };
     run_sink(&mut sink, &sub, routing_key, alive)
+}
+
+/// Open an amqps:// connection with pure-Rust rustls TLS (ADR-0026 Q1). Minimal URL
+/// parse (amqps://[user:pass@]host[:port][/vhost]); trust roots come from
+/// VEJAS_AMQP_TLS_CA (a PEM, e.g. a self-signed broker) or the webpki roots, and the
+/// SNI defaults to the URL host (VEJAS_AMQP_TLS_SERVER_NAME overrides).
+fn open_tls(url: &str) -> Result<Connection, String> {
+    let rest = url.trim_start_matches("amqps://");
+    let (userinfo, hostpart) = rest.split_once('@').unwrap_or(("", rest));
+    let (user, pass) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None if !userinfo.is_empty() => (userinfo.to_string(), String::new()),
+        None => ("guest".to_string(), "guest".to_string()),
+    };
+    let (hostport, vhost) = match hostpart.split_once('/') {
+        Some((hp, v)) if !v.is_empty() => (hp, v.to_string()),
+        Some((hp, _)) => (hp, "/".to_string()),
+        None => (hostpart, "/".to_string()),
+    };
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| "bad port in URL")?),
+        None => (hostport.to_string(), 5671),
+    };
+    let server_name = env("VEJAS_AMQP_TLS_SERVER_NAME").unwrap_or_else(|| host.clone());
+    let stream = tls::connect(&host, port, &server_name, env("VEJAS_AMQP_TLS_CA").as_deref())?;
+    let options = ConnectionOptions::default()
+        .auth(Auth::Plain { username: user, password: pass })
+        .virtual_host(vhost);
+    Connection::insecure_open_stream(stream, options, ConnectionTuning::default())
+        .map_err(|e| e.to_string())
 }
 
 // ───────────────────────── tests ─────────────────────────
