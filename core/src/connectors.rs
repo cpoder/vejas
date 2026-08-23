@@ -192,7 +192,10 @@ impl Driver for HttpIn {
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let port = ctx.config.u64_or("PORT", 8787) as u16;
-        let js = ctx.jetstream()?;
+        // nc for publish_confirmed (direct flush past the 5ms flusher floor —
+        // measured: /ingest p50 5.2ms→0.77ms, no throughput regression at conc=32);
+        // _js keeps the stream ensured.
+        let (_js, nc) = ctx.jetstream_and_conn()?;
         let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).ok();
         eprintln!("[{}] http-in on :{port}, publishing under {}.*", ctx.name, ctx.subj_root);
@@ -202,10 +205,10 @@ impl Driver for HttpIn {
             }
             match s {
                 Ok(mut sock) => {
-                    let js = js.clone();
+                    let nc = nc.clone();
                     let root = ctx.subj_root.clone();
                     let name = ctx.name.clone();
-                    thread::spawn(move || handle_http_in(&name, &mut sock, &js, &root));
+                    thread::spawn(move || handle_http_in(&name, &mut sock, &nc, &root));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Poll responsively (stop is re-checked each turn) without a
@@ -220,7 +223,7 @@ impl Driver for HttpIn {
     }
 }
 
-fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, js: &nats::jetstream::JetStream, subj_root: &str) {
+fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, nc: &nats::Connection, subj_root: &str) {
     // TCP_NODELAY: without it, the small response write + the client's delayed
     // ACK collide with Nagle for a ~40ms stall on every keep-alive request.
     sock.set_nodelay(true).ok();
@@ -285,7 +288,7 @@ fn handle_http_in(name: &str, sock: &mut std::net::TcpStream, js: &nats::jetstre
                     ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string())
                 } else {
                     let subject = format!("{subj_root}.{suffix}");
-                    match js.publish(&subject, body) {
+                    match publish_confirmed(nc, &subject, body, Duration::from_secs(5)) {
                         Ok(_) => {
                             trace_pub(name, &subject, body);
                             ("202 Accepted", format!("{{\"published\":\"{subject}\"}}"))
