@@ -86,13 +86,50 @@ fn load_config() -> Result<Config, String> {
 }
 
 // ───────────────────────── source: MQ → bus ─────────────────────────
+/// Publish and wait for the JetStream pub-ack, flushing DIRECTLY past nats 0.25's
+/// 5ms flusher floor (client.rs MIN_FLUSH_BETWEEN) — that floor caps every
+/// sequential pub-ack at ~200/s, and this get→publish→commit loop is exactly that.
+/// Reimplements the crate's request path (inbox, buffered publish-with-reply,
+/// no-responders guard) + a direct flush; Ok still means a real pub-ack (persisted),
+/// so the at-least-once ordering (publish-before-MQCMIT) is unchanged.
+fn publish_confirmed(
+    nc: &nats::Connection,
+    subject: &str,
+    payload: &[u8],
+    wait: Duration,
+) -> Result<(), String> {
+    let reply = nc.new_inbox();
+    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
+    nc.publish_request(subject, &reply, payload)
+        .map_err(|e| e.to_string())?;
+    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
+    let msg = sub
+        .next_timeout(wait)
+        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
+    if msg.is_no_responders() {
+        return Err("no JetStream responder for the subject (stream missing?)".into());
+    }
+    let ack: serde_json::Value =
+        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
+    if let Some(err) = ack.get("error") {
+        return Err(format!("JetStream rejected the publish: {err}"));
+    }
+    if ack.get("stream").is_none() {
+        return Err(format!(
+            "unexpected pub-ack (no stream): {}",
+            String::from_utf8_lossy(&msg.data)
+        ));
+    }
+    Ok(())
+}
+
 /// Get under syncpoint, publish to the bus awaiting the JetStream pub-ack, then —
 /// and only then — MQCMIT. Any failure before the commit is an MQBACK, so the
 /// message stays on the queue and is re-got: at-least-once, no loss. The broker is
 /// the durable cursor (no offset KV — contrast Kafka/ADR-0022).
 fn run_source(
     broker: &mut dyn Broker,
-    js: &nats::jetstream::JetStream,
+    nc: &nats::Connection,
     subject: &str,
     wait: Duration,
     alive: impl Fn() -> bool,
@@ -103,7 +140,7 @@ fn run_source(
             .get_syncpoint(wait)
             .map_err(|e| format!("get: {e}"))?;
         let Some(msg) = got else { continue }; // idle: no message within the wait
-        match js.publish(subject, &msg.body) {
+        match publish_confirmed(nc, subject, &msg.body, Duration::from_secs(5)) {
             Ok(_) => {
                 // JetStream pub-ack received (message is durable on the bus) →
                 // safe to remove it from MQ.
@@ -232,7 +269,7 @@ fn main() {
         // stop getting if the lease is lost (fenced / aged out) as well as on signal
         let source_alive = || alive() && held.as_ref().map_or(true, |l| !l.lost());
         MqiQueue::open(&cfg.qmgr, &cfg.queue, false)
-            .and_then(|mut q| run_source(&mut q, &js, &cfg.subject, cfg.wait, source_alive))
+            .and_then(|mut q| run_source(&mut q, &nc, &cfg.subject, cfg.wait, source_alive))
     } else {
         // durable pull consumer, competing-safe by its own durable (SUBJECTS.md).
         let sub = js
@@ -406,7 +443,7 @@ mod tests {
             fn backout(&mut self) -> Result<(), mqi::MqError> { self.inner.backout() }
         }
         let mut draining = Draining { inner: std::mem::take(&mut broker), flag: &seen_empty };
-        run_source(&mut draining, &js, &subject, Duration::from_millis(50), alive).expect("source");
+        run_source(&mut draining, &nc, &subject, Duration::from_millis(50), alive).expect("source");
 
         let mut got = Vec::new();
         while let Ok(m) = sub.next_timeout(Duration::from_millis(300)) {
