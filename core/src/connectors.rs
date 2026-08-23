@@ -449,28 +449,40 @@ pub fn ack_wait() -> Duration {
         .unwrap_or_default()
 }
 
+/// The idle poll window (`expires`). One outstanding pull covers this whole span,
+/// so a message arriving any time inside it is delivered at once — there is NO gap
+/// between rounds where a message would sit unpolled. It is therefore two things at
+/// once: the idle pull cadence (one pull per window when quiet) AND the worst-case
+/// stop-response latency (the loop re-checks its `alive` flag each time a pull
+/// returns). 500ms keeps idle chatter to ~2 pulls/s per consumer while leaving stop
+/// far inside the transport suite's 3s bound (T5).
+const PULL_EXPIRES_MS: u64 = 500;
+
 pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
-    // no_wait: the server returns IMMEDIATELY with whatever is available (up to
-    // `batch`) instead of holding the request until the batch fills — so a single
-    // available message is delivered at once (no batch-fill latency), and no pull
-    // ever parks in max_waiting (the anti-zombie invariant: every pull resolves
-    // now, the loop re-checks its stop flag between rounds). Idle rounds come back
-    // empty; a short sleep paces them (and bounds the stop-response latency).
+    // A continuous long-poll. `no_wait` returns the instant messages are available
+    // (a single message is delivered at once — no batch-fill latency, and the
+    // benched high-rate drain still fills 64-batches in one round). When the subject
+    // is idle the pull is HELD server-side for `expires` and returns empty — so the
+    // loop paces itself on the server with no client sleep, and crucially no
+    // coverage gap: previously a 150ms idle sleep sat between rounds with no pull
+    // outstanding, and a message landing in that window waited it out (measured tail
+    // ~150ms — the connector-latency bug the MQTT bench surfaced). No pull parks in
+    // max_waiting: one is in flight at a time and each resolves within `expires`, so
+    // the anti-zombie invariant holds and stop is re-checked every round.
+    let expires_ns = (PULL_EXPIRES_MS * 1_000_000) as usize;
     let iter = sub
         .timeout_fetch(
             nats::jetstream::BatchOptions {
                 batch: 64,
-                expires: Some(100_000_000),
+                expires: Some(expires_ns),
                 no_wait: true,
             },
-            Duration::from_millis(500),
+            // client-side backstop: comfortably past the server's `expires` so the
+            // server's own empty/timeout status ends the round, not this timeout.
+            Duration::from_millis(PULL_EXPIRES_MS + 250),
         )
         .map_err(|e| e.to_string())?;
-    let msgs: Vec<nats::Message> = iter.map_while(|m| m.ok()).collect();
-    if msgs.is_empty() {
-        thread::sleep(Duration::from_millis(150));
-    }
-    Ok(msgs)
+    Ok(iter.map_while(|m| m.ok()).collect())
 }
 
 /// Hydrate up to `n` recent REAL events for `subject` from the persisted stream,
@@ -2037,5 +2049,89 @@ mod tests {
         // non-string values are ignored, string ones pass through
         assert_eq!(cfg.headers(), vec![("Authorization".to_string(), "Bearer x".to_string())]);
         assert!(Config::default().headers().is_empty());
+    }
+
+    /// Latency probe for `fetch_round` — the shared pull loop every sink/flow runs.
+    /// Measures (A) idle empty-round wall time and (B) publish→receipt latency when
+    /// a message lands mid-idle. Needs a live NATS on 127.0.0.1:4222; excluded from
+    /// CI. Run: `cargo test fetch_round_latency_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fetch_round_latency_probe() {
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
+        let nc = nats::connect(&url).expect("connect nats");
+        let js = nats::jetstream::new(nc.clone());
+        let pid = std::process::id();
+        let stream = format!("PROBE_{pid}");
+        let subject = format!("probe.{pid}.in");
+        let _ = js.delete_stream(&stream);
+        js.add_stream(nats::jetstream::StreamConfig {
+            name: stream.clone(),
+            subjects: vec![format!("probe.{pid}.>")],
+            ..Default::default()
+        })
+        .expect("add_stream");
+        let durable = format!("probe_dur_{pid}");
+        let _ = js.add_consumer(
+            &stream,
+            nats::jetstream::ConsumerConfig {
+                durable_name: Some(durable.clone()),
+                filter_subject: subject.clone(),
+                ..Default::default()
+            },
+        );
+        let sub = js
+            .pull_subscribe_with_options(
+                &subject,
+                &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
+            )
+            .expect("pull_subscribe");
+
+        // (A) idle: how long does an empty round block?
+        let mut empties = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let msgs = fetch_round(&sub).expect("fetch");
+            assert!(msgs.is_empty(), "probe subject should be idle");
+            empties.push(t.elapsed().as_millis());
+        }
+        eprintln!("[probe] empty-round ms: {empties:?}");
+
+        // (B) publish->receipt: a message lands at a SWEPT offset into an idle
+        // stretch (20..~300ms) so samples hit every phase of the poll cycle — most
+        // importantly the coverage GAP where no pull is outstanding (the current
+        // 150ms idle sleep). Detection latency = receipt - the publish offset.
+        let mut lat = Vec::new();
+        for i in 0..30u32 {
+            let delay_ms = 20 + (i as u64 * 23) % 280; // sweep across the ~252ms cycle
+            let (ncp, subj, payload) = (nc.clone(), subject.clone(), format!("m{i}"));
+            let t0 = Instant::now();
+            let pubber = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                ncp.publish(&subj, payload.as_bytes()).expect("publish");
+                ncp.flush().ok();
+            });
+            let detected = loop {
+                let msgs = fetch_round(&sub).expect("fetch");
+                if !msgs.is_empty() {
+                    for m in &msgs {
+                        let _ = m.ack();
+                    }
+                    break t0.elapsed().as_millis() as i64 - delay_ms as i64;
+                }
+            };
+            pubber.join().unwrap();
+            lat.push(detected.max(0));
+        }
+        lat.sort_unstable();
+        eprintln!(
+            "[probe] publish->receipt detection ms: min={} p50={} p90={} max={} all={:?}",
+            lat[0],
+            lat[lat.len() / 2],
+            lat[(lat.len() * 9) / 10],
+            lat[lat.len() - 1],
+            lat
+        );
+        let _ = js.delete_stream(&stream);
     }
 }
