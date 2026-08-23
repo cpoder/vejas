@@ -1,0 +1,5 @@
+{
+  "literals": {
+    "BROKER": "127.0.0.1:{BROKER_PORT}"
+  }
+}

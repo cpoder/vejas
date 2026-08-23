@@ -130,7 +130,12 @@ sys.exit(0 if d.get('ok') or 'no test probe' in d.get('detail', '') else 1)" \
   fi
 
   # ── the data must flow ────────────────────────────────────────────────
-  if [ $ok -eq 1 ]; then
+  if [ $ok -eq 1 ] && [ -x "$DIR/dataflow.sh" ]; then
+    # recipe-owned data-flow check (real-broker recipes): env carries the stage
+    HTTP_P="$HTTP_P" NATS_P="$NATS_P" BROKER_P="$BROKER_P" DIR="$DIR" \
+      "$DIR/dataflow.sh" > "$STORE/dataflow.log" 2>&1 \
+      || { echo "  ✗ dataflow: $(tail -1 "$STORE/dataflow.log")"; ok=0; }
+  elif [ $ok -eq 1 ]; then
     SUBJECT=$(grep -oP 'SUBJECT\s*=\s*"\K[^"]+' "$MANIFEST" || true)
     INGEST=$(python3 -c "import json,sys; print(json.load(open('$DIR/overrides.json')).get('ingest_path',''))")
     if [ -n "$INGEST" ]; then

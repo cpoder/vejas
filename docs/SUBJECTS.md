@@ -26,6 +26,11 @@ hot-addable). No subprocess, no Python. Drivers today:
 - **http-out** (sink) — consumes SUBJECT → POST to URL. Optional HEADERS doc for
   authenticated pushes, values via `secret()`:
   `HEADERS = {"Authorization": f"Bearer {secret("acme/api_token")}"}`.
+- **mqtt-in** (source) / **mqtt-out** (sink) — a hand-rolled synchronous MQTT
+  3.1.1 client, in-binary, zero dependency (ADR-0025). QoS 1 maps our
+  at-least-once natively: the source holds the broker's PUBACK until the bus
+  publish is confirmed; the sink acks the bus only after the broker's PUBACK.
+  TLS / QoS 2 / MQTT 5 → the mosquitto exec-bridge escape hatch.
 - **exec-source** / **exec-sink** — bridge an external program in ANY language over stdio (source prints JSON on stdout; sink reads JSON on stdin). The hot-add path for new connector types without recompiling the core or loading native libs (ADR-0011).
 
 An **external connector** in any language is still a first-class citizen: it is

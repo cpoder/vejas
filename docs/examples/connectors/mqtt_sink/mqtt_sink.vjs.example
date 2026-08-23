@@ -1,0 +1,12 @@
+# connector: mqtt_sink — publish bus messages to an MQTT topic (ADR-0025).
+# Hand-rolled sync 3.1.1 client, in-binary. QoS 1: PUBLISH -> await the
+# broker's PUBACK -> THEN ack the bus message (side-effect-before-ack);
+# competing-safe (durable pull). Subjects in: vx.mqtt.alerts.out · secrets:
+# mqtt/username, mqtt/password (uncomment for an authenticated broker).
+driver "mqtt-out"
+BROKER = "broker.example.com:1883"
+TOPIC = "alerts/out"
+SUBJECT = "vx.mqtt.alerts.out"
+QOS = 1
+# USERNAME = secret("mqtt/username")
+# PASSWORD = secret("mqtt/password")

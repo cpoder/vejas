@@ -1,0 +1,15 @@
+# connector: mqtt_source — subscribe an MQTT topic onto the bus (ADR-0025).
+# Hand-rolled sync 3.1.1 client, in-binary, zero dependency. QoS 1 IS our
+# at-least-once: the PUBACK goes to the broker only after the bus publish is
+# confirmed (CLEAN_SESSION=false — the broker retransmits the unacked).
+# Singleton is structural in 3.1.1 (shared subscriptions are MQTT 5).
+# Subjects in: (none) · out: vx.mqtt.sensors.in · secrets: mqtt/username,
+# mqtt/password (uncomment for an authenticated broker; CI runs anonymous).
+# TLS / QoS 2 / MQTT 5 -> the mosquitto exec-bridge escape hatch.
+driver "mqtt-in"
+BROKER = "broker.example.com:1883"
+TOPIC = "sensors/temp"
+SUBJECT = "vx.mqtt.sensors.in"
+QOS = 1
+# USERNAME = secret("mqtt/username")
+# PASSWORD = secret("mqtt/password")
