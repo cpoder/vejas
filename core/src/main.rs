@@ -343,6 +343,185 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
     }))
 }
 
+// ───────────────────────── canary (ADR-0021, inc 3) ─────────────────────────
+//
+// A canary is time-travel on the TAIL of the live stream: a shadow consumer
+// follows the live source subject (deliver-new, never acked), runs each new event
+// through both the current and the candidate version in the shadow engine, and
+// accumulates the diff. Zero real side effects — the same shadow invariant as
+// time-travel. Recordings are an in-memory bounded ring for v1.
+
+struct Canary {
+    candidate_hash: String,
+    started_at: u64,
+    running: Arc<AtomicBool>,
+    total: Arc<AtomicU64>,
+    changed: Arc<AtomicU64>,
+    ring: Arc<Mutex<VecDeque<Value>>>,
+    // set when the canary auto-stops (the live version changed under it, so the
+    // accumulated diff would compare against a stale baseline) — never a silently
+    // wrong diff.
+    stop_reason: Arc<Mutex<Option<String>>>,
+}
+static CANARIES: OnceLock<Mutex<HashMap<String, Canary>>> = OnceLock::new();
+fn canaries() -> &'static Mutex<HashMap<String, Canary>> {
+    CANARIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run one event through a parsed version in shadow, returning its emits (never
+/// published — vjs::run only collects them).
+fn shadow_emits(prog: &vjs::Program, ev: &Value, root: &Path, pkg: &str) -> Value {
+    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.to_string());
+    match vjs::run(prog, ev, &mut engine) {
+        Ok(ctx) => json!({
+            "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
+            "error": Value::Null,
+        }),
+        Err(e) => json!({ "emits": [], "error": e }),
+    }
+}
+
+/// Start (or replace) a canary for a flow: shadow-follow the live source and diff
+/// the candidate against the current effective version.
+fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let unit = flow_proc_name(&path);
+    let pkg = pkg_of_path(&path);
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let js = nats::jetstream::new(nc);
+    let store = versions::open_store(&js);
+    let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
+    let current = vjs::parse(&current_src)?;
+    let candidate = vjs::parse(candidate_src)?;
+    let subject = current.source.clone().ok_or("flow has no bus source to shadow")?;
+    let candidate_hash = versions::hash_content(candidate_src);
+    // the effective version this canary diffs against — snapshotted so we can
+    // detect a live promote / eviction under it.
+    let current_hash = versions::hash_content(&current_src);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let total = Arc::new(AtomicU64::new(0));
+    let changed = Arc::new(AtomicU64::new(0));
+    let ring = Arc::new(Mutex::new(VecDeque::new()));
+    let stop_reason = Arc::new(Mutex::new(None::<String>));
+    {
+        let mut map = canaries().lock().unwrap();
+        // Refuse a double start: a running canary vanishing without trace would
+        // surprise the operator watching it. Stop it first.
+        if let Some(prev) = map.get(&unit) {
+            if prev.running.load(Ordering::SeqCst) {
+                return Err("canary already running for this flow — stop it first".into());
+            }
+        }
+        map.insert(
+            unit.clone(),
+            Canary {
+                candidate_hash: candidate_hash.clone(),
+                started_at: now_secs(),
+                running: running.clone(),
+                total: total.clone(),
+                changed: changed.clone(),
+                ring: ring.clone(),
+                stop_reason: stop_reason.clone(),
+            },
+        );
+    }
+    let (root, pkg, path, unit_t, store_t) =
+        (root.to_path_buf(), pkg, path.clone(), unit.clone(), store);
+    thread::spawn(move || {
+        let cfg = nats::jetstream::ConsumerConfig {
+            deliver_policy: nats::jetstream::DeliverPolicy::New, // only the live tail
+            ack_policy: nats::jetstream::AckPolicy::Explicit,    // never acked (read-only)
+            filter_subject: subject.clone(),
+            inactive_threshold: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let sub = match js.pull_subscribe_with_options(
+            &subject,
+            &nats::jetstream::PullSubscribeOptions::new().consumer_config(cfg),
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        while running.load(Ordering::SeqCst) && RUNNING.load(Ordering::SeqCst) {
+            // Auto-stop if the live version changed under us (a promote or an
+            // overlay eviction): the accumulated diff would otherwise silently
+            // compare the candidate against a stale baseline.
+            if let Ok(baseline) = fs::read_to_string(&path) {
+                let (eff, _) =
+                    versions::resolve_source(store_t.as_ref(), &unit_t, &baseline, now_secs());
+                if versions::hash_content(&eff) != current_hash {
+                    *stop_reason.lock().unwrap() =
+                        Some("baseline changed (live version promoted or overlay evicted)".into());
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+            let batch = connectors::fetch_round(&sub).unwrap_or_default();
+            for m in &batch {
+                let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
+                    continue;
+                };
+                let seq = m.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
+                let b = shadow_emits(&current, &event, &root, &pkg);
+                let a = shadow_emits(&candidate, &event, &root, &pkg);
+                let ch = b != a;
+                total.fetch_add(1, Ordering::SeqCst);
+                if ch {
+                    changed.fetch_add(1, Ordering::SeqCst);
+                }
+                let mut r = ring.lock().unwrap();
+                r.push_back(json!({"seq": seq, "changed": ch, "before": b, "after": a}));
+                while r.len() > 500 {
+                    r.pop_front();
+                }
+            }
+        }
+    });
+    Ok(json!({"ok": true, "flow": unit, "candidate_hash": candidate_hash}))
+}
+
+/// The accumulated diff of a running (or last) canary for a flow.
+fn canary_read(root: &Path, file: &str) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let unit = flow_proc_name(&path);
+    let map = canaries().lock().unwrap();
+    let Some(c) = map.get(&unit) else {
+        return Ok(json!({"running": false, "flow": unit, "events": 0}));
+    };
+    let results: Vec<Value> = {
+        let r = c.ring.lock().unwrap();
+        r.iter().rev().take(100).cloned().collect()
+    };
+    Ok(json!({
+        "running": c.running.load(Ordering::SeqCst),
+        "flow": unit,
+        "candidate_hash": c.candidate_hash,
+        "started_at": c.started_at,
+        "events": c.total.load(Ordering::SeqCst),
+        "changed": c.changed.load(Ordering::SeqCst),
+        "stop_reason": *c.stop_reason.lock().unwrap(),
+        "results": results,
+    }))
+}
+
+/// Stop a running canary (the shadow consumer thread exits; state is kept for a
+/// final read until replaced).
+fn canary_stop(root: &Path, file: &str) -> Result<Value, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let unit = flow_proc_name(&path);
+    let map = canaries().lock().unwrap();
+    match map.get(&unit) {
+        Some(c) => {
+            c.running.store(false, Ordering::SeqCst);
+            Ok(json!({"ok": true, "flow": unit, "stopped": true}))
+        }
+        None => Ok(json!({"ok": true, "flow": unit, "stopped": false})),
+    }
+}
+
 /// Promote a literal change as a cluster-wide VERSION (ADR-0021) instead of a
 /// local file write: compute the new source by applying set_literal to the
 /// current EFFECTIVE source (overlay-or-baseline), then publish it to
@@ -2378,6 +2557,9 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
         json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
+        json!({"name": "vejas_canary_start", "description": "Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candidate version against the current effective version as events arrive, accumulating a diff. Read-only (shadow — no real emit). Refuses if a canary is already running for the flow. Auto-stops if the live version changes under it (reason in status).", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}}), vec!["file", "candidate"])}),
+        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_canary_stop", "description": "Stop a running canary for a flow (its shadow consumer exits; the last diff stays readable).", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
@@ -2482,6 +2664,19 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let candidate = args["candidate"].as_str().ok_or("candidate required")?;
             let n = args["n"].as_u64().unwrap_or(20) as usize;
             text(time_travel(root, file, candidate, n)?.to_string())
+        }
+        "vejas_canary_start" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let candidate = args["candidate"].as_str().ok_or("candidate required")?;
+            text(canary_start(root, file, candidate)?.to_string())
+        }
+        "vejas_canary_status" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            text(canary_read(root, file)?.to_string())
+        }
+        "vejas_canary_stop" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            text(canary_stop(root, file)?.to_string())
         }
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
@@ -2981,6 +3176,34 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match time_travel(&root, &file, &candidate, n) {
                 Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/surface/canary/start") => {
+            let body = read_body(&mut request);
+            let file = body["file"].as_str().unwrap_or("").to_string();
+            let candidate = body["candidate"].as_str().unwrap_or("").to_string();
+            match canary_start(&root, &file, &candidate) {
+                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                // a double-start is refused, not silently replaced
+                Err(e) if e.contains("already running") => respond(request, 409, e, "text/plain"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, "/surface/canary") => {
+            let Some(file) = qparam(&url, "file") else {
+                return respond(request, 400, "missing file".into(), "text/plain");
+            };
+            match canary_read(&root, &file) {
+                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/surface/canary/stop") => {
+            let body = read_body(&mut request);
+            let file = body["file"].as_str().unwrap_or("").to_string();
+            match canary_stop(&root, &file) {
+                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
