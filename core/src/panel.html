@@ -857,11 +857,22 @@ async function loadEvents() {
         <td class="sample payload">${(e.preview || '').length > 46
           ? `<details><summary>${esc(trunc(e.preview || '', 46))}</summary><pre class="payload-full">${esc(pretty(e.preview || ''))}</pre></details>`
           : esc(e.preview || '')}</td>
+        <td>${e.ok && String(e.flow || '').startsWith('flow:') && e.seq != null
+          ? `<button class="apply" title="Save this real event as a golden test (tests/vjs)" onclick="saveGolden('${esc(String(e.flow))}',${e.seq})">★ golden</button>`
+          : ''}</td>
       </tr>`;
     }).join('');
     $('#events').innerHTML =
-      `<table><tr><th>time</th><th>flow</th><th>event on</th><th>emitted</th><th>payload</th></tr>${rows}</table>`;
+      `<table><tr><th>time</th><th>flow</th><th>event on</th><th>emitted</th><th>payload</th><th></th></tr>${rows}</table>`;
   } catch {}
+}
+// Curate a golden test from a real processed event (candidate 4.4): the flow is
+// re-run on the stored event and what it actually emits becomes the expectation.
+async function saveGolden(flow, seq) {
+  try {
+    const r = await (await post('/events/golden', { flow, seq })).json();
+    toast(`Golden test saved: ${r.case} (${r.expect_emits} emit${r.expect_emits === 1 ? '' : 's'})`);
+  } catch (e) { toast(e.message.slice(0, 160), true); }
 }
 loadEvents();
 setInterval(loadEvents, 4000);

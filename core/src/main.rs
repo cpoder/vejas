@@ -2229,6 +2229,51 @@ fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
 // (call it, it runs on the arguments and returns its emits). New tools are
 // added by writing new flows; the MCP surface grows with the platform.
 
+/// Curate a golden test from a real processed event (candidate 4.4): take the
+/// event a flow actually handled (from the trace ring), re-run the flow on it to
+/// capture what it ACTUALLY emitted — that is the contract, "real traffic becomes
+/// the test" — and write a golden case under tests/vjs/. The generated name is
+/// prefixed `curated_` so it never collides with the hand-written NN_ cases.
+fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, String> {
+    // the stored input for this flow+seq (the ring keeps the full event as replay
+    // fuel; /events strips it, but we read TRACES directly here)
+    let event = {
+        let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        map.get(flow_unit)
+            .and_then(|ring| ring.iter().find(|e| e["seq"].as_u64() == Some(seq)))
+            .and_then(|e| e.get("event").cloned())
+            .filter(|v| !v.is_null())
+            .ok_or("no stored event for that flow/seq (ring rotated, or a non-JSON event)")?
+    };
+    // map the unit back to its flow file (repo-relative)
+    let file = vjs_files(root)
+        .into_iter()
+        .map(|(p, _)| p)
+        .find(|p| flow_proc_name(p) == flow_unit)
+        .ok_or("flow not found for that unit")?;
+    let rel = file
+        .strip_prefix(root)
+        .unwrap_or(&file)
+        .to_string_lossy()
+        .to_string();
+    // re-run to capture the real emits (deterministic — the flow is pure)
+    let expect_emits = run_flow_on_input(root, &rel, &event)?;
+    let stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let case = json!({ "flow": rel, "input": event, "expect_emits": expect_emits });
+    let dir = root.join("tests").join("vjs");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = format!("curated_{stem}_{seq}.json");
+    fs::write(
+        dir.join(&name),
+        serde_json::to_string_pretty(&case).unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({"ok": true, "case": name, "flow": rel, "expect_emits": expect_emits.len()}))
+}
+
 fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value>, String> {
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -2973,6 +3018,20 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/events") => {
             let flow = qparam(&url, "flow");
             respond(request, 200, events_json(flow.as_deref()), "application/json")
+        }
+        (tiny_http::Method::Post, "/events/golden") => {
+            // Curate a golden test from a real event (candidate 4.4). Writes a
+            // repo file, so cluster mode refuses it (golden tests go via git).
+            if let Err(e) = cluster_write_guard() {
+                return respond(request, 409, e, "text/plain");
+            }
+            let body = read_body(&mut request);
+            let flow = body["flow"].as_str().unwrap_or("");
+            let seq = body["seq"].as_u64().unwrap_or(u64::MAX);
+            match golden_from_event(&root, flow, seq) {
+                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Err(e) => respond(request, 422, e, "text/plain"),
+            }
         }
         (tiny_http::Method::Get, "/dlq") => match dlq_list(200) {
             Ok(l) => respond(request, 200, json!({"dead_letters": l}).to_string(), "application/json"),
