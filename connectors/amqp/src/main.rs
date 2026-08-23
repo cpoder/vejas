@@ -15,6 +15,7 @@
 //! path. The transactional ordering is exercised against a fake below with fault
 //! injection; real-RabbitMQ certification is the declared CI exception (ADR-0017).
 
+mod lease;
 mod tls;
 
 use amiquip::{
@@ -246,6 +247,7 @@ fn main() {
     let durable = env_or("VEJAS_AMQP_DURABLE", "vejas_amqp");
     let stream = env_or("VEJAS_STREAM", "VEJAS");
     let wait = Duration::from_secs(env("VEJAS_AMQP_WAIT_SECS").and_then(|s| s.parse().ok()).unwrap_or(3));
+    let competing = matches!(env("VEJAS_AMQP_COMPETING").as_deref(), Some("1") | Some("true"));
 
     let nc = match nats::connect(&nats_url) {
         Ok(nc) => nc,
@@ -279,7 +281,27 @@ fn main() {
     };
 
     let result = if mode == "source" {
-        run_source_amqp(&channel, &nc, &queue, &subject, wait)
+        // Singleton by default (ADR-0026, because order): RabbitMQ round-robins N
+        // consumers so competing is duplication-safe, but the queue's order is lost
+        // across N — so one consumer holds a lease. VEJAS_AMQP_COMPETING=1 opts out.
+        let held = if competing {
+            None
+        } else if let Some(store) = lease::open_store(&js) {
+            let key = lease::source_key(&queue);
+            match lease::acquire_blocking(&store, &key, alive) {
+                Some(l) => Some(l),
+                None => {
+                    eprintln!("[vejas-amqp] stopped before acquiring the lease");
+                    let _ = conn.close();
+                    return;
+                }
+            }
+        } else {
+            eprintln!("[vejas-amqp] no JetStream KV for the lease — running unleased (single instance)");
+            None
+        };
+        let source_alive = || alive() && held.as_ref().map_or(true, |l| !l.lost());
+        run_source_amqp(&channel, &nc, &queue, &subject, wait, source_alive)
     } else {
         run_sink_amqp(&channel, &js, &stream, &subject, &durable, &routing_key)
     };
@@ -299,6 +321,7 @@ fn run_source_amqp(
     queue: &str,
     subject: &str,
     wait: Duration,
+    alive: impl Fn() -> bool,
 ) -> Result<(), String> {
     // passive-ish: declare durable so the queue exists; a real recipe may bind it.
     channel
