@@ -15,6 +15,10 @@ nats = "0.25"
 # Pooled, blocking HTTP(S) client for the http-out/http-poll/oauth-poll drivers
 # (replaces one curl process per request). Pure-Rust TLS (rustls), self-contained.
 ureq = "2"
+# Already in the tree via ureq (rustls 0.23 + webpki-roots 0.26) — made direct so
+# the hand-rolled MQTT client can wrap its stream in TLS. No new binary weight.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
 
 [[bin]]
 name = "vejas-runtime"

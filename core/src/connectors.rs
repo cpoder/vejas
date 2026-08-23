@@ -1514,9 +1514,54 @@ impl Driver for ExecStreamSource {
 
 // ───────────────────────── MQTT (hand-rolled sync, ADR-0025) ─────────────────────────
 
-/// Connect a TCP MQTT session with the given read timeout (drives the keepalive
-/// tick / PUBACK wait). TLS is a follow-up: swap the TcpStream for a rustls stream
-/// behind the same Read+Write client.
+/// The MQTT client's stream: plain TCP or a rustls TLS stream. One monomorphic
+/// type so `Client<MqttTransport>` covers both without a trait object.
+enum MqttTransport {
+    Plain(std::net::TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+}
+impl std::io::Read for MqttTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+impl std::io::Write for MqttTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Shared rustls client config (Mozilla roots via webpki-roots), built once.
+fn mqtt_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    })
+    .clone()
+}
+
+/// Connect an MQTT session (plain TCP or TLS) with the given read timeout (drives
+/// the keepalive tick / PUBACK wait). The read timeout is set on the underlying
+/// TcpStream before the TLS wrap, so an idle keepalive read times out cleanly
+/// before any TLS record starts.
 fn mqtt_connect(
     broker: &str,
     client_id: &str,
@@ -1525,11 +1570,22 @@ fn mqtt_connect(
     pass: Option<&str>,
     keepalive: u16,
     read_timeout: Duration,
-) -> Result<crate::mqtt::Client<std::net::TcpStream>, String> {
+    tls: bool,
+) -> Result<crate::mqtt::Client<MqttTransport>, String> {
     let tcp = std::net::TcpStream::connect(broker).map_err(|e| e.to_string())?;
     tcp.set_read_timeout(Some(read_timeout)).ok();
     tcp.set_nodelay(true).ok();
-    let mut client = crate::mqtt::Client::new(tcp, keepalive);
+    let transport = if tls {
+        let host = broker.rsplit_once(':').map(|(h, _)| h).unwrap_or(broker);
+        let name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("bad TLS host {host:?}: {e}"))?;
+        let conn = rustls::ClientConnection::new(mqtt_tls_config(), name)
+            .map_err(|e| e.to_string())?;
+        MqttTransport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
+    } else {
+        MqttTransport::Plain(tcp)
+    };
+    let mut client = crate::mqtt::Client::new(transport, keepalive);
     client.connect(client_id, clean_session, user, pass)?;
     Ok(client)
 }
@@ -1548,7 +1604,7 @@ impl Driver for MqttIn {
         "source:mqtt"
     }
     fn about(&self) -> &'static str {
-        "Subscribes to an MQTT topic and publishes each message to SUBJECT (hand-rolled sync client, 3.1.1, QoS 0/1). At-least-once maps onto QoS 1 with no KV: the PUBACK to the broker is sent only AFTER the bus publish is confirmed, so the broker retransmits anything not yet acked — CLEAN_SESSION=false keeps the subscription across reconnects. Singleton (structural in 3.1.1). Config: BROKER (host:port), TOPIC, SUBJECT, QOS (0/1, default 1), CLIENT_ID (default vejas-<name>), USERNAME/PASSWORD (secret()), KEEPALIVE_SECS (default 30). TLS + QoS2/MQTT5 → mosquitto exec-bridge."
+        "Subscribes to an MQTT topic and publishes each message to SUBJECT (hand-rolled sync client, 3.1.1, QoS 0/1). At-least-once maps onto QoS 1 with no KV: the PUBACK to the broker is sent only AFTER the bus publish is confirmed, so the broker retransmits anything not yet acked — CLEAN_SESSION=false keeps the subscription across reconnects. Singleton (structural in 3.1.1). Config: BROKER (host:port), TOPIC, SUBJECT, QOS (0/1, default 1), CLIENT_ID (default vejas-<name>), USERNAME/PASSWORD (secret()), KEEPALIVE_SECS (default 30), TLS (bool, default false → rustls). QoS2/MQTT5 → mosquitto exec-bridge."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let broker = ctx.config.str("BROKER").ok_or("BROKER required")?;
@@ -1556,6 +1612,7 @@ impl Driver for MqttIn {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let qos = ctx.config.u64_or("QOS", 1).min(1) as u8;
         let keepalive = ctx.config.u64_or("KEEPALIVE_SECS", 30) as u16;
+        let tls = ctx.config.value("TLS").and_then(|v| v.as_bool()).unwrap_or(false);
         let client_id = mqtt_client_id(ctx);
         let user = ctx.config.str("USERNAME");
         let pass = ctx.config.str("PASSWORD");
@@ -1564,7 +1621,7 @@ impl Driver for MqttIn {
             let attempt = (|| -> Result<(), String> {
                 let mut client = mqtt_connect(
                     &broker, &client_id, false, user.as_deref(), pass.as_deref(),
-                    keepalive, Duration::from_millis(500),
+                    keepalive, Duration::from_millis(500), tls,
                 )?;
                 client.subscribe(&topic, qos)?;
                 eprintln!("[{}] mqtt subscribed {topic} @qos{qos} -> {subject}", ctx.name);
@@ -1618,18 +1675,19 @@ impl Driver for MqttOut {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let qos = ctx.config.u64_or("QOS", 1).min(1) as u8;
         let keepalive = ctx.config.u64_or("KEEPALIVE_SECS", 30) as u16;
+        let tls = ctx.config.value("TLS").and_then(|v| v.as_bool()).unwrap_or(false);
         let client_id = mqtt_client_id(ctx);
         let user = ctx.config.str("USERNAME");
         let pass = ctx.config.str("PASSWORD");
         // one MQTT session, reconnected on error (Mutex<Option<_>> for the Fn handler)
-        let slot: std::sync::Mutex<Option<crate::mqtt::Client<std::net::TcpStream>>> =
+        let slot: std::sync::Mutex<Option<crate::mqtt::Client<MqttTransport>>> =
             std::sync::Mutex::new(None);
         run_sink(ctx, &subject, move |data| {
             let mut guard = slot.lock().unwrap();
             if guard.is_none() {
                 *guard = Some(mqtt_connect(
                     &broker, &client_id, true, user.as_deref(), pass.as_deref(),
-                    keepalive, Duration::from_secs(5),
+                    keepalive, Duration::from_secs(5), tls,
                 )?);
             }
             let client = guard.as_mut().unwrap();

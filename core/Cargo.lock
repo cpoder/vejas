@@ -1342,9 +1342,11 @@ version = "0.1.0"
 dependencies = [
  "ctrlc",
  "nats",
+ "rustls 0.23.43",
  "serde_json",
  "tiny_http",
  "ureq",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
