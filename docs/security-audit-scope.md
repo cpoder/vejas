@@ -181,3 +181,42 @@ Every surface's claimed invariant survives an adversarial attempt to break it
 under the stated assumptions; every by-design risk is bounded as claimed; and
 any gap is either fixed or explicitly accepted in writing before Vejas is
 distributed (ADR-0029 R7).
+
+## Already found and fixed this session (auditor orientation)
+
+An internal adversarial pass ran before this external audit. Do not spend
+time re-deriving these — they are fixed and regression-tested; instead, try
+to *break the fix* and look for siblings the pass missed:
+
+- **F1 — path traversal via symlink (CRITICAL, fixed).** `guard_path`
+  blocked `..` but not symlinks; a link under `flows/` to `/etc/passwd` or
+  the secrets file was read in the clear by `GET /file` (unauthenticated).
+  Fixed by canonicalizing the resolved path under `root.canonicalize()`;
+  regression test `e2e/security-traversal.sh` runs in CI. **Residual:** a
+  TOCTOU symlink swap during the read is out of scope for a static attacker
+  but worth a look.
+- **F3 — non-constant-time token compare (fixed).** `ct_eq` now used for
+  `VEJAS_TOKEN` and `X-Approval-Token`.
+- **F2 — http-in published to any `vx.*` (fixed, defence in depth).**
+  Optional `ALLOW` on the `http-in` connector restricts the subject
+  suffixes; out-of-list → 403. Absent = any suffix (compat), documented.
+
+## Known minor points to confirm or harden (not blockers)
+
+- **M1 — poller URL in logs.** `http-poll`/`oauth-poll` log the full poll
+  URL. Convention is that credentials ride in `HEADERS` via `secret()`, not
+  the URL, so the URL carries no secret — but a user who puts a token in the
+  URL would see it logged. Consider masking query params in the log.
+- **M2 — the secret-shaped mask is client-side only.** The panel masks
+  credential-shaped values using `SECRET_KEY_PATTERN`, but `GET /surface`
+  returns raw literal values; the real protection is the model itself
+  (secrets are `secret()` references, never literal values — enforced by the
+  admission lint). Confirm no path lets a resolved secret value reach a read
+  endpoint; the mask is cosmetic, not the boundary.
+
+## Method note
+
+The internal pass used **static data-flow tracing** (no heavy live
+processes) after a bug in `rand_hex` (unbounded `/dev/urandom` read → OOM)
+took down sessions running live flows. Prefer static analysis over standing
+up the full stack repeatedly.
