@@ -37,7 +37,7 @@ production (NIS2 evidence collection across four EU countries).
 
 ### Container image
 - The release image is published to `ghcr.io/cpoder/vejas-runtime`
-  (`:0.1.0` and `:latest`).
+  (`:v0.1.0` and `:latest`).
 
 ### Measured (8-core dev machine; `bench/`)
 - Cold start 11 ms · 6–8 MB RSS · end-to-end p50 2 ms uncongested ·
