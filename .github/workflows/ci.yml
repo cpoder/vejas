@@ -68,3 +68,7 @@ jobs:
         run: e2e/transport/run.sh
       - name: Offset-resume invariant (ADR-0022, kill -9 mid-stream)
         run: e2e/offset-resume.sh
+      - name: Docs book builds (broken includes fail here, not on deploy)
+        run: |
+          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          ./mdbook build docs/book

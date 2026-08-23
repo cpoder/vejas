@@ -12,9 +12,10 @@ drawing the route.
 
 **Status: young, but real** — the first production deployment runs today,
 collecting NIS2 compliance evidence across four EU countries; interfaces still
-move fast. Start here: [COOKBOOK](docs/COOKBOOK.md) · [VISION](docs/VISION.md) ·
+move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
+[COOKBOOK](docs/COOKBOOK.md) · [VISION](docs/VISION.md) ·
 [ARCHITECTURE](docs/ARCHITECTURE.md) · [ROADMAP](docs/ROADMAP.md) ·
-[ADRs](docs/adr/) · [MCP](docs/MCP.md). The bet, long-form:
+[ADRs](docs/adr/). The bet, long-form:
 [MANIFESTO.md](MANIFESTO.md).
 
 **The demo, 53 seconds** — a real SAP NetWeaver and a real Salesforce org,

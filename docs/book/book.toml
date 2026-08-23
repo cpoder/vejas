@@ -1,0 +1,15 @@
+[book]
+title = "Vejas Documentation"
+authors = ["The Vejas project"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/docs/"
+git-repository-url = "https://github.com/cpoder/vejas"
+edit-url-template = "https://github.com/cpoder/vejas/edit/master/docs/book/{path}"
+default-theme = "rust"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
