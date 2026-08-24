@@ -12,6 +12,7 @@
 
 - [The bus](concepts/bus.md)
 - [Flows & VejasScript](concepts/flows.md)
+- [Composing services](concepts/composition.md)
 - [Connectors](concepts/connectors.md)
 - [The business surface](concepts/business-surface.md)
 - [Secrets](concepts/secrets.md)
