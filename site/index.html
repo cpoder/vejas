@@ -131,6 +131,12 @@
   .prose p{margin-bottom:16px; color:var(--ink)}
   .prose p b{font-weight:600}
 
+  /* demo film */
+  #demo .demo-lede{max-width:64ch; font-size:17px; line-height:1.5; color:var(--ink); margin-bottom:24px}
+  #demo .demo-lede b{font-weight:600}
+  .demo-figure{margin:0}
+  .demo-figure video{width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:8px; box-shadow:0 18px 50px rgba(0,0,0,.14); background:var(--ink)}
+
   /* two surfaces */
   .split{display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:30px}
   .who{background:var(--card); border:1px solid var(--line); border-radius:6px; padding:26px 26px 20px}
@@ -283,6 +289,20 @@ positions = []
     <p>1 binary&nbsp;&nbsp;·&nbsp;&nbsp;1 dependency (NATS)&nbsp;&nbsp;·&nbsp;&nbsp;<b>0 builder UI</b>&nbsp;&nbsp;·&nbsp;&nbsp;nothing proprietary to export</p>
     <p>measured: cold start 11–13&thinsp;ms&nbsp;&nbsp;·&nbsp;&nbsp;6–8&thinsp;MB RSS&nbsp;&nbsp;·&nbsp;&nbsp;p50 2&thinsp;ms, every event hop persisted&nbsp;&nbsp;·&nbsp;&nbsp;cluster promote 60&thinsp;ms, lossless&nbsp;&nbsp;·&nbsp;&nbsp;<a href="https://github.com/cpoder/vejas/tree/master/bench">the benchmarks</a></p>
   </div>
+
+  <section id="demo">
+    <p class="kicker">The proof, in 45 seconds</p>
+    <h2>Real SAP, real Salesforce — bridged both ways by two flows an agent wrote.</h2>
+    <p class="demo-lede">A domain expert corrects a business rule on screen; the change is
+    shadow-replayed on the real events just processed, promoted, and the next IDoc lives the
+    corrected rule. <b>This recording is also a green end-to-end test</b> — the video can't lie.</p>
+    <figure class="demo-figure">
+      <video controls preload="none" playsinline poster="demo/bridge-poster.jpg">
+        <source src="demo/vejas-bridge-film.mp4" type="video/mp4">
+        Your browser can't play this video — <a href="demo/vejas-bridge-film.mp4">download it</a>.
+      </video>
+    </figure>
+  </section>
 
   <section id="thesis">
     <p class="kicker">The bet</p>

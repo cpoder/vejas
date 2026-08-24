@@ -18,7 +18,7 @@ move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
 [ADRs](docs/adr/). The bet, long-form:
 [MANIFESTO.md](MANIFESTO.md).
 
-**The demo, 53 seconds** — a real SAP NetWeaver and a real Salesforce org,
+**The demo, 45 seconds** — a real SAP NetWeaver and a real Salesforce org,
 bridged both ways by two readable flows; a domain expert corrects a business
 rule on screen, the change is shadow-replayed on the real events, promoted,
 and the next IDoc lives the corrected rule. The recording is also a green

@@ -60,11 +60,12 @@ Title alternates (kept for reference):
 > arbitrated by me across ~30 recorded decisions (ADRs). That's not a caveat — it's
 > the thesis. The platform is built the way it says software should be built.
 >
-> Docs: https://vejas.dev/docs · a 53s demo (which is also a green e2e test): [DEMO LINK]
+> Docs: https://vejas.dev/docs · a 45-second demo (which is also a green e2e test): https://vejas.dev/#demo
 >
 > Happy to answer anything — especially the sharp questions.
 
-**⚠️ Before posting: fill `[DEMO LINK]`** (hosted 53s demo, or the mp4 in the repo).
+The demo is live at **https://vejas.dev/#demo** (45s, embedded on the landing) and in
+the repo README (`docs/demo/vejas-bridge-film.mp4`).
 
 Follow-up answers to have ready (post them yourself into the sub-threads if the
 questions come):
