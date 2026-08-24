@@ -7,6 +7,39 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-24
+
+A security-hardening release. The write gate is now keyed on what a flow
+actually *does* to the bus — not the HTTP verb — closing four HIGH findings from
+an independent adversarial audit (R7). Adds the service-composition guide with an
+executable CI guarantee, and corrects the published production numbers.
+
+### Security — R7 audit (four HIGH, all fixed and frozen in CI)
+- The write gate authorizes by **mutation, not HTTP verb**: it keys on
+  `Program::writes_bus()`, an exhaustive AST walk over `emit` *and* `invoke`, so
+  a bus write can no longer slip through a non-POST route (Finding A), a dynamic
+  emit subject (Finding A′), or an invoke-mediated read (Finding A″). The
+  fail-closed guarantees are frozen as end-to-end tests.
+- `/connectors/new` is gated behind governed mode + the cluster guard, closing a
+  connector-bypass path to command execution (Finding B).
+- The three-way audit pass (A / A′ / A″ / B, plus the S4-1 secret-exposure note)
+  is recorded in the security-audit scope.
+
+### Language & docs
+- **Composing services**: a new concept page for `invoke` (pipeline-merge
+  composition) and cross-package `EXPORTS`, backed by an executable guarantee in
+  CI — a service invoked from a flow merges its output into the caller, and the
+  doc-contracts leg fails if that ever drifts.
+
+### Corrected & honest
+- Published numbers re-measured, not claimed (binary size, cold start, latency
+  percentiles), each linked to its bench script.
+- The Reglyze production line made accurate: young but real — two production
+  customers, collecting NIS2 supplier-compliance evidence across eight EU
+  countries today.
+- Launch distribution kit added (`docs/launch/`): Show HN as a URL post + a
+  seeded first comment.
+
 ## [0.1.0] — 2026-08-23
 
 First tagged release. The platform is public, measured, certified and in
