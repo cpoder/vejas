@@ -45,6 +45,16 @@ respond 200, {id: id, status: "shipped"}
 VJS
 # the async ingestion example, from guides/expose-an-api.md
 printf '# connector: orders_webhook\ndriver "http-in"\nPORT = 8787\n' > "$R/connectors/orders_webhook.vjs"
+# service composition example, from concepts/composition.md
+mkdir -p "$R/services"
+printf '# service: format_alert\nalert_text = f"[{sev}] {subj} - {lower(email)}"\n' > "$R/services/format_alert.vjs"
+cat > "$R/flows/compose_demo.vjs" << 'VJS'
+# flow: compose_demo
+source "vx.compose.in"
+code = "P1"
+invoke format_alert(sev: code, subj: subject, email: requester.email)
+emit "vx.compose.out", {text: alert_text}
+VJS
 
 nats-server -js -sd "$S" -a 127.0.0.1 -p 4270 > /dev/null 2>&1 &
 NP=$!
@@ -105,6 +115,16 @@ rs=d.get("rules",[]); assert rs, "no rules projected"
 assert any("ALERT_LEVELS" in json.dumps(r) for r in rs), rs' \
   && ok "/rules projects the documented condition" \
   || ko "/rules shape" "guides/rules-view.md"
+
+say "concepts/composition — invoke merges the service output into the caller"
+( timeout 10 nats -s nats://127.0.0.1:4270 sub vx.compose.out --count=1 --raw 2>/dev/null > "$S/compose" ) &
+CCAP=$!
+sleep 0.5
+nats -s nats://127.0.0.1:4270 pub vx.compose.in '{"subject":"SAP down","requester":{"email":"Jane@ACME.com"}}' > /dev/null 2>&1
+wait $CCAP 2>/dev/null
+grep -q '\[P1\] SAP down - jane@acme.com' "$S/compose" \
+  && ok "invoke merged the service's alert_text into the caller's emit" \
+  || ko "service composition (got: $(cat "$S/compose" 2>/dev/null))" "concepts/composition.md"
 
 say "guides/change-safely — /surface/set edits one literal"
 curl -sf -o /dev/null -X POST http://127.0.0.1:8740/surface/set -H 'content-type: application/json' \
