@@ -95,9 +95,13 @@ async function captionOff(page) {
   await page.waitForTimeout(500);
 }
 async function glide(page, locator) {
-  await locator.scrollIntoViewIfNeeded();
+  // The 0.2.0 panel live-refreshes the events feed, so a row/table locator can
+  // detach mid-action. The cursor glide is cosmetic — never let a detached
+  // element abort the take.
+  try { await locator.scrollIntoViewIfNeeded(); } catch {}
   await page.waitForTimeout(400);
-  const box = await locator.boundingBox();
+  let box = null;
+  try { box = await locator.boundingBox(); } catch {}
   if (box) {
     await page.evaluate(([x, y]) => {
       const k = document.getElementById('vjs-cursor');
@@ -132,13 +136,13 @@ async function main() {
   await caption(page, CAPTIONS.intro, 4600);
   await captionOff(page);
   const graph = page.locator('#graph, svg').first();
-  await graph.scrollIntoViewIfNeeded();
+  await graph.scrollIntoViewIfNeeded().catch(() => {});
   await caption(page, CAPTIONS.pipeline, 2800);
   await captionOff(page);
 
   console.log('· scene 2: a real IDoc arrives on camera');
   const before = (await events()).length;
-  await page.locator('#events table').scrollIntoViewIfNeeded();
+  await page.locator('#events table').scrollIntoViewIfNeeded().catch(() => {});
   await caption(page, CAPTIONS.idoc, 1400);
   triggerIdoc();
   await waitForEvents(before + 1);
@@ -149,7 +153,7 @@ async function main() {
 
   console.log('· scene 3: the expert corrects the meaning — replay — promote');
   const card = page.locator('.card', { has: page.locator('h2', { hasText: 'sap_idoc_to_sf' }) });
-  await card.scrollIntoViewIfNeeded();
+  await card.scrollIntoViewIfNeeded().catch(() => {});
   await caption(page, CAPTIONS.rules, 3200);
   await captionOff(page);
   const box = card.locator('.const', { hasText: 'DEFAULT_INDUSTRY' });
@@ -173,7 +177,7 @@ async function main() {
   await captionOff(page);
 
   console.log('· scene 4: the next IDoc lives the corrected rule');
-  await page.locator('#events table').scrollIntoViewIfNeeded();
+  await page.locator('#events table').scrollIntoViewIfNeeded().catch(() => {});
   await caption(page, CAPTIONS.live, 1400);
   const n2 = (await events()).length;
   triggerIdoc();
