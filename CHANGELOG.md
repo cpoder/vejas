@@ -7,6 +7,17 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed
+- `vejas-sap-rfc` (connectors/sap-rfc): a lost RFC conversation no longer
+  poisons the connector for the rest of its life. The gateway (or a NAT in
+  between) closes RFC connections left idle for a while; every later call then
+  failed with `RFC_COMMUNICATION_FAILURE … no conversation found` until the
+  process was restarted. The connector now pings a connection idle for more
+  than a minute before using it, and when a call still finds the conversation
+  gone (`RFC_COMMUNICATION_FAILURE`, `RFC_CLOSED`, `RFC_INVALID_HANDLE`) it
+  reopens the connection and replays the call once. `SAP_RFC_TEST_HOOKS=1`
+  enables `{"op":"_drop"}` to exercise that path.
+
 ## [0.2.0] — 2026-08-24
 
 A security-hardening release. The write gate is now keyed on what a flow

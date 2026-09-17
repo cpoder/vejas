@@ -20,6 +20,12 @@
 //! parameter from the function's own metadata — the caller need not know types.
 //! Replies: {"ok":true, ...} | {"ok":false,"stage":"...","code":N,"key":"...","message":"..."}
 //!
+//! One RFC connection is kept for the life of the process. If it sits idle for
+//! more than a minute it is pinged before use, and a call that finds the
+//! conversation gone (RFC_COMMUNICATION_FAILURE, RFC_CLOSED, RFC_INVALID_HANDLE)
+//! reopens the connection and is replayed once. SAP_RFC_TEST_HOOKS=1 enables
+//! {"op":"_drop"} to exercise that path.
+//!
 //! Credentials come from the environment (the runtime injects `secret()` values,
 //! never literals — ADR-0008): SAP_ASHOST, SAP_SYSNR, SAP_CLIENT, SAP_USER,
 //! SAP_PASSWD, SAP_LANG.
@@ -817,6 +823,7 @@ fn op_list(sdk: &Sdk, conn: RfcHandle, req: &Value) -> Value {
 const RFC_OK: RfcRc = 0;
 const RFC_COMMUNICATION_FAILURE: RfcRc = 1;
 const RFC_CLOSED: RfcRc = 6;
+const RFC_INVALID_HANDLE: RfcRc = 13;
 const RFC_RETRY: RfcRc = 14;
 
 /// The server function SAP invokes on our registered program. Generic: it
@@ -956,6 +963,53 @@ fn run_server() -> ! {
     }
 }
 
+// ───────────────────── connection upkeep (RPC client mode) ─────────────────────
+/// After this much idle time the connection is pinged before use.
+const IDLE_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn dispatch(sdk: &Sdk, conn: RfcHandle, op: &str, req: &Value) -> Value {
+    match op {
+        "ping" => op_ping(sdk, conn),
+        "describe" => op_describe(sdk, conn, req),
+        "list" => op_list(sdk, conn, req),
+        "call" => op_call(sdk, conn, req),
+        "send_idoc" => op_send_idoc(sdk, conn, req),
+        other => json!({"ok": false, "error": format!("unknown op: {other}")}),
+    }
+}
+
+/// A failed reply whose RFC_RC says the connection itself is gone.
+fn connection_lost(out: &Value) -> bool {
+    out.get("ok") == Some(&Value::Bool(false))
+        && matches!(
+            out.get("code").and_then(Value::as_i64),
+            Some(c) if c == RFC_COMMUNICATION_FAILURE as i64 || c == RFC_CLOSED as i64 || c == RFC_INVALID_HANDLE as i64
+        )
+}
+
+fn connection_alive(sdk: &Sdk, conn: RfcHandle) -> bool {
+    let mut err = RfcErrorInfo::zeroed();
+    let rc = unsafe { (sdk.ping)(conn, &mut err) };
+    rc == RFC_OK
+}
+
+/// Close what is left of `old` and open a fresh connection with the same parameters.
+fn reopen(sdk: &Sdk, old: RfcHandle, why: &str) -> Result<RfcHandle, Value> {
+    unsafe { (sdk.close)(old, &mut RfcErrorInfo::zeroed()) };
+    eprintln!("[sap-rfc] reopening the RFC connection ({why})");
+    open_connection(sdk)
+}
+
+fn with_id(req: &Value, out: Value) -> Value {
+    match (req.get("id"), out) {
+        (Some(id), Value::Object(mut m)) => {
+            m.insert("id".into(), id.clone());
+            Value::Object(m)
+        }
+        (_, o) => o,
+    }
+}
+
 // ─────────────────────────── main loop ───────────────────────────
 /// Data channel: request/reply results (RPC) and streamed events (server mode)
 /// go to stdout — this is what the runtime's exec-stream-source publishes.
@@ -994,7 +1048,7 @@ fn main() {
         run_server();
     }
 
-    let conn = match open_connection(sdk) {
+    let mut conn = match open_connection(sdk) {
         Ok(c) => c,
         Err(je) => {
             reply(&je);
@@ -1002,6 +1056,12 @@ fn main() {
         }
     };
     reply(&json!({"ok": true, "ready": true, "connector": "sap-rfc"}));
+    // SAP_RFC_TEST_HOOKS=1 enables `{"op":"_drop"}`, which closes the RFC
+    // connection behind the loop's back to exercise the reconnect path.
+    let test_hooks = std::env::var("SAP_RFC_TEST_HOOKS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mut last_use = std::time::Instant::now();
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -1018,14 +1078,35 @@ fn main() {
             }
         };
         let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let out = match op {
-            "ping" => op_ping(sdk, conn),
-            "describe" => op_describe(sdk, conn, &req),
-            "list" => op_list(sdk, conn, &req),
-            "call" => op_call(sdk, conn, &req),
-            "send_idoc" => op_send_idoc(sdk, conn, &req),
-            other => json!({"ok": false, "error": format!("unknown op: {other}")}),
-        };
+        if test_hooks && op == "_drop" {
+            unsafe { (sdk.close)(conn, &mut RfcErrorInfo::zeroed()) };
+            reply(&json!({"ok": true, "dropped": true}));
+            continue;
+        }
+        // The gateway (or a NAT in between) closes RFC conversations that stay idle;
+        // the next call would then fail with RFC_COMMUNICATION_FAILURE ("no
+        // conversation found"). Check an idle connection first, and when a call
+        // still finds the conversation gone, reopen and replay it once.
+        if last_use.elapsed() >= IDLE_CHECK_AFTER && !connection_alive(sdk, conn) {
+            conn = match reopen(sdk, conn, "idle check failed") {
+                Ok(c) => c,
+                Err(je) => {
+                    reply(&with_id(&req, je));
+                    continue;
+                }
+            };
+        }
+        let mut out = dispatch(sdk, conn, op, &req);
+        if connection_lost(&out) {
+            out = match reopen(sdk, conn, "conversation lost during a call") {
+                Ok(c) => {
+                    conn = c;
+                    dispatch(sdk, conn, op, &req)
+                }
+                Err(je) => je,
+            };
+        }
+        last_use = std::time::Instant::now();
         let out = match (req.get("id"), out) {
             (Some(id), Value::Object(mut m)) => {
                 m.insert("id".into(), id.clone());
