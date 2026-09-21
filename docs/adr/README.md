@@ -36,6 +36,12 @@ the old one.
 | [0023](0023-ibm-mq-transactional-connector.md) | IBM MQ: first-class transactional connector (destructive get, syncpoint) | Accepted |
 | [0024](0024-proposal-queue.md) | The proposal queue: governed change, from agents and the fleet | Accepted |
 | [0025](0025-mqtt-hand-rolled-sync-client.md) | MQTT: hand-rolled sync client (3.1.1, QoS 0/1, in-binary) | Proposed |
+| [0026](0026-amqp-connector-amiquip-spike.md) | AMQP 0-9-1 (RabbitMQ): a sync connector on amiquip | Accepted |
+| [0027](0027-pulsar-connector-spike.md) | Apache Pulsar: spike, and a deliberate defer | Proposed |
+| [0028](0028-open-core-boundary.md) | The open-core boundary | Accepted |
+| [0029](0029-failure-mode-guardrails.md) | The failure-mode guardrails | Accepted |
+| [0030](0030-enterprise-repo-architecture.md) | How the enterprise tier attaches: seams, not plugins | Proposed |
+| [0031](0031-pattern-detection-unit-varpulis-engine.md) | Pattern detection as a unit type: the Varpulis engine embedded | Proposed |
 
 ## Template
 
