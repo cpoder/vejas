@@ -22,6 +22,16 @@ struct Unit {
     err: u64,
     emits: u64,
     dead: u64,
+    /// Pull rounds the consumer loop made, and messages they returned.
+    /// `messages / rounds` is the mean batch: the number that says whether a
+    /// unit is paying one pull round-trip per message or per sixty-four.
+    fetch_rounds: u64,
+    fetch_messages: u64,
+    /// Where a round's wall time goes: waiting for the pull, running the flow
+    /// over the batch, and the publish-before-ack barrier (flush + acks).
+    round_fetch_secs: f64,
+    round_process_secs: f64,
+    round_barrier_secs: f64,
     buckets: [u64; 13], // per-bucket (non-cumulative) counts
     sum: f64,
     count: u64,
@@ -59,6 +69,24 @@ pub fn observe(unit: &str, ok: bool, emits: u64, secs: f64) {
             u.buckets[i] += 1;
         }
     }
+}
+
+/// One pull round of the consumer loop and how many messages it returned.
+/// Empty rounds count too: they are the idle long-poll cadence.
+pub fn observe_fetch(unit: &str, messages: usize) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.fetch_rounds += 1;
+    u.fetch_messages += messages as u64;
+}
+
+/// The wall-time breakdown of one round: pull wait, batch processing, barrier.
+pub fn observe_round(unit: &str, fetch_secs: f64, process_secs: f64, barrier_secs: f64) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.round_fetch_secs += fetch_secs;
+    u.round_process_secs += process_secs;
+    u.round_barrier_secs += barrier_secs;
 }
 
 /// A message that was dead-lettered (ADR-0015). Kept separate from `observe`
@@ -115,6 +143,43 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
         out.push_str(&format!(
             "vejas_events_processed_total{{unit=\"{e}\",result=\"error\"}} {}\n",
             u.err
+        ));
+    }
+
+    out.push_str("# HELP vejas_fetch_rounds_total Pull rounds a unit's consumer loop made.\n");
+    out.push_str("# TYPE vejas_fetch_rounds_total counter\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!(
+            "vejas_fetch_rounds_total{{unit=\"{}\"}} {}\n",
+            esc(unit),
+            u.fetch_rounds
+        ));
+    }
+    out.push_str("# HELP vejas_fetch_messages_total Messages those pull rounds returned.\n");
+    out.push_str("# TYPE vejas_fetch_messages_total counter\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!(
+            "vejas_fetch_messages_total{{unit=\"{}\"}} {}\n",
+            esc(unit),
+            u.fetch_messages
+        ));
+    }
+
+    out.push_str("# HELP vejas_round_seconds_sum Wall time of the consumer loop by phase: fetch (wait for the first message of a round), process, barrier (flush + acks).\n");
+    out.push_str("# TYPE vejas_round_seconds_sum counter\n");
+    for (unit, u) in map.iter() {
+        let e = esc(unit);
+        out.push_str(&format!(
+            "vejas_round_seconds_sum{{unit=\"{e}\",phase=\"fetch\"}} {}\n",
+            u.round_fetch_secs
+        ));
+        out.push_str(&format!(
+            "vejas_round_seconds_sum{{unit=\"{e}\",phase=\"process\"}} {}\n",
+            u.round_process_secs
+        ));
+        out.push_str(&format!(
+            "vejas_round_seconds_sum{{unit=\"{e}\",phase=\"barrier\"}} {}\n",
+            u.round_barrier_secs
         ));
     }
 

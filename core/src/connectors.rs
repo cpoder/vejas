@@ -505,6 +505,57 @@ pub fn ack_wait() -> Duration {
 const PULL_EXPIRES_MS: u64 = 500;
 
 pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
+    Ok(fetch_iter_with(sub, None)?.collect())
+}
+
+/// [`fetch_round`] for a hot loop: the pull request leaves NOW, and the
+/// messages come back one by one as the reader thread hands them over.
+///
+/// Two things a hot loop needs that a one-off scan does not.
+///
+/// **The request leaves now.** A pull request is a publish, and the `nats`
+/// 0.25 client only *buffers* a publish: its flusher thread writes the buffer
+/// out, and it waits at least 5 ms between two writes (`MIN_FLUSH_BETWEEN` in
+/// its `client.rs`, a never-done `TODO(dlc)`). So every round of the consumer
+/// loop paid up to 5 ms before the server even saw the request. Measured on
+/// the flow loop under a backlog: 64 messages per round, ~7 ms per round,
+/// ~9 000 evt/s — with the interpreter itself at 10 µs per event. Flushing
+/// the request in the calling thread (`Connection::flush` writes a PING and
+/// flushes the writer directly, the same bypass `publish_confirmed` uses for
+/// pub-acks) turns that wait into one round-trip: 13 500 evt/s.
+///
+/// **Streaming, not collecting.** Collecting the whole batch into a `Vec`
+/// before processing meant the reader thread decoded 64 messages while this
+/// thread waited, then this thread processed 64 while the reader idled —
+/// two costs added instead of overlapped. Iterating as messages arrive lets
+/// both run at once. The batch boundary is unchanged: the caller still does
+/// its publish-before-ack barrier once the iterator ends.
+///
+/// One-off scans (replay hydration, the audit list, the shadow watch) keep
+/// [`fetch_round`]: they pull a handful of rounds and a few milliseconds each
+/// do not matter there.
+pub fn fetch_iter_flushed<'a>(
+    sub: &'a nats::jetstream::PullSubscription,
+    nc: &nats::Connection,
+) -> Result<FetchRound<'a>, String> {
+    fetch_iter_with(sub, Some(nc))
+}
+
+/// One pull round: the messages of one request, ending when the request is
+/// exhausted (batch filled, or the server's own timeout status).
+pub struct FetchRound<'a>(Box<dyn Iterator<Item = std::io::Result<nats::Message>> + 'a>);
+
+impl Iterator for FetchRound<'_> {
+    type Item = nats::Message;
+    fn next(&mut self) -> Option<nats::Message> {
+        self.0.next()?.ok()
+    }
+}
+
+fn fetch_iter_with<'a>(
+    sub: &'a nats::jetstream::PullSubscription,
+    flush_on: Option<&nats::Connection>,
+) -> Result<FetchRound<'a>, String> {
     // A continuous long-poll. `no_wait` returns the instant messages are available
     // (a single message is delivered at once — no batch-fill latency, and the
     // benched high-rate drain still fills 64-batches in one round). When the subject
@@ -528,7 +579,11 @@ pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::
             Duration::from_millis(PULL_EXPIRES_MS + 250),
         )
         .map_err(|e| e.to_string())?;
-    Ok(iter.map_while(|m| m.ok()).collect())
+    // `timeout_fetch` has buffered the pull request; send it before waiting on it.
+    if let Some(nc) = flush_on {
+        nc.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(FetchRound(Box::new(iter)))
 }
 
 /// Publish to a JetStream subject and wait for the pub-ack, flushing the write
@@ -1231,7 +1286,7 @@ fn run_sink(
     subject: &str,
     handler: impl Fn(&[u8]) -> Result<Option<String>, String>,
 ) -> Result<(), String> {
-    let js = ctx.jetstream()?;
+    let (js, nc) = ctx.jetstream_and_conn()?;
     let durable = ctx.name.replace([':', '.', '-'], "_");
     let _ = js.add_consumer(
         &ctx.stream,
@@ -1253,7 +1308,7 @@ fn run_sink(
         if !ctx.alive() {
             return Ok(());
         }
-        for msg in fetch_round(&sub)? {
+        for msg in fetch_iter_flushed(&sub, &nc)? {
             if !ctx.alive() {
                 // stopped mid-batch: leave the message un-acked, it redelivers
                 return Ok(());

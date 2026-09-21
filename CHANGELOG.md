@@ -7,6 +7,21 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Changed
+- The flow consumer loop no longer waits on itself: the pull request is
+  flushed the moment it is made instead of sitting behind the sync client's
+  5 ms flusher floor, messages are processed as they arrive instead of after
+  the whole batch has landed, the next pull is kept in flight while a batch is
+  processed, acks go out on a connection of their own, and the trace ring
+  derives an event's preview on read instead of serialising every message a
+  second time. Isolated flow hop 8 110 → 13 652 evt/s; the merge evaluation's
+  flow 9 003 → 16 133 evt/s (16 publishers, 64 000 events, same box). The
+  contract is unchanged — publish before ack, at-least-once (transport
+  invariants T1–T5 pass; kill -9 mid-stream: 20 000/20 000 with 4
+  duplicates, 0 lost). New on `/metrics`: `vejas_fetch_rounds_total`,
+  `vejas_fetch_messages_total` and `vejas_round_seconds_sum{phase}` say where
+  a unit's time goes. See `bench/README.md`, findings #6 and #7.
+
 ### Fixed
 - `vejas-sap-rfc` (connectors/sap-rfc): a lost RFC conversation no longer
   poisons the connector for the rest of its life. The gateway (or a NAT in

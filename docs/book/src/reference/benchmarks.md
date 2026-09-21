@@ -15,7 +15,7 @@ yours.
 | e2e latency, uncongested (webhook→flow→sink) | **p50 2 ms, p99 3 ms** | `bench/paced.sh 20 15` |
 | e2e paced sustained ~1 900/s | p50 14 ms, p99 36 ms, 20 000/20 000 | `bench/paced.sh 2000 15` |
 | e2e saturated (32 conns) | ~4 900/s ingest, ~2 650/s delivered (sink-bound) | `bench/run.sh 15 32` |
-| Isolated flow hop | 8 110/s (9 948/s over 10 flows) | `bench/flow-only.sh`, `bench/multi-flow.sh` |
+| Isolated flow hop | 13 652/s (13 746/s aggregate over 10 flows) | `bench/flow-only.sh`, `bench/multi-flow.sh` |
 | MQTT loopback, QoS 1 both ways, real mosquitto | 2 285 rt/s, 5 000/5 000 | `bench/broker-mqtt.sh 5000` |
 | Cluster: instance kill -9 under load | 20 000/20 000, zero loss | `bench/cluster.sh` |
 | Cluster: singleton failover | ~2.6 s graceful / ~5.9 s crash (TTL-bound) | `bench/cluster-gaps.sh` |

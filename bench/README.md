@@ -79,10 +79,10 @@ quoted without the scenario and the machine.
 Publish straight onto the bus, run only the flow, count its emits with a
 plain subscription — no HTTP anywhere:
 
-| Metric | v0 | after `5cffb7b` | with parallel publishers (`PUBS=4`) |
-|---|---|---|---|
-| Flow-hop rate | 171/s | ≥ 2 786/s (publisher-bound) | **8 110/s** |
-| Runtime RSS | 5.6 MB | 5.5 MB | 6.2 MB |
+| Metric | v0 | after `5cffb7b` | `PUBS=4` | after the consumer-loop rework (`PUBS=16`, 64 000 events) |
+|---|---|---|---|---|
+| Flow-hop rate | 171/s | ≥ 2 786/s (publisher-bound) | 8 110/s | **13 652/s** |
+| Runtime RSS | 5.6 MB | 5.5 MB | 6.2 MB | 7.5 MB |
 
 Finding **#4 (the structural one — fixed)**: ~5.8 ms per message was the
 per-message synchronous JetStream round-trips in the consumer loop. The
@@ -92,16 +92,44 @@ loss test: 0 lost, DLQ clean), with `no_wait` pulls killing the batch-fill
 wait (#3) at the same time. 16× on the isolated hop; the true ceiling needs
 a faster publisher to measure.
 
+Findings **#6 and #7 (the consumer loop — fixed, 2026-09-21)**, found with
+the flow hop instrumented per phase (`vejas_round_seconds_sum{phase}` and
+`vejas_fetch_rounds_total` / `vejas_fetch_messages_total` on `/metrics`):
+
+- **#6 The pull request sat behind the flusher floor.** A pull request is a
+  publish, and the sync `nats` client only buffers a publish — its flusher
+  thread waits at least 5 ms between writes (the same floor as #5). Every
+  round of 64 messages paid it: 7 ms a round, 9 003 evt/s on the merge
+  evaluation's workload, with the interpreter at 10 µs per event. A direct
+  flush of the request (`fetch_iter_flushed`) made it one round-trip.
+- **#7 The loop collected a batch, then processed it.** The reader thread
+  decoded 64 messages while the flow thread waited, then the flow thread ran
+  64 while the reader idled. Now the loop consumes messages as they arrive,
+  keeps the next pull request in flight while it works, and sends its acks on
+  a connection of their own so no PING waits behind them; the trace ring
+  keeps the event and derives the preview on read instead of serialising
+  every message twice.
+
+Together: **9 003 → 16 133 evt/s** on the evaluation's flow (`h2h`, 16
+publishers), **8 110 → 13 652/s** on the bench flow above. What remains,
+measured: ~33 µs of loop time per message (12 µs of it the interpreter, the
+rest JSON in and out, the trace ring, metrics) and two round-trips per
+64-message batch. For scale, `nats bench js fetch --batch 64` (the Go client,
+explicit acks, same server, same box) pulls 72 644 msgs/s: the server is not
+the ceiling, the sync client's receive path and the per-message bookkeeping
+are. Past ~16 k/s per unit, partition (ADR-0020: one unit per slice, one
+lease per unit) rather than tune further.
+
 ## The true hop ceiling and multi-flow scaling
 
-With parallel publishers (`PUBS=4/8`), the single-flow hop tops out around
-**7–8 k/s** (the publisher pushes 9.7 k/s, the flow drains just behind).
-Scaling the number of flows (`bench/multi-flow.sh`):
+With parallel publishers, the single-flow hop tops out around **14–16 k/s**
+(`PUBS=16`; four publishers push ~10.6 k/s and the flow drains as fast as
+they publish). Scaling the number of flows (`bench/multi-flow.sh`):
 
 | Flows | Aggregate rate | Runtime RSS |
 |---|---|---|
 | 1 | 7–8 k/s | 6 MB |
-| 10 | **9 948/s** | 12.9 MB |
+| 10 | **13 746/s** | 16.6 MB |
 | 50 | 8 410/s | 49.3 MB |
 
 Throughput *rises* with flow count (consumers parallelize; the bus, not the

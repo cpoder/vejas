@@ -88,11 +88,21 @@ The contract, in eight points:
    same way. The Varpulis LSP and VS Code grammar keep working on `.vpl`
    files as they are.
 
-The first engineering step is not the unit: it is the consumer path.
-Vejas acknowledges one message at a time and tops out around 9 000 evt/s per
-unit; the engine it is about to host processes hundreds of thousands. Batch
-fetch and batch acknowledgement come first, measured with the same harness
-the evaluation used, so the fast engine never waits on the slow bus.
+The first engineering step is not the unit: it is the consumer path. When
+this ADR was written Vejas topped out around 9 000 evt/s per unit, and the
+engine it is about to host processes hundreds of thousands.
+
+*Done the same day, measured with the evaluation's harness.* The ceiling was
+not the acknowledgements: it was the loop waiting on itself — the pull
+request buffered behind the sync client's 5 ms flusher floor, then a batch
+collected in full before any of it was processed. With the request flushed
+on the spot, messages processed as they arrive, the next pull kept in flight
+and acks on their own connection, the same flow runs at **16 133 evt/s**
+(bench flow: 8 110 → 13 652). What remains is ~33 µs of loop time per
+message and two round-trips per batch; the Go client pulls 72 000 msgs/s
+from the same server, so the next lever is the client, not the server —
+and past that, partition (point 6). The engine will still be faster than
+the bus per unit; the unit is sized by the slice it owns.
 
 ## Consequences
 

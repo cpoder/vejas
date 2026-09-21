@@ -171,6 +171,12 @@ fn events_json(flow: Option<&str>) -> String {
             ring.iter().map(|e| {
                 let mut e = e.clone();
                 if let Some(o) = e.as_object_mut() {
+                    // Hot loops store the event and no preview (one JSON walk
+                    // less per message); derive it here, on read.
+                    if o.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
+                        let pv = o.get("event").map(preview_of).unwrap_or_default();
+                        o.insert("preview".into(), Value::String(pv));
+                    }
                     o.remove("event");
                 }
                 e
@@ -279,7 +285,7 @@ fn replay_literal(
             changed_count += 1;
         }
         results.push(json!({
-            "ts": entry["ts"], "subject": entry["subject"], "preview": entry["preview"],
+            "ts": entry["ts"], "subject": entry["subject"], "preview": trace_preview(entry),
             "before": b, "after": a, "changed": changed,
         }));
     }
@@ -914,6 +920,15 @@ fn panel_html() -> String {
     include_str!("panel.html").replace("{{SECRET_PATTERN}}", secrets::SECRET_KEY_PATTERN)
 }
 
+/// A trace entry's preview: the stored one, or derived from the stored event
+/// when the hot loop skipped serialising it.
+fn trace_preview(entry: &Value) -> String {
+    match entry.get("preview").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => entry.get("event").map(preview_of).unwrap_or_default(),
+    }
+}
+
 fn preview_of(v: &Value) -> String {
     let s = v.to_string();
     if s.chars().count() > 160 {
@@ -1098,6 +1113,15 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 return Err("no `source` declaration".into());
             };
             let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+            // Acks travel on their own connection. An ack is a publish to the
+            // message's reply subject, and any connection may send it. On the
+            // consuming connection the 64 acks of a round sat in front of the
+            // next round's PING, and every PONG waited for the server to work
+            // through them (~30 µs each, ~2 ms a round, measured). On a
+            // connection of their own they cost the server the same and this
+            // loop nothing. If that connection drops, un-acked messages simply
+            // redeliver (at-least-once, ADR-0002).
+            let ack_nc = nats::connect(&url).map_err(|e| e.to_string())?;
             let js = nats::jetstream::new(nc.clone());
             let _ = js.add_stream(&nats::jetstream::StreamConfig {
                 name: stream.clone(),
@@ -1133,17 +1157,39 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 handle.spec.name
             );
             let mut engine = vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+            // One pull request is always in flight ahead of the round being
+            // processed. Without it every round began with ~2 ms of waiting for
+            // its first message — request, round-trip, server delivery — while
+            // this thread sat idle at ~50 % CPU; a Go client on the same
+            // server pulls 72 k msgs/s with the same batch precisely because it
+            // keeps the next request outstanding. The request for round N+1
+            // leaves before round N is processed; its messages queue in the
+            // subscription and are there when N is done. If the stream idles,
+            // the outstanding request expires server-side like any other
+            // (`PULL_EXPIRES_MS`) and its round comes back empty. A stop
+            // leaves at most one request outstanding, whose messages redeliver
+            // un-acked after `ack_wait` — the same as stopping mid-batch.
+            let mut round = connectors::fetch_iter_flushed(&sub, &nc)?;
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 engine.invalidate(); // pick up live service edits
-                let batch = connectors::fetch_round(&sub)?;
+                let round_t0 = Instant::now();
+                let next = connectors::fetch_iter_flushed(&sub, &nc)?;
+                // Messages are processed as the reader thread hands them over, not
+                // once the whole batch has landed, so the two threads overlap
+                // instead of taking turns (see `fetch_iter_flushed`).
+                let fetch = &mut round;
+                let mut fetched = 0usize;
+                let mut first_at: Option<Instant> = None;
                 // Emits are buffered (core publish) and confirmed by ONE flush per
                 // batch before their source messages are acked — one round-trip a
                 // batch instead of one per emit, at-least-once preserved (ADR-0002).
-                let mut to_ack: Vec<&nats::Message> = Vec::new();
-                for msg in &batch {
+                let mut to_ack: Vec<nats::Message> = Vec::new();
+                for msg in fetch {
+                    fetched += 1;
+                    first_at.get_or_insert_with(Instant::now);
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                         // stopped mid-batch: leave the message un-acked, it
                         // redelivers to whoever holds the durable next
@@ -1210,8 +1256,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 ok,
                                 (!ok).then(|| "publish failed (will redeliver)".to_string()),
                                 ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
-                                preview_of(&event),
-                                Some(event.clone()),
+                                // The preview is derived from the stored event when
+                                // /events is read; serialising it here cost every
+                                // message a second walk of its JSON.
+                                String::new(),
+                                Some(event),
                             );
                             if ok {
                                 to_ack.push(msg); // acked after the batch flush
@@ -1240,19 +1289,19 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                         metrics::inc_dead_letter(&handle.spec.name);
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
-                                            vec![], preview_of(&event), Some(event.clone()));
+                                            vec![], String::new(), Some(event.clone()));
                                         let _ = msg.ack();
                                     }
                                     Err(de) => {
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — DLQ publish failed: {de}")),
-                                            vec![], preview_of(&event), Some(event.clone()));
+                                            vec![], String::new(), Some(event.clone()));
                                         let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
                                     }
                                 }
                             } else {
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], preview_of(&event), Some(event.clone()));
+                                    vec![], String::new(), Some(event.clone()));
                                 // no ack -> redelivery after ack_wait
                             }
                             set_state(&handle, |st| st.last_error = Some(e));
@@ -1263,11 +1312,25 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 // server received every buffered emit, THEN ack the fully-published
                 // source messages. On flush failure, ack none — the batch
                 // redelivers (nothing is lost; at-least-once, ADR-0002).
+                metrics::observe_fetch(&handle.spec.name, fetched);
+                let processed_at = Instant::now();
                 if !to_ack.is_empty() {
                     match nc.flush() {
                         Ok(_) => {
                             for m in &to_ack {
-                                let _ = m.ack();
+                                match m.reply.as_deref() {
+                                    Some(reply) => {
+                                        if let Err(e) = ack_nc.publish(reply, b"") {
+                                            eprintln!(
+                                                "[vejas] {}: ack: {e} (redelivers)",
+                                                handle.spec.name
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        let _ = m.ack();
+                                    }
+                                }
                             }
                         }
                         Err(e) => eprintln!(
@@ -1276,6 +1339,14 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         ),
                     }
                 }
+                round = next;
+                let first = first_at.unwrap_or(processed_at);
+                metrics::observe_round(
+                    &handle.spec.name,
+                    (first - round_t0).as_secs_f64(),
+                    (processed_at - first).as_secs_f64(),
+                    processed_at.elapsed().as_secs_f64(),
+                );
             }
         })();
         match attempt {
