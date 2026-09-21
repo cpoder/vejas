@@ -1093,6 +1093,78 @@ impl Driver for OAuthPoll {
     }
 }
 
+// ───────────────────────── pull consumers over several subjects ─────────────────────────
+
+/// NATS subject matching: `*` stands for one token, `>` for the rest (at least one).
+pub fn subject_matches(pattern: &str, subject: &str) -> bool {
+    let mut p = pattern.split('.');
+    let mut s = subject.split('.');
+    loop {
+        match (p.next(), s.next()) {
+            (None, None) => return true,
+            (Some(">"), Some(_)) => return true,
+            (Some("*"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Create (or verify) a durable pull consumer that delivers every one of
+/// `filters` in stream order. The sync `nats` client knows one filter subject
+/// per consumer; the JetStream API knows several since 2.10, so the request is
+/// sent raw. Idempotent: the same request on an existing consumer is accepted,
+/// and 2.10 updates the filters of an existing one in place (its ack floor
+/// stays). The reply's filters must be exactly the ones asked for — a server
+/// that ignored `filter_subjects` would deliver the whole stream.
+pub fn create_pull_consumer(
+    nc: &nats::Connection,
+    stream: &str,
+    durable: &str,
+    filters: &[String],
+    ack_wait: Duration,
+) -> Result<(), String> {
+    let mut config = serde_json::json!({
+        "durable_name": durable,
+        "ack_policy": "explicit",
+        "ack_wait": ack_wait.as_nanos() as u64,
+        "deliver_policy": "all",
+        "replay_policy": "instant",
+    });
+    match filters {
+        [one] => config["filter_subject"] = Value::String(one.clone()),
+        many => config["filter_subjects"] = Value::from(many.to_vec()),
+    }
+    let body = serde_json::json!({ "stream_name": stream, "config": config }).to_string();
+    let reply = nc
+        .request(&format!("$JS.API.CONSUMER.DURABLE.CREATE.{stream}.{durable}"), body)
+        .map_err(|e| format!("consumer {durable}: {e}"))?;
+    let v: Value = serde_json::from_slice(&reply.data)
+        .map_err(|e| format!("consumer {durable}: unreadable reply: {e}"))?;
+    if let Some(err) = v.get("error") {
+        let what = err.get("description").and_then(Value::as_str).unwrap_or("error");
+        return Err(format!("consumer {durable}: {what}"));
+    }
+    let mut kept: Vec<String> = match v["config"].get("filter_subjects").and_then(Value::as_array) {
+        Some(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        None => v["config"]
+            .get("filter_subject")
+            .and_then(Value::as_str)
+            .map(|x| vec![x.to_string()])
+            .unwrap_or_default(),
+    };
+    let mut asked = filters.to_vec();
+    kept.sort();
+    asked.sort();
+    if kept != asked {
+        return Err(format!(
+            "consumer {durable}: the server kept the filters {kept:?}, not {asked:?} \
+             (several `.from()` subjects need NATS 2.10 or newer)"
+        ));
+    }
+    Ok(())
+}
+
 // ───────────────────────── connector traces ─────────────────────────
 
 pub fn trace_preview(bytes: &[u8]) -> String {
@@ -2379,5 +2451,22 @@ mod tests {
             lat
         );
         let _ = js.delete_stream(&stream);
+    }
+}
+
+#[cfg(test)]
+mod subject_tests {
+    use super::subject_matches;
+
+    #[test]
+    fn literal_and_wildcards() {
+        assert!(subject_matches("vx.sysmon.net", "vx.sysmon.net"));
+        assert!(!subject_matches("vx.sysmon.net", "vx.sysmon.proc"));
+        assert!(subject_matches("vx.sysmon.*", "vx.sysmon.net"));
+        assert!(!subject_matches("vx.sysmon.*", "vx.sysmon.net.extra"));
+        assert!(subject_matches("vx.>", "vx.sysmon.net"));
+        assert!(!subject_matches("vx.>", "vx"));
+        assert!(!subject_matches("vx.sysmon", "vx.sysmon.net"));
+        assert!(!subject_matches("vx.sysmon.net", "vx.sysmon"));
     }
 }

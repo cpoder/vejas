@@ -39,8 +39,12 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
 ## The contract
 
 - **Source.** Every `.from(<connector>, topic: "...")` names a bus subject
-  under the subject root. The unit gets one durable consumer per subject,
-  like a flow gets one for its `source`: *stopped is not losing*.
+  under the subject root. The unit gets one durable consumer over all of
+  them, like a flow gets one for its `source`: *stopped is not losing*. One
+  consumer, not one per subject, so the engine sees the bus in stream
+  order: a sequence across two subjects is judged in the order the events
+  were published, also when a backlog is replayed after a restart. Several
+  subjects need NATS 2.10 or newer.
 - **Time is event time.** A payload's `@timestamp` (RFC 3339), else its
   `ts` or `timestamp` (epoch milliseconds), is the event's time. Every
   `.within()` and window is judged against it, never against the clock, so

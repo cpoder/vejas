@@ -11,8 +11,9 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 - **Detect units** (ADR-0031): a VPL program under `detects/`, run by the
   Varpulis CEP engine embedded as a library — sequences, Kleene closures,
   negation, `.within()` in event time, windows, joins, forecast — with the
-  contract a flow has: a durable consumer per `.from()` subject, emit before
-  ack, poison to the DLQ. `vejas-runtime vpl-check <file>` and the MCP tool
+  contract a flow has: one durable consumer over its `.from()` subjects
+  (stream order, so a sequence across subjects survives a backlog; several
+  subjects need NATS 2.10), emit before ack, poison to the DLQ. `vejas-runtime vpl-check <file>` and the MCP tool
   `vejas_vpl_check` give the engine's verdict; `/topology` lists the units
   under `detects`; CI checks every `.vpl` and runs `e2e/detect/run.sh`. The
   engine adds no async runtime to the binary (5.9 → 8.1 MB). Measured:

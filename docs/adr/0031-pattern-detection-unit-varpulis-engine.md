@@ -108,15 +108,19 @@ the bus per unit; the unit is sized by the slice it owns.
 ## What is built (2026-09-22)
 
 `detects/<name>.vpl` is a unit (`Kind::Detect`): one durable pull consumer
-per `.from()` subject, each on a thread of its own feeding one channel; the
-engine (`varpulis-engine`, a git dependency, no async runtime) runs on the
-unit's thread in event time over the merged arrival order; emits are
+over every `.from()` subject (a multi-filter consumer, NATS 2.10, created
+through the raw JetStream API because the sync client predates it), read by
+one thread into one channel; the engine (`varpulis-engine`, a git
+dependency, no async runtime) runs on the unit's thread in event time over
+the stream's order. The first cut had one consumer per subject: a backlog
+then arrived subject by subject and a `->` across two subjects broke (CI
+saw 1 match of 20; the backlog round of D2 now pins this). Emits are
 published before their source messages are acked, to the stream's `.to()`
 subject or to `<root>.detect.<unit>.<stream>`; poison is dead-lettered like
 a flow's. `vejas-runtime vpl-check` and the MCP tool `vejas_vpl_check` give
 the engine's verdict; `/topology` lists the units under `detects`; CI checks
 every `.vpl` and runs `e2e/detect/run.sh` (D1 stateless no-loss under
-`kill -9`, D2 two-source sequence in event time, D3 verdicts, D4 topology).
+`kill -9`, D2 two-source sequence in event time, consumed live and as one backlog, D3 verdicts, D4 topology).
 Payloads follow the connectors' rules — `event_type`, `@timestamp`, `ts` —
 decoded by the connectors' own decoder, moved into `varpulis-core` for it.
 

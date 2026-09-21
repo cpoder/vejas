@@ -1436,30 +1436,28 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                 subjects: vec![format!("{subj_root}.>")],
                 ..Default::default()
             });
-            // One consumer per source subject, each pulled on its own thread
+            // One durable consumer per unit over every `.from()` subject, so the
+            // engine sees the bus in stream order: a sequence across two subjects
+            // is judged in the order the events were published, also when a
+            // backlog is replayed after a restart. (One consumer per subject
+            // delivered a backlog subject by subject, and a `->` across subjects
+            // broke: e2e/detect D2, backlog round.) One reader thread pulls it
             // into one channel. Stop is shared: the unit's flag plus one for
             // this attempt, so a restart never leaves a stale reader behind.
             let attempt_stop = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, nats::Message)>();
-            for (i, (subject, _)) in sources.iter().enumerate() {
-                let durable = format!("{}_{i}", handle.spec.name.replace([':', '.'], "_"));
-                let _ = js.add_consumer(
-                    &stream,
-                    nats::jetstream::ConsumerConfig {
-                        durable_name: Some(durable.clone()),
-                        deliver_subject: None,
-                        filter_subject: subject.clone(),
-                        ack_wait: connectors::ack_wait(),
-                        ..Default::default()
-                    },
-                );
-                let sub = js
-                    .pull_subscribe_with_options(
-                        subject,
-                        &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
-                    )
-                    .map_err(|e| format!("{subject}: {e}"))?;
-                let tx = tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<nats::Message>();
+            let durable = handle.spec.name.replace([':', '.'], "_");
+            let filters: Vec<String> = sources.iter().map(|(s, _)| s.clone()).collect();
+            connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait())?;
+            let sub = js
+                .pull_subscribe_with_options(
+                    &filters[0],
+                    &nats::jetstream::PullSubscribeOptions::new()
+                        .durable_name(durable.clone())
+                        .bind_stream(stream.clone()),
+                )
+                .map_err(|e| format!("{durable}: {e}"))?;
+            {
                 let reader_nc = nc.clone();
                 let stop = attempt_stop.clone();
                 let unit = handle.clone();
@@ -1474,7 +1472,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 let mut n = 0usize;
                                 for msg in round {
                                     n += 1;
-                                    if tx.send((i, msg)).is_err() {
+                                    if tx.send(msg).is_err() {
                                         return;
                                     }
                                 }
@@ -1488,7 +1486,6 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     }
                 });
             }
-            drop(tx);
             set_state(&handle, |st| {
                 st.status = "running".into();
                 st.started_at = Some(now_secs());
@@ -1510,7 +1507,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         Ok(m) => m,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err("every source consumer stopped".into())
+                            return Err("the consumer reader stopped".into())
                         }
                     };
                     let round_t0 = Instant::now();
@@ -1522,11 +1519,23 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         }
                     }
                     let mut to_ack: Vec<nats::Message> = Vec::new();
-                    for (i, msg) in batch {
+                    for msg in batch {
                         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                             return Ok(()); // un-acked: redelivers to whoever holds the durable next
                         }
-                        let event_type = &sources[i].1;
+                        // The consumer's filters are the `.from()` subjects, so one
+                        // matches; the first declared wins when two overlap.
+                        let Some(event_type) = sources
+                            .iter()
+                            .find(|(topic, _)| connectors::subject_matches(topic, &msg.subject))
+                            .map(|(_, event_type)| event_type.as_str())
+                        else {
+                            return Err(format!(
+                                "received {} which no `.from()` subject matches: consumer `{durable}` \
+                                 is not the one this unit created",
+                                msg.subject
+                            ));
+                        };
                         let t0 = Instant::now();
                         // The program decodes the payload itself: its decoder
                         // interns field names and event types once per program,
