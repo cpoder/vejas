@@ -1095,7 +1095,7 @@ impl Driver for OAuthPoll {
 
 // ───────────────────────── connector traces ─────────────────────────
 
-fn trace_preview(bytes: &[u8]) -> String {
+pub fn trace_preview(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().take(160).collect()
 }
 

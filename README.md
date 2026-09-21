@@ -5,7 +5,10 @@ readable code written by your coding agent, reviewed in git, and run natively by
 a single Rust binary on NATS. Humans keep two screens: monitoring for operators,
 and a business panel where non-technical experts validate and correct
 transcoding tables and thresholds. The agent owns *how*; the human owns *what it
-means*. The whole platform is drivable over MCP.
+means*. The whole platform is drivable over MCP. Detection over time — a
+sequence of events, a window, an absence — is a **detect unit**: a VPL program
+run by the Varpulis CEP engine, embedded as a library
+([ADR-0031](docs/adr/0031-pattern-detection-unit-varpulis-engine.md)).
 
 Vėjas is the old Baltic god of the wind. Wind moves things without anyone
 drawing the route.

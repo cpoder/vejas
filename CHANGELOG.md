@@ -7,6 +7,21 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **Detect units** (ADR-0031): a VPL program under `detects/`, run by the
+  Varpulis CEP engine embedded as a library — sequences, Kleene closures,
+  negation, `.within()` in event time, windows, joins, forecast — with the
+  contract a flow has: a durable consumer per `.from()` subject, emit before
+  ack, poison to the DLQ. `vejas-runtime vpl-check <file>` and the MCP tool
+  `vejas_vpl_check` give the engine's verdict; `/topology` lists the units
+  under `detects`; CI checks every `.vpl` and runs `e2e/detect/run.sh`. The
+  engine adds no async runtime to the binary (5.9 → 8.1 MB). Measured:
+  18 643 evt/s on the merge evaluation's program (16 publishers,
+  64 000 events; the flow unit runs it at 16 182). Not yet: snapshot-and-resume of a unit's state — a
+  stateless detection loses nothing across a crash, a sequence can miss the
+  matches that straddle one — the panel graph, and the business surface of
+  a VPL program. See the book, *Detect units*.
+
 ### Changed
 - The flow consumer loop no longer waits on itself: the pull request is
   flushed the moment it is made instead of sitting behind the sync client's

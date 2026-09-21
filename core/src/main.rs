@@ -48,6 +48,9 @@ use serde_json::{json, Value};
 enum Kind {
     Flow,
     Connector,
+    /// A pattern-detection unit (ADR-0031): a VPL program under `detects/`,
+    /// run by the embedded Varpulis engine.
+    Detect,
 }
 
 #[derive(Clone)]
@@ -975,19 +978,20 @@ fn package_enabled(pkg_dir: &Path) -> bool {
 
 fn scan_units(dir: &Path, pkg: &str, kind: Kind, out: &mut Vec<Spec>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
-    let prefix = match kind {
-        Kind::Flow => "flow",
-        Kind::Connector => "connector",
+    let (prefix, ext) = match kind {
+        Kind::Flow => ("flow", ".vjs"),
+        Kind::Connector => ("connector", ".vjs"),
+        Kind::Detect => ("detect", ".vpl"),
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if fname.starts_with('_') || !fname.ends_with(".vjs") {
+        if fname.starts_with('_') || !fname.ends_with(ext) {
             continue;
         }
-        let stem = fname.trim_end_matches(".vjs").to_string();
+        let stem = fname.trim_end_matches(ext).to_string();
         let name = if pkg == "default" {
             format!("{prefix}:{stem}")
         } else {
@@ -1007,6 +1011,7 @@ fn scan_all(root: &Path) -> Vec<Spec> {
     let mut out = Vec::new();
     scan_units(&root.join("flows"), "default", Kind::Flow, &mut out);
     scan_units(&root.join("connectors"), "default", Kind::Connector, &mut out);
+    scan_units(&root.join("detects"), "default", Kind::Detect, &mut out);
     if let Ok(pkgs) = fs::read_dir(root.join("packages")) {
         for p in pkgs.flatten() {
             let dir = p.path();
@@ -1019,6 +1024,7 @@ fn scan_all(root: &Path) -> Vec<Spec> {
             }
             scan_units(&dir.join("flows"), &pkg, Kind::Flow, &mut out);
             scan_units(&dir.join("connectors"), &pkg, Kind::Connector, &mut out);
+            scan_units(&dir.join("detects"), &pkg, Kind::Detect, &mut out);
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1368,6 +1374,289 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     });
 }
 
+/// A detect unit (ADR-0031): a VPL program run by the embedded Varpulis engine.
+///
+/// One durable pull consumer per `.from()` subject, each on a thread of its
+/// own that feeds one channel; the engine runs on this thread, in event time,
+/// over the merged arrival order. Emits are published before the messages
+/// that caused them are acked (ADR-0002), exactly as a flow's are. An emit
+/// whose stream has a `.to(<connector>, topic: "...")` goes to that subject;
+/// one without goes to `<subject root>.detect.<unit>.<stream>`.
+///
+/// Payloads follow the Varpulis connectors' rules: a string `event_type`
+/// names the event type, else the `.from()` binding's; `@timestamp` (RFC
+/// 3339), else `ts` or `timestamp` (epoch milliseconds), is the event's time
+/// — and every `.within()` and window is judged against it, not the clock.
+///
+/// State (windows, open sequences) lives in the engine and is lost on a
+/// crash until the snapshot-and-resume of ADR-0031 points 4–5 lands: after
+/// a `kill -9`, redelivered messages replay into an empty engine. A
+/// stateless detection (a threshold, a filter) loses nothing today; a
+/// sequence can miss the matches that straddle the crash.
+fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    let mut delay = Duration::from_secs(1);
+    'outer: loop {
+        if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let attempt = (|| -> Result<(), String> {
+            let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
+            let mut program =
+                varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
+            let version = versions::hash_content(&src);
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for b in program.sources() {
+                let Some(subject) = b.topic_override.clone() else {
+                    return Err(format!(
+                        "`.from({}, ...)` names no topic: a detect unit consumes a bus subject, \
+                         write `.from({}, topic: \"{subj_root}.some.subject\")`",
+                        b.connector_name, b.connector_name
+                    ));
+                };
+                sources.push((subject, b.event_type.clone()));
+            }
+            if sources.is_empty() {
+                return Err("no `.from(<connector>, topic: \"...\")` declaration: nothing to consume".into());
+            }
+            let stem = handle
+                .spec
+                .name
+                .rsplit(':')
+                .next()
+                .unwrap_or(&handle.spec.name)
+                .to_string();
+            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+            let ack_nc = nats::connect(&url).map_err(|e| e.to_string())?;
+            let js = nats::jetstream::new(nc.clone());
+            let _ = js.add_stream(&nats::jetstream::StreamConfig {
+                name: stream.clone(),
+                subjects: vec![format!("{subj_root}.>")],
+                ..Default::default()
+            });
+            // One consumer per source subject, each pulled on its own thread
+            // into one channel. Stop is shared: the unit's flag plus one for
+            // this attempt, so a restart never leaves a stale reader behind.
+            let attempt_stop = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, nats::Message)>();
+            for (i, (subject, _)) in sources.iter().enumerate() {
+                let durable = format!("{}_{i}", handle.spec.name.replace([':', '.'], "_"));
+                let _ = js.add_consumer(
+                    &stream,
+                    nats::jetstream::ConsumerConfig {
+                        durable_name: Some(durable.clone()),
+                        deliver_subject: None,
+                        filter_subject: subject.clone(),
+                        ack_wait: connectors::ack_wait(),
+                        ..Default::default()
+                    },
+                );
+                let sub = js
+                    .pull_subscribe_with_options(
+                        subject,
+                        &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
+                    )
+                    .map_err(|e| format!("{subject}: {e}"))?;
+                let tx = tx.clone();
+                let reader_nc = nc.clone();
+                let stop = attempt_stop.clone();
+                let unit = handle.clone();
+                let name = handle.spec.name.clone();
+                thread::spawn(move || {
+                    while RUNNING.load(Ordering::SeqCst)
+                        && !unit.stop.load(Ordering::SeqCst)
+                        && !stop.load(Ordering::SeqCst)
+                    {
+                        match connectors::fetch_iter_flushed(&sub, &reader_nc) {
+                            Ok(round) => {
+                                let mut n = 0usize;
+                                for msg in round {
+                                    n += 1;
+                                    if tx.send((i, msg)).is_err() {
+                                        return;
+                                    }
+                                }
+                                metrics::observe_fetch(&name, n);
+                            }
+                            Err(e) => {
+                                eprintln!("[vejas] {name}: pull: {e}");
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            set_state(&handle, |st| {
+                st.status = "running".into();
+                st.started_at = Some(now_secs());
+                st.last_error = None;
+            });
+            eprintln!(
+                "[vejas] {} (vpl, embedded engine) consuming {}",
+                handle.spec.name,
+                sources.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            let result = (|| -> Result<(), String> {
+                loop {
+                    if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    // A batch is whatever has arrived: wait for one message, take
+                    // the rest without waiting, bounded.
+                    let first = match rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(m) => m,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("every source consumer stopped".into())
+                        }
+                    };
+                    let round_t0 = Instant::now();
+                    let mut batch = vec![first];
+                    while batch.len() < 256 {
+                        match rx.try_recv() {
+                            Ok(m) => batch.push(m),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut to_ack: Vec<nats::Message> = Vec::new();
+                    for (i, msg) in batch {
+                        if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                            return Ok(()); // un-acked: redelivers to whoever holds the durable next
+                        }
+                        let event_type = &sources[i].1;
+                        let t0 = Instant::now();
+                        // The program decodes the payload itself: its decoder
+                        // interns field names and event types once per program,
+                        // not once per message (21.6 → 5.4 µs an event).
+                        match program.feed_json(event_type, &msg.data) {
+                            Err(varpulis_engine::Error::Event(e)) => {
+                                // Not an event: permanent poison. Dead-letter it
+                                // (ADR-0015), publish before ack, nak if the DLQ
+                                // write fails.
+                                let err = format!("bad payload: {e}");
+                                eprintln!("[vejas] {}: {err}", handle.spec.name);
+                                let delivered =
+                                    msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                metrics::observe(&handle.spec.name, false, 0, 0.0);
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version) {
+                                    Ok(()) => {
+                                        metrics::inc_dead_letter(&handle.spec.name);
+                                        let _ = msg.ack();
+                                    }
+                                    Err(_) => {
+                                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                    }
+                                }
+                            }
+                            Ok(emits) => {
+                                let mut ok = true;
+                                let mut subjects = Vec::with_capacity(emits.len());
+                                for emit in &emits {
+                                    let subject = emit
+                                        .sink
+                                        .as_ref()
+                                        .and_then(|s| s.topic.clone())
+                                        .unwrap_or_else(|| {
+                                            format!("{subj_root}.detect.{stem}.{}", emit.stream)
+                                        });
+                                    if let Err(e) = nc.publish(&subject, emit.to_payload()) {
+                                        eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
+                                        ok = false;
+                                    }
+                                    subjects.push(subject);
+                                }
+                                metrics::observe(&handle.spec.name, ok, emits.len() as u64, t0.elapsed().as_secs_f64());
+                                record_trace(
+                                    &handle.spec.name,
+                                    &msg.subject,
+                                    ok,
+                                    (!ok).then(|| "publish failed (will redeliver)".to_string()),
+                                    subjects,
+                                    connectors::trace_preview(&msg.data),
+                                    None,
+                                );
+                                if ok {
+                                    to_ack.push(msg);
+                                }
+                            }
+                            Err(e) => {
+                                let e = e.to_string();
+                                eprintln!("[vejas] {}: {e}", handle.spec.name);
+                                metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
+                                let delivered =
+                                    msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                if delivered >= MAX_DELIVERIES {
+                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version) {
+                                        Ok(()) => {
+                                            metrics::inc_dead_letter(&handle.spec.name);
+                                            let _ = msg.ack();
+                                        }
+                                        Err(_) => {
+                                            let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                        }
+                                    }
+                                }
+                                record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
+                                    vec![], connectors::trace_preview(&msg.data), None);
+                                set_state(&handle, |st| st.last_error = Some(e));
+                            }
+                        }
+                    }
+                    let processed_at = Instant::now();
+                    // Publish-before-ack barrier, one flush per batch (ADR-0002).
+                    if !to_ack.is_empty() {
+                        match nc.flush() {
+                            Ok(_) => {
+                                for m in &to_ack {
+                                    match m.reply.as_deref() {
+                                        Some(reply) => {
+                                            let _ = ack_nc.publish(reply, b"");
+                                        }
+                                        None => {
+                                            let _ = m.ack();
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
+                                handle.spec.name
+                            ),
+                        }
+                    }
+                    metrics::observe_round(
+                        &handle.spec.name,
+                        0.0,
+                        (processed_at - round_t0).as_secs_f64(),
+                        processed_at.elapsed().as_secs_f64(),
+                    );
+                }
+            })();
+            attempt_stop.store(true, Ordering::SeqCst);
+            result
+        })();
+        match attempt {
+            Ok(()) => break 'outer,
+            Err(e) => {
+                eprintln!("[vejas] {}: {e}", handle.spec.name);
+                set_state(&handle, |st| {
+                    st.status = "restarting".into();
+                    st.restarts += 1;
+                    st.last_error = Some(e);
+                });
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+    set_state(&handle, |st| {
+        st.status = "stopped".into();
+    });
+}
+
 fn pkg_of_path(path: &Path) -> String {
     let s = path.display().to_string();
     if let Some(rest) = s.split("packages/").nth(1) {
@@ -1397,6 +1686,9 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
         }
         Kind::Connector => {
             thread::spawn(move || supervise_connector(handle, root));
+        }
+        Kind::Detect => {
+            thread::spawn(move || supervise_detect(handle, root));
         }
     }
 }
@@ -1687,13 +1979,14 @@ fn topology_json(registry: &Registry) -> Value {
     let reg = registry.lock().unwrap();
     let mut flows = Vec::new();
     let mut connectors = Vec::new();
+    let mut detects = Vec::new();
     for handle in reg.values() {
         let st = handle.state.lock().unwrap();
         let entry = json!({
             "name": handle.spec.name,
             "file": handle.spec.path.display().to_string(),
             "pkg": handle.spec.pkg,
-            "lang": "vjs",
+            "lang": if matches!(handle.spec.kind, Kind::Detect) { "vpl" } else { "vjs" },
             "status": st.status,
             "restarts": st.restarts,
             "started_at": st.started_at,
@@ -1702,9 +1995,10 @@ fn topology_json(registry: &Registry) -> Value {
         match handle.spec.kind {
             Kind::Flow => flows.push(entry),
             Kind::Connector => connectors.push(entry),
+            Kind::Detect => detects.push(entry),
         }
     }
-    json!({ "flows": flows, "connectors": connectors })
+    json!({ "flows": flows, "connectors": connectors, "detects": detects })
 }
 
 /// Connector instances (manifests), for the graph: name, driver, kind, in/out.
@@ -2968,6 +3262,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_graph", "description": "The pipeline graph: sources, flows, composed services, destinations, connectors.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_surface", "description": "The business surface of every flow: mappings, transcoding tables, constants.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_language", "description": "The VejasScript reference: grammar, builtins, and the rules for flow files and connector manifests. Read this before writing any .vjs.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_vpl_check", "description": "Check a detect unit (a VPL program under detects/, run by the embedded Varpulis engine — ADR-0031): the engine's own verdict, the same refusal a running unit would give. Returns {ok} or {ok:false, error}.", "inputSchema": obj(json!({"file": {"type": "string", "description": "path of the .vpl file"}}), vec!["file"])}),
         json!({"name": "vejas_read", "description": "Read a script file (.vjs) or fixture (.json).", "inputSchema": obj(json!({"path": {"type": "string"}}), vec!["path"])}),
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
@@ -3025,6 +3320,16 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(fs::read_to_string(&path).map_err(|e| e.to_string())?)
         }
         "vejas_language" => text(LANGUAGE_VJS.to_string()),
+        "vejas_vpl_check" => {
+            let file = args["file"].as_str().ok_or("file required")?;
+            let src = fs::read_to_string(root.join(file))
+                .or_else(|_| fs::read_to_string(file))
+                .map_err(|e| e.to_string())?;
+            match varpulis_engine::Program::check(&src) {
+                Ok(()) => text(json!({"ok": true, "file": file}).to_string()),
+                Err(e) => text(json!({"ok": false, "file": file, "error": e.to_string()}).to_string()),
+            }
+        }
         "vejas_events" => text(events_json(args["flow"].as_str())),
         "vejas_write_flow" => {
             approval_gate()?;
@@ -3420,6 +3725,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         let kind = match h.spec.kind {
                             Kind::Connector => "connector",
                             Kind::Flow => "flow",
+                            Kind::Detect => "detect",
                         };
                         let restarts = h.state.lock().unwrap().restarts;
                         (h.spec.name.clone(), kind.to_string(), restarts)
@@ -3895,6 +4201,23 @@ fn main() {
     }
     if args.len() >= 3 && args[1] == "vjs-check" {
         match fs::read_to_string(&args[2]).map_err(|e| e.to_string()).and_then(|s| vjs::parse(&s).map(|_| ())) {
+            Ok(()) => {
+                println!("ok");
+                return;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.len() >= 3 && args[1] == "vpl-check" {
+        // The embedded engine's own verdict (ADR-0031, point 8): the same
+        // refusal a running detect unit would give.
+        match fs::read_to_string(&args[2])
+            .map_err(|e| e.to_string())
+            .and_then(|s| varpulis_engine::Program::check(&s).map_err(|e| e.to_string()))
+        {
             Ok(()) => {
                 println!("ok");
                 return;

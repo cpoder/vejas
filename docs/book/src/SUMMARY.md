@@ -14,6 +14,7 @@
 - [Flows & VejasScript](concepts/flows.md)
 - [Composing services](concepts/composition.md)
 - [Connectors](concepts/connectors.md)
+- [Detect units](concepts/detects.md)
 - [The business surface](concepts/business-surface.md)
 - [Secrets](concepts/secrets.md)
 - [Agents & MCP](concepts/agents-mcp.md)

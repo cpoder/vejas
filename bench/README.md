@@ -120,6 +120,12 @@ the ceiling, the sync client's receive path and the per-message bookkeeping
 are. Past ~16 k/s per unit, partition (ADR-0020: one unit per slice, one
 lease per unit) rather than tune further.
 
+**The detect unit** (ADR-0031, the Varpulis engine embedded) on the same
+harness and the same program: **18 643 evt/s** at 16 publishers (17 265 at
+32), 10.3 MB RSS, against 16 182 for the flow unit — the engine's share is
+about 20 µs per event under load and under 10 µs in isolation (its own
+`throughput_probe`). Same consumer path, same publish-before-ack barrier.
+
 ## The true hop ceiling and multi-flow scaling
 
 With parallel publishers, the single-flow hop tops out around **14–16 k/s**

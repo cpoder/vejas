@@ -1,8 +1,9 @@
 # 0031 — Pattern detection as a unit type: the Varpulis engine embedded
 
-- Status: Proposed (decided direction; the engine extraction on the Varpulis
-  side is under way, the unit is not built)
-- Date: 2026-09-21
+- Status: Accepted (partial) — the unit is built and gated (points 1, 2, 3,
+  6 by construction, 8 in part); snapshot-and-resume (points 4–5), the panel
+  graph and the business surface of a VPL program (point 7) are not
+- Date: 2026-09-21 (unit built 2026-09-22)
 
 ## Context
 
@@ -103,6 +104,26 @@ message and two round-trips per batch; the Go client pulls 72 000 msgs/s
 from the same server, so the next lever is the client, not the server —
 and past that, partition (point 6). The engine will still be faster than
 the bus per unit; the unit is sized by the slice it owns.
+
+## What is built (2026-09-22)
+
+`detects/<name>.vpl` is a unit (`Kind::Detect`): one durable pull consumer
+per `.from()` subject, each on a thread of its own feeding one channel; the
+engine (`varpulis-engine`, a git dependency, no async runtime) runs on the
+unit's thread in event time over the merged arrival order; emits are
+published before their source messages are acked, to the stream's `.to()`
+subject or to `<root>.detect.<unit>.<stream>`; poison is dead-lettered like
+a flow's. `vejas-runtime vpl-check` and the MCP tool `vejas_vpl_check` give
+the engine's verdict; `/topology` lists the units under `detects`; CI checks
+every `.vpl` and runs `e2e/detect/run.sh` (D1 stateless no-loss under
+`kill -9`, D2 two-source sequence in event time, D3 verdicts, D4 topology).
+Payloads follow the connectors' rules — `event_type`, `@timestamp`, `ts` —
+decoded by the connectors' own decoder, moved into `varpulis-core` for it.
+
+Measured on the evaluation's harness (16 publishers, 64 000 events, same
+box): the detect unit runs the evaluation's program at **18 643 evt/s**,
+the flow unit the same program at 16 182 evt/s; the engine's own share is
+about 20 (under 10 in isolation) µs per event.
 
 ## Consequences
 

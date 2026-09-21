@@ -35,6 +35,16 @@ jobs:
           done < <(find flows services connectors packages docs/examples bench \
                      \( -name '*.vjs' -o -name '*.vjs.example' \) \
                      -not -path '*/target/*')
+          # Detect units are VPL, checked by the embedded engine (ADR-0031).
+          while IFS= read -r f; do
+            out=$(core/target/release/vejas-runtime vpl-check "$f" 2>&1) || true
+            if [ "$out" != "ok" ]; then
+              echo "FAIL $f: $out"
+              fail=1
+            fi
+          done < <(find detects packages docs/examples \
+                     \( -name '*.vpl' -o -name '*.vpl.example' \) \
+                     -not -path '*/target/*' 2>/dev/null)
           exit $fail
 
   image:
@@ -66,6 +76,8 @@ jobs:
         run: e2e/admission/run.sh
       - name: Transport invariants (ROADMAP Phase 4)
         run: e2e/transport/run.sh
+      - name: Detect-unit invariants (ADR-0031, embedded engine)
+        run: e2e/detect/run.sh
       - name: Offset-resume invariant (ADR-0022, kill -9 mid-stream)
         run: e2e/offset-resume.sh
       - name: Documented contracts hold (ADR-0029 R7 — doc examples vs master)
