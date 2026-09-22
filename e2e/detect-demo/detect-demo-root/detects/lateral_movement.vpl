@@ -1,0 +1,57 @@
+# Lateral movement, judged on behaviour: an outbound SMB connection (445)
+# followed, within two minutes of EVENT time, by a process that services.exe
+# spawned on the target — the mechanism PsExec and its imitators use.
+# MITRE ATT&CK T1021.002. The binary's name is never looked at.
+
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event SysmonNetworkConnect:
+    Image: str
+    SourceIp: str
+    DestinationIp: str
+    DestinationPort: int
+    Protocol: str
+    Hostname: str
+    ProcessId: int
+
+event SysmonProcessCreate:
+    Image: str
+    CommandLine: str
+    ParentImage: str
+    User: str
+    Hostname: str
+    ProcessId: int
+    ParentProcessId: int
+
+stream Network = SysmonNetworkConnect
+    .from(Bus, topic: "vx.sysmon.network")
+
+stream Process = SysmonProcessCreate
+    .from(Bus, topic: "vx.sysmon.process")
+
+stream SmbServicePipe = Network
+    .where(DestinationPort == 445)
+
+stream RemoteServiceExec = Process
+    .where(ParentImage.ends_with("\services.exe"))
+
+stream LateralMovement = SmbServicePipe as smb
+    -> RemoteServiceExec as exec
+    .within(2m)
+    .emit(
+        event_type: "KillChainAlert",
+        rule: "lateral_movement_smb",
+        mitre: "T1021.002",
+        severity: "critical",
+        source_host: smb.Hostname,
+        source_image: smb.Image,
+        target_ip: smb.DestinationIp,
+        remote_host: exec.Hostname,
+        remote_parent: exec.ParentImage,
+        remote_process: exec.Image,
+        remote_cmdline: exec.CommandLine,
+        summary: "SMB lateral movement: remote service execution"
+    )
+    .to(Bus, topic: "vx.alerts.lateral")

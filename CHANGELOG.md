@@ -8,6 +8,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **The detect demo** (`e2e/detect-demo/`): a signature and a behavioural
+  sequence on the same Sysmon bus, four asserted beats — both fire on PsExec
+  under its own name, the signature alone goes quiet when the binary is
+  renamed, and a `kill -9` between the two halves of a sequence does not cost
+  the alert. Runs in CI.
 - **Detect units** (ADR-0031): a VPL program under `detects/`, run by the
   Varpulis CEP engine embedded as a library — sequences, Kleene closures,
   negation, `.within()` in event time, windows, joins, forecast — with the

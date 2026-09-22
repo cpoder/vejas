@@ -42,7 +42,7 @@ jobs:
               echo "FAIL $f: $out"
               fail=1
             fi
-          done < <(find detects packages docs/examples \
+          done < <(find detects packages docs/examples e2e \
                      \( -name '*.vpl' -o -name '*.vpl.example' \) \
                      -not -path '*/target/*' 2>/dev/null)
           exit $fail
@@ -78,6 +78,8 @@ jobs:
         run: e2e/transport/run.sh
       - name: Detect-unit invariants (ADR-0031, embedded engine)
         run: e2e/detect/run.sh
+      - name: Detect demo — signature vs behaviour, across a kill -9
+        run: e2e/detect-demo/run.sh
       - name: Offset-resume invariant (ADR-0022, kill -9 mid-stream)
         run: e2e/offset-resume.sh
       - name: Documented contracts hold (ADR-0029 R7 — doc examples vs master)

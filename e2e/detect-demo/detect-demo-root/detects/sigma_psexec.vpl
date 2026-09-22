@@ -1,0 +1,31 @@
+# The same attack, the way a signature sees it: PsExec by file name. This is
+# a faithful VPL transcription of the Sigma rule, and it is here to be missed
+# — rename the binary and the rule goes quiet.
+
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event SysmonProcessCreate:
+    Image: str
+    CommandLine: str
+    ParentImage: str
+    User: str
+    Hostname: str
+    ProcessId: int
+    ParentProcessId: int
+
+stream Process = SysmonProcessCreate
+    .from(Bus, topic: "vx.sysmon.process")
+
+stream SigmaPsExec = Process
+    .where(Image.ends_with("\PsExec.exe") or Image.ends_with("\PsExec64.exe"))
+    .emit(
+        event_type: "SigmaAlert",
+        rule: "sigma_psexec",
+        host: Hostname,
+        image: Image,
+        cmdline: CommandLine,
+        user: User
+    )
+    .to(Bus, topic: "vx.alerts.sigma")

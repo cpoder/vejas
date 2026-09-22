@@ -95,6 +95,16 @@ a restart. `vejas_snapshots_total`, `vejas_snapshot_seq`,
 `vejas_snapshot_bytes`, `vejas_restores_total` and `vejas_restore_seq` on
 `/metrics` say what a unit is doing about it.
 
+## See it
+
+`e2e/detect-demo/run.sh` is four beats on one bus, each asserted: two units
+boot; a lazy attacker runs PsExec under its own name and both a
+signature-style rule and a behavioural sequence fire; the attacker renames
+the binary and the signature goes quiet while the sequence still fires; and
+the runtime is killed with `-9` between the two halves of a sequence, after
+which the alert still arrives out of the snapshot. It runs in about forty
+seconds, brings up its own bus, and `PAUSE=manual` walks it beat by beat.
+
 ## What is not there yet
 
 The panel lists detect units in `/topology` under `detects` and their events
