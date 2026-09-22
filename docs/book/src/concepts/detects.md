@@ -102,6 +102,26 @@ a restart. `vejas_snapshots_total`, `vejas_snapshot_seq`,
 `vejas_snapshot_bytes`, `vejas_restores_total` and `vejas_restore_seq` on
 `/metrics` say what a unit is doing about it.
 
+## What it costs
+
+A stateless rule runs at about 30 000 events/s in 10 MB. A correlation is
+sized by how many of its sequences are **open at once** — first steps still
+waiting for their second:
+
+```
+open at once  =  first steps per second  x  how long a first step waits
+```
+
+Under a hundred open, a unit keeps 25 000 events/s; at a thousand, 17 000;
+at ten thousand, 11 000 and about 40 MB. Past that it falls away sharply, so
+ten thousand open sequences is the number to stay under on one unit.
+`.partition_by` on the field a pair shares is worth three to four times the
+throughput as soon as anything is open — partition every correlation.
+
+One process saturates near 44 000 events/s whatever the unit count; beyond
+it, add instances. The measurements and the method are in
+[`bench/README.md`](https://github.com/cpoder/vejas/blob/master/bench/README.md).
+
 ## See it
 
 `e2e/detect-demo/run.sh` is four beats on one bus, each asserted: two units

@@ -14,7 +14,13 @@ BIN="core/target/release/vejas-runtime"
 NATS_PORT=4224
 STORE=$(mktemp -d)
 ROOT=$(mktemp -d)
-trap 'kill $NATS_PID $RUNTIME_PID $SUB_PID 2>/dev/null || true; rm -rf "$STORE" "$ROOT"' EXIT
+cleanup() {
+  for pid in "${SUB_PID:-}" "${RUNTIME_PID:-}" "${NATS_PID:-}"; do
+    [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+  done
+  rm -rf "$STORE" "$ROOT"
+}
+trap cleanup EXIT
 
 # a root with only the flow — no connectors, so no curl, no webhook
 mkdir -p "$ROOT/flows/fixtures"

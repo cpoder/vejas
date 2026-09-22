@@ -142,9 +142,112 @@ Throughput *rises* with flow count (consumers parallelize; the bus, not the
 interpreter, is the bound) and memory stays ~1 MB per running flow — fifty
 live, persisted flows in under 50 MB.
 
+## Detect units (`bench/detect.sh`)
+
+A detect unit is a VPL program run by the embedded Varpulis engine. Two
+programs are measured, both in `bench/root/detects/`:
+
+- **`bench_orders.vpl`** — the twin of `flows/bench_orders.vjs`, so the two
+  unit kinds meet on one workload: a lookup with a fallback, two conversions,
+  a threshold, one emit per event.
+- **`bench_sequence.vpl`** — what a flow cannot express: an SMB connection
+  followed, within two minutes of **event** time, by a process whose parent is
+  `services.exe`, keyed on the host. Every pair matches, so the run measures
+  carrying state rather than leaking it.
+
+Events are published by `bench/pub.py`, a socket and a buffer — the NATS
+protocol is a line and a payload. It does 2.1 M messages/s onto a subject
+nobody reads, so the publisher is never what is being measured. (The `nats`
+CLI tops out near 16 k/s across sixteen processes, which is what earlier
+numbers in this file were actually reporting.)
+
+```
+bench/detect.sh 64000 1                       # a stateless rule, one unit
+PROGRAM=sequence LAG=1000 bench/detect.sh      # a correlation, 1000 runs open
+```
+
+### A stateless rule
+
+| Units on one instance | Aggregate | Per unit | RSS |
+|---|---:|---:|---:|
+| 1 | 33 000 – 35 400/s | same | 10.2 MB |
+| 2 | 40 900 – 44 700/s | ~21 000/s | 11.0 MB |
+| 4 | 44 300 – 44 600/s | ~11 000/s | 13.3 MB |
+
+One unit does the work; more units share one process and the box saturates
+near **44 000/s**. Past that, add instances, not units.
+
+### A correlation, and what it costs
+
+The number that matters is not the key count and not the event rate: it is
+how many correlations are **open at once** — first steps still waiting for
+their second. `LAG` sets it directly.
+
+| Open at once | Rate | RSS | Unpartitioned |
+|---:|---:|---:|---:|
+| 1 | 24 000 – 26 700/s | 10.9 MB | — |
+| 100 | 22 400 – 26 800/s | 11.7 MB | — |
+| 1 000 | 16 900 – 17 400/s | 14.2 MB | 4 400 – 4 500/s |
+| 10 000 | 10 600 – 11 700/s | 38 – 44 MB | 3 500 – 3 600/s |
+| 30 000 | 1 800 – 2 200/s | 130 – 136 MB | — |
+
+Three things fall out of that table.
+
+**`.partition_by` is worth three to four times** as soon as anything is open:
+without it the engine has to consider every open run for every event, and at
+1 000 open that is 17 400/s against 4 500. Partition every correlation, on
+the field the pair shares.
+
+**An open correlation costs about 2.8 KB.** Ten thousand of them is 28 MB on
+top of the unit's 11.
+
+**Past ten thousand open runs there is a cliff**: 30 000 open falls to
+2 000/s and 130 MB — five times slower for three times the state. It is a
+real limit of the current engine, not a measurement artefact, and it is the
+number to stay under until it is fixed.
+
+Correlations spread across units the way flows do — 1 000 open in each:
+
+| Units | Aggregate | Per unit | RSS |
+|---|---:|---:|---:|
+| 1 | 17 000/s | 17 000/s | 14.2 MB |
+| 2 | 29 100/s | 14 500/s | 19.1 MB |
+| 4 | 37 900/s | 9 500/s | 27.2 MB |
+
+### Sizing, then
+
+Open runs are what you size for, and you can compute them before deploying:
+
+```
+open at once  =  first steps per second  x  how long a first step waits
+```
+
+A rule whose first step fires 200 times a second and whose second step
+typically follows within ten seconds carries 2 000 open runs. From the table,
+one unit handles that at around 15 000 events/s in 15 MB.
+
+- **A stateless rule:** budget 30 000 events/s and 10 MB per unit.
+- **A correlation under 100 open:** 25 000 events/s, 11 MB.
+- **At 1 000 open:** 17 000 events/s, 14 MB. **At 10 000:** 11 000 events/s,
+  40 MB. Do not plan past that on one unit.
+- **Always partition a correlation** — three to four times the throughput.
+- **One instance saturates near 44 000 events/s** whatever the unit count.
+  Beyond it, add instances: they share the durable consumers and the work
+  (see *Clustering*).
+- **Artefacts:** the binary is 8.2 MiB, the image 37.6 MiB, and a unit that is
+  idle costs nothing measurable.
+
+Measured on the dev box in this file's header — 8 cores, WSL2 — two runs of
+everything, serially, on a quiet machine. Timing-sensitive figures move by a
+fifth under load; if your numbers disagree, check `uptime` first.
+
 ## Clustering (ADR-0020, measured)
 
-Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh`:
+Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh` — and
+the same probe at **three** (`bench/cluster.sh 3 20000`): 20 000/20 000
+delivered, the singleton timer ticked 8 times in 8 seconds rather than 24,
+and after a `kill -9` at 1.5 s the two survivors shared the rest between
+them (8 243 and 7 611).
 
 | Invariant | Result |
 |---|---|
@@ -158,4 +261,6 @@ Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh`:
 ## Not measured yet
 
 Comparative runs beyond Redpanda Connect (n8n, Windmill done/in table) —
-Windmill pending. Cluster scaling beyond 2 instances.
+Windmill pending. Detect units against an incumbent correlation engine
+(Esper, Siddhi, Flink CEP) on one scenario. What happens past 30 000 open
+correlations, and why the cliff is there.

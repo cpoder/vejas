@@ -1,0 +1,47 @@
+# detect: bench_sequence — what a flow cannot do: a two-step correlation.
+# A connection to port 445 followed, within two minutes of EVENT time, by a
+# process whose parent is services.exe. Every pair closes, so the run measures
+# the cost of carrying state rather than the cost of leaking it.
+# bench/detect.sh rewrites IN and OUT per unit when it measures several.
+
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event SysmonNetworkConnect:
+    Image: str
+    DestinationIp: str
+    DestinationPort: int
+    Hostname: str
+    t: int
+
+event SysmonProcessCreate:
+    Image: str
+    ParentImage: str
+    Hostname: str
+    t: int
+
+stream Net = SysmonNetworkConnect
+    .from(Bus, topic: "IN_SUBJECT")
+
+stream Proc = SysmonProcessCreate
+    .from(Bus, topic: "IN_SUBJECT_PROC")
+
+stream Smb = Net
+    .where(DestinationPort == 445)
+
+stream RemoteExec = Proc
+    .where(ParentImage.ends_with("\services.exe"))
+
+stream LateralMovement = Smb as smb
+    -> RemoteExec where Hostname == smb.Hostname as exec
+    .within(2m)
+    .partition_by(Hostname)
+    .emit(
+        rule: "bench_lateral",
+        source_host: smb.Hostname,
+        target_ip: smb.DestinationIp,
+        remote_process: exec.Image,
+        t: exec.t
+    )
+    .to(Bus, topic: "OUT_SUBJECT")

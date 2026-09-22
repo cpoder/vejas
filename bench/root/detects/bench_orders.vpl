@@ -1,0 +1,35 @@
+# detect: bench_orders — the twin of flows/bench_orders.vjs, so the two unit
+# kinds can be compared on one workload: a lookup with fallback, two
+# conversions, a threshold branch, one emit. bench/detect.sh rewrites IN and
+# OUT per unit when it measures several.
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+type Address:
+    country: str
+
+event Order:
+    id: str
+    email: str
+    total_price: str
+    t: int
+    shipping_address: Address
+
+stream Orders = Order
+    .from(Bus, topic: "IN_SUBJECT")
+
+stream Out = Order
+    .where(to_float(total_price) >= 0.0)
+    .emit(
+        order_ref: split(id, "#").last(),
+        customer_email: lower(email),
+        total_eur: to_float(total_price),
+        country: if shipping_address.country == "France" then "FR"
+                 else if shipping_address.country == "Germany" then "DE"
+                 else if shipping_address.country == "Italy" then "IT"
+                 else if shipping_address.country == "Portugal" then "PT"
+                 else shipping_address.country,
+        t: t
+    )
+    .to(Bus, topic: "OUT_SUBJECT")
