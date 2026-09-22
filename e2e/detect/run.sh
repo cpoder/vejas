@@ -11,6 +11,10 @@
 #                     when the events are consumed as they are published and
 #                     when they reach the unit as one backlog (runtime paused
 #                     during publication: a restart with a queue behind it)
+#   D5 snapshot       a stateful sequence survives kill -9: the open sequences
+#                     come back from the unit's snapshot (round A), and what was
+#                     acked after the last snapshot is replayed from the bus
+#                     (round B) — resume by sequence, ADR-0031 points 4-5
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -90,7 +94,8 @@ VPL
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
-    VEJAS_HTTP_ADDR="127.0.0.1:$HTTP_P" VEJAS_ACK_WAIT_SECS=1 "$BIN" >> "$WORK/rt.log" 2>&1 &
+    VEJAS_HTTP_ADDR="127.0.0.1:$HTTP_P" VEJAS_ACK_WAIT_SECS=1 VEJAS_SNAPSHOT_SECS="${SNAP_SECS:-1}" \
+    "$BIN" >> "$WORK/rt.log" 2>&1 &
   RT_PID=$!
   until curl -sf -o /dev/null "http://127.0.0.1:$HTTP_P/healthz"; do sleep 0.05; done
   sleep 1.5
@@ -191,6 +196,47 @@ lateral_round live 0 10
 [ "$got" -eq "$M" ] && ok "$M pairs within 2m matched once each; 5 pairs 3m apart did not (consumed as published)" || { bad "live: expected $M lateral alerts, got $got"; diag_lateral; }
 lateral_round backlog 1 12
 [ "$got" -eq "$M" ] && ok "the same $M, and no more, when the second step arrives as one backlog" || { bad "backlog: expected $M lateral alerts, got $got"; diag_lateral; }
+kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.lateral" 2>/dev/null
+
+echo "── D5 a stateful sequence survives kill -9 (snapshot, resume by sequence)"
+( timeout 60 "$NATS" -s "$URL" sub vxt.lateral --raw > "$WORK/lateral5.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+snapshots() { curl -s "http://127.0.0.1:$HTTP_P/metrics" | grep "vejas_snapshots_total{unit=\"detect:lateral\"}" | awk '{print $2}'; }
+crash_and_restart() { # <snapshot cadence seconds for the new runtime>
+  kill -9 "$RT_PID"; wait "$RT_PID" 2>/dev/null; RT_PID=""
+  SNAP_SECS="$1" start_rt
+}
+open_sequences() { # <prefix> <hour>: M SmbConnect, consumed
+  local pfx="$1" h="$2" before now i
+  before=$(processed detect:lateral); before=${before:-0}
+  for i in $(seq 1 $M); do "$NATS" -s "$URL" pub vxt.sysmon.net "{\"event_type\":\"SmbConnect\",\"@timestamp\":\"2026-09-21T$h:00:00Z\",\"host\":\"$pfx-ws-$i\",\"target\":\"$pfx-srv-$i\"}" > /dev/null 2>&1; done
+  deadline=$((SECONDS+10)); while [ "$SECONDS" -lt "$deadline" ]; do now=$(processed detect:lateral); [ $(( ${now:-0} - before )) -ge "$M" ] && break; sleep 0.2; done
+}
+close_sequences() { # <prefix> <hour>: M ServiceStart a minute on; got = distinct alerts with the prefix
+  local pfx="$1" h="$2" i
+  for i in $(seq 1 $M); do "$NATS" -s "$URL" pub vxt.sysmon.proc "{\"event_type\":\"ServiceStart\",\"@timestamp\":\"2026-09-21T$h:01:00Z\",\"host\":\"$pfx-srv-$i\",\"image\":\"psexesvc.exe\"}" > /dev/null 2>&1; done
+  deadline=$((SECONDS+10)); got=0
+  while [ "$SECONDS" -lt "$deadline" ]; do got=$(distinct_ids "$WORK/lateral5.txt" to "$pfx-"); [ "$got" -ge "$M" ] && break; sleep 0.3; done
+  sleep 1.5; got=$(distinct_ids "$WORK/lateral5.txt" to "$pfx-")
+}
+# Round A: the open sequences are in a snapshot when the runtime dies.
+open_sequences snapA 14
+s0=$(snapshots); s0=${s0:-0}
+deadline=$((SECONDS+3)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(snapshots)" -gt "$s0" ] 2>/dev/null && break; sleep 0.2; done
+crash_and_restart 1
+grep -q 'restored its snapshot' "$WORK/rt.log" && ok "the restart restored the unit's snapshot" || bad "no 'restored its snapshot' in the runtime log"
+close_sequences snapA 14
+[ "$got" -eq "$M" ] && ok "$M sequences opened before the crash closed after it (from the snapshot)" || { bad "round A: expected $M alerts, got $got"; diag_lateral; }
+# Round B: the crash comes before any snapshot holds the open sequences
+# (cadence one hour); the restart replays what was acked after the last
+# snapshot, and the sequences come back from the bus.
+crash_and_restart 3600
+open_sequences replay 16
+crash_and_restart 1
+close_sequences replay 16
+[ "$got" -eq "$M" ] && ok "$M sequences acked after the last snapshot came back from the bus (replay by sequence)" || { bad "round B: expected $M alerts, got $got"; diag_lateral; }
+restores=$(curl -s "http://127.0.0.1:$HTTP_P/metrics" | grep 'vejas_restores_total{unit="detect:lateral"}' | awk '{print $2}')
+[ "${restores:-0}" -ge 1 ] && ok "restores are counted (vejas_restores_total=$restores)" || bad "vejas_restores_total is ${restores:-missing}"
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.lateral" 2>/dev/null
 
 if [ "$fail" -eq 0 ]; then echo "detect: all invariants hold ✓"; else echo "detect: FAILED"; tail -30 "$WORK/rt.log"; fi

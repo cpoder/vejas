@@ -18,10 +18,13 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   under `detects`; CI checks every `.vpl` and runs `e2e/detect/run.sh`. The
   engine adds no async runtime to the binary (5.9 → 8.1 MB). Measured:
   18 643 evt/s on the merge evaluation's program (16 publishers,
-  64 000 events; the flow unit runs it at 16 182). Not yet: snapshot-and-resume of a unit's state — a
-  stateless detection loses nothing across a crash, a sequence can miss the
-  matches that straddle one — the panel graph, and the business surface of
-  a VPL program. See the book, *Detect units*.
+  64 000 events; the flow unit runs it at 16 182). A unit with state (a
+  sequence, a window, a join) snapshots it to the object store
+  `VEJAS_DETECT_STATE` with the stream sequence it stands for
+  (`VEJAS_SNAPSHOT_SECS`, `VEJAS_SNAPSHOT_ACKS`) and, on restart, restores it
+  and resumes its consumer after that sequence: what was acked since replays,
+  at least once. Not yet: the panel graph and the business surface of a VPL
+  program. See the book, *Detect units*.
 
 ### Changed
 - The flow consumer loop no longer waits on itself: the pull request is

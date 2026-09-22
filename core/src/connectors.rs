@@ -1111,7 +1111,8 @@ pub fn subject_matches(pattern: &str, subject: &str) -> bool {
 }
 
 /// Create (or verify) a durable pull consumer that delivers every one of
-/// `filters` in stream order. The sync `nats` client knows one filter subject
+/// `filters` in stream order, from the beginning or, with `start_seq`, from
+/// that stream sequence on. The sync `nats` client knows one filter subject
 /// per consumer; the JetStream API knows several since 2.10, so the request is
 /// sent raw. Idempotent: the same request on an existing consumer is accepted,
 /// and 2.10 updates the filters of an existing one in place (its ack floor
@@ -1123,6 +1124,7 @@ pub fn create_pull_consumer(
     durable: &str,
     filters: &[String],
     ack_wait: Duration,
+    start_seq: Option<u64>,
 ) -> Result<(), String> {
     let mut config = serde_json::json!({
         "durable_name": durable,
@@ -1131,6 +1133,13 @@ pub fn create_pull_consumer(
         "deliver_policy": "all",
         "replay_policy": "instant",
     });
+    // Resuming after a snapshot: start at the sequence after it. The server
+    // cannot change an existing consumer's deliver policy, so the caller
+    // deletes the durable first.
+    if let Some(seq) = start_seq {
+        config["deliver_policy"] = Value::from("by_start_sequence");
+        config["opt_start_seq"] = Value::from(seq);
+    }
     match filters {
         [one] => config["filter_subject"] = Value::String(one.clone()),
         many => config["filter_subjects"] = Value::from(many.to_vec()),
@@ -1163,6 +1172,93 @@ pub fn create_pull_consumer(
         ));
     }
     Ok(())
+}
+
+// ───────────────────────── detect snapshots ─────────────────────────
+
+pub const DETECT_STATE_BUCKET: &str = "VEJAS_DETECT_STATE";
+
+/// A detect unit's snapshot as stored: which program it belongs to (the hash
+/// of its source), the stream sequence it stands for — everything up to it is
+/// in the state, everything after it replays on restart — when it was taken,
+/// and the engine's bytes.
+pub struct Snapshot {
+    pub version: String,
+    pub seq: u64,
+    pub taken_at: u64,
+    pub state: Vec<u8>,
+}
+
+/// The object store the detect units keep their snapshots in: one object per
+/// unit, the latest only. Create-or-open, like every bucket in this repo.
+pub fn open_state_store(
+    js: &nats::jetstream::JetStream,
+) -> Option<nats::object_store::ObjectStore> {
+    let cfg = nats::object_store::Config {
+        bucket: DETECT_STATE_BUCKET.to_string(),
+        ..Default::default()
+    };
+    js.create_object_store(&cfg)
+        .or_else(|_| js.object_store(DETECT_STATE_BUCKET))
+        .ok()
+}
+
+/// Store a snapshot: one JSON header line, then the engine's bytes as they are.
+pub fn snapshot_put(
+    store: &nats::object_store::ObjectStore,
+    unit: &str,
+    snap: &Snapshot,
+) -> Result<(), String> {
+    let mut bytes = serde_json::json!({
+        "version": snap.version,
+        "seq": snap.seq,
+        "taken_at": snap.taken_at,
+        "bytes": snap.state.len(),
+    })
+    .to_string()
+    .into_bytes();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&snap.state);
+    store
+        .put(unit, &mut bytes.as_slice())
+        .map(|_| ())
+        .map_err(|e| format!("snapshot put: {e}"))
+}
+
+/// The unit's snapshot, if it has one.
+pub fn snapshot_get(
+    store: &nats::object_store::ObjectStore,
+    unit: &str,
+) -> Result<Option<Snapshot>, String> {
+    let mut object = match store.get(unit) {
+        Ok(o) => o,
+        Err(e) => {
+            let text = e.to_string();
+            if e.kind() == std::io::ErrorKind::NotFound
+                || text.contains("not found")
+                || text.contains("no message")
+            {
+                return Ok(None);
+            }
+            return Err(format!("snapshot get: {e}"));
+        }
+    };
+    let mut bytes = Vec::new();
+    object
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("snapshot read: {e}"))?;
+    let nl = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("snapshot without a header")?;
+    let header: Value = serde_json::from_slice(&bytes[..nl])
+        .map_err(|e| format!("snapshot header: {e}"))?;
+    Ok(Some(Snapshot {
+        version: header["version"].as_str().unwrap_or("").to_string(),
+        seq: header["seq"].as_u64().unwrap_or(0),
+        taken_at: header["taken_at"].as_u64().unwrap_or(0),
+        state: bytes[nl + 1..].to_vec(),
+    }))
 }
 
 // ───────────────────────── connector traces ─────────────────────────

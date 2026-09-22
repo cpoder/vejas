@@ -1397,6 +1397,13 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
     let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    // Snapshot cadence (ADR-0031 point 4): whichever comes first, at a batch
+    // boundary with nothing left for redelivery.
+    let snapshot_every = Duration::from_secs(
+        env::var("VEJAS_SNAPSHOT_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).max(1),
+    );
+    let snapshot_every_acks: u64 =
+        env::var("VEJAS_SNAPSHOT_ACKS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000).max(1);
     let mut delay = Duration::from_secs(1);
     'outer: loop {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -1448,7 +1455,66 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             let (tx, rx) = std::sync::mpsc::channel::<nats::Message>();
             let durable = handle.spec.name.replace([':', '.'], "_");
             let filters: Vec<String> = sources.iter().map(|(s, _)| s.clone()).collect();
-            connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait())?;
+            // Snapshot and resume (ADR-0031 points 4-5), for a program with state
+            // to keep — sequences, windows, joins. Its latest snapshot, if it is
+            // this program's, is restored and the consumer resumes at the sequence
+            // after it: everything acked since then replays, and a sequence that
+            // closed in that window emits again — at least once, like every unit.
+            // A snapshot of another version of the program is ignored: the state
+            // of one program is not the state of another. A stateless program
+            // keeps no snapshot and resumes at its ack floor, as a flow does.
+            let stateful = program_is_stateful(&program);
+            let store = if stateful { connectors::open_state_store(&js) } else { None };
+            if stateful && store.is_none() {
+                eprintln!(
+                    "[vejas] {}: no snapshot store: open sequences are lost on a crash",
+                    handle.spec.name
+                );
+            }
+            let mut resume_seq: Option<u64> = None;
+            if let Some(store) = &store {
+                match connectors::snapshot_get(store, &handle.spec.name)? {
+                    Some(snap) if snap.version == version => {
+                        program
+                            .restore(&snap.state)
+                            .map_err(|e| format!("restore snapshot: {e}"))?;
+                        eprintln!(
+                            "[vejas] {}: restored its snapshot ({} bytes, stream seq {}, taken {}s ago)",
+                            handle.spec.name,
+                            snap.state.len(),
+                            snap.seq,
+                            now_secs().saturating_sub(snap.taken_at)
+                        );
+                        resume_seq = Some(snap.seq + 1);
+                    }
+                    Some(snap) => eprintln!(
+                        "[vejas] {}: its snapshot is of another version of the program ({} ≠ {}): ignored",
+                        handle.spec.name, snap.version, version
+                    ),
+                    None => {}
+                }
+            }
+            match resume_seq {
+                Some(seq) => {
+                    // The server cannot move an existing consumer: re-create it after the snapshot.
+                    let _ = js.delete_consumer(&stream, &durable);
+                    connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait(), Some(seq))?;
+                    metrics::observe_restore(&handle.spec.name, seq);
+                }
+                None => connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait(), None)?,
+            }
+            // A first snapshot at the consumer's position, so a crash before the
+            // first cadence still replays from here rather than resuming past
+            // events the state never saw.
+            if let (Some(store), None) = (&store, resume_seq) {
+                let floor = js
+                    .consumer_info(&stream, &durable)
+                    .map(|i| i.ack_floor.stream_seq)
+                    .unwrap_or(0);
+                if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, floor) {
+                    eprintln!("[vejas] {}: first snapshot: {e}", handle.spec.name);
+                }
+            }
             let sub = js
                 .pull_subscribe_with_options(
                     &filters[0],
@@ -1496,9 +1562,26 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                 handle.spec.name,
                 sources.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")
             );
+            // Snapshot bookkeeping: the highest acked stream sequence, the
+            // sequences left for redelivery (a snapshot must not stand for a
+            // sequence with an unprocessed message below it), acks since the
+            // last snapshot and when it was taken.
+            let mut acked_max: u64 = 0;
+            let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            let mut acks_since_snapshot: u64 = 0;
+            let mut last_snapshot = Instant::now();
             let result = (|| -> Result<(), String> {
                 loop {
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                        // A clean stop: what is acked is in the snapshot, so a
+                        // restart replays nothing.
+                        if let Some(store) = &store {
+                            if acks_since_snapshot > 0 && retrying.is_empty() {
+                                if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
+                                    eprintln!("[vejas] {}: snapshot on stop: {e}", handle.spec.name);
+                                }
+                            }
+                        }
                         return Ok(());
                     }
                     // A batch is whatever has arrived: wait for one message, take
@@ -1518,11 +1601,12 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                             Err(_) => break,
                         }
                     }
-                    let mut to_ack: Vec<nats::Message> = Vec::new();
+                    let mut to_ack: Vec<(nats::Message, u64)> = Vec::new();
                     for msg in batch {
                         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                             return Ok(()); // un-acked: redelivers to whoever holds the durable next
                         }
+                        let seq = msg.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
                         // The consumer's filters are the `.from()` subjects, so one
                         // matches; the first declared wins when two overlap.
                         let Some(event_type) = sources
@@ -1554,9 +1638,11 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                     Ok(()) => {
                                         metrics::inc_dead_letter(&handle.spec.name);
                                         let _ = msg.ack();
+                                        retrying.remove(&seq);
                                     }
                                     Err(_) => {
                                         let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                        retrying.insert(seq);
                                     }
                                 }
                             }
@@ -1588,7 +1674,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                     None,
                                 );
                                 if ok {
-                                    to_ack.push(msg);
+                                    to_ack.push((msg, seq));
                                 }
                             }
                             Err(e) => {
@@ -1602,11 +1688,15 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                         Ok(()) => {
                                             metrics::inc_dead_letter(&handle.spec.name);
                                             let _ = msg.ack();
+                                            retrying.remove(&seq);
                                         }
                                         Err(_) => {
                                             let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                            retrying.insert(seq);
                                         }
                                     }
+                                } else {
+                                    retrying.insert(seq); // left un-acked: redelivers after ack_wait
                                 }
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
                                     vec![], connectors::trace_preview(&msg.data), None);
@@ -1619,7 +1709,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     if !to_ack.is_empty() {
                         match nc.flush() {
                             Ok(_) => {
-                                for m in &to_ack {
+                                for (m, seq) in &to_ack {
                                     match m.reply.as_deref() {
                                         Some(reply) => {
                                             let _ = ack_nc.publish(reply, b"");
@@ -1628,7 +1718,10 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                             let _ = m.ack();
                                         }
                                     }
+                                    retrying.remove(seq);
+                                    acked_max = acked_max.max(*seq);
                                 }
+                                acks_since_snapshot += to_ack.len() as u64;
                             }
                             Err(e) => eprintln!(
                                 "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
@@ -1642,6 +1735,24 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         (processed_at - round_t0).as_secs_f64(),
                         processed_at.elapsed().as_secs_f64(),
                     );
+                    if let Some(store) = &store {
+                        if acks_since_snapshot > 0
+                            && retrying.is_empty()
+                            && (acks_since_snapshot >= snapshot_every_acks
+                                || last_snapshot.elapsed() >= snapshot_every)
+                        {
+                            match snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
+                                Ok(()) => {
+                                    acks_since_snapshot = 0;
+                                    last_snapshot = Instant::now();
+                                }
+                                Err(e) => eprintln!(
+                                    "[vejas] {}: snapshot: {e} (the next batch tries again)",
+                                    handle.spec.name
+                                ),
+                            }
+                        }
+                    }
                 }
             })();
             attempt_stop.store(true, Ordering::SeqCst);
@@ -1664,6 +1775,46 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
     set_state(&handle, |st| {
         st.status = "stopped".into();
     });
+}
+
+/// Whether the program has state worth a snapshot: a sequence, a window or a
+/// join. Read off a snapshot of the freshly compiled program: the engine lists
+/// every such operator in it, with or without anything in flight. A snapshot
+/// that is not JSON is taken as stateful.
+fn program_is_stateful(program: &varpulis_engine::Program) -> bool {
+    let Ok(bytes) = program.snapshot() else {
+        return true;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return true;
+    };
+    ["sase_states", "window_states", "join_states"].iter().any(|k| {
+        v.get(k)
+            .and_then(|m| m.as_object())
+            .is_some_and(|m| !m.is_empty())
+    })
+}
+
+/// Take the unit's snapshot standing for stream sequence `seq` and store it.
+fn snapshot_unit(
+    store: &nats::object_store::ObjectStore,
+    unit: &str,
+    version: &str,
+    program: &varpulis_engine::Program,
+    seq: u64,
+) -> Result<(), String> {
+    let t0 = Instant::now();
+    let state = program.snapshot().map_err(|e| e.to_string())?;
+    let bytes = state.len();
+    let snap = connectors::Snapshot {
+        version: version.to_string(),
+        seq,
+        taken_at: now_secs(),
+        state,
+    };
+    connectors::snapshot_put(store, unit, &snap)?;
+    metrics::observe_snapshot(unit, seq, bytes, t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn pkg_of_path(path: &Path) -> String {
@@ -4407,6 +4558,16 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_program_is_stateful_when_it_has_a_sequence_window_or_join() {
+        let threshold = "event Order:\n    id: int\n    total: float\n\nstream Big = Order\n    .where(total > 100.0)\n    .emit(id: id)\n";
+        let program = varpulis_engine::Program::compile(threshold).unwrap();
+        assert!(!program_is_stateful(&program), "a filter and an emit keep nothing");
+        let lateral = "event SmbConnect:\n    host: str\n    target: str\n\nevent ServiceStart:\n    host: str\n\nstream Lateral = SmbConnect as smb\n    -> ServiceStart where host == smb.target as svc\n    .within(2m)\n    .emit(to: svc.host)\n";
+        let program = varpulis_engine::Program::compile(lateral).unwrap();
+        assert!(program_is_stateful(&program), "an open sequence is state");
+    }
+
     use super::*;
     use serde_json::json;
 

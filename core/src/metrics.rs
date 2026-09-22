@@ -35,6 +35,15 @@ struct Unit {
     buckets: [u64; 13], // per-bucket (non-cumulative) counts
     sum: f64,
     count: u64,
+    /// Detect units: snapshots taken, the stream sequence and size of the
+    /// latest, the time they took, and restores (a restart that resumed from
+    /// a snapshot, with the sequence it resumed at).
+    snapshots: u64,
+    snapshot_seq: u64,
+    snapshot_bytes: u64,
+    snapshot_secs: f64,
+    restores: u64,
+    restore_seq: u64,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -87,6 +96,24 @@ pub fn observe_round(unit: &str, fetch_secs: f64, process_secs: f64, barrier_sec
     u.round_fetch_secs += fetch_secs;
     u.round_process_secs += process_secs;
     u.round_barrier_secs += barrier_secs;
+}
+
+/// A detect unit took a snapshot standing for stream sequence `seq`.
+pub fn observe_snapshot(unit: &str, seq: u64, bytes: usize, secs: f64) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.snapshots += 1;
+    u.snapshot_seq = seq;
+    u.snapshot_bytes = bytes as u64;
+    u.snapshot_secs += secs;
+}
+
+/// A detect unit restored a snapshot and resumed its consumer at `seq`.
+pub fn observe_restore(unit: &str, seq: u64) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.restores += 1;
+    u.restore_seq = seq;
 }
 
 /// A message that was dead-lettered (ADR-0015). Kept separate from `observe`
@@ -163,6 +190,37 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
             esc(unit),
             u.fetch_messages
         ));
+    }
+
+    out.push_str("# HELP vejas_snapshots_total Snapshots a detect unit took of its engine state.\n");
+    out.push_str("# TYPE vejas_snapshots_total counter\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_snapshots_total{{unit=\"{}\"}} {}\n", esc(unit), u.snapshots));
+    }
+    out.push_str("# HELP vejas_snapshot_seq Stream sequence the unit's latest snapshot stands for: everything up to it is in the state, everything after it replays on restart.\n");
+    out.push_str("# TYPE vejas_snapshot_seq gauge\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_snapshot_seq{{unit=\"{}\"}} {}\n", esc(unit), u.snapshot_seq));
+    }
+    out.push_str("# HELP vejas_snapshot_bytes Size of the unit's latest snapshot.\n");
+    out.push_str("# TYPE vejas_snapshot_bytes gauge\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_snapshot_bytes{{unit=\"{}\"}} {}\n", esc(unit), u.snapshot_bytes));
+    }
+    out.push_str("# HELP vejas_snapshot_seconds_sum Time spent taking and storing snapshots.\n");
+    out.push_str("# TYPE vejas_snapshot_seconds_sum counter\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_snapshot_seconds_sum{{unit=\"{}\"}} {:.6}\n", esc(unit), u.snapshot_secs));
+    }
+    out.push_str("# HELP vejas_restores_total Restarts that restored a snapshot and resumed the consumer after it.\n");
+    out.push_str("# TYPE vejas_restores_total counter\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_restores_total{{unit=\"{}\"}} {}\n", esc(unit), u.restores));
+    }
+    out.push_str("# HELP vejas_restore_seq Stream sequence the unit's last restore resumed at.\n");
+    out.push_str("# TYPE vejas_restore_seq gauge\n");
+    for (unit, u) in map.iter() {
+        out.push_str(&format!("vejas_restore_seq{{unit=\"{}\"}} {}\n", esc(unit), u.restore_seq));
     }
 
     out.push_str("# HELP vejas_round_seconds_sum Wall time of the consumer loop by phase: fetch (wait for the first message of a round), process, barrier (flush + acks).\n");

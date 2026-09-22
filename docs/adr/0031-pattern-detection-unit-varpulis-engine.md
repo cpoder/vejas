@@ -1,9 +1,9 @@
 # 0031 — Pattern detection as a unit type: the Varpulis engine embedded
 
-- Status: Accepted (partial) — the unit is built and gated (points 1, 2, 3,
-  6 by construction, 8 in part); snapshot-and-resume (points 4–5), the panel
-  graph and the business surface of a VPL program (point 7) are not
-- Date: 2026-09-21 (unit built 2026-09-22)
+- Status: Accepted (partial) — the unit is built and gated (points 1–5,
+  6 by construction, 8 in part); the panel graph and the business surface
+  of a VPL program (point 7) are not
+- Date: 2026-09-21 (unit built 2026-09-22, snapshot and resume the same day)
 
 ## Context
 
@@ -120,9 +120,25 @@ subject or to `<root>.detect.<unit>.<stream>`; poison is dead-lettered like
 a flow's. `vejas-runtime vpl-check` and the MCP tool `vejas_vpl_check` give
 the engine's verdict; `/topology` lists the units under `detects`; CI checks
 every `.vpl` and runs `e2e/detect/run.sh` (D1 stateless no-loss under
-`kill -9`, D2 two-source sequence in event time, consumed live and as one backlog, D3 verdicts, D4 topology).
+`kill -9`, D2 two-source sequence in event time, consumed live and as one
+backlog, D3 verdicts, D4 topology, D5 a stateful sequence across `kill -9`).
 Payloads follow the connectors' rules — `event_type`, `@timestamp`, `ts` —
 decoded by the connectors' own decoder, moved into `varpulis-core` for it.
+
+Snapshot and resume (points 4–5, 2026-09-22): a unit with state keeps one
+object in the object store `VEJAS_DETECT_STATE` — the engine's state under
+a header with the program's version and the stream sequence it stands for —
+written at batch boundaries every `VEJAS_SNAPSHOT_SECS` (5) or
+`VEJAS_SNAPSHOT_ACKS` (10 000), never while a message awaits redelivery, on
+a clean stop, and once at start. On restart it restores the snapshot,
+deletes its durable and re-creates it at the sequence after the snapshot
+(the server cannot move a consumer, the sync client cannot update one):
+what was acked since replays, at least once. Another program version's
+snapshot is ignored; a stateless program keeps none and resumes at its ack
+floor. The engine's side is `Program::snapshot`/`restore` (varpulis#266).
+D5: twenty sequences opened, `kill -9`, closed after the restart — from the
+snapshot (round A) and, with the cadence set to an hour, from the bus
+replay (round B).
 
 Measured on the evaluation's harness (16 publishers, 64 000 events, same
 box): the detect unit runs the evaluation's program at **18 643 evt/s**,
@@ -145,8 +161,9 @@ ADR-0011 in reverse.
 
 **Constrained.** A detect unit is stateful, so the guarantees of ADR-0018 and
 ADR-0021 change shape for it: replay is *deterministic in event time from a
-sequence*, not *pure per event*. Snapshot and resume (points 4 and 5) are the
-design work of this ADR; they are weeks, not months, and they gate the unit.
+sequence*, not *pure per event*. Snapshot and resume (points 4 and 5) were
+the design work of this ADR; built the day after the unit, they are what
+lets a detect unit be trusted with a sequence.
 
 **Costs.** The binary grows by the engine (its dependency tree is 91
 packages; the size will be measured, not claimed), and the release build gets
