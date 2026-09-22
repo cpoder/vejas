@@ -19,7 +19,7 @@ Pushing the tag runs `.github/workflows/release.yml`, which:
 - builds the release binary (`vejas-runtime`, Linux x86_64), stripped, and
   attaches it plus its SHA-256 to the GitHub Release;
 - builds and pushes the container image to
-  `ghcr.io/cpoder/vejas:X.Y.Z` and `:latest`;
+  `ghcr.io/cpoder/vejas-runtime:vX.Y.Z` and `:latest`;
 - creates the GitHub Release with the CHANGELOG section as its notes.
 
 ## Version discipline (ADR-0030)
