@@ -33,7 +33,11 @@ Because every publish is confirmed by JetStream **before** the source acks
 its input, a killed instance loses nothing — the message redelivers to a
 survivor.
 
-- Instance `kill -9` under load: **20 000/20 000, zero loss**.
+- Instance `kill -9` under load: **20 000/20 000, zero loss** — measured at
+  two instances and again at **three** (`bench/cluster.sh 3 20000`,
+  2026-09-22): everything delivered, the singleton timer ticked once per
+  second and not three times, and the two survivors shared the rest of the
+  work between them.
 - Singleton failover: **~2.6 s graceful**, ~5.9 s crash (TTL-bound).
 
 ([benchmarks](../reference/benchmarks.md).) Graceful shutdown rides

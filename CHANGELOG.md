@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-22
+
 ### Added
 - **The detect demo** (`e2e/detect-demo/`): a signature and a behavioural
   sequence on the same Sysmon bus, four asserted beats — both fire on PsExec
@@ -131,5 +133,6 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/cpoder/vejas/releases/tag/v0.3.0
 [0.1.0]: https://github.com/cpoder/vejas/releases/tag/v0.1.0

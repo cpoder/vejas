@@ -90,6 +90,13 @@ the state of another) and the unit starts empty at its ack floor. A
 **stateless** detection (a threshold, a filter) keeps no snapshot and
 resumes at its ack floor, as a flow does.
 
+What this costs, said plainly: after a crash a unit replays everything
+acked since its last snapshot — up to `VEJAS_SNAPSHOT_SECS` of traffic — so
+an alert raised inside that window is raised again. Alerts are at least
+once, like everything else on this bus; downstream must tolerate a repeat,
+by its own key or by the alert's fields. Lower the cadence to shrink the
+window; the snapshot costs a write to the object store at a batch boundary.
+
 Not in a snapshot: trend aggregates and forecasts, which start empty after
 a restart. `vejas_snapshots_total`, `vejas_snapshot_seq`,
 `vejas_snapshot_bytes`, `vejas_restores_total` and `vejas_restore_seq` on
