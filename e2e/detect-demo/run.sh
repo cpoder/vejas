@@ -149,7 +149,8 @@ import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
 a = rows[-1]
 print(f"      {a['summary']}")
-print(f"      {a['source_image']} → {a['target_ip']}, then {a['remote_process']} under {a['remote_parent']} on {a['remote_host']}")
+base = lambda path: path.replace("\\", "/").rsplit("/", 1)[-1]
+print(f"      {base(a['source_image'])} → {a['target_ip']}, then {base(a['remote_process'])} under {base(a['remote_parent'])} on {a['remote_host']}")
 PY
 pause
 

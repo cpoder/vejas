@@ -1,5 +1,7 @@
 # The detect demo — a signature, a behaviour, and a crash
 
+![A recording of one run: both rules fire on PsExec, the signature goes quiet on the renamed binary, the sequence still fires, and the alert survives a kill -9](media/detect-demo.gif)
+
 Four beats on one bus, each asserted, so this is a test as much as a film:
 
 | Beat | What happens | What it proves |
