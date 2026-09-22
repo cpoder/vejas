@@ -53,8 +53,9 @@ unit is a file `detects/<name>.vpl` — a VPL program, with its `event`
 declarations and its streams — run by the Varpulis engine embedded in the
 runtime as a library, `varpulis-engine`, taken as a git dependency. The
 platform around that engine (its cluster, its server, its CLI, its
-connectors, its SaaS layer) is not imported; that is the Varpulis
-repository's own retirement decision and is out of scope here.
+connectors, its SaaS layer) is not imported. That platform has since been
+retired at the source — Varpulis ADR-008, 2026-09-22 — so `varpulis-engine`
+is not a slice of a larger product any more; it is what the repository is.
 
 The contract, in eight points:
 
@@ -184,9 +185,10 @@ they come with it and are tracked here from now on.
   someone writes the JetStream consumer Vejas already has.
 - **Run Varpulis as an exec-bridge process.** Considered, since that is how
   SAP and Salesforce attach (ADR-0011). Rejected for this capability: the
-  engine is a library with no I/O of its own, and a bridge would keep the
-  whole Varpulis platform alive as a second runtime with its own delivery
-  semantics. Bridges are for vendor SDKs, not for our own code.
+  engine is a library with no I/O of its own, and a bridge would have kept
+  the whole Varpulis platform alive as a second runtime with its own
+  delivery semantics — a platform that has since been retired. Bridges are
+  for vendor SDKs, not for our own code.
 
 ## Interactions
 
