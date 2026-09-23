@@ -7,6 +7,22 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed — detect units, from the Varpulis engine (varpulis #284, #285)
+- **A time window closes when event time passes its end**, on the next event
+  of the types feeding it, not only when a later event reaches that same
+  window. A window over a filtered stream used to wait for the next event
+  passing the filter, a partitioned one for the next event of the same
+  partition: a brute force counted per address that ended in a successful
+  logon never raised its count in a running unit. A window fed by several
+  types waits for the slowest of them; a type that goes quiet holds back only
+  the windows it feeds (with `.watermark()` it used to hold back every
+  window). Windows close upstream first, so a count's alert reaches the
+  windows and correlations above it in time.
+- **A sequence step that names a derived stream reads what that stream
+  outputs**: over an aggregate it matched the raw events instead of the
+  results, a second `.where()` of the stream was lost, and a first step's own
+  filter replaced the stream's instead of adding to it.
+
 ## [0.3.1] — 2026-09-23
 
 ### Fixed — detect units, from the Varpulis engine (varpulis #277, #279, #281)

@@ -15,6 +15,9 @@
 #                     come back from the unit's snapshot (round A), and what was
 #                     acked after the last snapshot is replayed from the bus
 #                     (round B) — resume by sequence, ADR-0031 points 4-5
+#   D6 count close    a count per address closes on the next event of its source
+#                     past the window, from any address: a brute force whose
+#                     attacker got in and stopped is still raised
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -91,6 +94,30 @@ stream LateralMovement = SmbConnect as smb
     .to(Bus, topic: "vxt.lateral")
 VPL
 
+cat > "$ROOT/detects/bruteforce.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Auth:
+    ip: str
+    status: str
+
+stream Logons = Auth
+    .from(Bus, topic: "vxt.auth")
+
+stream Failed = Auth
+    .where(status == "failure")
+
+stream Brute = Failed
+    .partition_by(ip)
+    .window(5m)
+    .aggregate(ip: last(ip), n: count())
+    .where(n >= 3)
+    .emit(rule: "brute_force", ip: ip, n: n)
+    .to(Bus, topic: "vxt.brute")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
@@ -130,14 +157,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 2 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 3 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "two detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "three detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:lateral","detect:threshold"], names
+assert names==["detect:bruteforce","detect:lateral","detect:threshold"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -197,6 +224,24 @@ lateral_round live 0 10
 lateral_round backlog 1 12
 [ "$got" -eq "$M" ] && ok "the same $M, and no more, when the second step arrives as one backlog" || { bad "backlog: expected $M lateral alerts, got $got"; diag_lateral; }
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.lateral" 2>/dev/null
+
+echo "── D6 a count closes on its source's event time (the attacker stops)"
+( timeout 30 "$NATS" -s "$URL" sub vxt.brute --raw > "$WORK/brute.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+auth() { "$NATS" -s "$URL" pub vxt.auth "{\"event_type\":\"Auth\",\"@timestamp\":\"2026-09-21T18:$1Z\",\"ip\":\"$2\",\"status\":\"$3\"}" > /dev/null 2>&1; }
+for t in 00:00 00:10 00:20; do auth "$t" 10.0.0.66 failure; done
+auth 00:30 10.0.0.66 success   # the attacker got in, and stops
+sleep 1.5
+[ "$(grep -c '^{' "$WORK/brute.txt")" -eq 0 ] && ok "nothing while the window runs" || bad "an alert before the window ended: $(cat "$WORK/brute.txt")"
+auth 06:00 10.0.0.7 success    # any later logon, from anyone
+deadline=$((SECONDS+10)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '10.0.0.66' "$WORK/brute.txt" && break; sleep 0.2; done
+sleep 1
+python3 - "$WORK/brute.txt" <<'PY' && ok "the next logon of anyone raises the brute force, with its count" || bad "brute force: $(cat "$WORK/brute.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert len(alerts)==1 and alerts[0]["ip"]=="10.0.0.66" and alerts[0]["n"]==3, alerts
+PY
+kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.brute" 2>/dev/null
 
 echo "── D5 a stateful sequence survives kill -9 (snapshot, resume by sequence)"
 ( timeout 60 "$NATS" -s "$URL" sub vxt.lateral --raw > "$WORK/lateral5.txt" 2>/dev/null ) & SUB_PID=$!
