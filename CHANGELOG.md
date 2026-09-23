@@ -7,6 +7,35 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed — detect units, from the Varpulis engine (varpulis #277, #279, #281)
+- **A sequence with a closure followed by a step** (`A -> all B -> C`) no
+  longer matches before C. Under the default `.each()` it emitted a complete
+  match at every B, with or without a C; the brute-force example alerted on
+  failed logins alone. Matches now come when C arrives, one per closure event.
+- **`.stnm()` now keeps an event from opening a second run** when a run
+  already took it, so `.stnm().longest()` makes one alert of a brute force of
+  any length.
+- **A condition on a field the event does not carry is false** in `.where()`,
+  as it was in a sequence step: `a == "x" or ends_with(b, "y")` fired only
+  when `b` was present, and `selection and not filter` dropped events lacking
+  the filter's field.
+- **A program with a lambda (`arr.filter(x => ...)`), `a?.b` or a timestamp
+  literal no longer aborts the process** with a stack overflow, which took
+  every unit of the runtime down with it.
+- **`vejas-runtime vpl-check` and the MCP tool `vejas_vpl_check` run the
+  engine's semantic validator**: an unknown function (E050), a misspelled
+  event type once types are declared (E033), a regular expression that cannot
+  compile (E052) and an unbounded closure (W003, a warning) are reported with
+  their line. They checked parse and load only.
+
+### Added — in VPL
+- Single-quoted raw strings (`'\AppData\Local\Temp\'`, `''` for a quote),
+  `regex_match(s, pattern)`, and backticked field names (`` `cs-uri-query` ``)
+  for web and proxy logs. With them, rules converted from Sigma by
+  `sigma convert -t varpulis`
+  ([pySigma-backend-varpulis](https://github.com/varpulis/pySigma-backend-varpulis))
+  run as detect units.
+
 ## [0.3.0] — 2026-09-22
 
 ### Added
