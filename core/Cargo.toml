@@ -22,7 +22,7 @@ webpki-roots = "0.26"
 # The Varpulis CEP engine, embedded as a library (ADR-0031): compile a VPL
 # program, feed it events, publish its emits. No async runtime in its tree —
 # its own CI (scripts/check-engine-deps.py) fails if one ever appears.
-varpulis-engine = { git = "https://github.com/varpulis/varpulis", rev = "4e3dbb5eca2c985bfc5b4f568d1118a96123ef45" }
+varpulis-engine = { git = "https://github.com/varpulis/varpulis", rev = "92f07b966709bacc042ed97a71e16e8dd625c84d" }
 
 [[bin]]
 name = "vejas-runtime"

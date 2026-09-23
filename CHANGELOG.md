@@ -7,6 +7,18 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed — a window on a quiet source closes
+- **A window fed by a source that goes quiet closes**: a detect unit sets an
+  idle grace, `VEJAS_IDLE_CLOSE_SECS` (60 seconds by default, 0 turns it
+  off). Once a subject's type has sent nothing that long, its event time
+  moves on with the wall clock, less the grace, and the unit checks while it
+  has nothing to read. A brute force on a sparse source (VPN logons, one
+  application's log) was raised only when that source spoke again; it is now
+  raised about a grace after its window ends. The types' clocks are in the
+  unit's snapshot, so a restarted unit closes the windows it restored on time
+  too (varpulis #286). `e2e/detect` D7 covers it: three VPN failures, then
+  silence; the previous runtime never raises it.
+
 ## [0.3.2] — 2026-09-23
 
 ### Fixed — detect units, from the Varpulis engine (varpulis #284, #285)

@@ -80,6 +80,13 @@ pub fn observe(unit: &str, ok: bool, emits: u64, secs: f64) {
     }
 }
 
+/// Emits published by a detect unit's tick: windows that time closed while
+/// nothing arrived. They count as emits, not as processed events.
+pub fn observe_tick_emits(unit: &str, emits: u64) {
+    let mut map = units().lock().unwrap();
+    map.entry(unit.to_string()).or_default().emits += emits;
+}
+
 /// One pull round of the consumer loop and how many messages it returned.
 /// Empty rounds count too: they are the idle long-poll cadence.
 pub fn observe_fetch(unit: &str, messages: usize) {
