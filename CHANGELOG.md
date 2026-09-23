@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-09-24
+
 ### Fixed — a window on a quiet source closes
 - **A window fed by a source that goes quiet closes**: a detect unit sets an
   idle grace, `VEJAS_IDLE_CLOSE_SECS` (60 seconds by default, 0 turns it
@@ -194,7 +196,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/cpoder/vejas/releases/tag/v0.3.3
 [0.3.2]: https://github.com/cpoder/vejas/releases/tag/v0.3.2
 [0.3.1]: https://github.com/cpoder/vejas/releases/tag/v0.3.1
 [0.3.0]: https://github.com/cpoder/vejas/releases/tag/v0.3.0
