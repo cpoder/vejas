@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "vejas-runtime"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ctrlc",
  "nats",

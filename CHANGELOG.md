@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-23
+
 ### Fixed — detect units, from the Varpulis engine (varpulis #284, #285)
 - **A time window closes when event time passes its end**, on the next event
   of the types feeding it, not only when a later event reaches that same
@@ -180,7 +182,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/cpoder/vejas/releases/tag/v0.3.2
 [0.3.1]: https://github.com/cpoder/vejas/releases/tag/v0.3.1
 [0.3.0]: https://github.com/cpoder/vejas/releases/tag/v0.3.0
 [0.1.0]: https://github.com/cpoder/vejas/releases/tag/v0.1.0
