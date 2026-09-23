@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-23
+
 ### Fixed — detect units, from the Varpulis engine (varpulis #277, #279, #281)
 - **A sequence with a closure followed by a step** (`A -> all B -> C`) no
   longer matches before C. Under the default `.each()` it emitted a complete
@@ -162,6 +164,7 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/cpoder/vejas/releases/tag/v0.3.1
 [0.3.0]: https://github.com/cpoder/vejas/releases/tag/v0.3.0
 [0.1.0]: https://github.com/cpoder/vejas/releases/tag/v0.1.0
