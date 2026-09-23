@@ -18,6 +18,9 @@
 #   D6 count close    a count per address closes on the next event of its source
 #                     past the window, from any address: a brute force whose
 #                     attacker got in and stopped is still raised
+#   D7 quiet source   a count on a source that goes silent still closes: past
+#                     the idle grace (VEJAS_IDLE_CLOSE_SECS, 1 s here) the
+#                     source's event time moves on with the wall clock
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -118,10 +121,35 @@ stream Brute = Failed
     .to(Bus, topic: "vxt.brute")
 VPL
 
+cat > "$ROOT/detects/quiet.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Vpn:
+    ip: str
+    status: str
+
+stream Logons = Vpn
+    .from(Bus, topic: "vxt.vpn")
+
+stream Failed = Vpn
+    .where(status == "failure")
+
+stream Brute = Failed
+    .partition_by(ip)
+    .window(5s)
+    .aggregate(ip: last(ip), n: count())
+    .where(n >= 3)
+    .emit(rule: "vpn_brute_force", ip: ip, n: n)
+    .to(Bus, topic: "vxt.vpnbrute")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
     VEJAS_HTTP_ADDR="127.0.0.1:$HTTP_P" VEJAS_ACK_WAIT_SECS=1 VEJAS_SNAPSHOT_SECS="${SNAP_SECS:-1}" \
+    VEJAS_IDLE_CLOSE_SECS=1 \
     "$BIN" >> "$WORK/rt.log" 2>&1 &
   RT_PID=$!
   until curl -sf -o /dev/null "http://127.0.0.1:$HTTP_P/healthz"; do sleep 0.05; done
@@ -157,14 +185,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 3 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 4 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "three detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "four detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:bruteforce","detect:lateral","detect:threshold"], names
+assert names==["detect:bruteforce","detect:lateral","detect:quiet","detect:threshold"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -242,6 +270,22 @@ alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
 assert len(alerts)==1 and alerts[0]["ip"]=="10.0.0.66" and alerts[0]["n"]==3, alerts
 PY
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.brute" 2>/dev/null
+
+echo "── D7 a count on a source that goes quiet still closes (idle grace)"
+( timeout 30 "$NATS" -s "$URL" sub vxt.vpnbrute --raw > "$WORK/vpnbrute.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+for s in 00 01 02; do
+  "$NATS" -s "$URL" pub vxt.vpn "{\"event_type\":\"Vpn\",\"@timestamp\":\"2026-09-21T19:00:${s}Z\",\"ip\":\"10.0.0.88\",\"status\":\"failure\"}" > /dev/null 2>&1
+done
+# Nothing else is ever published on the VPN subject.
+deadline=$((SECONDS+15)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '10.0.0.88' "$WORK/vpnbrute.txt" && break; sleep 0.2; done
+sleep 1
+python3 - "$WORK/vpnbrute.txt" <<'PY' && ok "the silent source's brute force is raised once the grace has passed, with its count" || bad "quiet source: $(cat "$WORK/vpnbrute.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert len(alerts)==1 and alerts[0]["ip"]=="10.0.0.88" and alerts[0]["n"]==3, alerts
+PY
+kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.vpnbrute" 2>/dev/null
 
 echo "── D5 a stateful sequence survives kill -9 (snapshot, resume by sequence)"
 ( timeout 60 "$NATS" -s "$URL" sub vxt.lateral --raw > "$WORK/lateral5.txt" 2>/dev/null ) & SUB_PID=$!

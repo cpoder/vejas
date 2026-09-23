@@ -54,9 +54,12 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
   end**: on any event of those types, not only one of the window's own. A
   brute force counted per address on Security events is raised by the next
   Security event of any kind, even when the attacker got in and stopped. A
-  window fed by several types waits for the slowest; one that no event
-  follows stays open, so a source that can go quiet should send a heartbeat
-  of its own type. A stream whose events arrive late declares
+  window fed by several types waits for the slowest. A type that sends
+  nothing for `VEJAS_IDLE_CLOSE_SECS` (60 by default; 0 turns it off) has
+  its event time move on with the wall clock, less that grace, so a brute
+  force on a sparse source (VPN logons) is raised about a minute after its
+  window ends even if the source never speaks again; the unit also checks
+  while it has nothing to read. A stream whose events arrive late declares
   `.watermark(out_of_order: 30s)` to hold its windows that much longer.
 - **Types.** A string `event_type` in the payload names the event type;
   without it, the type is the one the `.from()` binding declares for that

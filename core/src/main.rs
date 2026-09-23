@@ -1374,6 +1374,15 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     });
 }
 
+/// Where a detect unit publishes an emit: the subject its `.to()` names, else
+/// `<root>.detect.<unit>.<stream>`.
+fn emit_subject(emit: &varpulis_engine::Emit, subj_root: &str, stem: &str) -> String {
+    emit.sink
+        .as_ref()
+        .and_then(|s| s.topic.clone())
+        .unwrap_or_else(|| format!("{subj_root}.detect.{stem}.{}", emit.stream))
+}
+
 /// A detect unit (ADR-0031): a VPL program run by the embedded Varpulis engine.
 ///
 /// One durable pull consumer per `.from()` subject, each on a thread of its
@@ -1404,6 +1413,15 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
     );
     let snapshot_every_acks: u64 =
         env::var("VEJAS_SNAPSHOT_ACKS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000).max(1);
+    // A window whose sources go quiet closes about this long after its end:
+    // once a source has sent nothing for the grace, its event time moves on
+    // with the wall clock (varpulis `Program::set_idle_grace`), at every
+    // batch and on the ticks of an idle unit. 0 turns it off: the unit is
+    // then judged in event time alone, like a replay.
+    let idle_grace = match env::var("VEJAS_IDLE_CLOSE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
     let mut delay = Duration::from_secs(1);
     'outer: loop {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -1494,6 +1512,9 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     None => {}
                 }
             }
+            // After the restore: a restored window's sources start counting
+            // their silence from now.
+            program.set_idle_grace(idle_grace);
             match resume_seq {
                 Some(seq) => {
                     // The server cannot move an existing consumer: re-create it after the snapshot.
@@ -1588,7 +1609,28 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     // the rest without waiting, bounded.
                     let first = match rx.recv_timeout(Duration::from_millis(500)) {
                         Ok(m) => m,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Nothing to feed: close what time has closed on
+                            // quiet sources. Those emits stand for no message,
+                            // so there is nothing to ack; a crash before the
+                            // next snapshot replays and closes them again.
+                            if idle_grace.is_some() {
+                                match program.tick() {
+                                    Ok(emits) if !emits.is_empty() => {
+                                        for emit in &emits {
+                                            let subject = emit_subject(emit, &subj_root, &stem);
+                                            if let Err(e) = nc.publish(&subject, emit.to_payload()) {
+                                                eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
+                                            }
+                                        }
+                                        metrics::observe_tick_emits(&handle.spec.name, emits.len() as u64);
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => eprintln!("[vejas] {}: tick: {e}", handle.spec.name),
+                                }
+                            }
+                            continue;
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             return Err("the consumer reader stopped".into())
                         }
@@ -1650,13 +1692,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 let mut ok = true;
                                 let mut subjects = Vec::with_capacity(emits.len());
                                 for emit in &emits {
-                                    let subject = emit
-                                        .sink
-                                        .as_ref()
-                                        .and_then(|s| s.topic.clone())
-                                        .unwrap_or_else(|| {
-                                            format!("{subj_root}.detect.{stem}.{}", emit.stream)
-                                        });
+                                    let subject = emit_subject(emit, &subj_root, &stem);
                                     if let Err(e) = nc.publish(&subject, emit.to_payload()) {
                                         eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
                                         ok = false;

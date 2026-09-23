@@ -1846,7 +1846,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "varpulis-core"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1863,7 +1863,7 @@ dependencies = [
 [[package]]
 name = "varpulis-dead-letter"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "chrono",
  "serde",
@@ -1875,7 +1875,7 @@ dependencies = [
 [[package]]
 name = "varpulis-engine"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -1887,7 +1887,7 @@ dependencies = [
 [[package]]
 name = "varpulis-hamlet"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "rustc-hash",
  "smallvec",
@@ -1898,7 +1898,7 @@ dependencies = [
 [[package]]
 name = "varpulis-parser"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "logos",
  "miette",
@@ -1911,7 +1911,7 @@ dependencies = [
 [[package]]
 name = "varpulis-pst"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "hashlink",
  "rustc-hash",
@@ -1921,7 +1921,7 @@ dependencies = [
 [[package]]
 name = "varpulis-runtime"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "chrono",
  "hashlink",
@@ -1949,7 +1949,7 @@ dependencies = [
 [[package]]
 name = "varpulis-sase"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "chrono",
  "rustc-hash",
@@ -1961,7 +1961,7 @@ dependencies = [
 [[package]]
 name = "varpulis-simd"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "varpulis-core",
 ]
@@ -1969,7 +1969,7 @@ dependencies = [
 [[package]]
 name = "varpulis-zdd"
 version = "0.11.0"
-source = "git+https://github.com/varpulis/varpulis?rev=4e3dbb5eca2c985bfc5b4f568d1118a96123ef45#4e3dbb5eca2c985bfc5b4f568d1118a96123ef45"
+source = "git+https://github.com/varpulis/varpulis?rev=92f07b966709bacc042ed97a71e16e8dd625c84d#92f07b966709bacc042ed97a71e16e8dd625c84d"
 dependencies = [
  "rustc-hash",
 ]
