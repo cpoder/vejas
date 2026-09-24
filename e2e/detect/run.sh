@@ -204,6 +204,10 @@ PY
 }
 
 echo "── D3 vpl-check"
+want="vejas-runtime $(grep -m1 '^version' core/Cargo.toml | cut -d'"' -f2)"
+# A binary without the flag starts a runtime here: give it nothing to reach.
+out=$(NATS_URL=nats://127.0.0.1:1 VEJAS_ROOT="$WORK/none" timeout -k 2 5 "$BIN" --version 2>&1)
+[ "$out" = "$want" ] && ok "--version answers and exits: $out" || bad "--version: expected '$want', got: $(printf '%s' "$out" | head -c 200)"
 out=$("$BIN" vpl-check "$ROOT/detects/threshold.vpl" 2>&1); [ "$out" = "ok" ] && ok "threshold.vpl: ok" || bad "threshold.vpl: $out"
 out=$("$BIN" vpl-check "$ROOT/detects/lateral.vpl" 2>&1); [ "$out" = "ok" ] && ok "lateral.vpl: ok" || bad "lateral.vpl: $out"
 printf 'event Order:\n    id: int\n\nstream Bad = Order\n    .filter(id == 1)\n    .emit(x: 1)\n' > "$WORK/bad.vpl"

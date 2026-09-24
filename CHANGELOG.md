@@ -7,6 +7,12 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **`vejas-runtime --version`** (or `-V`) prints the version and exits. It
+  used to start a runtime, like any argument the binary does not know, so
+  `docker run IMAGE vejas-runtime --version` stayed up instead of answering.
+  `e2e/detect` D3 checks it.
+
 ## [0.3.5] — 2026-09-24
 
 ### Changed — no cliff past ten thousand open correlations (varpulis #289)

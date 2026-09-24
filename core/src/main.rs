@@ -4388,6 +4388,13 @@ fn main() {
     //   vejas-runtime vjs-check <file>
     //   vejas-runtime vjs-run <file> <fixture.json>
     let args: Vec<String> = env::args().collect();
+    // `--version` answers and exits. It used to start a runtime, like any
+    // argument the binary does not know: `docker run IMAGE --version` stayed
+    // up for a day.
+    if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        println!("vejas-runtime {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     // Print the single credential-mask pattern (secrets::SECRET_KEY_PATTERN) so
     // the admission lint (ADR-0017) reads it without parsing source — one
     // definition, shared by the panel mask and the lint.
