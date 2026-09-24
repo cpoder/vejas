@@ -21,6 +21,10 @@
 #   D7 quiet source   a count on a source that goes silent still closes: past
 #                     the idle grace (VEJAS_IDLE_CLOSE_SECS, 1 s here) the
 #                     source's event time moves on with the wall clock
+#   D8 absence        "no acknowledgement within 5s" is raised on subjects that
+#                     go silent after the order, and not for an order acked
+#   D9 absence, kill  an absence the unit was waiting out when killed -9 is
+#                     still raised after the restart (from the snapshot)
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -145,6 +149,33 @@ stream Brute = Failed
     .to(Bus, topic: "vxt.vpnbrute")
 VPL
 
+cat > "$ROOT/detects/unacked.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Order:
+    id: str
+event Ack:
+    id: str
+
+stream Orders = Order
+    .from(Bus, topic: "vxt.shop.order")
+
+stream Acks = Ack
+    .from(Bus, topic: "vxt.shop.ack")
+
+pattern Unacked =
+    Order as o
+    -> NOT Ack where id == o.id
+    within 5s
+    partition by id
+
+stream Late = Unacked
+    .emit(rule: "unacked", order: o.id)
+    .to(Bus, topic: "vxt.unacked")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
@@ -185,14 +216,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 4 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 5 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "four detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "five detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:bruteforce","detect:lateral","detect:quiet","detect:threshold"], names
+assert names==["detect:bruteforce","detect:lateral","detect:quiet","detect:threshold","detect:unacked"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -286,6 +317,46 @@ alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
 assert len(alerts)==1 and alerts[0]["ip"]=="10.0.0.88" and alerts[0]["n"]==3, alerts
 PY
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.vpnbrute" 2>/dev/null
+
+echo "── D8 an absence on subjects that go silent is raised (idle grace)"
+( timeout 90 "$NATS" -s "$URL" sub vxt.unacked --raw > "$WORK/unacked.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+shop() { # <order|ack> <Order|Ack> <time> <id>
+  "$NATS" -s "$URL" pub "vxt.shop.$1" "{\"event_type\":\"$2\",\"@timestamp\":\"2026-09-21T$3Z\",\"id\":\"$4\"}" > /dev/null 2>&1
+}
+shop order Order 20:00:00 o-1
+shop order Order 20:00:00 o-2
+shop ack Ack 20:00:01 o-2
+# Nothing else is ever published on the shop subjects.
+deadline=$((SECONDS+20)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '"o-1"' "$WORK/unacked.txt" && break; sleep 0.2; done
+sleep 1.5
+python3 - "$WORK/unacked.txt" <<'PY' && ok "the unacknowledged order is raised once its five seconds and the grace have passed, the acked one is not" || bad "absence: $(cat "$WORK/unacked.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert [a["order"] for a in alerts]==["o-1"], alerts
+PY
+
+echo "── D9 an absence survives kill -9 (snapshot)"
+unacked_snapshots() { curl -s "http://127.0.0.1:$HTTP_P/metrics" | grep "vejas_snapshots_total{unit=\"detect:unacked\"}" | awk '{print $2}'; }
+before=$(processed detect:unacked); before=${before:-0}
+# The pattern waits for the slower of its two subjects: an acknowledgement for
+# another order keeps the ack subject's event time current, as on a live bus.
+shop ack Ack 21:00:00 o-0
+shop order Order 21:00:00 o-3
+deadline=$((SECONDS+5)); while [ "$SECONDS" -lt "$deadline" ]; do now=$(processed detect:unacked); [ $(( ${now:-0} - before )) -ge 2 ] && break; sleep 0.1; done
+s0=$(unacked_snapshots); s0=${s0:-0}
+deadline=$((SECONDS+3)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(unacked_snapshots)" -gt "$s0" ] 2>/dev/null && break; sleep 0.1; done
+kill -9 "$RT_PID"; wait "$RT_PID" 2>/dev/null; RT_PID=""
+grep -q '"o-3"' "$WORK/unacked.txt" && bad "o-3 was raised before the crash: the check proves nothing" || ok "o-3 still open when the runtime is killed"
+start_rt
+deadline=$((SECONDS+20)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '"o-3"' "$WORK/unacked.txt" && break; sleep 0.2; done
+sleep 1.5
+python3 - "$WORK/unacked.txt" <<'PY' && ok "the absence the unit was waiting out is raised after the restart, once" || bad "absence after kill -9: $(cat "$WORK/unacked.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert [a["order"] for a in alerts]==["o-1","o-3"], alerts
+PY
+kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.unacked" 2>/dev/null
 
 echo "── D5 a stateful sequence survives kill -9 (snapshot, resume by sequence)"
 ( timeout 60 "$NATS" -s "$URL" sub vxt.lateral --raw > "$WORK/lateral5.txt" 2>/dev/null ) & SUB_PID=$!

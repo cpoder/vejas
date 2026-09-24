@@ -7,6 +7,21 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed — an absence is raised when its deadline passes (varpulis #287)
+- **"An order not acknowledged within 4h" (`-> NOT Ack ... within 4h`) is
+  raised when the four hours are over**, by the first event that takes the
+  event time of the pattern's types past them or, when nothing more comes at
+  all, about a grace (`VEJAS_IDLE_CLOSE_SECS`) after them. It used to wait
+  for the next event that reached the pattern itself: on subjects that went
+  quiet after the order, never. `e2e/detect` D8 covers it: an order, an
+  acknowledged order, then silence; the previous runtime raises nothing.
+- **An absence the unit was waiting out when it stopped is still raised
+  after the restart.** The snapshot kept the open sequence but not what its
+  negated step waited for, so after a restore the acknowledgement no longer
+  cancelled it and the deadline dropped it without an alert. `e2e/detect`
+  D9 covers it: an order, kill -9 with the order in the snapshot, restart,
+  silence; the previous runtime never raises it.
+
 ## [0.3.3] — 2026-09-24
 
 ### Fixed — a window on a quiet source closes
