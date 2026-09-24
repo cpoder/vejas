@@ -185,34 +185,51 @@ their second. `LAG` sets it directly.
 
 | Open at once | Rate | RSS | Unpartitioned |
 |---:|---:|---:|---:|
-| 1 | 24 000 – 26 700/s | 10.9 MB | — |
-| 100 | 22 400 – 26 800/s | 11.7 MB | — |
-| 1 000 | 16 900 – 17 400/s | 14.2 MB | 4 400 – 4 500/s |
-| 10 000 | 10 600 – 11 700/s | 38 – 44 MB | 3 500 – 3 600/s |
-| 30 000 | 1 800 – 2 200/s | 130 – 136 MB | — |
+| 1 | 28 600/s | 12.5 MB | — |
+| 100 | 28 200 – 28 600/s | 13.3 MB | — |
+| 1 000 | 25 900 – 26 200/s | 16.2 – 16.5 MB | 4 250 – 4 260/s |
+| 10 000 | 21 600 – 22 600/s | 32 – 34 MB | — |
+| 30 000 | 14 200 – 14 900/s | 88 – 109 MB | — |
+| 100 000 (400 000 events) | 11 100 – 11 200/s | 448 MB | — |
 
 Three things fall out of that table.
 
-**`.partition_by` is worth three to four times** as soon as anything is open:
+**`.partition_by` is worth about six times** as soon as anything is open:
 without it the engine has to consider every open run for every event, and at
-1 000 open that is 17 400/s against 4 500. Partition every correlation, on
+1 000 open that is 26 000/s against 4 300. Partition every correlation, on
 the field the pair shares.
 
-**An open correlation costs about 2.8 KB.** Ten thousand of them is 28 MB on
-top of the unit's 11.
+**What bounds a unit is memory, not a cliff.** An open correlation costs
+about 2 KB at ten thousand and 4.5 KB at a hundred thousand; the rate falls
+gently with the runs each partition carries (here 500 hosts, so 200 runs a
+partition at a hundred thousand open).
 
-**Past ten thousand open runs there is a cliff**: 30 000 open falls to
-2 000/s and 130 MB — five times slower for three times the state. It is a
-real limit of the current engine, not a measurement artefact, and it is the
-number to stay under until it is fixed.
+**The cliff this table used to show is gone.** Up to v0.3.4 the engine swept
+every partition's open runs on each event, to expire them and to confirm
+absences: 30 000 open fell to 2 000/s and 145 MB. Since varpulis #289 it
+keeps their deadlines in order and visits only the partitions with one due.
+Measured against the v0.3.4 runtime in the same session, same box:
+
+| Open at once | v0.3.4 | now |
+|---:|---:|---:|
+| 1 | 28 400 – 28 500/s | 28 600/s |
+| 100 | 27 100 – 27 200/s | 28 200 – 28 600/s |
+| 1 000 | 19 500 – 19 600/s | 25 900 – 26 200/s |
+| 10 000 | 11 900/s | 21 600 – 22 600/s |
+| 30 000 | 2 075 – 2 085/s (145 MB) | 14 200 – 14 900/s (88 – 109 MB) |
+| 1 000, unpartitioned | 4 280 – 4 290/s | 4 250 – 4 260/s |
 
 Correlations spread across units the way flows do — 1 000 open in each:
 
 | Units | Aggregate | Per unit | RSS |
 |---|---:|---:|---:|
-| 1 | 17 000/s | 17 000/s | 14.2 MB |
-| 2 | 29 100/s | 14 500/s | 19.1 MB |
-| 4 | 37 900/s | 9 500/s | 27.2 MB |
+| 1 | 27 100 – 27 200/s | 27 100/s | 16.4 MB |
+| 2 | 37 200 – 39 400/s | 18 600 – 19 700/s | 21.1 – 21.5 MB |
+| 4 | 48 300 – 48 900/s | 12 100 – 12 200/s | 28.4 – 29.1 MB |
+
+Four correlation units go past the stateless ceiling above because they emit
+one alert per pair, where the stateless rule emits one per event: publishing
+is part of what saturates a process.
 
 ### Sizing, then
 
@@ -224,13 +241,14 @@ open at once  =  first steps per second  x  how long a first step waits
 
 A rule whose first step fires 200 times a second and whose second step
 typically follows within ten seconds carries 2 000 open runs. From the table,
-one unit handles that at around 15 000 events/s in 15 MB.
+one unit handles that at around 25 000 events/s in 18 MB.
 
 - **A stateless rule:** budget 30 000 events/s and 10 MB per unit.
-- **A correlation under 100 open:** 25 000 events/s, 11 MB.
-- **At 1 000 open:** 17 000 events/s, 14 MB. **At 10 000:** 11 000 events/s,
-  40 MB. Do not plan past that on one unit.
-- **Always partition a correlation** — three to four times the throughput.
+- **A correlation under 100 open:** 28 000 events/s, 13 MB.
+- **At 1 000 open:** 26 000 events/s, 16 MB. **At 10 000:** 22 000 events/s,
+  33 MB. **At 100 000:** 11 000 events/s, 450 MB: plan on memory, about 4 KB
+  an open run.
+- **Always partition a correlation** — about six times the throughput.
 - **One instance saturates near 44 000 events/s** whatever the unit count.
   Beyond it, add instances: they share the durable consumers and the work
   (see *Clustering*).

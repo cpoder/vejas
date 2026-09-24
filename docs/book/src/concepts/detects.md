@@ -129,10 +129,10 @@ waiting for their second:
 open at once  =  first steps per second  x  how long a first step waits
 ```
 
-Under a hundred open, a unit keeps 25 000 events/s; at a thousand, 17 000;
-at ten thousand, 11 000 and about 40 MB. Past that it falls away sharply, so
-ten thousand open sequences is the number to stay under on one unit.
-`.partition_by` on the field a pair shares is worth three to four times the
+Under a hundred open, a unit keeps 28 000 events/s; at a thousand, 26 000;
+at ten thousand, 22 000 in about 33 MB; at a hundred thousand, 11 000 in
+450 MB. What bounds a unit is memory, about 4 KB an open sequence.
+`.partition_by` on the field a pair shares is worth about six times the
 throughput as soon as anything is open — partition every correlation.
 
 One process saturates near 44 000 events/s whatever the unit count; beyond
