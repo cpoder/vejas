@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-09-24
+
 ### Fixed — an absence is raised when its deadline passes (varpulis #287)
 - **"An order not acknowledged within 4h" (`-> NOT Ack ... within 4h`) is
   raised when the four hours are over**, by the first event that takes the
@@ -211,7 +213,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/cpoder/vejas/releases/tag/v0.3.4
 [0.3.3]: https://github.com/cpoder/vejas/releases/tag/v0.3.3
 [0.3.2]: https://github.com/cpoder/vejas/releases/tag/v0.3.2
 [0.3.1]: https://github.com/cpoder/vejas/releases/tag/v0.3.1
