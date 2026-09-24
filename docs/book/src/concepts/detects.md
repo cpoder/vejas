@@ -61,6 +61,12 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
   window ends even if the source never speaks again; the unit also checks
   while it has nothing to read. A stream whose events arrive late declares
   `.watermark(out_of_order: 30s)` to hold its windows that much longer.
+- **An absence is raised when its deadline passes**, on the same clocks:
+  "an order not acknowledged within 4h" (`-> NOT Ack ... within 4h`) is
+  raised by the first event that takes the time of the pattern's types past
+  the four hours or, when nothing more comes at all, about a grace after
+  them. An absence the unit was waiting out when it stopped is in its
+  snapshot, and is still raised after the restart.
 - **Types.** A string `event_type` in the payload names the event type;
   without it, the type is the one the `.from()` binding declares for that
   subject. The engine's own decoder does this, the same one every Varpulis
