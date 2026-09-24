@@ -7,6 +7,24 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Changed — no cliff past ten thousand open correlations (varpulis #289)
+- **A correlation with many sequences open at once no longer falls off a
+  cliff.** The engine swept every partition's open runs on each event, to
+  expire them and confirm absences; since varpulis #289 it keeps their
+  deadlines in order and visits only the partitions with one due.
+  `bench/detect.sh` (`PROGRAM=sequence`), against v0.3.4 in the same
+  session: 30 000 open went from 2 080 to 14 500 events/s (and 145 to about
+  100 MB), 10 000 from 11 900 to 22 000, 1 000 from 19 600 to 26 000; a
+  hundred thousand open now runs at 11 000 events/s in 450 MB. The sizing in
+  `bench/README.md` and `concepts/detects.md` is re-measured: what bounds a
+  unit is memory, about 4 KB an open sequence.
+
+### Fixed — a cancellation on a named pattern (varpulis #288)
+- **`.not(C)` on a stream that reads a named pattern cancels its runs.** It
+  was accepted and silently did nothing, so `Unacked.not(Cancel)` still
+  raised the cancelled orders. It now cancels them as it does on an inline
+  sequence, per partition when the pattern has one.
+
 ## [0.3.4] — 2026-09-24
 
 ### Fixed — an absence is raised when its deadline passes (varpulis #287)
