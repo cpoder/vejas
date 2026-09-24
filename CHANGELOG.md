@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-09-24
+
 ### Changed — no cliff past ten thousand open correlations (varpulis #289)
 - **A correlation with many sequences open at once no longer falls off a
   cliff.** The engine swept every partition's open runs on each event, to
@@ -231,7 +233,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/cpoder/vejas/releases/tag/v0.3.5
 [0.3.4]: https://github.com/cpoder/vejas/releases/tag/v0.3.4
 [0.3.3]: https://github.com/cpoder/vejas/releases/tag/v0.3.3
 [0.3.2]: https://github.com/cpoder/vejas/releases/tag/v0.3.2
