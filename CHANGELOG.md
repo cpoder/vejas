@@ -13,6 +13,19 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `docker run IMAGE vejas-runtime --version` stayed up instead of answering.
   `e2e/detect` D3 checks it.
 
+### Security
+- **rustls 0.23.43 → 0.23.46** in the runtime, for RUSTSEC-2026-0285 (TLS 1.3
+  handshake messages accepted across encryption levels), -0346, -0348 and
+  -0349. rustls is the TLS stack of the runtime's HTTP client (http-poll,
+  oauth-poll, webhooks, Vault) and of MQTT over TLS.
+- **Dependency advisories are checked in CI.** `scripts/audit.sh` runs
+  cargo-audit on every `Cargo.lock` in the repo, the runtime and each
+  connector, on every push and once a day. Six advisories against rustls 0.22
+  and rustls-webpki 0.102 remain: they come with the sync `nats` 0.25 client,
+  which has no patched release, and moving to async-nats removes them.
+  `.cargo/audit.toml` lists them with the reason none is reachable here, as
+  well as idna 0.1.5 in the AMQP connector (via amiquip).
+
 ## [0.3.5] — 2026-09-24
 
 ### Changed — no cliff past ten thousand open correlations (varpulis #289)

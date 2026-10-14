@@ -1,0 +1,37 @@
+# cargo-audit configuration. cargo-audit reads it from the current directory
+# only, so run scripts/audit.sh from anywhere: it audits every Cargo.lock in the
+# repo (the runtime and each connector) from the root, against this one list.
+
+[advisories]
+ignore = [
+    # rustls 0.22.4 and rustls-webpki 0.102.8 come with the sync `nats` 0.25
+    # client (core, connectors/amqp, connectors/mq); connectors/amqp also uses
+    # rustls 0.22 directly for amqps://. nats 0.25 is the last release of the
+    # sync client, so this line gets no patched version; moving to async-nats
+    # removes all six. Ignores go by advisory ID, so these would also hide
+    # 0346/0349 on rustls 0.23: keep core on >= 0.23.46.
+    # None is reachable the way the crates are used here:
+
+    # Debug output of client session values leaks secrets only through a
+    # custom ClientSessionStore; neither nats nor vejas-amqp installs one.
+    "RUSTSEC-2026-0346",
+    # An unauthenticated ServerHello can drop later connections from hybrid
+    # post-quantum to classical key exchange. rustls 0.22 on ring never offers
+    # a post-quantum group, so there is nothing to downgrade.
+    "RUSTSEC-2026-0349",
+    # CRL distribution-point matching and CRL parsing: no CRL is ever loaded.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0104",
+    # URI and wildcard name constraints: reachable only after signature
+    # verification, with a certificate misissued by a CA the client already
+    # trusts, and only on a TLS connection (a nats:// URL to a server that does
+    # not require TLS stays plaintext).
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+
+    # idna 0.1.5 accepts Punycode labels that decode to plain ASCII. It comes
+    # through url 1.7 <- amq-protocol 1.4 <- amiquip 0.4.2 (the last amiquip
+    # release), in connectors/amqp only, where it parses the broker URL the
+    # operator configures, never untrusted input. Leaves with amiquip.
+    "RUSTSEC-2024-0421",
+]
