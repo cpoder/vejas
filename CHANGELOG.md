@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-10-14
+
 ### Added
 - **`vejas-runtime --version`** (or `-V`) prints the version and exits. It
   used to start a runtime, like any argument the binary does not know, so
@@ -252,7 +254,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/cpoder/vejas/releases/tag/v0.3.6
 [0.3.5]: https://github.com/cpoder/vejas/releases/tag/v0.3.5
 [0.3.4]: https://github.com/cpoder/vejas/releases/tag/v0.3.4
 [0.3.3]: https://github.com/cpoder/vejas/releases/tag/v0.3.3
