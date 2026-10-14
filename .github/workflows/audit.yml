@@ -1,0 +1,21 @@
+name: audit
+
+# Every Cargo.lock in the repo against the RustSec advisory database. Daily as
+# well as on push: advisories are published without any commit here.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit the runtime and every connector
+        run: scripts/audit.sh
