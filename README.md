@@ -13,9 +13,11 @@ run by the Varpulis CEP engine, embedded as a library
 Vėjas is the old Baltic god of the wind. Wind moves things without anyone
 drawing the route.
 
-**Status: young, but real** — two production customers so far, collecting NIS2
-supplier-compliance evidence across eight EU countries today. Interfaces still
-move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
+**Status: young.** Vejas is the evidence-collection engine of Reglyze (NIS2
+compliance) and has run in its production since August 2026: Microsoft 365 and
+EDR (SentinelOne, CrowdStrike) collectors, mapped to the national laws of Italy,
+Portugal, Croatia and Poland. No customer has connected a source yet.
+Interfaces still move fast. Start here: **[the documentation](https://vejas.dev/docs/)** ·
 [COOKBOOK](docs/COOKBOOK.md) · [VISION](docs/VISION.md) ·
 [ARCHITECTURE](docs/ARCHITECTURE.md) · [ROADMAP](docs/ROADMAP.md) ·
 [ADRs](docs/adr/). The bet, long-form:

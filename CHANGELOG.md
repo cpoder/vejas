@@ -7,6 +7,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Corrected
+- The production line (README, vejas.dev, launch kit) claimed two production
+  customers collecting NIS2 supplier-compliance evidence across eight EU
+  countries. Checked in Reglyze's production on 2026-10-15: the collection cell
+  has run there since August, with Microsoft 365 and EDR collectors mapped to
+  four national laws (IT, PT, HR, PL), and no customer has connected a source
+  yet. The line now says that.
+
 ## [0.3.6] — 2026-10-14
 
 ### Added

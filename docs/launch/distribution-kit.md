@@ -2,8 +2,8 @@
 
 Positioning: **the agent writes, under provable governance.** Honest about the
 AI-authored code — it's the thesis, not a caveat to hide. Lead with the 5-minute
-result; numbers as proof, not as hook. Reglyze/NIS2 is the real production proof —
-use it.
+result; numbers as proof, not as hook. Reglyze/NIS2 is a real deployment, but no
+customer has connected a source yet (checked 2026-10-15): do not present it as usage.
 
 Channels deliberately skipped:
 - **r/rust** — an AI-co-authored repo is a dealbreaker there.
@@ -53,8 +53,9 @@ Title alternates (kept for reference):
 > persisted, cluster promote 60ms lossless. Twenty-one connector recipes admitted
 > by CI (MQTT/RabbitMQ against real brokers; IBM MQ, Kafka).
 >
-> Early — two production customers so far — but real: a compliance tool collects
-> NIS2 supplier-compliance evidence across eight EU countries on it today.
+> Young: it has run since August 2026 as the evidence-collection engine of a NIS2
+> compliance tool (Microsoft 365 and EDR, four national laws). No customer has
+> connected a source yet.
 >
 > Full disclosure: most of this code was written by AI agents, reviewed and
 > arbitrated by me across ~30 recorded decisions (ADRs). That's not a caveat — it's
