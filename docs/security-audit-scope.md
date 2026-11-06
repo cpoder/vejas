@@ -134,8 +134,13 @@ pressure-test.
   is therefore "inject any bus event," not "publish to a source only." The
   optional `ALLOW` list restricts the surface to declared suffixes/prefixes
   (recommended, defence in depth); without it the port is any unauthenticated
-  webhook — it belongs behind the operator's ingress / trust boundary.
-- **How to test:** confirm `http-in` reaches no mutation route or secret;
+  webhook — it belongs behind the operator's ingress / trust boundary. A burst
+  costs refusals and never the connector: at most `MAX_CONNECTIONS` threads, a
+  request has 30 s to arrive, and when the OS refuses a thread that connection
+  drops. It is not rate limiting: a client holding every slot blocks ingestion
+  until it stops, so a hostile network still needs the ingress in front.
+- **How to test:** `e2e/http-in-bound.sh` holds the bound and survives a pids
+  limit; confirm `http-in` reaches no mutation route or secret;
   with `ALLOW` set, confirm a suffix outside it is refused (`403`) and a
   permitted one still publishes (`e2e` covers this); without `ALLOW`, confirm
   the honest bound above is documented, not surprising; fuzz the suffix for

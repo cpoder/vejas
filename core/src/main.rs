@@ -1110,7 +1110,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let baseline = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             // Cluster-wide overlay (ADR-0021): a promoted version overrides the
             // file iff it forked from exactly this baseline; a stale overlay
@@ -1404,7 +1404,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     processed_at.elapsed().as_secs_f64(),
                 );
             }
-        })();
+        });
         match attempt {
             Ok(()) => break 'outer,
             Err(e) => {
@@ -1477,7 +1477,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let mut program =
                 varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
@@ -1520,6 +1520,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             // into one channel. Stop is shared: the unit's flag plus one for
             // this attempt, so a restart never leaves a stale reader behind.
             let attempt_stop = Arc::new(AtomicBool::new(false));
+            let _stop_reader = StopOnDrop(attempt_stop.clone());
             let (tx, rx) = std::sync::mpsc::channel::<nats::Message>();
             let durable = handle.spec.name.replace([':', '.'], "_");
             let filters: Vec<String> = sources.iter().map(|(s, _)| s.clone()).collect();
@@ -1841,9 +1842,8 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     }
                 }
             })();
-            attempt_stop.store(true, Ordering::SeqCst);
             result
-        })();
+        });
         match attempt {
             Ok(()) => break 'outer,
             Err(e) => {
@@ -1913,6 +1913,32 @@ fn pkg_of_path(path: &Path) -> String {
     "default".to_string()
 }
 
+/// Run one supervised attempt with its panics caught. Each unit's supervisor is
+/// the thread that runs it, so a panic used to end the supervision too: the unit
+/// stopped for good while its status stayed `running`, `restarts` 0 and
+/// `last_error` null. Caught here, a panic takes the path of any other failure:
+/// `restarting`, the error on record, backoff, another attempt.
+fn contained(attempt: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).unwrap_or_else(|p| {
+        let text = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(format!("panic: {text}"))
+    })
+}
+
+/// Raises a flag when dropped, so that a helper thread stops on every way out of
+/// an attempt, a panic included.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
     let handle = Arc::new(Handle {
         spec: spec.clone(),
@@ -1926,16 +1952,18 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();
-    match spec.kind {
-        Kind::Flow => {
-            thread::spawn(move || supervise_vjs(handle, root));
-        }
-        Kind::Connector => {
-            thread::spawn(move || supervise_connector(handle, root));
-        }
-        Kind::Detect => {
-            thread::spawn(move || supervise_detect(handle, root));
-        }
+    let supervised = handle.clone();
+    let spawned = thread::Builder::new().name(spec.name.clone()).spawn(move || match spec.kind {
+        Kind::Flow => supervise_vjs(handle, root),
+        Kind::Connector => supervise_connector(handle, root),
+        Kind::Detect => supervise_detect(handle, root),
+    });
+    if let Err(e) = spawned {
+        eprintln!("[vejas] {}: cannot start its thread: {e}", supervised.spec.name);
+        set_state(&supervised, |st| {
+            st.status = "failed".into();
+            st.last_error = Some(format!("cannot start its thread: {e}"));
+        });
     }
 }
 
@@ -1951,7 +1979,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
@@ -2037,7 +2065,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
                 None
             };
             driver.run(&ctx)
-        })();
+        });
         stop.store(false, Ordering::SeqCst);
         match attempt {
             Ok(()) => {
@@ -4453,10 +4481,31 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
         }
     };
     eprintln!("[vejas] panel + monitoring on http://{addr}");
+    // One thread per request, so a slow /flows/new never blocks monitoring, and a
+    // bound on them, so a burst costs a 503 instead of this loop.
+    let max_inflight = env::var("VEJAS_HTTP_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(1);
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for request in server.incoming_requests() {
+        let Some(slot) = connectors::Slot::try_take(&inflight, max_inflight) else {
+            metrics::inc_rejected("panel");
+            respond(request, 503, "too many requests in flight".into(), "text/plain");
+            continue;
+        };
         let registry = registry.clone();
         let root = root.clone();
-        thread::spawn(move || handle_request(request, registry, root));
+        // On failure the request drops with the closure and tiny_http answers 500.
+        let spawned = thread::Builder::new().name("http-request".into()).spawn(move || {
+            let _slot = slot;
+            handle_request(request, registry, root)
+        });
+        if let Err(e) = spawned {
+            metrics::inc_rejected("panel");
+            eprintln!("[vejas] no thread for a request: {e}");
+        }
         if !RUNNING.load(Ordering::SeqCst) {
             break;
         }
@@ -4677,6 +4726,32 @@ fn main() {
     }
     drop(reg);
     thread::sleep(Duration::from_millis(800));
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_an_attempt_comes_back_as_an_error() {
+        assert_eq!(contained(|| Ok(())), Ok(()));
+        assert_eq!(contained(|| Err("plain".into())), Err("plain".to_string()));
+        let err = contained(|| panic!("boom {}", 7)).unwrap_err();
+        assert_eq!(err, "panic: boom 7");
+    }
+
+    #[test]
+    fn a_slot_comes_back_when_its_thread_panics() {
+        let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = connectors::Slot::try_take(&open, 1).unwrap();
+        assert!(connectors::Slot::try_take(&open, 1).is_none(), "the bound holds");
+        let _ = thread::spawn(move || {
+            let _slot = slot;
+            panic!("in the handler");
+        })
+        .join();
+        assert!(connectors::Slot::try_take(&open, 1).is_some(), "the slot came back");
+    }
 }
 
 #[cfg(test)]

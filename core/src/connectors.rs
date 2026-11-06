@@ -15,8 +15,8 @@
 // bus. These native drivers are the batteries included.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -188,10 +188,15 @@ impl Driver for HttpIn {
         "source:webhook"
     }
     fn about(&self) -> &'static str {
-        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT, ALLOW (optional list of permitted subject suffixes/prefixes — this port is unauthenticated, so restrict it to your ingest subjects; without ALLOW any vx.* subject is reachable)."
+        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT, MAX_CONNECTIONS (default 512, past it a 503), ALLOW (optional list of permitted subject suffixes/prefixes — this port is unauthenticated, so restrict it to your ingest subjects; without ALLOW any vx.* subject is reachable)."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let port = ctx.config.u64_or("PORT", 8787) as u16;
+        // One OS thread per connection on an unauthenticated port: bounded, so a
+        // burst costs a 503 rather than the thread budget of the whole runtime.
+        let max_connections = ctx.config.u64_or("MAX_CONNECTIONS", 512).max(1) as usize;
+        let open = Arc::new(AtomicUsize::new(0));
+        let mut refused = 0u64;
         // nc for publish_confirmed (direct flush past the 5ms flusher floor —
         // measured: /ingest p50 5.2ms→0.77ms, no throughput regression at conc=32);
         // _js keeps the stream ensured.
@@ -220,11 +225,40 @@ impl Driver for HttpIn {
             }
             match s {
                 Ok(mut sock) => {
+                    let Some(slot) = Slot::try_take(&open, max_connections) else {
+                        crate::metrics::inc_rejected(&ctx.name);
+                        refused += 1;
+                        if refused.is_power_of_two() {
+                            eprintln!(
+                                "[{}] {refused} connection(s) refused so far: MAX_CONNECTIONS is {max_connections}",
+                                ctx.name
+                            );
+                        }
+                        refuse(sock);
+                        continue;
+                    };
                     let nc = nc.clone();
                     let root = ctx.subj_root.clone();
                     let name = ctx.name.clone();
                     let allow = allow.clone();
-                    thread::spawn(move || handle_http_in(&name, &mut sock, &nc, &root, &allow));
+                    // `thread::spawn` panics when the OS has no thread to give (a
+                    // pids limit, memory), which here killed the connector and left
+                    // it reported as running. The closure drops with the error,
+                    // which closes this one connection and frees its slot.
+                    let spawned = thread::Builder::new().name(format!("{name}:conn")).spawn(
+                        move || {
+                            let _slot = slot;
+                            handle_http_in(&name, &mut sock, &nc, &root, &allow)
+                        },
+                    );
+                    if let Err(e) = spawned {
+                        crate::metrics::inc_rejected(&ctx.name);
+                        refused += 1;
+                        if refused.is_power_of_two() {
+                            eprintln!("[{}] {refused} connection(s) refused so far: {e}", ctx.name);
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Poll responsively (stop is re-checked each turn) without a
@@ -247,6 +281,36 @@ fn suffix_allowed(suffix: &str, allow: &[String]) -> bool {
         .any(|e| suffix == e || suffix.starts_with(&format!("{e}.")))
 }
 
+/// One place in a bounded pool of per-connection or per-request threads, given
+/// back when the thread ends, a panic included.
+pub struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    pub fn try_take(open: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
+        open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1))
+            .ok()
+            .map(|_| Slot(open.clone()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Past the bound: tell the client, without a thread, then close.
+fn refuse(mut sock: TcpStream) {
+    sock.set_write_timeout(Some(Duration::from_millis(200))).ok();
+    let _ = sock.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+/// How long one request may take to arrive. The 5 s read timeout restarts on
+/// every byte, so without this a client trickling bytes keeps its slot for good.
+const REQUEST_READ_LIMIT: Duration = Duration::from_secs(30);
+
 fn handle_http_in(
     name: &str,
     sock: &mut std::net::TcpStream,
@@ -268,7 +332,12 @@ fn handle_http_in(
         let mut tmp = [0u8; 4096];
         let mut header_end = None;
         let mut eof = false;
+        let deadline = Instant::now() + REQUEST_READ_LIMIT;
         loop {
+            if Instant::now() >= deadline {
+                eof = true;
+                break;
+            }
             match sock.read(&mut tmp) {
                 Ok(0) => {
                     eof = true;

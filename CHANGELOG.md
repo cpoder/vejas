@@ -25,6 +25,25 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   its OS trust store, so -0382 stays ignored there, with the reason in
   `.cargo/audit.toml`, until the move to async-nats.
 
+### Fixed
+- **A burst of connections could silently kill `http-in`.** When the OS refused
+  a thread (a pids limit, memory), `thread::spawn` panicked in the accept loop:
+  the connector stopped for good, while `/healthz` said 200 and the topology said
+  `running`, `restarts: 0`, `last_error: null`. Reproduced on the v0.3.6 image
+  with `--pids-limit=64` and 300 idle connections. `http-in` now holds at most
+  `MAX_CONNECTIONS` (default 512) and answers 503 past it, gives a request 30 s
+  to arrive, and drops one connection when no thread is available. The panel
+  port has the same bound (`VEJAS_HTTP_MAX_INFLIGHT`, default 256). Refusals
+  count in `vejas_http_rejected_total`.
+- **A panic in a unit no longer ends its supervision.** It takes the path of
+  any other failure: `restarting`, the message in `last_error`, backoff, another
+  attempt. Supervisor threads carry the unit's name, so a panic in the log says
+  which unit it was.
+- **The panel could not approve when `VEJAS_TOKEN` was set.** Approve and Reject
+  got a 401 from the write gate, because the panel holds the approval token and
+  never the agent's. A valid `X-Approval-Token` now answers the write gate on
+  the routes that belong to the human.
+
 ### Changed
 - **Governed mode: replaying and discarding dead letters are human acts.**
   `vejas_dlq_replay` and `vejas_dlq_purge` are refused, and `POST /dlq/replay`
@@ -33,12 +52,6 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   moves to the panel in governed mode (ADR-0024 Amendment A). Outside governed
   mode nothing changes.
 - Replays and purges are now recorded in `VEJAS_AUDIT`, as the guide already said.
-
-### Fixed
-- **The panel could not approve when `VEJAS_TOKEN` was set.** Approve and Reject
-  got a 401 from the write gate, because the panel holds the approval token and
-  never the agent's. A valid `X-Approval-Token` now answers the write gate on
-  the routes that belong to the human.
 
 ### Corrected
 - The production line (README, vejas.dev, launch kit) claimed two production
