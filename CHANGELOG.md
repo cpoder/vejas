@@ -25,6 +25,21 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   its OS trust store, so -0382 stays ignored there, with the reason in
   `.cargo/audit.toml`, until the move to async-nats.
 
+### Changed
+- **Governed mode: replaying and discarding dead letters are human acts.**
+  `vejas_dlq_replay` and `vejas_dlq_purge` are refused, and `POST /dlq/replay`
+  and `/dlq/purge` answer 409 without `X-Approval-Token`. They used to accept
+  `VEJAS_TOKEN`, which the agent holds. The last step of the self-healing loop
+  moves to the panel in governed mode (ADR-0024 Amendment A). Outside governed
+  mode nothing changes.
+- Replays and purges are now recorded in `VEJAS_AUDIT`, as the guide already said.
+
+### Fixed
+- **The panel could not approve when `VEJAS_TOKEN` was set.** Approve and Reject
+  got a 401 from the write gate, because the panel holds the approval token and
+  never the agent's. A valid `X-Approval-Token` now answers the write gate on
+  the routes that belong to the human.
+
 ### Corrected
 - The production line (README, vejas.dev, launch kit) claimed two production
   customers collecting NIS2 supplier-compliance evidence across eight EU

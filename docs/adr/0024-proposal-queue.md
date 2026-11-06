@@ -103,6 +103,18 @@ the on-call human hear about a pending proposal? The platform's own answer:
 a flow — route it to Slack, PagerDuty, email with the connectors that
 already exist. No notification subsystem; dogfood.
 
+**Amendment A (2026-11-06, normative):** dead letters are in scope of "every
+mutating path". Replay and purge had stayed on `VEJAS_TOKEN` as operational
+actions, which left them in the agent's hands: a replay re-runs side effects, a
+purge destroys what the agent's work is judged on, and dead letters are
+untrusted content that agent reads. No proposal kind carries them, so in
+governed mode they sit on `VEJAS_APPROVAL_TOKEN`: refused over MCP, and
+`POST /dlq/replay|purge` want the `X-Approval-Token` header. On those routes
+and on approve/reject, a valid approval token also answers the write gate. The
+panel holds that token and never `VEJAS_TOKEN`, so with both set, the documented
+production posture, the human could not approve from the panel (401 from the
+write gate) until this change.
+
 ## The loop this enables (the acte-6 recipe)
 
 A message dies (DLQ, version-tagged) → an agent reads `vejas_dlq`, drafts a

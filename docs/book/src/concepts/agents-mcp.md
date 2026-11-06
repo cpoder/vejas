@@ -25,4 +25,5 @@ MCP tool — the platform grows its own tool surface as flows are written.
 And the self-healing loop closes the circle: a dead letter → the agent
 reads `vejas_dlq`, drafts a candidate, proves it on real traffic
 (`vejas_time_travel`, `vejas_canary_start`), proposes with evidence → human
-approves → cluster-wide promote in 60 ms → `vejas_dlq_replay`.
+approves → cluster-wide promote in 60 ms → replay, from the panel in governed
+mode, `vejas_dlq_replay` otherwise.

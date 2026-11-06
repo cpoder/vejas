@@ -31,6 +31,11 @@ executing and answers:
 Reads stay open. A direct write is never silently accepted; it is turned
 into a request.
 
+Two things cannot be proposed, so they sit on the approval token instead:
+replaying and discarding dead letters. `vejas_dlq_replay` and
+`vejas_dlq_purge` are refused, and `POST /dlq/replay|purge` answer 409 without
+the `X-Approval-Token` header. The panel asks for the token when it needs it.
+
 ## The flow
 
 1. **Agent proposes** — `vejas_propose` with the change and its *evidence*
@@ -38,7 +43,8 @@ into a request.
    lists the queue.
 2. **Human decides** — in the panel's **Approval queue** card, or
    `POST /proposals/{id}/approve|reject` with the `X-Approval-Token`
-   header. The card shows the evidence; a proposal with none is flagged
+   header, which is enough on its own even when `VEJAS_TOKEN` is set: the
+   panel never holds the agent's token. The card shows the evidence; a proposal with none is flagged
    **"⚠ No evidence"** loud — approving blind is a deliberate act.
 3. **On approve** — the change executes exactly as a normal promote would
    (hot-reload, or a [cluster-wide version](change-safely.md) in 60 ms) and

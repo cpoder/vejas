@@ -101,5 +101,54 @@ mcp vejas_time_travel "{\"file\":\"flows/sdemo.vjs\",\"candidate\":\"$CAND\",\"n
 
 grep -q "$SECRET" "$S/rt.log" && ko "the value reached the runtime log" || ok "the value is not in the log"
 
+echo "── dead letters: the agent reads them, a human acts on them"
+code(){ curl -s -o /dev/null -w "%{http_code}" -m 10 "$@"; }
+dead_letters(){ curl -s -m 10 "$H/dlq"; }
+bury(){ # a dead letter on the bus, as the runtime parks one
+  nats -s $URL pub vxdlq.vx.sdemo.in \
+    "{\"unit\":\"flow:sdemo\",\"original_subject\":\"vx.sdemo.in\",\"payload\":\"{\\\"id\\\":$1}\",\"error\":\"boom\",\"attempts\":5}" \
+    > /dev/null 2>&1
+}
+BEARER="Authorization: Bearer $AGENT"
+JSON='Content-Type: application/json'
+dead_letters > /dev/null   # ensures the stream
+bury 9
+mcp vejas_dlq '{"limit":5}' | grep -q 'flow:sdemo' && ok "the agent reads them" || ko "vejas_dlq shows nothing"
+mcp vejas_dlq_purge '{"unit":"flow:sdemo"}' | grep -q 'human action' \
+  && ok "vejas_dlq_purge refused" || ko "vejas_dlq_purge NOT governed"
+mcp vejas_dlq_replay '{"unit":"flow:sdemo"}' | grep -q 'human action' \
+  && ok "vejas_dlq_replay refused" || ko "vejas_dlq_replay NOT governed"
+C=$(code -X POST -H "$BEARER" -H "$JSON" -d '{}' "$H/dlq/purge")
+[ "$C" = "409" ] && ok "POST /dlq/purge with the agent's token: $C" || ko "/dlq/purge NOT governed ($C)"
+C=$(code -X POST -H "$BEARER" -H "$JSON" -d '{}' "$H/dlq/replay")
+[ "$C" = "409" ] && ok "POST /dlq/replay with the agent's token: $C" || ko "/dlq/replay NOT governed ($C)"
+C=$(code -X POST -H "X-Approval-Token: wrong" -H "$JSON" -d '{}' "$H/dlq/purge")
+[ "$C" = "401" ] && ok "a wrong approval token: $C" || ko "a wrong approval token got $C"
+C=$(code -X POST -H "$JSON" -d '{}' "$H/dlq/purge")
+[ "$C" = "401" ] && ok "no credential at all: $C" || ko "no credential at all got $C"
+dead_letters | grep -q 'flow:sdemo' && ok "the dead letter is still there" || ko "the refused calls lost the dead letter"
+
+# what the panel sends: the approval token, never the agent's
+OUT=$(curl -s -m 10 -X POST -H "X-Approval-Token: $HUMAN" -H "$JSON" -d '{"unit":"flow:sdemo"}' "$H/dlq/replay")
+echo "$OUT" | grep -q '"replayed":1' && ok "the human replays with the approval token alone" \
+  || ko "human replay: $OUT"
+bury 10
+OUT=$(curl -s -m 10 -X POST -H "X-Approval-Token: $HUMAN" -H "$JSON" -d '{"unit":"flow:sdemo"}' "$H/dlq/purge")
+echo "$OUT" | grep -q '"purged":1' && ok "the human purges with the approval token alone" \
+  || ko "human purge: $OUT"
+AUDIT=$(for seq in 1 2 3 4 5 6; do
+  nats -s $URL stream get VEJAS_AUDIT $seq --json 2>/dev/null \
+    | python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["data"]).decode())' 2>/dev/null
+done)
+echo "$AUDIT" | grep -q '"dlq-replay"' && ok "the replay is audited" || ko "no audit record for the replay"
+echo "$AUDIT" | grep -q '"dlq-purge"' && ok "the purge is audited" || ko "no audit record for the purge"
+
+echo "── the human can decide from the panel with both tokens set"
+C=$(code -X POST -H "X-Approval-Token: $HUMAN" "$H/proposals/nope/approve")
+[ "$C" = "422" ] && ok "approve passes the write gate on the approval token alone ($C: no such proposal)" \
+  || ko "approve got $C"
+C=$(code -X POST -H "$BEARER" "$H/proposals/nope/approve")
+[ "$C" = "401" ] && ok "the agent's token still cannot approve ($C)" || ko "the agent's token got $C on approve"
+
 [ $fail -eq 0 ] && echo "GOVERNED AGENT SURFACE HOLDS" || echo "GOVERNED AGENT SURFACE REGRESSION — do not ship"
 exit $fail

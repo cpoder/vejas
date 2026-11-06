@@ -634,6 +634,28 @@ fn write_token() -> Option<String> {
     env::var("VEJAS_TOKEN").ok().filter(|t| !t.is_empty())
 }
 
+/// Does the request carry the human approval credential? Constant-time.
+fn approval_authorized(request: &tiny_http::Request) -> bool {
+    approval_token().is_some_and(|tok| {
+        request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("x-approval-token") && ct_eq(h.value.as_str(), &tok))
+    })
+}
+
+/// The doors that belong to the human, not to the agent: deciding a proposal,
+/// and replaying or discarding dead letters. The panel holds the approval token
+/// and never the agent's `VEJAS_TOKEN`, so on these routes a valid approval
+/// token answers the write gate too. Otherwise a deployment with both tokens
+/// set, the documented production posture, leaves the human unable to approve
+/// from the panel.
+fn is_human_route(path: &str) -> bool {
+    matches!(path, "/dlq/replay" | "/dlq/purge")
+        || (path.starts_with("/proposals/")
+            && (path.ends_with("/approve") || path.ends_with("/reject")))
+}
+
 /// Does the request carry a valid `Authorization: Bearer <token>`? Constant-time.
 fn bearer_authorized(request: &tiny_http::Request, token: &str) -> bool {
     request.headers().iter().any(|h| {
@@ -808,6 +830,33 @@ fn decide_proposal(
     let updated = proposals::set_status(&store, id, "approved", Some(decided_by), now_secs())?;
     emit_proposal_event(&js, "approved", &updated);
     Ok(json!({"ok": true, "proposal": updated, "applied": result}))
+}
+
+const DLQ_HUMAN_ACT: &str = "approval required: replaying or discarding dead letters is a human \
+    action in governed mode: the panel, or X-Approval-Token (ADR-0024)";
+
+/// Replaying or discarding dead letters in governed mode. No proposal carries
+/// them, and an agent holds `VEJAS_TOKEN`, so they sit on the human credential:
+/// a replay re-runs side effects, and a purge destroys what the agent would be
+/// judged on. A dead letter is also untrusted content the agent reads, so these
+/// are the last things it should be able to reach.
+fn dlq_agent_gate() -> Result<(), String> {
+    if require_approval() {
+        Err(DLQ_HUMAN_ACT.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// The same rule on the HTTP door, where the human can present the credential.
+fn dlq_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
+    if !require_approval() || approval_authorized(request) {
+        return Ok(());
+    }
+    if request.headers().iter().any(|h| h.field.equiv("x-approval-token")) {
+        return Err((401, "unauthorized: X-Approval-Token required".into()));
+    }
+    Err((409, DLQ_HUMAN_ACT.into()))
 }
 
 /// Governed-change mode (ADR-0024): when `VEJAS_REQUIRE_APPROVAL=1`, a direct
@@ -2996,11 +3045,30 @@ fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// Record a replay or a purge: one summary per call, best-effort like the
+/// live-promote path. A purge in particular leaves no other trace.
+fn dlq_audit(
+    js: &nats::jetstream::JetStream,
+    kind: &str,
+    actor: &str,
+    seq: Option<u64>,
+    unit: Option<&str>,
+    count: u64,
+) {
+    let record = json!({
+        "ts": now_secs(), "actor": actor, "kind": kind,
+        "unit": unit, "seq": seq, "count": count,
+    });
+    if let Err(e) = connectors::to_audit(js, unit.unwrap_or("dlq"), &record) {
+        eprintln!("[vejas] {kind}: audit not written: {e}");
+    }
+}
+
 /// Replay dead letters: re-publish each to its ORIGINAL subject (where the
 /// corrected flow reprocesses it), then remove it from the DLQ. Publish-before-
 /// delete, so a failed re-inject keeps the dead letter. By `seq`, by `unit`, or
 /// all (both None).
-fn dlq_replay(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
     let mut targets: Vec<(u64, String, Vec<u8>)> = Vec::new();
     let take = |env: &Value| -> (u64, String, Vec<u8>) {
@@ -3037,14 +3105,16 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
             Err(e) => errs.push(format!("seq {s}: {e}")),
         }
     }
+    dlq_audit(&js, "dlq-replay", actor, seq, unit, n);
     Ok(json!({"replayed": n, "errors": errs}))
 }
 
 /// Discard dead letters without replaying — by `seq`, by `unit`, or all.
-fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+fn dlq_purge(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
     if seq.is_none() && unit.is_none() {
         let r = js.purge_stream(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
+        dlq_audit(&js, "dlq-purge", actor, None, None, r.purged);
         return Ok(json!({"purged": r.purged}));
     }
     let mut n = 0u64;
@@ -3062,6 +3132,7 @@ fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
             }
         }
     }
+    dlq_audit(&js, "dlq-purge", actor, seq, unit, n);
     Ok(json!({"purged": n}))
 }
 
@@ -3486,8 +3557,8 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
-        json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -3709,14 +3780,16 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"dead_letters": dlq_list(limit)?}).to_string())
         }
         "vejas_dlq_replay" => {
+            dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
             let unit = args.get("unit").and_then(|v| v.as_str());
-            text(dlq_replay(seq, unit)?.to_string())
+            text(dlq_replay(seq, unit, "mcp")?.to_string())
         }
         "vejas_dlq_purge" => {
+            dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
             let unit = args.get("unit").and_then(|v| v.as_str());
-            text(dlq_purge(seq, unit)?.to_string())
+            text(dlq_purge(seq, unit, "mcp")?.to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -3802,7 +3875,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     // an emitting `api "GET /x"` slipped past — a bus write with no token.)
     let wtoken = write_token();
     if let Some(tok) = &wtoken {
-        if !is_read_method(&method) && !bearer_authorized(&request, tok) {
+        if !is_read_method(&method)
+            && !bearer_authorized(&request, tok)
+            && !(is_human_route(&path_only) && approval_authorized(&request))
+        {
             return respond(
                 request,
                 401,
@@ -3878,14 +3954,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         "approval requires VEJAS_APPROVAL_TOKEN (a credential distinct from the agent's VEJAS_TOKEN)".into(),
                         "text/plain");
                 }
-                Some(tok) => {
-                    let ok = request.headers().iter().any(|h| {
-                        h.field.equiv("x-approval-token") && ct_eq(h.value.as_str(), &tok)
-                    });
-                    if !ok {
-                        return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
-                    }
+                Some(_) if !approval_authorized(&request) => {
+                    return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
                 }
+                Some(_) => {}
             }
             return match decide_proposal(&registry, &root, id, approve, &actor) {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
@@ -3981,16 +4053,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Post, "/dlq/replay") => {
+            if let Err((code, e)) = dlq_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
             let body = read_body(&mut request);
-            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
         (tiny_http::Method::Post, "/dlq/purge") => {
+            if let Err((code, e)) = dlq_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
             let body = read_body(&mut request);
-            let r = dlq_purge(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            let r = dlq_purge(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),

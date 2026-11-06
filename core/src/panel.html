@@ -904,7 +904,26 @@ async function saveGolden(flow, seq) {
 loadEvents();
 setInterval(loadEvents, 4000);
 
-async function dlqAction(path, body) { try { await post(path, body); toast('Done — reloaded'); await loadDlq(); } catch (e) { toast(e.message.slice(0,160), true); } }
+// In governed mode a replay or a discard is a human act (ADR-0024): the server
+// answers 409 or 401 and the approval token goes with the retry.
+async function dlqAction(path, body) {
+  const send = tok => fetch(path, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(tok ? { 'X-Approval-Token': tok } : {}) },
+    body: JSON.stringify(body) });
+  try {
+    let tok = ($('#approval-token').value || '').trim();
+    let res = await send(tok);
+    if ((res.status === 409 || res.status === 401) && !tok) {
+      tok = (prompt('Approval token (governed mode)') || '').trim();
+      if (!tok) return;
+      $('#approval-token').value = tok;
+      res = await send(tok);
+    }
+    if (!res.ok) throw new Error(await res.text());
+    toast('Done — reloaded');
+    await loadDlq();
+  } catch (e) { toast(e.message.slice(0, 160), true); }
+}
 async function loadDlq() {
   try {
     const items = (await fetch('/dlq').then(r => r.json())).dead_letters || [];

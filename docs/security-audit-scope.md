@@ -16,7 +16,7 @@ invariant is wrong, that is the finding we want.
 |---|---|---|
 | **Operator** | The write API (panel, `/mcp`, HTTP mutations) with `VEJAS_TOKEN` | Everything: write flows, promote, set secrets — this is the admin |
 | **Agent** | `/mcp` with `VEJAS_TOKEN` | Propose and (outside governed mode) mutate; in governed mode, *propose only* — never approve |
-| **Approver (human)** | `/proposals/{id}/approve` with `VEJAS_APPROVAL_TOKEN` | Approve/reject in governed mode; nothing else |
+| **Approver (human)** | `/proposals/{id}/approve` and `/dlq/replay`, `/dlq/purge` with `VEJAS_APPROVAL_TOKEN` | Approve/reject in governed mode, and replay or discard dead letters; nothing else |
 | **Event source** | `http-in` on its own port, **no auth** | Publish a JSON body to one subject — nothing else |
 | **Bus peer** | NATS/JetStream | Governed by NATS's own auth (deployment-owned) |
 
@@ -248,8 +248,11 @@ re-deriving these — they are fixed and regression-tested; instead, try to
   connector (an exec driver = arbitrary `CMD`) with no human approval:
   governance bypass **and** RCE. Fixed to mirror `/flows/new`;
   `e2e/governed-gate.sh` in CI. Sibling-checked: the HTTP twin, all mutating
-  MCP tools, and `/provision` are gated; `dlq/replay`, `dlq/purge` and
-  `connectors/test` are operational (write-token, not approval) by design.
+  MCP tools, and `/provision` are gated; `connectors/test` is operational
+  (write-token, not approval) by design. `dlq/replay` and `dlq/purge` were
+  too until 2026-11-06, when ADR-0024 Amendment A moved them to the approval
+  token: an agent that reads dead letters reads untrusted content, and must
+  not hold what destroys them.
 
 ## Known minor points to confirm or harden (not blockers)
 
