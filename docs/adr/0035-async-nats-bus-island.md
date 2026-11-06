@@ -1,6 +1,6 @@
 # 0035 — The NATS client moves to async-nats, behind one synchronous module
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-06
 
 ## Context
