@@ -29,9 +29,8 @@ type. Flows, the interpreter, connectors and supervisors do not change shape.
 `Engine::live` and `Engine::shadow` are untouched and the interpreter has no bus
 access, so `Program::writes_bus()` means what it meant.
 
-This is not an async rewrite. The rewrite was never on the table: threads are
-what make a flow simple to read, and the cost above was the client's, not the
-threads'.
+There is no async rewrite. Threads are what make a flow simple to read, and the
+cost above was the client's.
 
 The eight points that make the module.
 

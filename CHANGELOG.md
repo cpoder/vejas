@@ -7,12 +7,41 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **Seven advisories leave `.cargo/audit.toml`**: RUSTSEC-2026-0049, -0098, -0099,
+  -0104, -0346, -0349 and -0382, all held by the sync `nats` client's rustls 0.22
+  and rustls-webpki 0.102. Every lockfile is now on rustls 0.23.46 and
+  rustls-webpki 0.103.16, `connectors/amqp` included.
+
+
 ### Fixed
 - **A burst of connections during boot could end the version watch for good.** Its
   first connection panicked when the OS had no thread to give: nothing showed it,
   and a promoted version no longer reached that instance until a restart. It
   needs a thread limit and a burst at that moment. The watch and the control loop
   now carry a name and start again after a panic.
+- **A consumer deleted under a running flow no longer leaves a zombie.** The flow
+  stayed `running` for good, consuming nothing, and two empty dead letters from an
+  `_INBOX` subject landed in the queue. It now restarts and recreates the consumer.
+
+### Changed
+- **The NATS client is now `async-nats`, behind one module (ADR-0035).** `nats` 0.25
+  is deprecated. `core/src/bus.rs` runs `async-nats` on one tokio worker and gives
+  the rest of the runtime a blocking API: no other module sees tokio or a NATS type,
+  and flows, connectors and supervisors stay threads. A process now holds one
+  connection, where it held two per flow. At 200 flows that is 210 threads against
+  1 011, 1 connection against 401, and 26 MB against 140. A flow is running 11 ms
+  after spawn, against 1.7 s. The flow hop holds its rate, ten flows run about 10 %
+  faster, and the 5 ms flusher floor is gone, with `publish_confirmed`,
+  `fetch_iter_flushed` and the second connection for acks. The costs: the binary
+  grows from 9.9 to 11.2 MB, RSS at one flow from 9.2 to 10.2 MB, and the MQTT
+  loopback falls from about 2 400 to 2 070 round-trips/s. Existing streams,
+  consumers, buckets and snapshots work as they are, and v0.3.6 reads back what this
+  version writes. **To upgrade:** a NATS user with a publish allow-list needs
+  `_INBOX.>` on it. Without it nothing is ever acked and everything redelivers; the
+  log names the permissions violation.
+- **`connectors/mq` and `connectors/amqp` compile the same module**, and
+  `connectors/amqp` moves to rustls 0.23.
 
 ## [0.4.0] — 2026-11-06
 

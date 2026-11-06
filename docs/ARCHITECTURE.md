@@ -31,11 +31,11 @@ docker-compose.yml        two containers: nats + vejas
 
 The runtime is a single OS process. Inside it:
 
-- **one supervisor thread per flow** — connects to NATS, creates a durable pull
-  consumer on the flow's `source`, and loops: fetch a bounded batch (the pull
-  carries a server-side expiry so a stopped flow actually stops), run each
-  event through the interpreter, publish the emits **before** acking
-  (at-least-once; a crash means redelivery, never a lost emit), and record the
+- **one supervisor thread per flow** — creates a durable pull consumer on the
+  flow's `source`, and loops: fetch a bounded batch (the pull carries a
+  server-side expiry so a stopped flow actually stops), run each event through
+  the interpreter, publish the emits **before** acking (at-least-once; a crash
+  means redelivery, never a lost emit), and record the
   event in the in-memory trace ring (last 50 per flow, `/events`; the full
   event is kept internally as shadow-replay fuel). A message that still fails
   after 5 deliveries is dropped (acked) and the drop is traced — redelivery is
@@ -48,6 +48,11 @@ The runtime is a single OS process. Inside it:
   endpoints, the editing endpoints, and the MCP endpoint. One request = one
   thread (so a slow `/flows/new` never blocks monitoring), at most
   `VEJAS_HTTP_MAX_INFLIGHT` at once; past it the request gets a 503.
+- **the bus** (`core/src/bus.rs`, ADR-0035) — the only thread that speaks NATS.
+  One tokio worker runs the `async-nats` client on one connection, shared by the
+  whole process. Everything above stays synchronous: a thread that needs the bus
+  calls a blocking function and parks until it returns. No other module sees
+  tokio or a NATS type, and the interpreter has no access to the bus.
 
 A panic in a unit's supervisor is caught around each attempt and takes the path
 of any other failure: `restarting`, the error in `last_error`, backoff, another
