@@ -8,7 +8,7 @@ ignore = [
     # client (core, connectors/amqp, connectors/mq); connectors/amqp also uses
     # rustls 0.22 directly for amqps://. nats 0.25 is the last release of the
     # sync client, so this line gets no patched version; moving to async-nats
-    # removes all six. Ignores go by advisory ID, so these would also hide
+    # removes all seven. Ignores go by advisory ID, so these would also hide
     # 0346/0349 on rustls 0.23: keep core on >= 0.23.46.
     # None is reachable the way the crates are used here:
 
@@ -28,6 +28,13 @@ ignore = [
     # not require TLS stays plaintext).
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    # Certificate paths through the distrusted emSign intermediates: rustls-webpki
+    # 0.102 has no distrust list. Reachable only on a tls:// NATS_URL, from a
+    # network position that can impersonate the NATS server, with a chain the
+    # machine's OS trust store accepts (nats 0.25 loads the native roots). A NATS
+    # server on a plain or private-CA connection is outside it. This ID also
+    # covers rustls-webpki 0.103: keep core on >= 0.103.16, webpki-roots >= 1.0.10.
+    "RUSTSEC-2026-0382",
 
     # idna 0.1.5 accepts Punycode labels that decode to plain ASCII. It comes
     # through url 1.7 <- amq-protocol 1.4 <- amiquip 0.4.2 (the last amiquip

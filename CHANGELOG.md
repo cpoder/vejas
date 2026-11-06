@@ -7,6 +7,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **rustls-webpki 0.103.15 → 0.103.16 and webpki-roots 1.0.9 → 1.0.11**, for
+  RUSTSEC-2026-0382 and -0381 (certificate paths through distrusted emSign
+  intermediates). The TLS stack of the runtime's HTTP client and of MQTT over
+  TLS rejects them again. The sync `nats` client keeps rustls-webpki 0.102 and
+  its OS trust store, so -0382 stays ignored there, with the reason in
+  `.cargo/audit.toml`, until the move to async-nats.
+
 ### Corrected
 - The production line (README, vejas.dev, launch kit) claimed two production
   customers collecting NIS2 supplier-compliance evidence across eight EU
