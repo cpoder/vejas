@@ -13,7 +13,6 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   and rustls-webpki 0.102. Every lockfile is now on rustls 0.23.46 and
   rustls-webpki 0.103.16, `connectors/amqp` included.
 
-
 ### Fixed
 - **A burst of connections during boot could end the version watch for good.** Its
   first connection panicked when the OS had no thread to give: nothing showed it,
@@ -23,6 +22,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 - **A consumer deleted under a running flow no longer leaves a zombie.** The flow
   stayed `running` for good, consuming nothing, and two empty dead letters from an
   `_INBOX` subject landed in the queue. It now restarts and recreates the consumer.
+- **An emit the server cannot take no longer redelivers forever.** A publish
+  refused before it leaves, for a payload over the server's limit, left its source
+  message un-acked with no cap on deliveries. It is now a failed run, dead-lettered
+  after `MAX_DELIVERIES` like any other. Detect units keep the old behaviour here:
+  their emits are small and their engine state makes a redelivery a different case.
 
 ### Changed
 - **The NATS client is now `async-nats`, behind one module (ADR-0035).** `nats` 0.25

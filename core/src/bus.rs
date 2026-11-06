@@ -365,8 +365,8 @@ pub struct Batch {
 impl Batch {
     /// Hold a publish. An error means this one can never leave (a subject the
     /// protocol cannot carry, a payload over the server's limit), and only this
-    /// one: the caller leaves its source message un-acked, and the rest of the
-    /// batch goes on.
+    /// one: the caller treats its source message as a failed run, and the rest of
+    /// the batch goes on.
     pub fn publish(&mut self, subject: &str, payload: impl Into<Bytes>) -> Result<(), String> {
         let payload = payload.into();
         if subject.is_empty() || subject.contains([' ', '\t', '\r', '\n']) {

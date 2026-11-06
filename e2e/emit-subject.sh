@@ -19,6 +19,9 @@ URL=nats://127.0.0.1:4281; H="http://127.0.0.1:8753"; IN=18794
 mkdir -p "$R/flows" "$R/connectors"
 printf '# flow: dyn\nsource "vx.dyn.in"\nemit f"vx.out.{tenant}", {id: id}\n' > "$R/flows/dyn.vjs"
 printf '# connector: http_in\ndriver "http-in"\nPORT = %s\n' $IN > "$R/connectors/http_in.vjs"
+# an emit over the server's 1 MB limit: 16 bytes doubled seventeen times
+printf '# flow: big\nsource "vx.big.in"\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.big.out", {s: s}\n' \
+  > "$R/flows/big.vjs"
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4281 > /dev/null 2>&1 & NP=$!
 sleep 0.5
@@ -56,6 +59,15 @@ import json, sys
 print(len([d for d in json.load(sys.stdin)["dead_letters"] if "not a valid subject" in d.get("last_error", "")]))'; }
 for _ in $(seq 1 150); do [ "$(letters)" = "2" ] && break; sleep 0.1; done
 [ "$(letters)" = "2" ] && ok "both messages reached the DLQ with the reason" || ko "$(letters) of 2 reached the DLQ"
+
+echo "── an emit the server would refuse takes it too"
+curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' \
+  -d '{"items":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]}' "http://127.0.0.1:$IN/ingest/big.in"
+big_letters(){ curl -s -m 5 "$H/dlq" | python3 -c '
+import json, sys
+print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:big"]))'; }
+for _ in $(seq 1 150); do [ "$(big_letters)" = "1" ] && break; sleep 0.1; done
+[ "$(big_letters)" = "1" ] && ok "an oversized emit reached the DLQ" || ko "the oversized emit never reached the DLQ"
 
 echo "── a shadow run shows the same error"
 curl -s -m 10 -H 'Content-Type: application/json' -d \

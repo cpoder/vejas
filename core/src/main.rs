@@ -1253,26 +1253,25 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     };
                     let t0 = Instant::now();
                     let start_nanos = metrics::now_nanos();
-                    match vjs::run(&prog, &event, &mut engine) {
+                    // Holding an emit is local, so a refusal is final for this message:
+                    // it can never leave, however often it redelivers. That makes it
+                    // a failed run, capped by MAX_DELIVERIES and dead-lettered.
+                    let outcome = vjs::run(&prog, &event, &mut engine).and_then(|ctx| {
+                        for (subj, payload) in &ctx.emits {
+                            let bytes = serde_json::to_vec(payload).unwrap_or_default();
+                            // held; sent and confirmed once per batch below
+                            batch.publish(subj, bytes).map_err(|e| format!("publish {subj}: {e}"))?;
+                        }
+                        Ok(ctx)
+                    });
+                    match outcome {
                         Ok(ctx) => {
-                            let mut ok = true;
-                            for (subj, payload) in &ctx.emits {
-                                let bytes = serde_json::to_vec(payload).unwrap_or_default();
-                                // held; sent and confirmed once per batch below
-                                if let Err(e) = batch.publish(subj, bytes) {
-                                    eprintln!(
-                                        "[vejas] {}: publish {subj}: {e}",
-                                        handle.spec.name
-                                    );
-                                    ok = false;
-                                }
-                            }
                             let emits = ctx.emits.len() as u64;
-                            metrics::observe(&handle.spec.name, ok, emits, t0.elapsed().as_secs_f64());
+                            metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
                             metrics::span(metrics::Span {
                                 unit: handle.spec.name.clone(),
                                 subject: msg.subject.clone(),
-                                ok,
+                                ok: true,
                                 error: None,
                                 start_nanos,
                                 end_nanos: metrics::now_nanos(),
@@ -1281,8 +1280,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             record_trace(
                                 &handle.spec.name,
                                 &msg.subject,
-                                ok,
-                                (!ok).then(|| "publish failed (will redeliver)".to_string()),
+                                true,
+                                None,
                                 ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
                                 // The preview is derived from the stored event when
                                 // /events is read; serialising it here cost every
@@ -1290,9 +1289,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 String::new(),
                                 Some(event),
                             );
-                            if ok {
-                                to_ack.push(msg); // acked after the batch flush
-                            }
+                            to_ack.push(msg); // acked after the batch flush
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
