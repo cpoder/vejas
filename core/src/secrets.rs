@@ -53,6 +53,33 @@ pub trait SecretStore: Send + Sync {
     }
 }
 
+/// What every path that SHOWS a run instead of performing it resolves through:
+/// preview, run on a fixture, flow-as-tool, shadow-replay, time-travel, canary,
+/// golden capture. `secret("a/b")` stays fail-closed (a missing secret aborts as
+/// in a real run) and evaluates to the placeholder `<secret:a/b>`, never to the
+/// value. Those results go to an agent, into a model's context, or to an open
+/// GET, and a time-travel candidate is arbitrary code that could emit the value
+/// or transform it, so masking the output afterwards cannot work: the value must
+/// never enter the run. The price is that a branch comparing with a secret takes
+/// the not-equal path in shadow.
+pub struct RedactedStore(Arc<dyn SecretStore>);
+
+impl RedactedStore {
+    pub fn new(inner: Arc<dyn SecretStore>) -> Self {
+        RedactedStore(inner)
+    }
+}
+
+impl SecretStore for RedactedStore {
+    fn kind(&self) -> &'static str {
+        "redacted"
+    }
+    fn get(&self, reference: &str) -> Result<String, String> {
+        self.0.get(reference)?;
+        Ok(format!("<secret:{reference}>"))
+    }
+}
+
 /// The store the runtime uses, selected at startup: Vault if configured, else
 /// the writable file backend if configured, else the dev env backend.
 pub fn default_store() -> Arc<dyn SecretStore> {

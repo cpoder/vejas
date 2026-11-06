@@ -22,6 +22,7 @@ struct Unit {
     err: u64,
     emits: u64,
     dead: u64,
+    rejected: u64,
     /// Pull rounds the consumer loop made, and messages they returned.
     /// `messages / rounds` is the mean batch: the number that says whether a
     /// unit is paying one pull round-trip per message or per sixty-four.
@@ -129,6 +130,13 @@ pub fn observe_restore(unit: &str, seq: u64) {
 pub fn inc_dead_letter(unit: &str) {
     let mut map = units().lock().unwrap();
     map.entry(unit.to_string()).or_default().dead += 1;
+}
+
+/// A connection or request refused because a bound was reached, or because the
+/// OS would not give a thread: the visible side of keeping the listener alive.
+pub fn inc_rejected(unit: &str) {
+    let mut map = units().lock().unwrap();
+    map.entry(unit.to_string()).or_default().rejected += 1;
 }
 
 fn esc(s: &str) -> String {
@@ -258,6 +266,15 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
         ));
     }
 
+    out.push_str("# HELP vejas_http_rejected_total Connections or requests refused past a bound, or for want of a thread.\n");
+    out.push_str("# TYPE vejas_http_rejected_total counter\n");
+    for (unit, u) in map.iter().filter(|(_, u)| u.rejected > 0) {
+        out.push_str(&format!(
+            "vejas_http_rejected_total{{unit=\"{}\"}} {}\n",
+            esc(unit),
+            u.rejected
+        ));
+    }
     out.push_str("# HELP vejas_dead_letters_total Messages a unit dead-lettered (ADR-0015).\n");
     out.push_str("# TYPE vejas_dead_letters_total counter\n");
     for (unit, u) in map.iter() {
@@ -428,12 +445,14 @@ mod tests {
         observe("flow:t", true, 2, 0.003);
         observe("flow:t", false, 0, 0.02);
         inc_dead_letter("flow:t");
+        inc_rejected("flow:t");
         let text = render(&[("flow:t".into(), "flow".into(), 1)]);
         assert!(text.contains("vejas_up 1"));
         assert!(text.contains("vejas_events_processed_total{unit=\"flow:t\",result=\"ok\"} 1"));
         assert!(text.contains("vejas_events_processed_total{unit=\"flow:t\",result=\"error\"} 1"));
         assert!(text.contains("vejas_emits_published_total{unit=\"flow:t\"} 2"));
         assert!(text.contains("vejas_dead_letters_total{unit=\"flow:t\"} 1"));
+        assert!(text.contains("vejas_http_rejected_total{unit=\"flow:t\"} 1"));
         assert!(text.contains("vejas_event_duration_seconds_count{unit=\"flow:t\"} 2"));
         assert!(text.contains("le=\"+Inf\"} 2"));
         assert!(text.contains("vejas_flow_restarts{unit=\"flow:t\"} 1"));

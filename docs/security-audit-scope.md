@@ -16,7 +16,7 @@ invariant is wrong, that is the finding we want.
 |---|---|---|
 | **Operator** | The write API (panel, `/mcp`, HTTP mutations) with `VEJAS_TOKEN` | Everything: write flows, promote, set secrets — this is the admin |
 | **Agent** | `/mcp` with `VEJAS_TOKEN` | Propose and (outside governed mode) mutate; in governed mode, *propose only* — never approve |
-| **Approver (human)** | `/proposals/{id}/approve` with `VEJAS_APPROVAL_TOKEN` | Approve/reject in governed mode; nothing else |
+| **Approver (human)** | `/proposals/{id}/approve` and `/dlq/replay`, `/dlq/purge` with `VEJAS_APPROVAL_TOKEN` | Approve/reject in governed mode, and replay or discard dead letters; nothing else |
 | **Event source** | `http-in` on its own port, **no auth** | Publish a JSON body to one subject — nothing else |
 | **Bus peer** | NATS/JetStream | Governed by NATS's own auth (deployment-owned) |
 
@@ -100,10 +100,16 @@ pressure-test.
   in-process HTTP (ureq) carries them in headers, never a subprocess argv; the
   standalone connectors that shell out use a `0600` config file, never argv
   (ADR-0008). A literal is never accepted where a `secret()` is required.
+  Whatever shows a run instead of performing it uses `Engine::shadow`, where
+  `secret()` yields the placeholder `<secret:path/key>`; `Engine::live` is the
+  only way to the value, and there is no default constructor.
 - **How to test:** grep every response body and log line for a set secret;
   set a secret and confirm `GET /secrets` shows status only, never the value;
   inspect argv and env of every spawned process; attempt to store a credential
-  as a plain literal and confirm refusal.
+  as a plain literal and confirm refusal; `e2e/governed-agent.sh` checks every
+  shadow path, a candidate included, and that a live run still gets the value.
+  **Break it:** a surface returning a run's result that does not go through
+  `Engine::shadow`.
 - **Honest bound (found this pass — S4-1).** `secret()` protects the **store**:
   no endpoint returns a stored secret, and secrets are references, never
   literals. But a flow *author* can copy a resolved secret onto the **data
@@ -128,8 +134,13 @@ pressure-test.
   is therefore "inject any bus event," not "publish to a source only." The
   optional `ALLOW` list restricts the surface to declared suffixes/prefixes
   (recommended, defence in depth); without it the port is any unauthenticated
-  webhook — it belongs behind the operator's ingress / trust boundary.
-- **How to test:** confirm `http-in` reaches no mutation route or secret;
+  webhook — it belongs behind the operator's ingress / trust boundary. A burst
+  costs refusals and never the connector: at most `MAX_CONNECTIONS` threads, a
+  request has 30 s to arrive, and when the OS refuses a thread that connection
+  drops. It is not rate limiting: a client holding every slot blocks ingestion
+  until it stops, so a hostile network still needs the ingress in front.
+- **How to test:** `e2e/http-in-bound.sh` holds the bound and survives a pids
+  limit; confirm `http-in` reaches no mutation route or secret;
   with `ALLOW` set, confirm a suffix outside it is refused (`403`) and a
   permitted one still publishes (`e2e` covers this); without `ALLOW`, confirm
   the honest bound above is documented, not surprising; fuzz the suffix for
@@ -242,8 +253,20 @@ re-deriving these — they are fixed and regression-tested; instead, try to
   connector (an exec driver = arbitrary `CMD`) with no human approval:
   governance bypass **and** RCE. Fixed to mirror `/flows/new`;
   `e2e/governed-gate.sh` in CI. Sibling-checked: the HTTP twin, all mutating
-  MCP tools, and `/provision` are gated; `dlq/replay`, `dlq/purge` and
-  `connectors/test` are operational (write-token, not approval) by design.
+  MCP tools, and `/provision` are gated; `connectors/test` is operational
+  (write-token, not approval) by design. `dlq/replay` and `dlq/purge` were
+  too until 2026-11-06, when ADR-0024 Amendment A moved them to the approval
+  token: an agent that reads dead letters reads untrusted content, and must
+  not hold what destroys them.
+
+- **G — protocol injection through an `emit` subject (HIGH, fixed).** A subject
+  built from an event field reached the NATS wire as it was, so a line break in
+  the field became protocol commands with the runtime's NATS permissions, and
+  `http-in` makes that field anonymous. Fixed where a flow emits, by
+  `vjs::valid_subject`; `http-in` applies it to its suffix, which had no injection
+  of its own (the path cannot carry the CRLF a payload must end with) but could
+  drop the connection. `e2e/emit-subject.sh` in CI. **Break it:** a subject that
+  reaches the bus from outside without passing `valid_subject`.
 
 ## Known minor points to confirm or harden (not blockers)
 

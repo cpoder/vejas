@@ -17,7 +17,11 @@ post-mortem knows *which* logic failed, even after a promote.
 - Panel: the DLQ card; API: `GET /dlq`; agent: `vejas_dlq`.
 - Replay is **explicit** — `POST /dlq/replay` (`vejas_dlq_replay`), never
   automatic: if the logic was wrong, replaying before fixing just kills the
-  message again. Purge (`/dlq/purge`) is equally explicit and audited.
+  message again. Purge (`/dlq/purge`) is equally explicit. Both are recorded
+  in `VEJAS_AUDIT` with the actor and the count.
+- In [governed mode](governed-mode.md) both are human acts: `vejas_dlq_replay`
+  and `vejas_dlq_purge` are refused, and the HTTP routes want the
+  `X-Approval-Token` header, which the panel sends.
 
 ## The loop that makes it self-healing
 
@@ -28,7 +32,8 @@ post-mortem knows *which* logic failed, even after a promote.
    (canary).
 3. In governed mode it *proposes* with that evidence; you approve — the
    promote fans out cluster-wide in 60 ms.
-4. `vejas_dlq_replay` — the dead messages pass under the new version, and
-   their envelopes record the transition.
+4. Replay from the panel, or `vejas_dlq_replay` outside governed mode — the
+   dead messages pass under the new version, and their envelopes record the
+   transition.
 
 The human owns exactly one step: the meaning.

@@ -1327,8 +1327,19 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project_root: PathBuf, caller_pkg: String) -> Self {
+    /// An engine for a REAL run: `secret()` yields the value. Only what performs
+    /// a flow or a connector takes this; anything that returns a run's result to
+    /// a caller takes `shadow`. There is deliberately no `new`, so that a new
+    /// proof path cannot inherit real secrets by default.
+    pub fn live(project_root: PathBuf, caller_pkg: String) -> Self {
         Self::with_secrets(project_root, caller_pkg, crate::secrets::default_store())
+    }
+
+    /// An engine for a SHADOW run: `secret()` stays fail-closed and yields a
+    /// placeholder, never the value (see `secrets::RedactedStore`).
+    pub fn shadow(project_root: PathBuf, caller_pkg: String) -> Self {
+        let store = crate::secrets::RedactedStore::new(crate::secrets::default_store());
+        Self::with_secrets(project_root, caller_pkg, Arc::new(store))
     }
     pub fn with_secrets(
         project_root: PathBuf,
@@ -1528,6 +1539,9 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
                     Value::String(s) => s,
                     other => return Err(format!("emit subject must be a string, got {other}")),
                 };
+                if !valid_subject(&s) {
+                    return Err(format!("emit subject {s:?} is not a valid subject"));
+                }
                 let p = eval(payload, ctx, engine)?;
                 ctx.emits.push((s, p));
             }
@@ -1539,6 +1553,15 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Can this string go on the wire as a subject? The NATS protocol is line-based
+/// and space-separated, so a line break in a subject is a second protocol
+/// command, and a subject built from an event field hands that to whoever sends
+/// the event. Checked where a flow emits: the run fails, the message takes the
+/// poison path to the DLQ, and a shadow run shows the error a live run would get.
+pub fn valid_subject(subject: &str) -> bool {
+    !subject.is_empty() && !subject.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn set_path(root: &mut Value, path: &[String], v: Value) {
@@ -1927,7 +1950,7 @@ mod tests {
 
     fn eval_flow(src: &str, event: Value) -> Result<Vec<(String, Value)>, String> {
         let prog = parse(src)?;
-        let mut engine = Engine::new(std::env::temp_dir(), "default".into());
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
         run(&prog, &event, &mut engine).map(|c| c.emits)
     }
 
@@ -2169,6 +2192,39 @@ mod tests {
     }
 
     #[test]
+    fn an_emit_subject_that_cannot_go_on_the_wire_fails_the_run() {
+        let prog = parse("emit f\"vx.{t}\", {a: 1}\n").unwrap();
+        let run_with = |t: &str| {
+            let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+            run(&prog, &json!({"t": t}), &mut engine).map(|ctx| ctx.emits.len())
+        };
+        assert_eq!(run_with("orders.eu-west_1"), Ok(1));
+        for bad in ["a b", "a\tb", "a\nb", "a\r\nPUB b 0", "a\u{0}b", "a\u{a0}b"] {
+            let err = run_with(bad).unwrap_err();
+            assert!(err.contains("not a valid subject"), "{bad:?}: {err}");
+        }
+        assert!(!valid_subject(""));
+    }
+
+    #[test]
+    fn shadow_never_sees_a_secret_value() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a/b".to_string(), "s3cret".to_string());
+        let store = std::sync::Arc::new(MapStore(map));
+        let shadow = std::sync::Arc::new(crate::secrets::RedactedStore::new(store));
+        let prog = parse("v = secret(\"a/b\")\nemit \"o\", {v: v, up: upper(v)}\n").unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), shadow.clone());
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        let shown = serde_json::to_string(&ctx.emits).unwrap() + &format!("{:?}", ctx.vars);
+        assert!(!shown.contains("s3cret") && !shown.contains("S3CRET"), "{shown}");
+        assert!(shown.contains("<secret:a/b>"), "{shown}");
+        // fail-closed like a real run: a missing secret still aborts
+        let prog = parse("v = secret(\"missing/x\")\n").unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), shadow);
+        assert!(run(&prog, &json!({}), &mut engine).is_err());
+    }
+
+    #[test]
     fn secret_resolves_and_fails_closed() {
         let mut m = std::collections::HashMap::new();
         m.insert("api/key".to_string(), "TOP-SECRET".to_string());
@@ -2209,7 +2265,7 @@ mod tests {
         std::fs::write(pkg.join("services").join("secret.vjs"), "y = 1\n").unwrap();
         std::fs::write(pkg.join("package.vjs"), "ENABLED = true\nEXPORTS = [\"fmt\"]\n").unwrap();
 
-        let mut engine = Engine::new(root.clone(), "default".into());
+        let mut engine = Engine::live(root.clone(), "default".into());
         // merge form
         let prog = parse("invoke double(n: 21)\nemit \"vx.t\", {t: twice}").unwrap();
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();
@@ -2240,7 +2296,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pkg.join("package.vjs"), "EXPORTS = [\"outer\"]\n").unwrap();
-        let mut engine = Engine::new(root.clone(), "default".into());
+        let mut engine = Engine::live(root.clone(), "default".into());
         // outer is exported; inner is private but called FROM WITHIN pkg n -> allowed
         let prog = parse("invoke n:outer(v: 9)\n").unwrap();
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();

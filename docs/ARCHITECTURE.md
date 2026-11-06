@@ -46,7 +46,13 @@ The runtime is a single OS process. Inside it:
   consumer on `vx.slack.out` → webhook or DRY-RUN).
 - **the HTTP server thread** — serves the panel, the JSON introspection
   endpoints, the editing endpoints, and the MCP endpoint. One request = one
-  thread (so a slow `/flows/new` never blocks monitoring).
+  thread (so a slow `/flows/new` never blocks monitoring), at most
+  `VEJAS_HTTP_MAX_INFLIGHT` at once; past it the request gets a 503.
+
+A panic in a unit's supervisor is caught around each attempt and takes the path
+of any other failure: `restarting`, the error in `last_error`, backoff, another
+attempt. `http-in` holds one thread per connection, at most `MAX_CONNECTIONS`,
+and when the OS refuses a thread it drops that one connection.
 
 There is no database. NATS JetStream holds the stream `VEJAS` bound to `vx.>`,
 the durable consumers, and (later) KV/object state.

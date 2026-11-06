@@ -7,6 +7,61 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **An event field in an `emit` subject could inject NATS protocol.** The subject
+  reached the wire as it was, so a line break in a field of an event turned the
+  rest of that field into protocol commands, within the permissions of the
+  runtime's NATS user. Through `http-in` this needed no credential: a flow that
+  builds a subject from an event field let an anonymous POST publish anywhere or
+  purge a stream. No shipped flow or template does this; check the flows of your
+  own that do. `emit` now refuses a subject with whitespace or a control
+  character: the run fails and the message reaches the DLQ. `http-in` answers 400
+  on such a suffix.
+- **Secret values left through every path that shows a run.** In v0.3.6
+  preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel, canary
+  and golden capture evaluated flows with the real secret store and returned
+  the result. `GET /preview`, which needs no token, returned any variable
+  holding a secret. In governed mode, `vejas_time_travel` handed the value to an
+  agent holding only `VEJAS_TOKEN`, through a candidate that emits it. These
+  paths now evaluate `secret()` to the placeholder `<secret:path/key>`,
+  fail-closed as before, and a real run still gets the value. Rotate any secret
+  that a shared or agent-facing deployment could have exposed this way. A branch
+  comparing with a secret now takes the not-equal path in shadow.
+- **rustls-webpki 0.103.15 → 0.103.16 and webpki-roots 1.0.9 → 1.0.11**, for
+  RUSTSEC-2026-0382 and -0381 (certificate paths through distrusted emSign
+  intermediates). The TLS stack of the runtime's HTTP client and of MQTT over
+  TLS rejects them again. The sync `nats` client keeps rustls-webpki 0.102 and
+  its OS trust store, so -0382 stays ignored there, with the reason in
+  `.cargo/audit.toml`, until the move to async-nats.
+
+### Fixed
+- **A burst of connections could silently kill `http-in`.** When the OS refused
+  a thread (a pids limit, memory), `thread::spawn` panicked in the accept loop:
+  the connector stopped for good, while `/healthz` said 200 and the topology said
+  `running`, `restarts: 0`, `last_error: null`. Reproduced on the v0.3.6 image
+  with `--pids-limit=64` and 300 idle connections. `http-in` now holds at most
+  `MAX_CONNECTIONS` (default 512) and answers 503 past it, gives a request 30 s
+  to arrive, and drops one connection when no thread is available. The panel
+  port has the same bound (`VEJAS_HTTP_MAX_INFLIGHT`, default 256). Refusals
+  count in `vejas_http_rejected_total`.
+- **A panic in a unit no longer ends its supervision.** It takes the path of
+  any other failure: `restarting`, the message in `last_error`, backoff, another
+  attempt. Supervisor threads carry the unit's name, so a panic in the log says
+  which unit it was.
+- **The panel could not approve when `VEJAS_TOKEN` was set.** Approve and Reject
+  got a 401 from the write gate, because the panel holds the approval token and
+  never the agent's. A valid `X-Approval-Token` now answers the write gate on
+  the routes that belong to the human.
+
+### Changed
+- **Governed mode: replaying and discarding dead letters are human acts.**
+  `vejas_dlq_replay` and `vejas_dlq_purge` are refused, and `POST /dlq/replay`
+  and `/dlq/purge` answer 409 without `X-Approval-Token`. They used to accept
+  `VEJAS_TOKEN`, which the agent holds. The last step of the self-healing loop
+  moves to the panel in governed mode (ADR-0024 Amendment A). Outside governed
+  mode nothing changes.
+- Replays and purges are now recorded in `VEJAS_AUDIT`, as the guide already said.
+
 ### Corrected
 - The production line (README, vejas.dev, launch kit) claimed two production
   customers collecting NIS2 supplier-compliance evidence across eight EU

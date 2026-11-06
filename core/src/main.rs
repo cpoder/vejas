@@ -265,7 +265,7 @@ fn replay_literal(
     };
     let pkg = pkg_of_path(&path);
     let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
         match vjs::run(prog, ev, &mut engine) {
             Ok(ctx) => json!({
                 "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -304,7 +304,8 @@ fn replay_literal(
 /// side-by-side emit diff joined by the source message's stream sequence. This is
 /// `replay_literal` generalised from a literal patch to an arbitrary new source.
 /// The shadow invariant holds by construction — `vjs::run` collects emits, it
-/// never publishes, so nothing a candidate emits reaches a real subject.
+/// never publishes, so nothing a candidate emits reaches a real subject — and
+/// `Engine::shadow` holds no secret value, so a candidate cannot read one back.
 fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result<Value, String> {
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -325,7 +326,7 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
         .ok_or("flow has no bus source to replay")?;
     let rows = connectors::hydrate_recent(&js, &stream, &source_subj, n)?;
     let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
         match vjs::run(prog, ev, &mut engine) {
             Ok(ctx) => json!({
                 "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -382,7 +383,7 @@ fn canaries() -> &'static Mutex<HashMap<String, Canary>> {
 /// Run one event through a parsed version in shadow, returning its emits (never
 /// published — vjs::run only collects them).
 fn shadow_emits(prog: &vjs::Program, ev: &Value, root: &Path, pkg: &str) -> Value {
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.to_string());
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.to_string());
     match vjs::run(prog, ev, &mut engine) {
         Ok(ctx) => json!({
             "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -633,6 +634,28 @@ fn write_token() -> Option<String> {
     env::var("VEJAS_TOKEN").ok().filter(|t| !t.is_empty())
 }
 
+/// Does the request carry the human approval credential? Constant-time.
+fn approval_authorized(request: &tiny_http::Request) -> bool {
+    approval_token().is_some_and(|tok| {
+        request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("x-approval-token") && ct_eq(h.value.as_str(), &tok))
+    })
+}
+
+/// The doors that belong to the human, not to the agent: deciding a proposal,
+/// and replaying or discarding dead letters. The panel holds the approval token
+/// and never the agent's `VEJAS_TOKEN`, so on these routes a valid approval
+/// token answers the write gate too. Otherwise a deployment with both tokens
+/// set, the documented production posture, leaves the human unable to approve
+/// from the panel.
+fn is_human_route(path: &str) -> bool {
+    matches!(path, "/dlq/replay" | "/dlq/purge")
+        || (path.starts_with("/proposals/")
+            && (path.ends_with("/approve") || path.ends_with("/reject")))
+}
+
 /// Does the request carry a valid `Authorization: Bearer <token>`? Constant-time.
 fn bearer_authorized(request: &tiny_http::Request, token: &str) -> bool {
     request.headers().iter().any(|h| {
@@ -807,6 +830,33 @@ fn decide_proposal(
     let updated = proposals::set_status(&store, id, "approved", Some(decided_by), now_secs())?;
     emit_proposal_event(&js, "approved", &updated);
     Ok(json!({"ok": true, "proposal": updated, "applied": result}))
+}
+
+const DLQ_HUMAN_ACT: &str = "approval required: replaying or discarding dead letters is a human \
+    action in governed mode: the panel, or X-Approval-Token (ADR-0024)";
+
+/// Replaying or discarding dead letters in governed mode. No proposal carries
+/// them, and an agent holds `VEJAS_TOKEN`, so they sit on the human credential:
+/// a replay re-runs side effects, and a purge destroys what the agent would be
+/// judged on. A dead letter is also untrusted content the agent reads, so these
+/// are the last things it should be able to reach.
+fn dlq_agent_gate() -> Result<(), String> {
+    if require_approval() {
+        Err(DLQ_HUMAN_ACT.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// The same rule on the HTTP door, where the human can present the credential.
+fn dlq_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
+    if !require_approval() || approval_authorized(request) {
+        return Ok(());
+    }
+    if request.headers().iter().any(|h| h.field.equiv("x-approval-token")) {
+        return Err((401, "unauthorized: X-Approval-Token required".into()));
+    }
+    Err((409, DLQ_HUMAN_ACT.into()))
 }
 
 /// Governed-change mode (ADR-0024): when `VEJAS_REQUIRE_APPROVAL=1`, a direct
@@ -1060,7 +1110,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let baseline = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             // Cluster-wide overlay (ADR-0021): a promoted version overrides the
             // file iff it forked from exactly this baseline; a stale overlay
@@ -1162,7 +1212,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 "[vejas] {} (vjs, native) consuming {source}",
                 handle.spec.name
             );
-            let mut engine = vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+            let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
             // One pull request is always in flight ahead of the round being
             // processed. Without it every round began with ~2 ms of waiting for
             // its first message — request, round-trip, server delivery — while
@@ -1354,7 +1404,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     processed_at.elapsed().as_secs_f64(),
                 );
             }
-        })();
+        });
         match attempt {
             Ok(()) => break 'outer,
             Err(e) => {
@@ -1427,7 +1477,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let mut program =
                 varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
@@ -1470,6 +1520,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             // into one channel. Stop is shared: the unit's flag plus one for
             // this attempt, so a restart never leaves a stale reader behind.
             let attempt_stop = Arc::new(AtomicBool::new(false));
+            let _stop_reader = StopOnDrop(attempt_stop.clone());
             let (tx, rx) = std::sync::mpsc::channel::<nats::Message>();
             let durable = handle.spec.name.replace([':', '.'], "_");
             let filters: Vec<String> = sources.iter().map(|(s, _)| s.clone()).collect();
@@ -1791,9 +1842,8 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     }
                 }
             })();
-            attempt_stop.store(true, Ordering::SeqCst);
             result
-        })();
+        });
         match attempt {
             Ok(()) => break 'outer,
             Err(e) => {
@@ -1863,6 +1913,32 @@ fn pkg_of_path(path: &Path) -> String {
     "default".to_string()
 }
 
+/// Run one supervised attempt with its panics caught. Each unit's supervisor is
+/// the thread that runs it, so a panic used to end the supervision too: the unit
+/// stopped for good while its status stayed `running`, `restarts` 0 and
+/// `last_error` null. Caught here, a panic takes the path of any other failure:
+/// `restarting`, the error on record, backoff, another attempt.
+fn contained(attempt: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).unwrap_or_else(|p| {
+        let text = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(format!("panic: {text}"))
+    })
+}
+
+/// Raises a flag when dropped, so that a helper thread stops on every way out of
+/// an attempt, a panic included.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
     let handle = Arc::new(Handle {
         spec: spec.clone(),
@@ -1876,16 +1952,18 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();
-    match spec.kind {
-        Kind::Flow => {
-            thread::spawn(move || supervise_vjs(handle, root));
-        }
-        Kind::Connector => {
-            thread::spawn(move || supervise_connector(handle, root));
-        }
-        Kind::Detect => {
-            thread::spawn(move || supervise_detect(handle, root));
-        }
+    let supervised = handle.clone();
+    let spawned = thread::Builder::new().name(spec.name.clone()).spawn(move || match spec.kind {
+        Kind::Flow => supervise_vjs(handle, root),
+        Kind::Connector => supervise_connector(handle, root),
+        Kind::Detect => supervise_detect(handle, root),
+    });
+    if let Err(e) = spawned {
+        eprintln!("[vejas] {}: cannot start its thread: {e}", supervised.spec.name);
+        set_state(&supervised, |st| {
+            st.status = "failed".into();
+            st.last_error = Some(format!("cannot start its thread: {e}"));
+        });
     }
 }
 
@@ -1901,7 +1979,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
-        let attempt = (|| -> Result<(), String> {
+        let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
@@ -1911,7 +1989,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             // config value resolves to the real value, fail-closed). The
             // manifest's UPPERCASE variables are the driver's config.
             let mut cfg_engine =
-                vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+                vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
             let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut cfg_engine)?;
             let mut config = serde_json::Map::new();
             for (k, v) in cfg_ctx.vars {
@@ -1987,7 +2065,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
                 None
             };
             driver.run(&ctx)
-        })();
+        });
         stop.store(false, Ordering::SeqCst);
         match attempt {
             Ok(()) => {
@@ -2438,7 +2516,7 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     )
     .map_err(|e| format!("fixture: {e}"))?;
     // package context: services resolve relative to the file's package
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
     let (emits, error, pipeline) = match vjs::run(&prog, &event, &mut engine) {
         Ok(ctx) => {
             let emits: Vec<Value> = ctx
@@ -2545,6 +2623,8 @@ Rules:
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
 - A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
+- An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
+- `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -2865,7 +2945,7 @@ fn probe_connector(root: &Path, file: &str) -> Value {
         let driver_name = prog.driver.clone().ok_or("not a connector manifest (no `driver`)")?;
         let driver = connectors::driver_for(&driver_name)
             .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
         let mut config = serde_json::Map::new();
@@ -2932,7 +3012,7 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
         if prog.driver.as_deref() != Some("exec-rpc") {
             continue;
         }
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
         for (k, v) in cfg.vars {
@@ -2994,11 +3074,30 @@ fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// Record a replay or a purge: one summary per call, best-effort like the
+/// live-promote path. A purge in particular leaves no other trace.
+fn dlq_audit(
+    js: &nats::jetstream::JetStream,
+    kind: &str,
+    actor: &str,
+    seq: Option<u64>,
+    unit: Option<&str>,
+    count: u64,
+) {
+    let record = json!({
+        "ts": now_secs(), "actor": actor, "kind": kind,
+        "unit": unit, "seq": seq, "count": count,
+    });
+    if let Err(e) = connectors::to_audit(js, unit.unwrap_or("dlq"), &record) {
+        eprintln!("[vejas] {kind}: audit not written: {e}");
+    }
+}
+
 /// Replay dead letters: re-publish each to its ORIGINAL subject (where the
 /// corrected flow reprocesses it), then remove it from the DLQ. Publish-before-
 /// delete, so a failed re-inject keeps the dead letter. By `seq`, by `unit`, or
 /// all (both None).
-fn dlq_replay(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
     let mut targets: Vec<(u64, String, Vec<u8>)> = Vec::new();
     let take = |env: &Value| -> (u64, String, Vec<u8>) {
@@ -3035,14 +3134,16 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
             Err(e) => errs.push(format!("seq {s}: {e}")),
         }
     }
+    dlq_audit(&js, "dlq-replay", actor, seq, unit, n);
     Ok(json!({"replayed": n, "errors": errs}))
 }
 
 /// Discard dead letters without replaying — by `seq`, by `unit`, or all.
-fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
+fn dlq_purge(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
     if seq.is_none() && unit.is_none() {
         let r = js.purge_stream(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
+        dlq_audit(&js, "dlq-purge", actor, None, None, r.purged);
         return Ok(json!({"purged": r.purged}));
     }
     let mut n = 0u64;
@@ -3060,6 +3161,7 @@ fn dlq_purge(seq: Option<u64>, unit: Option<&str>) -> Result<Value, String> {
             }
         }
     }
+    dlq_audit(&js, "dlq-purge", actor, seq, unit, n);
     Ok(json!({"purged": n}))
 }
 
@@ -3122,7 +3224,7 @@ fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
     let ctx = vjs::run(&prog, input, &mut engine)?;
     Ok(ctx
         .emits
@@ -3278,7 +3380,7 @@ fn run_flow_ctx(root: &Path, file: &str, input: &Value) -> Result<vjs::Ctx, Stri
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
     vjs::run(&prog, input, &mut engine)
 }
 
@@ -3484,8 +3586,8 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
-        json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both).", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
     // one exists (the stock container has none — external agents write .vjs)
@@ -3707,14 +3809,16 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(json!({"dead_letters": dlq_list(limit)?}).to_string())
         }
         "vejas_dlq_replay" => {
+            dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
             let unit = args.get("unit").and_then(|v| v.as_str());
-            text(dlq_replay(seq, unit)?.to_string())
+            text(dlq_replay(seq, unit, "mcp")?.to_string())
         }
         "vejas_dlq_purge" => {
+            dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
             let unit = args.get("unit").and_then(|v| v.as_str());
-            text(dlq_purge(seq, unit)?.to_string())
+            text(dlq_purge(seq, unit, "mcp")?.to_string())
         }
         other => {
             // flow-as-tool: run the declaring flow on the arguments
@@ -3800,7 +3904,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     // an emitting `api "GET /x"` slipped past — a bus write with no token.)
     let wtoken = write_token();
     if let Some(tok) = &wtoken {
-        if !is_read_method(&method) && !bearer_authorized(&request, tok) {
+        if !is_read_method(&method)
+            && !bearer_authorized(&request, tok)
+            && !(is_human_route(&path_only) && approval_authorized(&request))
+        {
             return respond(
                 request,
                 401,
@@ -3876,14 +3983,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         "approval requires VEJAS_APPROVAL_TOKEN (a credential distinct from the agent's VEJAS_TOKEN)".into(),
                         "text/plain");
                 }
-                Some(tok) => {
-                    let ok = request.headers().iter().any(|h| {
-                        h.field.equiv("x-approval-token") && ct_eq(h.value.as_str(), &tok)
-                    });
-                    if !ok {
-                        return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
-                    }
+                Some(_) if !approval_authorized(&request) => {
+                    return respond(request, 401, "unauthorized: X-Approval-Token required".into(), "text/plain");
                 }
+                Some(_) => {}
             }
             return match decide_proposal(&registry, &root, id, approve, &actor) {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
@@ -3979,16 +4082,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Post, "/dlq/replay") => {
+            if let Err((code, e)) = dlq_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
             let body = read_body(&mut request);
-            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
         (tiny_http::Method::Post, "/dlq/purge") => {
+            if let Err((code, e)) = dlq_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
             let body = read_body(&mut request);
-            let r = dlq_purge(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()));
+            let r = dlq_purge(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
@@ -4373,10 +4482,31 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
         }
     };
     eprintln!("[vejas] panel + monitoring on http://{addr}");
+    // One thread per request, so a slow /flows/new never blocks monitoring, and a
+    // bound on them, so a burst costs a 503 instead of this loop.
+    let max_inflight = env::var("VEJAS_HTTP_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(1);
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for request in server.incoming_requests() {
+        let Some(slot) = connectors::Slot::try_take(&inflight, max_inflight) else {
+            metrics::inc_rejected("panel");
+            respond(request, 503, "too many requests in flight".into(), "text/plain");
+            continue;
+        };
         let registry = registry.clone();
         let root = root.clone();
-        thread::spawn(move || handle_request(request, registry, root));
+        // On failure the request drops with the closure and tiny_http answers 500.
+        let spawned = thread::Builder::new().name("http-request".into()).spawn(move || {
+            let _slot = slot;
+            handle_request(request, registry, root)
+        });
+        if let Err(e) = spawned {
+            metrics::inc_rejected("panel");
+            eprintln!("[vejas] no thread for a request: {e}");
+        }
         if !RUNNING.load(Ordering::SeqCst) {
             break;
         }
@@ -4438,7 +4568,7 @@ fn main() {
             serde_json::from_str(&fs::read_to_string(&args[3]).expect("read fixture"))
                 .expect("fixture json");
         let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
-        let mut engine = vjs::Engine::new(root, pkg_of_path(&PathBuf::from(&args[2])));
+        let mut engine = vjs::Engine::live(root, pkg_of_path(&PathBuf::from(&args[2])));
         match vjs::run(&prog, &event, &mut engine) {
             Ok(ctx) => {
                 for (s, p) in &ctx.emits {
@@ -4482,7 +4612,7 @@ fn main() {
                 .and_then(|src| vjs::parse(&src))
                 .and_then(|prog| {
                     let mut engine =
-                        vjs::Engine::new(root.clone(), pkg_of_path(&PathBuf::from(flow)));
+                        vjs::Engine::shadow(root.clone(), pkg_of_path(&PathBuf::from(flow)));
                     vjs::run(&prog, &input, &mut engine)
                         .map(|ctx| ctx.emits)
                 });
@@ -4597,6 +4727,32 @@ fn main() {
     }
     drop(reg);
     thread::sleep(Duration::from_millis(800));
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_an_attempt_comes_back_as_an_error() {
+        assert_eq!(contained(|| Ok(())), Ok(()));
+        assert_eq!(contained(|| Err("plain".into())), Err("plain".to_string()));
+        let err = contained(|| panic!("boom {}", 7)).unwrap_err();
+        assert_eq!(err, "panic: boom 7");
+    }
+
+    #[test]
+    fn a_slot_comes_back_when_its_thread_panics() {
+        let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = connectors::Slot::try_take(&open, 1).unwrap();
+        assert!(connectors::Slot::try_take(&open, 1).is_none(), "the bound holds");
+        let _ = thread::spawn(move || {
+            let _slot = slot;
+            panic!("in the handler");
+        })
+        .join();
+        assert!(connectors::Slot::try_take(&open, 1).is_some(), "the slot came back");
+    }
 }
 
 #[cfg(test)]
