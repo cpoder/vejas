@@ -68,7 +68,13 @@ import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
 s.sendall(b"POST /ingest/x\t0\n\nPUB\tvx.evil\t6 HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
 s.settimeout(4)
-print(s.recv(100).split(b" ")[1].decode())' $IN)
+head = b""
+while b"\r\n" not in head:  # the status line can arrive in several segments
+    chunk = s.recv(100)
+    if not chunk:
+        break
+    head += chunk
+print(head.split(b" ")[1].decode())' $IN)
 [ "$C" = "400" ] && ok "a tab and a bare line feed in the path: $C" || ko "the suffix got $C"
 C=$(post '{"id":3,"tenant":"acme"}')
 [ "$C" = "202" ] && ok "ingestion carries on ($C)" || ko "ingestion broke ($C)"
