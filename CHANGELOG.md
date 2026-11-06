@@ -8,6 +8,16 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Security
+- **Secret values left through every path that shows a run.** In v0.3.6
+  preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel, canary
+  and golden capture evaluated flows with the real secret store and returned
+  the result. `GET /preview`, which needs no token, returned any variable
+  holding a secret. In governed mode, `vejas_time_travel` handed the value to an
+  agent holding only `VEJAS_TOKEN`, through a candidate that emits it. These
+  paths now evaluate `secret()` to the placeholder `<secret:path/key>`,
+  fail-closed as before, and a real run still gets the value. Rotate any secret
+  that a shared or agent-facing deployment could have exposed this way. A branch
+  comparing with a secret now takes the not-equal path in shadow.
 - **rustls-webpki 0.103.15 → 0.103.16 and webpki-roots 1.0.9 → 1.0.11**, for
   RUSTSEC-2026-0382 and -0381 (certificate paths through distrusted emSign
   intermediates). The TLS stack of the runtime's HTTP client and of MQTT over

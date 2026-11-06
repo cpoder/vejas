@@ -23,3 +23,11 @@ What keeps the rule real, rather than aspirational:
   a credential-shaped env key must be a `${VAR:?}` reference, never a
   value.
 - Secret **paths** are listed (`GET /secrets`); values are never returned.
+- **Shadow runs hold no value.** Whatever shows a run instead of performing
+  it (preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel,
+  canary, golden capture) resolves `secret()` to the placeholder
+  `<secret:path/key>`. It stays fail-closed: a missing secret still aborts.
+  A candidate is arbitrary code, so it cannot be left to a filter on the
+  output, and the value never enters the run. One consequence to know when
+  reading a diff: a branch that compares with a secret takes the not-equal
+  path in shadow.

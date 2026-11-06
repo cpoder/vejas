@@ -1327,8 +1327,19 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project_root: PathBuf, caller_pkg: String) -> Self {
+    /// An engine for a REAL run: `secret()` yields the value. Only what performs
+    /// a flow or a connector takes this; anything that returns a run's result to
+    /// a caller takes `shadow`. There is deliberately no `new`, so that a new
+    /// proof path cannot inherit real secrets by default.
+    pub fn live(project_root: PathBuf, caller_pkg: String) -> Self {
         Self::with_secrets(project_root, caller_pkg, crate::secrets::default_store())
+    }
+
+    /// An engine for a SHADOW run: `secret()` stays fail-closed and yields a
+    /// placeholder, never the value (see `secrets::RedactedStore`).
+    pub fn shadow(project_root: PathBuf, caller_pkg: String) -> Self {
+        let store = crate::secrets::RedactedStore::new(crate::secrets::default_store());
+        Self::with_secrets(project_root, caller_pkg, Arc::new(store))
     }
     pub fn with_secrets(
         project_root: PathBuf,
@@ -1927,7 +1938,7 @@ mod tests {
 
     fn eval_flow(src: &str, event: Value) -> Result<Vec<(String, Value)>, String> {
         let prog = parse(src)?;
-        let mut engine = Engine::new(std::env::temp_dir(), "default".into());
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
         run(&prog, &event, &mut engine).map(|c| c.emits)
     }
 
@@ -2169,6 +2180,24 @@ mod tests {
     }
 
     #[test]
+    fn shadow_never_sees_a_secret_value() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a/b".to_string(), "s3cret".to_string());
+        let store = std::sync::Arc::new(MapStore(map));
+        let shadow = std::sync::Arc::new(crate::secrets::RedactedStore::new(store));
+        let prog = parse("v = secret(\"a/b\")\nemit \"o\", {v: v, up: upper(v)}\n").unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), shadow.clone());
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        let shown = serde_json::to_string(&ctx.emits).unwrap() + &format!("{:?}", ctx.vars);
+        assert!(!shown.contains("s3cret") && !shown.contains("S3CRET"), "{shown}");
+        assert!(shown.contains("<secret:a/b>"), "{shown}");
+        // fail-closed like a real run: a missing secret still aborts
+        let prog = parse("v = secret(\"missing/x\")\n").unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), shadow);
+        assert!(run(&prog, &json!({}), &mut engine).is_err());
+    }
+
+    #[test]
     fn secret_resolves_and_fails_closed() {
         let mut m = std::collections::HashMap::new();
         m.insert("api/key".to_string(), "TOP-SECRET".to_string());
@@ -2209,7 +2238,7 @@ mod tests {
         std::fs::write(pkg.join("services").join("secret.vjs"), "y = 1\n").unwrap();
         std::fs::write(pkg.join("package.vjs"), "ENABLED = true\nEXPORTS = [\"fmt\"]\n").unwrap();
 
-        let mut engine = Engine::new(root.clone(), "default".into());
+        let mut engine = Engine::live(root.clone(), "default".into());
         // merge form
         let prog = parse("invoke double(n: 21)\nemit \"vx.t\", {t: twice}").unwrap();
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();
@@ -2240,7 +2269,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pkg.join("package.vjs"), "EXPORTS = [\"outer\"]\n").unwrap();
-        let mut engine = Engine::new(root.clone(), "default".into());
+        let mut engine = Engine::live(root.clone(), "default".into());
         // outer is exported; inner is private but called FROM WITHIN pkg n -> allowed
         let prog = parse("invoke n:outer(v: 9)\n").unwrap();
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();

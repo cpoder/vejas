@@ -47,6 +47,15 @@ a sidecar.
   paths (a package should not read another's secrets — mirrors ADR-0004's
   private-by-default stance); audit of secret access.
 
+**Amendment A (2026-11-06, normative):** a secret value never enters a run
+that is shown rather than performed. v0.3.6 evaluated preview, time-travel,
+shadow-replay and canary with the real store, so their results carried the
+value: a time-travel candidate gave it to an agent holding only `VEJAS_TOKEN`,
+and `GET /preview` gave it to anyone who reached the port. Those paths now use
+`Engine::shadow`, where `secret()` stays fail-closed and yields
+`<secret:path/key>`. `Engine::live` is the only way to a value and there is no
+default constructor, so a new proof path has to choose.
+
 ## Alternatives considered
 
 - **Env vars only** (today's stopgap): fine for one Slack webhook, doesn't

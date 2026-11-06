@@ -100,10 +100,16 @@ pressure-test.
   in-process HTTP (ureq) carries them in headers, never a subprocess argv; the
   standalone connectors that shell out use a `0600` config file, never argv
   (ADR-0008). A literal is never accepted where a `secret()` is required.
+  Whatever shows a run instead of performing it uses `Engine::shadow`, where
+  `secret()` yields the placeholder `<secret:path/key>`; `Engine::live` is the
+  only way to the value, and there is no default constructor.
 - **How to test:** grep every response body and log line for a set secret;
   set a secret and confirm `GET /secrets` shows status only, never the value;
   inspect argv and env of every spawned process; attempt to store a credential
-  as a plain literal and confirm refusal.
+  as a plain literal and confirm refusal; `e2e/governed-agent.sh` checks every
+  shadow path, a candidate included, and that a live run still gets the value.
+  **Break it:** a surface returning a run's result that does not go through
+  `Engine::shadow`.
 - **Honest bound (found this pass — S4-1).** `secret()` protects the **store**:
   no endpoint returns a stored secret, and secrets are references, never
   literals. But a flow *author* can copy a resolved secret onto the **data

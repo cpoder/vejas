@@ -265,7 +265,7 @@ fn replay_literal(
     };
     let pkg = pkg_of_path(&path);
     let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
         match vjs::run(prog, ev, &mut engine) {
             Ok(ctx) => json!({
                 "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -304,7 +304,8 @@ fn replay_literal(
 /// side-by-side emit diff joined by the source message's stream sequence. This is
 /// `replay_literal` generalised from a literal patch to an arbitrary new source.
 /// The shadow invariant holds by construction — `vjs::run` collects emits, it
-/// never publishes, so nothing a candidate emits reaches a real subject.
+/// never publishes, so nothing a candidate emits reaches a real subject — and
+/// `Engine::shadow` holds no secret value, so a candidate cannot read one back.
 fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result<Value, String> {
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -325,7 +326,7 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
         .ok_or("flow has no bus source to replay")?;
     let rows = connectors::hydrate_recent(&js, &stream, &source_subj, n)?;
     let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.clone());
+        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
         match vjs::run(prog, ev, &mut engine) {
             Ok(ctx) => json!({
                 "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -382,7 +383,7 @@ fn canaries() -> &'static Mutex<HashMap<String, Canary>> {
 /// Run one event through a parsed version in shadow, returning its emits (never
 /// published — vjs::run only collects them).
 fn shadow_emits(prog: &vjs::Program, ev: &Value, root: &Path, pkg: &str) -> Value {
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg.to_string());
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.to_string());
     match vjs::run(prog, ev, &mut engine) {
         Ok(ctx) => json!({
             "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
@@ -1162,7 +1163,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 "[vejas] {} (vjs, native) consuming {source}",
                 handle.spec.name
             );
-            let mut engine = vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+            let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
             // One pull request is always in flight ahead of the round being
             // processed. Without it every round began with ~2 ms of waiting for
             // its first message — request, round-trip, server delivery — while
@@ -1911,7 +1912,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             // config value resolves to the real value, fail-closed). The
             // manifest's UPPERCASE variables are the driver's config.
             let mut cfg_engine =
-                vjs::Engine::new(root.clone(), handle.spec.pkg.clone());
+                vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
             let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut cfg_engine)?;
             let mut config = serde_json::Map::new();
             for (k, v) in cfg_ctx.vars {
@@ -2438,7 +2439,7 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     )
     .map_err(|e| format!("fixture: {e}"))?;
     // package context: services resolve relative to the file's package
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
     let (emits, error, pipeline) = match vjs::run(&prog, &event, &mut engine) {
         Ok(ctx) => {
             let emits: Vec<Value> = ctx
@@ -2545,6 +2546,7 @@ Rules:
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
 - A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
+- `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -2865,7 +2867,7 @@ fn probe_connector(root: &Path, file: &str) -> Value {
         let driver_name = prog.driver.clone().ok_or("not a connector manifest (no `driver`)")?;
         let driver = connectors::driver_for(&driver_name)
             .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
         let mut config = serde_json::Map::new();
@@ -2932,7 +2934,7 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
         if prog.driver.as_deref() != Some("exec-rpc") {
             continue;
         }
-        let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
         for (k, v) in cfg.vars {
@@ -3122,7 +3124,7 @@ fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
     let ctx = vjs::run(&prog, input, &mut engine)?;
     Ok(ctx
         .emits
@@ -3278,7 +3280,7 @@ fn run_flow_ctx(root: &Path, file: &str, input: &Value) -> Result<vjs::Ctx, Stri
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let prog = vjs::parse(&src)?;
-    let mut engine = vjs::Engine::new(root.to_path_buf(), pkg_of_path(&path));
+    let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
     vjs::run(&prog, input, &mut engine)
 }
 
@@ -4438,7 +4440,7 @@ fn main() {
             serde_json::from_str(&fs::read_to_string(&args[3]).expect("read fixture"))
                 .expect("fixture json");
         let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
-        let mut engine = vjs::Engine::new(root, pkg_of_path(&PathBuf::from(&args[2])));
+        let mut engine = vjs::Engine::live(root, pkg_of_path(&PathBuf::from(&args[2])));
         match vjs::run(&prog, &event, &mut engine) {
             Ok(ctx) => {
                 for (s, p) in &ctx.emits {
@@ -4482,7 +4484,7 @@ fn main() {
                 .and_then(|src| vjs::parse(&src))
                 .and_then(|prog| {
                     let mut engine =
-                        vjs::Engine::new(root.clone(), pkg_of_path(&PathBuf::from(flow)));
+                        vjs::Engine::shadow(root.clone(), pkg_of_path(&PathBuf::from(flow)));
                     vjs::run(&prog, &input, &mut engine)
                         .map(|ctx| ctx.emits)
                 });
