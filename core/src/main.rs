@@ -1929,6 +1929,32 @@ fn contained(attempt: impl FnOnce() -> Result<(), String>) -> Result<(), String>
     })
 }
 
+/// Start a background loop of the runtime itself, which no supervisor watches.
+/// `nats::connect` spawns threads and panics when the OS has none, and that used
+/// to end the loop for good with nothing to show for it: a burst of connections
+/// during boot took `version_watch`, and a promoted version no longer reached this
+/// instance. The thread carries a name, and a panic starts the loop again.
+fn background(name: &'static str, body: impl Fn() + Send + 'static) {
+    let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+        while RUNNING.load(Ordering::SeqCst) {
+            let run = contained(|| {
+                body();
+                Ok(())
+            });
+            match run {
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!("[vejas] {name}: {e}; starting it again");
+                    thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[vejas] {name}: cannot start its thread: {e}");
+    }
+}
+
 /// Raises a flag when dropped, so that a helper thread stops on every way out of
 /// an attempt, a panic included.
 struct StopOnDrop(Arc<AtomicBool>);
@@ -4709,7 +4735,7 @@ fn main() {
     {
         let registry = registry.clone();
         let root = root.clone();
-        thread::spawn(move || version_watch(registry, root));
+        background("version-watch", move || version_watch(registry.clone(), root.clone()));
     }
 
     {
@@ -4739,6 +4765,22 @@ mod supervision_tests {
         assert_eq!(contained(|| Err("plain".into())), Err("plain".to_string()));
         let err = contained(|| panic!("boom {}", 7)).unwrap_err();
         assert_eq!(err, "panic: boom 7");
+    }
+
+    #[test]
+    fn a_background_loop_starts_again_after_a_panic() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runs = AtomicU64::new(0);
+        background("test-loop", move || {
+            let n = runs.fetch_add(1, Ordering::SeqCst);
+            tx.send(n).unwrap();
+            if n == 0 {
+                panic!("no thread to give");
+            }
+        });
+        let timeout = Duration::from_secs(10);
+        assert_eq!(rx.recv_timeout(timeout), Ok(0));
+        assert_eq!(rx.recv_timeout(timeout), Ok(1), "the loop came back");
     }
 
     #[test]
