@@ -1539,6 +1539,9 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
                     Value::String(s) => s,
                     other => return Err(format!("emit subject must be a string, got {other}")),
                 };
+                if !valid_subject(&s) {
+                    return Err(format!("emit subject {s:?} is not a valid subject"));
+                }
                 let p = eval(payload, ctx, engine)?;
                 ctx.emits.push((s, p));
             }
@@ -1550,6 +1553,15 @@ fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Can this string go on the wire as a subject? The NATS protocol is line-based
+/// and space-separated, so a line break in a subject is a second protocol
+/// command, and a subject built from an event field hands that to whoever sends
+/// the event. Checked where a flow emits: the run fails, the message takes the
+/// poison path to the DLQ, and a shadow run shows the error a live run would get.
+pub fn valid_subject(subject: &str) -> bool {
+    !subject.is_empty() && !subject.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn set_path(root: &mut Value, path: &[String], v: Value) {
@@ -2177,6 +2189,21 @@ mod tests {
         fn get(&self, r: &str) -> Result<String, String> {
             self.0.get(r).cloned().ok_or_else(|| format!("secret {r:?} not found"))
         }
+    }
+
+    #[test]
+    fn an_emit_subject_that_cannot_go_on_the_wire_fails_the_run() {
+        let prog = parse("emit f\"vx.{t}\", {a: 1}\n").unwrap();
+        let run_with = |t: &str| {
+            let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+            run(&prog, &json!({"t": t}), &mut engine).map(|ctx| ctx.emits.len())
+        };
+        assert_eq!(run_with("orders.eu-west_1"), Ok(1));
+        for bad in ["a b", "a\tb", "a\nb", "a\r\nPUB b 0", "a\u{0}b", "a\u{a0}b"] {
+            let err = run_with(bad).unwrap_err();
+            assert!(err.contains("not a valid subject"), "{bad:?}: {err}");
+        }
+        assert!(!valid_subject(""));
     }
 
     #[test]

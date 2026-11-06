@@ -92,6 +92,8 @@ jobs:
         run: e2e/governed-gate.sh
       - name: Secrets stay write-only in shadow runs (ADR-0008, S4)
         run: e2e/governed-agent.sh
+      - name: An emit subject cannot carry protocol
+        run: e2e/emit-subject.sh
       - name: http-in survives a burst and a thread limit
         run: e2e/http-in-bound.sh
       - name: Docs book builds (broken includes fail here, not on deploy)

@@ -8,6 +8,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Security
+- **An event field in an `emit` subject could inject NATS protocol.** The subject
+  reached the wire as it was, so a line break in a field of an event turned the
+  rest of that field into protocol commands, within the permissions of the
+  runtime's NATS user. Through `http-in` this needed no credential: a flow that
+  builds a subject from an event field let an anonymous POST publish anywhere or
+  purge a stream. No shipped flow or template does this; check the flows of your
+  own that do. `emit` now refuses a subject with whitespace or a control
+  character: the run fails and the message reaches the DLQ. `http-in` answers 400
+  on such a suffix.
 - **Secret values left through every path that shows a run.** In v0.3.6
   preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel, canary
   and golden capture evaluated flows with the real secret store and returned

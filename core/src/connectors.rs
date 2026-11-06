@@ -383,6 +383,8 @@ fn handle_http_in(
                 let suffix = path.trim_start_matches("/ingest/").trim_matches('/');
                 if suffix.is_empty() {
                     ("400 Bad Request", "{\"error\":\"missing subject suffix\"}".to_string())
+                } else if !crate::vjs::valid_subject(suffix) {
+                    ("400 Bad Request", "{\"error\":\"invalid subject suffix\"}".to_string())
                 } else if serde_json::from_slice::<Value>(body).is_err() {
                     ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string())
                 } else if !allow.is_empty() && !suffix_allowed(suffix, allow) {

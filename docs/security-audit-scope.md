@@ -259,6 +259,15 @@ re-deriving these — they are fixed and regression-tested; instead, try to
   token: an agent that reads dead letters reads untrusted content, and must
   not hold what destroys them.
 
+- **G — protocol injection through an `emit` subject (HIGH, fixed).** A subject
+  built from an event field reached the NATS wire as it was, so a line break in
+  the field became protocol commands with the runtime's NATS permissions, and
+  `http-in` makes that field anonymous. Fixed where a flow emits, by
+  `vjs::valid_subject`; `http-in` applies it to its suffix, which had no injection
+  of its own (the path cannot carry the CRLF a payload must end with) but could
+  drop the connection. `e2e/emit-subject.sh` in CI. **Break it:** a subject that
+  reaches the bus from outside without passing `valid_subject`.
+
 ## Known minor points to confirm or harden (not blockers)
 
 - **M1 — poller URL in logs.** `http-poll`/`oauth-poll` log the full poll
