@@ -37,7 +37,7 @@ hot-addable). No subprocess, no Python. Drivers today:
   MQI FFI, `dlopen` of the MQ client at runtime — builds with no MQ present.
   Configured by env (`VEJAS_MQ_*`, see the recipe), not by a manifest.
 - **amqp source/sink** (standalone binary, `connectors/amqp`) — RabbitMQ /
-  AMQP 0-9-1 as a first-class citizen (ADR-0026): pure Rust, sync, no tokio,
+  AMQP 0-9-1 as a first-class citizen (ADR-0026): pure Rust, a sync broker client,
   TLS via rustls over amiquip's mio loop (no OpenSSL). Source acks AMQP only
   after the bus pub-ack; sink acks the bus only after the publisher confirm.
   Configured by env (`VEJAS_AMQP_*`, see the recipe). Certified against a

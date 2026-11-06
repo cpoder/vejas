@@ -8,7 +8,8 @@ description = "Vejas IBM MQ connector: a first-class bus citizen (ADR-0023). Own
 # NOT a member of the runtime workspace, and — unlike the SAP/Salesforce exec
 # children — this one holds its OWN NATS client (ADR-0023): a destructive MQGET
 # under syncpoint may only MQCMIT *after* the bus publish is confirmed, and a
-# stdout-only child cannot know the bus confirmed. So it needs `nats` directly.
+# stdout-only child cannot know the bus confirmed. So it needs the bus directly: it
+# compiles the runtime's own core/src/bus.rs (ADR-0035), hence the NATS client below.
 #
 # The IBM MQ C client (libmqic_r.so) is dlopen'd at RUNTIME (like libsapnwrfc,
 # ADR-0014) — there is NO build-time MQ dependency, so this crate builds anywhere.
@@ -17,7 +18,10 @@ description = "Vejas IBM MQ connector: a first-class bus citizen (ADR-0023). Own
 # via the standard MQSERVER / CCDT environment (no MQCD struct needed).
 
 [dependencies]
-nats = "0.25"
+async-nats = { version = "0.52", default-features = false, features = ["jetstream", "kv", "object-store", "ring", "server_2_10"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde_json = "1"
 
 [[bin]]

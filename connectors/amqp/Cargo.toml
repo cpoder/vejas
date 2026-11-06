@@ -8,12 +8,17 @@ description = "Vejas AMQP 0-9-1 (RabbitMQ) connector spike: sync pure-Rust via a
 [dependencies]
 amiquip = { version = "0.4", default-features = false }
 crossbeam-channel = "0.5"
-nats = "0.25"
+# The bus: this crate compiles the runtime's core/src/bus.rs (ADR-0035).
+async-nats = { version = "0.52", default-features = false, features = ["jetstream", "kv", "object-store", "ring", "server_2_10"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde_json = "1"
-# Pure-Rust TLS for amqps:// — rustls (already in the tree via nats, ring provider;
-# no openssl-sys) wrapped over amiquip's mio-0.6 stream via a small Evented adapter
-# (ADR-0026 Q1). This is the whole point of NOT using amiquip's native-tls default.
-rustls = "0.22"
+# Pure-Rust TLS for amqps:// — rustls (already in the tree via async-nats, ring
+# provider; no openssl-sys) wrapped over amiquip's mio-0.6 stream via a small Evented
+# adapter (ADR-0026 Q1). This is the whole point of NOT using amiquip's native-tls
+# default.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 mio = "0.6"

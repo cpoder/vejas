@@ -15,6 +15,11 @@
 //! path. The transactional ordering is exercised against a fake below with fault
 //! injection; real-RabbitMQ certification is the declared CI exception (ADR-0017).
 
+// The runtime's own bus module, compiled in as it is: one sync API over `async-nats`
+// on one small tokio runtime, and no NATS type anywhere else (ADR-0035).
+#[allow(dead_code)]
+#[path = "../../../core/src/bus.rs"]
+mod bus;
 mod lease;
 mod tls;
 
@@ -77,48 +82,9 @@ pub trait AmqpSink {
 }
 
 // ───────────────────────── loops ─────────────────────────
-/// Publish to a JetStream subject and wait for the pub-ack, flushing DIRECTLY past
-/// nats 0.25's 5ms flusher floor (client.rs MIN_FLUSH_BETWEEN) — that floor caps
-/// every sequential pub-ack at ~200/s, and the AMQP source is a sequential
-/// consume→publish→ack loop (the spike measured 186/s, dead on the floor). Faithful
-/// re-impl of the crate's request path incl. the no-responders guard + a direct
-/// flush; Ok still means a real pub-ack (persisted), so the ack-after-bus-publish
-/// ordering is unchanged. (Named bus_* to avoid the AmqpSink::publish_confirmed
-/// method, which is the RabbitMQ *broker* confirm.)
-fn bus_publish_confirmed(
-    nc: &nats::Connection,
-    subject: &str,
-    payload: &[u8],
-    wait: Duration,
-) -> Result<(), String> {
-    let reply = nc.new_inbox();
-    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
-    nc.publish_request(subject, &reply, payload)
-        .map_err(|e| e.to_string())?;
-    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
-    let msg = sub
-        .next_timeout(wait)
-        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
-    if msg.is_no_responders() {
-        return Err("no JetStream responder for the subject (stream missing?)".into());
-    }
-    let ack: serde_json::Value =
-        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
-    if let Some(err) = ack.get("error") {
-        return Err(format!("JetStream rejected the publish: {err}"));
-    }
-    if ack.get("stream").is_none() {
-        return Err(format!(
-            "unexpected pub-ack (no stream): {}",
-            String::from_utf8_lossy(&msg.data)
-        ));
-    }
-    Ok(())
-}
-
 fn run_source(
     src: &mut dyn AmqpSource,
-    nc: &nats::Connection,
+    js: &bus::JetStream,
     subject: &str,
     wait: Duration,
     alive: impl Fn() -> bool,
@@ -126,7 +92,7 @@ fn run_source(
     eprintln!("[vejas-amqp] source: AMQP → {subject} (consume→publish→ack)");
     while alive() {
         let Some(msg) = src.recv(wait)? else { continue };
-        match bus_publish_confirmed(nc, subject, &msg.body, Duration::from_secs(5)) {
+        match js.publish(subject, &msg.body) {
             Ok(_) => src.ack(msg.tag)?, // bus durable → ack the broker
             Err(e) => {
                 eprintln!("[vejas-amqp] publish failed ({e}); nack+requeue");
@@ -139,13 +105,13 @@ fn run_source(
 
 fn run_sink(
     sink: &mut dyn AmqpSink,
-    sub: &nats::jetstream::PullSubscription,
+    sub: &bus::Puller,
     routing_key: &str,
     alive: impl Fn() -> bool,
 ) -> Result<(), String> {
     eprintln!("[vejas-amqp] sink: bus → AMQP (publish→confirm→ack)");
     while alive() {
-        for m in fetch_round(sub)? {
+        for m in sub.round()? {
             if !alive() {
                 return Ok(());
             }
@@ -159,16 +125,6 @@ fn run_sink(
         }
     }
     Ok(())
-}
-
-fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
-    let iter = sub
-        .timeout_fetch(
-            nats::jetstream::BatchOptions { batch: 64, expires: Some(500_000_000), no_wait: true },
-            Duration::from_millis(750),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(iter.map_while(|m| m.ok()).collect())
 }
 
 // ───────────────────────── amiquip-backed impls ─────────────────────────
@@ -249,14 +205,13 @@ fn main() {
     let wait = Duration::from_secs(env("VEJAS_AMQP_WAIT_SECS").and_then(|s| s.parse().ok()).unwrap_or(3));
     let competing = matches!(env("VEJAS_AMQP_COMPETING").as_deref(), Some("1") | Some("true"));
 
-    let nc = match nats::connect(&nats_url) {
-        Ok(nc) => nc,
+    let js = match bus::connect(&nats_url) {
+        Ok(bus) => bus.jetstream(),
         Err(e) => {
             eprintln!("[vejas-amqp] cannot connect to NATS at {nats_url}: {e}");
             std::process::exit(1);
         }
     };
-    let js = nats::jetstream::new(nc.clone());
 
     // amqps:// → pure-Rust rustls over amiquip's mio stream (ADR-0026 Q1); amqp://
     // → plaintext. Both avoid amiquip's native-tls (openssl-sys) default.
@@ -301,7 +256,7 @@ fn main() {
             None
         };
         let source_alive = || alive() && held.as_ref().map_or(true, |l| !l.lost());
-        run_source_amqp(&channel, &nc, &queue, &subject, wait, source_alive)
+        run_source_amqp(&channel, &js, &queue, &subject, wait, source_alive)
     } else {
         run_sink_amqp(&channel, &js, &stream, &subject, &durable, &routing_key)
     };
@@ -317,7 +272,7 @@ fn main() {
 
 fn run_source_amqp(
     channel: &Channel,
-    nc: &nats::Connection,
+    js: &bus::JetStream,
     queue: &str,
     subject: &str,
     wait: Duration,
@@ -331,12 +286,12 @@ fn run_source_amqp(
         .basic_consume(queue, ConsumerOptions::default())
         .map_err(|e| e.to_string())?;
     let mut src = AmqpConsumer { consumer, pending: HashMap::new() };
-    run_source(&mut src, nc, subject, wait, alive)
+    run_source(&mut src, js, subject, wait, alive)
 }
 
 fn run_sink_amqp(
     channel: &Channel,
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     stream: &str,
     subject: &str,
     durable: &str,
@@ -346,22 +301,11 @@ fn run_sink_amqp(
     let confirms = channel.listen_for_publisher_confirms().map_err(|e| e.to_string())?;
     let exchange = Exchange::direct(channel);
     // Bind (creating if absent) the durable pull consumer on the stream — the
-    // runtime owns the stream, but pull_subscribe_with_options only BINDS an
-    // existing durable, so a standalone connector must declare it first (idempotent).
-    let _ = js.add_consumer(
-        stream,
-        nats::jetstream::ConsumerConfig {
-            durable_name: Some(durable.to_string()),
-            filter_subject: subject.to_string(),
-            ..Default::default()
-        },
-    );
-    let sub = js
-        .pull_subscribe_with_options(
-            subject,
-            &nats::jetstream::PullSubscribeOptions::new().durable_name(durable.to_string()),
-        )
-        .map_err(|e| e.to_string())?;
+    // runtime owns the stream, but pull_durable only BINDS an existing durable,
+    // so a standalone connector must declare it first (idempotent).
+    let filter = [subject.to_string()];
+    let _ = js.create_pull_consumer(stream, durable, &filter, Duration::ZERO, None);
+    let sub = js.pull_durable(stream, durable, Some(subject))?;
     let mut sink = AmqpPublisher { exchange, confirms };
     run_sink(&mut sink, &sub, routing_key, alive)
 }
