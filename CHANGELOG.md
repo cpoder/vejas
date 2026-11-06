@@ -7,6 +7,12 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-06
+
+A security release: upgrade from any 0.3.x, and rotate any secret a shared or
+agent-facing deployment could have exposed. It is a minor release because of one
+breaking change to the HTTP API in governed mode, under Changed.
+
 ### Security
 - **An event field in an `emit` subject could inject NATS protocol.** The subject
   reached the wire as it was, so a line break in a field of an event turned the
@@ -54,7 +60,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   the routes that belong to the human.
 
 ### Changed
-- **Governed mode: replaying and discarding dead letters are human acts.**
+- **Breaking, governed mode only: replaying and discarding dead letters are human
+  acts.**
   `vejas_dlq_replay` and `vejas_dlq_purge` are refused, and `POST /dlq/replay`
   and `/dlq/purge` answer 409 without `X-Approval-Token`. They used to accept
   `VEJAS_TOKEN`, which the agent holds. The last step of the self-healing loop
@@ -317,7 +324,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/cpoder/vejas/releases/tag/v0.4.0
 [0.3.6]: https://github.com/cpoder/vejas/releases/tag/v0.3.6
 [0.3.5]: https://github.com/cpoder/vejas/releases/tag/v0.3.5
 [0.3.4]: https://github.com/cpoder/vejas/releases/tag/v0.3.4
