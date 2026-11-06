@@ -1867,10 +1867,10 @@ fn contained(attempt: impl FnOnce() -> Result<(), String>) -> Result<(), String>
 }
 
 /// Start a background loop of the runtime itself, which no supervisor watches.
-/// `nats::connect` spawns threads and panics when the OS has none, and that used
-/// to end the loop for good with nothing to show for it: a burst of connections
-/// during boot took `version_watch`, and a promoted version no longer reached this
-/// instance. The thread carries a name, and a panic starts the loop again.
+/// A panic used to end such a loop for good with nothing to show for it: in v0.4.0
+/// a burst of connections during boot took `version_watch`, and a promoted version
+/// no longer reached that instance. The thread carries a name, and a panic starts
+/// the loop again.
 fn background(name: &'static str, body: impl Fn() + Send + 'static) {
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
         while RUNNING.load(Ordering::SeqCst) {
