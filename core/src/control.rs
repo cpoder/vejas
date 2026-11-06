@@ -53,8 +53,8 @@ fn supervise(registry: Registry, root: PathBuf, tenant: String) {
             return;
         }
         let attempt = (|| -> Result<(), String> {
-            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let sub = nc.subscribe(&cmd_subj).map_err(|e| e.to_string())?;
+            let nc = crate::bus::connect(&url)?;
+            let mut sub = nc.subscribe(&cmd_subj)?;
             eprintln!("[control] tenant {tenant}: serving {cmd_subj}, status every {}s", status_every.as_secs());
             // first status leaves immediately: the console sees us on connect
             let mut last_status = Instant::now() - status_every;
@@ -90,9 +90,7 @@ fn supervise(registry: Registry, root: PathBuf, tenant: String) {
                             }))
                             .unwrap_or_default(),
                         );
-                        if msg.reply.is_some() {
-                            let _ = msg.respond(serde_json::to_vec(&reply).unwrap_or_default());
-                        }
+                        let _ = msg.respond(serde_json::to_vec(&reply).unwrap_or_default());
                     }
                     Err(_) => {} // timeout: loop to re-check RUNNING / status schedule
                 }
