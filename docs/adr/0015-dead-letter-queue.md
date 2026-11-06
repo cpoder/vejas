@@ -83,6 +83,19 @@ The operator loop is: a dead letter shows the failure → correct the literal
   permanently unpublishable loops without a delivery cap. Out of scope here
   (it is a bus/config fault, not a poison payload), noted for a later pass.
 
+**Amendment A (2026-11-06, normative):** a dead letter announces itself. Nothing
+told anyone a message had died, so the self-healing loop of ADR-0024 waited for
+someone to open a session. `to_dlq` now publishes on `<root>.dlq.events`, an
+ordinary subject: waking a person or an agent is a flow or a sink, following
+ADR-0024's "notifications are flows". The event carries metadata the runtime
+wrote itself, never the payload or the error text, because a dead letter is
+untrusted content and this event is what wakes things up. One event per unit per
+`VEJAS_DLQ_EVENT_SECS` (default 60), with `count` for the letters it stands for,
+so that a burst wakes a reader once and loses nothing. A letter whose subject is
+the event subject is not announced, so a failing reader cannot feed itself. An
+agent started from an `exec-*` connector would inherit the runtime's environment,
+so the documented route out is `http-out`.
+
 ## Alternatives considered
 
 - **Keep dropping after the cap** — rejected: the failed work is lost and

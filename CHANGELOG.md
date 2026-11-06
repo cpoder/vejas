@@ -7,6 +7,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **Dead letters announce themselves** on `vx.dlq.events`, an ordinary subject,
+  so that a flow or a sink can wake a person or an agent (ADR-0015 Amendment A).
+  The event carries metadata only, never the payload or the error text, and
+  `VEJAS_DLQ_EVENT_SECS` (default 60) groups a burst into one event per unit,
+  with `count` for the letters it stands for. `docs/examples/dlq_webhook.vjs.example`
+  posts it to a URL.
+
 ### Security
 - **Seven advisories leave `.cargo/audit.toml`**: RUSTSEC-2026-0049, -0098, -0099,
   -0104, -0346, -0349 and -0382, all held by the sync `nats` client's rustls 0.22

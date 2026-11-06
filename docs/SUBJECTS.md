@@ -7,7 +7,7 @@ Bundled connectors are **native Rust drivers** run from a declarative manifest
 (`connectors/<name>.vjs`: `driver "..."` + literal config, editable in the panel,
 hot-addable). No subprocess, no Python. Drivers today:
 
-- **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT.
+- **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT, MAX_CONNECTIONS.
 - **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS
   (an object payload gains a `ts` field, ISO 8601 UTC, when absent).
 - **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS; optional `ENVELOPE = true` publishes `{endpoint, fetched_at, body}` (like oauth-poll) so a stateless flow gets a `collected_at`.
@@ -65,3 +65,15 @@ for content changes). It lives OUTSIDE `vx.>` on purpose: control traffic is
 transient and must never be captured by a stream (a stream on the command
 subject would hijack request/reply with its pub-ack). Specification:
 [CONTROL.md](CONTROL.md), decision: ADR-0013.
+
+## Events the platform publishes
+
+Ordinary subjects under the same root, so a flow or a sink reacts to them like to
+anything else. Both carry metadata the runtime wrote itself.
+
+- `vx.dlq.events`: a message reached the DLQ (ADR-0015 Amendment A). `{transition,
+  ts, unit, subject, attempts, version, count}`, at most one per unit per
+  `VEJAS_DLQ_EVENT_SECS`, with `count` for the letters it stands for. Never the
+  payload or the error text.
+- `vx.proposals.events`: a proposal changed state (ADR-0024). `{transition, ts,
+  proposal}`.

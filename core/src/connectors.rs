@@ -16,8 +16,9 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1180,7 +1181,125 @@ pub fn to_dlq(
     }))
     .map_err(|e| e.to_string())?;
     let dlq_subject = format!("{DLQ_ROOT}.{}", dlq_unit_token(unit));
-    js.publish(&dlq_subject, body).map(|_| ()).map_err(|e| e.to_string())
+    js.publish(&dlq_subject, body).map_err(|e| e.to_string())?;
+    announce_dead_letter(js, unit, subject, attempts, version);
+    Ok(())
+}
+
+// ───────────────────────── dead-letter events (ADR-0015, Amendment A) ─────────
+//
+// Nothing used to tell anyone that a message died: the self-healing loop waited
+// for someone to open a session. Each dead letter is now announced on
+// `<root>.dlq.events`, an ordinary subject, so waking a person or an agent is a
+// flow or a sink, like every other notification here (ADR-0024). The event holds
+// only what the runtime wrote itself, never the payload or the error text: a dead
+// letter is untrusted content, and this is what wakes things up. A reader that
+// needs the letter fetches it through `vejas_dlq`.
+
+/// Dead letters of one unit not announced yet, and the last one's coordinates.
+#[derive(Default)]
+struct DlqAnnouncement {
+    last_sent: u64,
+    count: u64,
+    subject: String,
+    attempts: i64,
+    version: String,
+}
+
+static DLQ_ANNOUNCEMENTS: OnceLock<Mutex<HashMap<String, DlqAnnouncement>>> = OnceLock::new();
+static DLQ_FLUSHER: AtomicBool = AtomicBool::new(false);
+
+fn dlq_announcements() -> &'static Mutex<HashMap<String, DlqAnnouncement>> {
+    DLQ_ANNOUNCEMENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dlq_events_subject() -> String {
+    let root = std::env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    format!("{root}.dlq.events")
+}
+
+/// At most one event per unit per this many seconds, so that a burst of poison
+/// wakes a reader once and not ten thousand times. 0 announces every letter.
+fn dlq_event_gap() -> u64 {
+    std::env::var("VEJAS_DLQ_EVENT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+}
+
+/// The events due now. Each carries `count`, the dead letters it stands for, so
+/// the window delays news without losing any.
+fn take_due_dlq_events(
+    pending: &mut HashMap<String, DlqAnnouncement>,
+    now: u64,
+    gap: u64,
+) -> Vec<Value> {
+    pending
+        .iter_mut()
+        .filter(|(_, a)| a.count > 0 && now.saturating_sub(a.last_sent) >= gap)
+        .map(|(unit, a)| {
+            let event = serde_json::json!({
+                "transition": "dead-lettered", "ts": now, "unit": unit,
+                "subject": a.subject, "attempts": a.attempts, "version": a.version,
+                "count": a.count,
+            });
+            a.last_sent = now;
+            a.count = 0;
+            event
+        })
+        .collect()
+}
+
+/// Best-effort, like the proposal events: the letter is stored and the caller
+/// goes on to ack, whatever happens to its announcement.
+fn publish_dlq_event(js: &bus::JetStream, event: &Value) {
+    let body = serde_json::to_vec(event).unwrap_or_default();
+    if let Err(e) = js.publish(&dlq_events_subject(), body) {
+        eprintln!("[vejas] dead-letter event not published: {e}");
+    }
+}
+
+fn announce_dead_letter(
+    js: &bus::JetStream,
+    unit: &str,
+    subject: &str,
+    attempts: i64,
+    version: &str,
+) {
+    // A reader of these events that keeps failing dead-letters them in turn. If
+    // that were announced too, the reader would feed itself forever.
+    if subject == dlq_events_subject() {
+        return;
+    }
+    let gap = dlq_event_gap();
+    let due = {
+        let mut pending = dlq_announcements().lock().unwrap();
+        let a = pending.entry(unit.to_string()).or_default();
+        a.count += 1;
+        a.subject = subject.to_string();
+        a.attempts = attempts;
+        a.version = version.to_string();
+        take_due_dlq_events(&mut pending, epoch_secs(), gap)
+    };
+    for event in &due {
+        publish_dlq_event(js, event);
+    }
+    // What the window held back must still go out if no letter follows it.
+    if gap > 0 && !DLQ_FLUSHER.swap(true, Ordering::SeqCst) {
+        let js = js.clone();
+        let flusher = thread::Builder::new().name("dlq-events".into()).spawn(move || {
+            while crate::RUNNING.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(1));
+                let due = {
+                    let mut pending = dlq_announcements().lock().unwrap();
+                    take_due_dlq_events(&mut pending, epoch_secs(), gap)
+                };
+                for event in &due {
+                    publish_dlq_event(&js, event);
+                }
+            }
+        });
+        if flusher.is_err() {
+            DLQ_FLUSHER.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 // ───────────────────────── exec-source offset resume (ADR-0011/0021) ─────────────────────────
@@ -2121,6 +2240,41 @@ fn next_url(base: &str, body: &serde_json::Value, field: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    fn letter(pending: &mut HashMap<String, DlqAnnouncement>, unit: &str) {
+        let a = pending.entry(unit.to_string()).or_default();
+        a.count += 1;
+        a.subject = "vx.in".into();
+    }
+
+    #[test]
+    fn a_burst_of_dead_letters_is_one_event_that_counts_them() {
+        let mut pending = HashMap::new();
+        letter(&mut pending, "flow:a");
+        let first = take_due_dlq_events(&mut pending, 1000, 60);
+        assert_eq!(first.len(), 1, "the first letter is news at once");
+        assert_eq!(first[0]["count"], 1);
+        for _ in 0..3 {
+            letter(&mut pending, "flow:a");
+        }
+        assert!(take_due_dlq_events(&mut pending, 1030, 60).is_empty(), "inside the window");
+        let held = take_due_dlq_events(&mut pending, 1060, 60);
+        assert_eq!(held[0]["count"], 3, "the window delays news, it loses none");
+        assert!(take_due_dlq_events(&mut pending, 2000, 60).is_empty(), "nothing pending");
+    }
+
+    #[test]
+    fn units_are_windowed_apart_and_zero_means_every_letter() {
+        let mut pending = HashMap::new();
+        letter(&mut pending, "flow:a");
+        take_due_dlq_events(&mut pending, 1000, 60);
+        letter(&mut pending, "flow:a");
+        letter(&mut pending, "flow:b");
+        let due = take_due_dlq_events(&mut pending, 1001, 60);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0]["unit"], "flow:b");
+        assert_eq!(take_due_dlq_events(&mut pending, 1001, 0).len(), 1, "gap 0 lets flow:a through");
+    }
+
     use super::*;
     use serde_json::json;
 

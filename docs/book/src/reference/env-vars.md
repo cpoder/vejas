@@ -19,6 +19,7 @@ directory is a complete system.
 | `VEJAS_TENANT` | *(unset)* | Tenant label for provisioned packages. |
 | `VEJAS_BUNDLE` | *(unset)* | Bundle path for provisioning (`vejas_provision`). |
 | `VEJAS_AGENT_CMD` | *(unset)* | Command the panel uses for its agent-assist box. |
+| `VEJAS_DLQ_EVENT_SECS` | `60` | At most one dead-letter event per unit per this many seconds on `vx.dlq.events`. `0` announces every letter. |
 | `VEJAS_HTTP_MAX_INFLIGHT` | `256` | Requests handled at once on the panel/MCP port, one thread each. Past it: 503. |
 
 ## Secrets (ADR-0008)
