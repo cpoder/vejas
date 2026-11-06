@@ -7,6 +7,13 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Fixed
+- **A burst of connections during boot could end the version watch for good.** Its
+  first connection panicked when the OS had no thread to give: nothing showed it,
+  and a promoted version no longer reached that instance until a restart. It
+  needs a thread limit and a burst at that moment. The watch and the control loop
+  now carry a name and start again after a panic.
+
 ## [0.4.0] — 2026-11-06
 
 A security release: upgrade from any 0.3.x, and rotate any secret a shared or

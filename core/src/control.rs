@@ -27,7 +27,9 @@ pub fn start(registry: Registry, root: PathBuf) {
     let Some(tenant) = env::var("VEJAS_TENANT").ok().filter(|t| !t.is_empty()) else {
         return;
     };
-    thread::spawn(move || supervise(registry, root, tenant));
+    crate::background("control", move || {
+        supervise(registry.clone(), root.clone(), tenant.clone())
+    });
 }
 
 fn supervise(registry: Registry, root: PathBuf, tenant: String) {

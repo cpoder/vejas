@@ -77,7 +77,8 @@ case "$C" in
 esac
 wait $HOLD 2>/dev/null
 wait_ingest $IN && ok "ingestion is back once the connections are gone" || ko "http-in did not recover"
-curl -s -m 5 "$H/metrics" | grep -q 'vejas_http_rejected_total{unit="connector:http_in"}' \
+METRICS=$(curl -s -m 5 "$H/metrics")
+[[ "$METRICS" == *'vejas_http_rejected_total{unit="connector:http_in"}'* ]] \
   && ok "the refusals are on /metrics" || ko "no vejas_http_rejected_total on /metrics"
 topology "$H" | grep -q 'running' && ok "the connector still reports running" || ko "the connector left running"
 
@@ -97,6 +98,9 @@ else
     debian:trixie-slim vejas-runtime > /dev/null
   for _ in $(seq 1 100); do curl -sf -o /dev/null "$H2/healthz" && break; sleep 0.1; done
   wait_ingest $IN2 || ko "http-in never came up in the container"
+  # Past the boot: a burst that lands on the first NATS connections is another
+  # case, covered by background(), and it made this check flaky.
+  sleep 5
   hold $IN2 300 3; HOLD=$!
   sleep 1
   wait $HOLD 2>/dev/null
@@ -104,6 +108,8 @@ else
     || ko "http-in died on the pids limit"
   P=$(docker logs "$CT" 2>&1 | grep -c panicked)
   [ "$P" = "0" ] && ok "no panic in the log" || ko "$P panic(s) in the log"
+  W=$(docker exec "$CT" sh -c 'cat /proc/1/task/*/comm' | grep -c version-watch)
+  [ "$W" -ge 1 ] && ok "the version watch is alive" || ko "the version watch died"
   UNIT=$(topology "$H2")
   echo "$UNIT" | grep -q '"restarts": 0' && ok "no restart was needed" || ko "the connector restarted: $UNIT"
 fi
