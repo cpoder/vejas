@@ -42,6 +42,7 @@ the old one.
 | [0029](0029-failure-mode-guardrails.md) | The failure-mode guardrails | Accepted |
 | [0030](0030-enterprise-repo-architecture.md) | How the enterprise tier attaches: seams, not plugins | Proposed |
 | [0031](0031-pattern-detection-unit-varpulis-engine.md) | Pattern detection as a unit type: the Varpulis engine embedded | Proposed |
+| [0035](0035-async-nats-bus-island.md) | The NATS client moves to async-nats, behind one synchronous module | Accepted |
 
 ## Template
 
