@@ -38,7 +38,7 @@ survivor.
   2026-09-22): everything delivered, the singleton timer ticked once per
   second and not three times, and the two survivors shared the rest of the
   work between them.
-- Singleton failover: **~2.6 s graceful**, ~5.9 s crash (TTL-bound).
+- Singleton failover: **at most 2 s graceful**, 4–5 s crash (TTL-bound).
 
 ([benchmarks](../reference/benchmarks.md).) Graceful shutdown rides
 `SIGTERM` (a k8s rolling restart): the lease hands off, in-flight work
@@ -49,7 +49,7 @@ drains, the instance exits.
 In cluster mode a local file write is **refused** (`409`) — a split where
 one instance fixed a rule and the others did not is the worst failure for a
 business surface. Change flows through GitOps, or through a **version** that
-publishes cluster-wide and every instance converges on in **60 ms,
+publishes cluster-wide and every instance converges on in **20 ms,
 lossless** ([change safely](change-safely.md)).
 
 ## Scaling past one getter

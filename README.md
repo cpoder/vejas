@@ -34,11 +34,11 @@ end-to-end test ([the script](e2e/bridge-film.mjs)) — the video cannot lie.
 
 **Measured, not claimed** — reproducible on an 8-core dev machine
 ([methodology and comparisons](bench/)): cold start **11–13 ms**, **10 MB**
-RSS under load (38 MB with fifty live flows), **11.2 MB** binary / **118 MB**
-image, end-to-end p50 **2 ms** uncongested / p50 14 ms at a paced 1 900/s
+RSS under load (38 MB with fifty live flows), **11.2 MB** binary / **40 MB**
+image to pull, end-to-end p50 **2 ms** uncongested / p50 14 ms at a paced 1 900/s
 sustained with **every event hop persisted** in JetStream, **2 070/s** through a
 real MQTT broker and back (QoS 1 both ways, PUBACK-gated). Same order of
-magnitude as engines that persist nothing, in ~25× less memory.
+magnitude as engines that persist nothing, in ~20× less memory.
 
 ![Prompt-to-flow and the pipeline, derived from the code itself](docs/screenshots/panel-top.png)
 
@@ -60,9 +60,9 @@ it without touching code:
 - **Clustering** — run N runtimes on the same NATS: flows load-balance and
   fail over natively (measured: an instance kill -9'd under load, every
   message still delivered exactly-all), singleton sources take a KV lease
-  (graceful handoff 2.6 s, crash failover bounded by the TTL), and a
+  (graceful handoff at most 2 s, crash failover bounded by the TTL), and a
   clustered instance refuses local-file mutations — a live promote instead
-  publishes a **version** every instance converges on (measured: 60 ms
+  publishes a **version** every instance converges on (measured: 20 ms
   convergence, lossless mid-burst). (ADR-0020/0021, measured in
   [bench/](bench/))
 - **Language** — VejasScript: `source` in, `emit` out, `invoke` to compose
@@ -72,19 +72,24 @@ it without touching code:
   through `EXPORTS` (private by default) or the bus. (ADR-0003, ADR-0004)
 - **Connectors** — a typed Rust **driver SDK** (`Driver` trait, Source/Sink).
   Bundled drivers: `http-in`, `timer`, `http-poll`, `oauth-poll` (a generic
-  OAuth2 REST poller that stands in for much of a SaaS catalog), `slack-out`,
-  `http-out`, plus the exec bridges (`exec-source`/`exec-sink`/
-  `exec-stream-source`/`exec-rpc`), which wrap a program in **any language**
-  over stdio, isolated by process. That is how the **SAP connector** ships:
+  OAuth2 REST poller that stands in for much of a SaaS catalog), `mqtt-in`,
+  `mqtt-out`, `slack-out`, `http-out`, plus the exec bridges
+  (`exec-source`/`exec-sink`/`exec-stream-source`/`exec-rpc`), which wrap a
+  program in **any language** over stdio, isolated by process. That is how the
+  **SAP connector** ships:
   native Rust over the official `libsapnwrfc` C library — BAPI/RFC calls,
   IDocs in and out over tRFC, no JVM (ADR-0014) — and the **Salesforce**
-  connector (OAuth2 + Bulk API 2.0, streaming). An instance is a declarative
-  `.vjs` manifest, hot-addable, and an agent can write one from a prompt. The
-  subject convention stays the whole interface, so an out-of-process connector
-  is first-class. (ADR-0007, ADR-0011, ADR-0014)
-- **Secrets** — `secret("path/key")` resolves from a Vault (HashiCorp KV v2; an
-  env backend for dev) at run time. A secret is never a literal, so it never
-  lands in git, the panel, or the business surface. (ADR-0008)
+  connector (OAuth2 + Bulk API 2.0, streaming). Brokers that need their own
+  transactional loop are standalone binaries (`connectors/amqp`,
+  `connectors/mq`). An instance is a declarative `.vjs` manifest, hot-addable,
+  and an agent can write one from a prompt. The subject convention stays the
+  whole interface, so an out-of-process connector is first-class. (ADR-0007,
+  ADR-0011, ADR-0014)
+- **Secrets** — `secret("path/key")` resolves at run time from a Vault
+  (HashiCorp KV v2), a local file, or an env backend for dev. A secret is never
+  a literal, so it never lands in git, the panel, or the business surface, and
+  every path that shows a run (preview, replay, time-travel, canary) gets a
+  placeholder instead of the value. (ADR-0008)
 - **UI** — no builder. Monitoring (pipeline graph, statuses, a live feed of the
   last processed events) + a business panel where experts review and correct
   the business surface (rendered from literals in the code). A correction is
@@ -93,8 +98,15 @@ it without touching code:
 - **Versioning** — a candidate version of a flow replays **yesterday's
   real traffic** (time-travel) or shadow-follows **live** traffic (canary),
   diffed side by side per event; unproven code never emits for real. Promote
-  publishes the version cluster-wide (measured: 60 ms, lossless), audited,
+  publishes the version cluster-wide (measured: 20 ms, lossless), audited,
   rollback included. (ADR-0021)
+- **Dead letters** — a message that keeps failing is parked with its error and
+  the flow version that killed it, never dropped. Replay is explicit, and each
+  dead letter is announced on `vx.dlq.events`, so a flow can wake someone.
+  (ADR-0015)
+- **Governed mode** — with `VEJAS_REQUIRE_APPROVAL=1`, agents propose and a
+  human approves. Every mutating path, MCP and HTTP, refuses a direct write, and
+  approval takes a token the agent never holds. (ADR-0024)
 - **MCP & API** — the runtime is its own MCP server; a flow that declares
   `tool "…"` becomes a first-class MCP tool, and one that declares
   `api "VERB /path"` becomes a synchronous HTTP endpoint with an auto-generated
@@ -111,6 +123,9 @@ claude mcp add --transport http vejas http://localhost:8686/mcp   # or any MCP c
 # The panel: http://localhost:8686 — a webhook entry: POST :8787/ingest/<subject>
 ```
 
+`docker compose up` builds from source. Prebuilt: `ghcr.io/cpoder/vejas-runtime`
+and a Linux x86_64 binary on [Releases](https://github.com/cpoder/vejas/releases/latest).
+
 Develop and test:
 
 ```bash
@@ -118,11 +133,13 @@ cargo test --manifest-path core/Cargo.toml     # language unit tests
 core/target/release/vejas-runtime vjs-test tests/vjs   # golden end-to-end cases
 ```
 
-Security defaults: the panel/MCP port (8686) binds to localhost only — that
-surface can write flows and run commands (exec connectors), so expose it
-deliberately. Set `VEJAS_TOKEN` and every write (POST, `/mcp` included)
-requires `Authorization: Bearer <token>`. The webhook port (8787) only
-publishes events onto the bus.
+Security defaults: the bundled compose publishes the panel/MCP port (8686) on
+localhost only, because that surface can write flows and run commands (exec
+connectors). The raw binary listens on `0.0.0.0:8686`, with no token: set
+`VEJAS_HTTP_ADDR` and `VEJAS_TOKEN` before running it anywhere reachable. With
+`VEJAS_TOKEN` set, every write (POST, `/mcp` included) requires
+`Authorization: Bearer <token>`. The webhook port (8787) only publishes events
+onto the bus.
 
 ## License
 

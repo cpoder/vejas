@@ -47,7 +47,7 @@ the `X-Approval-Token` header. The panel asks for the token when it needs it.
    shows the evidence; a proposal with none is flagged
    **"⚠ No evidence"** loud — approving blind is a deliberate act.
 3. **On approve** — the change executes exactly as a normal promote would
-   (hot-reload, or a [cluster-wide version](change-safely.md) in 60 ms) and
+   (hot-reload, or a [cluster-wide version](change-safely.md) in 20 ms) and
    is recorded.
 
 ## Two safeguards
