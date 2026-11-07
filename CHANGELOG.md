@@ -7,6 +7,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-07
+
+If you reach a raw binary from another machine, set `VEJAS_HTTP_ADDR` before you
+upgrade, and `VEJAS_TOKEN` with it: see Security. Containers do not change.
+
 ### Security
 - **The binary listens on `127.0.0.1:8686` by default.** It was `0.0.0.0:8686`, with
   no token, on a port that writes flows and runs commands. To reach a raw binary from
@@ -17,9 +22,7 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ### Changed
 - Published numbers corrected against v0.5.1: cluster promote 20 ms, graceful handoff
   at most 2 s, crash failover 4–5 s, image 40 MB to pull (100 MB unpacked), and against
-  Redpanda Connect ~20× less memory and a ~30× smaller binary. The README also said
-  port 8686 binds to localhost: that is the bundled compose, the raw binary listens on
-  `0.0.0.0:8686`.
+  Redpanda Connect ~20× less memory and a ~30× smaller binary.
 
 ## [0.5.1] — 2026-11-07
 
@@ -418,7 +421,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/cpoder/vejas/releases/tag/v0.6.0
 [0.5.1]: https://github.com/cpoder/vejas/releases/tag/v0.5.1
 [0.5.0]: https://github.com/cpoder/vejas/releases/tag/v0.5.0
 [0.4.0]: https://github.com/cpoder/vejas/releases/tag/v0.4.0
