@@ -39,7 +39,10 @@ business meaning**, safely, without a developer.
   is nothing to export because nothing was captured. Everything is Apache-2.0.
 - **One infra dependency.** NATS JetStream (persistence, KV, object store).
   Two containers, one `docker compose up`.
-- **All Rust.** One binary. No Python, no interpreter subprocess, no sidecar.
+- **All Rust.** The runtime is one binary and needs nothing else to run: no
+  Python, no interpreter subprocess, no sidecar. An integration agent, once
+  built, stays outside it, as an optional binary that talks to `/mcp`
+  (ADR-0036).
 - **Driven over MCP.** The runtime is its own MCP server; the whole platform is
   inspectable, editable, generatable and runnable by any agent.
 
