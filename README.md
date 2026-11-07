@@ -34,7 +34,7 @@ end-to-end test ([the script](e2e/bridge-film.mjs)) — the video cannot lie.
 
 **Measured, not claimed** — reproducible on an 8-core dev machine
 ([methodology and comparisons](bench/)): cold start **11–13 ms**, **10 MB**
-RSS under load (38 MB with fifty live flows), **11.2 MB** binary / **201 MB**
+RSS under load (38 MB with fifty live flows), **11.2 MB** binary / **118 MB**
 image, end-to-end p50 **2 ms** uncongested / p50 14 ms at a paced 1 900/s
 sustained with **every event hop persisted** in JetStream, **2 070/s** through a
 real MQTT broker and back (QoS 1 both ways, PUBACK-gated). Same order of
