@@ -143,9 +143,10 @@ MCP tools include `vejas_drivers` (connector driver catalog), `vejas_secrets`
 VejasScript reference for agents) and `vejas_events` (the trace ring).
 
 When `VEJAS_TOKEN` is set, every POST (the whole mutating surface, `/mcp`
-included) requires `Authorization: Bearer <token>`; reads stay open. The
-bundled compose binds 8686 (panel/MCP) to localhost only — that surface can
-write flows and run commands (exec connectors) — while 8787 (webhook ingest,
+included) requires `Authorization: Bearer <token>`; reads stay open. The binary
+listens on `127.0.0.1:8686` unless `VEJAS_HTTP_ADDR` says otherwise, and the
+bundled compose publishes 8686 (panel/MCP) on localhost only, since that surface
+can write flows and run commands (exec connectors). 8787 (webhook ingest,
 publish-only) stays exposed.
 
 ## MCP server (ADR-0006)

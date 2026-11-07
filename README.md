@@ -133,13 +133,14 @@ cargo test --manifest-path core/Cargo.toml     # language unit tests
 core/target/release/vejas-runtime vjs-test tests/vjs   # golden end-to-end cases
 ```
 
-Security defaults: the bundled compose publishes the panel/MCP port (8686) on
-localhost only, because that surface can write flows and run commands (exec
-connectors). The raw binary listens on `0.0.0.0:8686`, with no token: set
-`VEJAS_HTTP_ADDR` and `VEJAS_TOKEN` before running it anywhere reachable. With
-`VEJAS_TOKEN` set, every write (POST, `/mcp` included) requires
-`Authorization: Bearer <token>`. The webhook port (8787) only publishes events
-onto the bus.
+Security defaults: the panel/MCP port (8686) stays on this machine, because that
+surface can write flows and run commands (exec connectors). The binary listens on
+`127.0.0.1:8686` unless `VEJAS_HTTP_ADDR` says otherwise, and the bundled compose
+publishes the port on localhost only. The image binds `0.0.0.0` inside the
+container, so a bare `docker run -p 8686:8686` exposes it: set `VEJAS_TOKEN` first,
+and the runtime warns at boot if you did not. With `VEJAS_TOKEN` set, every write
+(POST, `/mcp` included) requires `Authorization: Bearer <token>`. The webhook port
+(8787) only publishes events onto the bus.
 
 ## License
 

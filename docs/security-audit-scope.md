@@ -20,9 +20,11 @@ invariant is wrong, that is the finding we want.
 | **Event source** | `http-in` on its own port, **no auth** | Publish a JSON body to one subject — nothing else |
 | **Bus peer** | NATS/JetStream | Governed by NATS's own auth (deployment-owned) |
 
-Default posture: the write API binds `0.0.0.0:8686` in the raw binary but
-**`127.0.0.1` in the shipped bundle**; `http-in` binds `0.0.0.0` on its own
-port by design. The invariants below assume the write API is not exposed
+Default posture: the write API binds **`127.0.0.1:8686` in the raw binary**. The
+image binds `0.0.0.0:8686` inside the container, and the shipped bundle publishes
+it on `127.0.0.1` only; the runtime warns at boot past loopback with no
+`VEJAS_TOKEN`. `http-in` binds `0.0.0.0` on its own port by design. The invariants
+below assume the write API is not exposed
 unauthenticated to a hostile network — an assumption the audit should
 pressure-test.
 

@@ -21,5 +21,8 @@ COPY connectors/ connectors/
 COPY docs/ docs/
 COPY --from=build /build/target/release/vejas-runtime /usr/local/bin/vejas-runtime
 ENV VEJAS_ROOT=/app
+# The binary alone stays on loopback. In a container that would reach nothing, and
+# publishing the port is the deliberate act: docker-compose.yml keeps it on localhost.
+ENV VEJAS_HTTP_ADDR=0.0.0.0:8686
 EXPOSE 8686 8787
 CMD ["vejas-runtime"]

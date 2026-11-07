@@ -624,6 +624,22 @@ fn approval_token() -> Option<String> {
 
 /// The optional write credential. When set (and non-empty), the mutating surface
 /// requires `Authorization: Bearer <it>`; None = writes are open (dev default).
+/// Where the panel, the API and `/mcp` listen unless `VEJAS_HTTP_ADDR` says otherwise.
+/// Loopback, because this port writes flows and runs commands and has no token until
+/// one is set. The image sets `0.0.0.0:8686`: inside a container, publishing the port
+/// is the deliberate act.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8686";
+
+/// Whether `addr` takes connections from anywhere but this machine. An address that
+/// does not resolve answers yes: all this feeds is a warning.
+fn beyond_loopback(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match addr.to_socket_addrs() {
+        Ok(mut resolved) => resolved.any(|s| !s.ip().is_loopback()),
+        Err(_) => true,
+    }
+}
+
 fn write_token() -> Option<String> {
     env::var("VEJAS_TOKEN").ok().filter(|t| !t.is_empty())
 }
@@ -4446,6 +4462,13 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
             return;
         }
     };
+    if write_token().is_none() && beyond_loopback(&addr) {
+        eprintln!(
+            "[vejas] WARNING: {addr} with no VEJAS_TOKEN: whatever reaches this port can \
+             write flows and run commands (exec connectors). Set VEJAS_TOKEN, or publish \
+             the port on localhost only."
+        );
+    }
     eprintln!("[vejas] panel + monitoring on http://{addr}");
     // One thread per request, so a slow /flows/new never blocks monitoring, and a
     // bound on them, so a burst costs a 503 instead of this loop.
@@ -4623,7 +4646,7 @@ fn main() {
     }
 
     let root = PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into()));
-    let addr = env::var("VEJAS_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8686".into());
+    let addr = env::var("VEJAS_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.into());
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
 
     // Governed-change mode (ADR-0024): refuse to boot without the DISTINCT approval
@@ -4733,6 +4756,25 @@ mod supervision_tests {
         })
         .join();
         assert!(connectors::Slot::try_take(&open, 1).is_some(), "the slot came back");
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::{beyond_loopback, DEFAULT_HTTP_ADDR};
+
+    #[test]
+    fn the_default_address_stays_on_this_machine() {
+        assert!(!beyond_loopback(DEFAULT_HTTP_ADDR));
+        assert!(!beyond_loopback("[::1]:8686"));
+    }
+
+    #[test]
+    fn any_other_address_counts_as_reachable() {
+        assert!(beyond_loopback("0.0.0.0:8686"));
+        assert!(beyond_loopback("[::]:8686"));
+        assert!(beyond_loopback("192.0.2.1:8686"));
+        assert!(beyond_loopback("not an address"));
     }
 }
 
