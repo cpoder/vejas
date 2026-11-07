@@ -11,15 +11,15 @@ yours.
 |---|---|---|
 | Cold start (spawn → healthz) | 11–13 ms | `bench/run.sh` |
 | Runtime RSS under load | 10 MB (38 MB with 50 live flows) | `bench/flow-only.sh`, `bench/multi-flow.sh` |
-| Binary / image | 11.2 MB / 118 MB | — |
+| Binary / image | 11.2 MB / 40 MB to pull, 100 MB unpacked | release assets, `docker buildx imagetools inspect --raw` |
 | e2e latency, uncongested (webhook→flow→sink) | **p50 2 ms, p99 3 ms** | `bench/paced.sh 20 15` |
 | e2e paced sustained ~1 900/s | p50 14 ms, p99 36 ms, 20 000/20 000 | `bench/paced.sh 2000 15` |
 | e2e saturated (32 conns) | ~4 900/s ingest, ~2 650/s delivered (sink-bound) | `bench/run.sh 15 32` |
 | Isolated flow hop | 13 652/s (13 746/s aggregate over 10 flows) | `bench/flow-only.sh`, `bench/multi-flow.sh` |
 | MQTT loopback, QoS 1 both ways, real mosquitto | 2 070 rt/s, 5 000/5 000 | `bench/broker-mqtt.sh 5000` |
 | Cluster: instance kill -9 under load | 20 000/20 000, zero loss | `bench/cluster.sh` |
-| Cluster: singleton failover | ~2.6 s graceful / ~5.9 s crash (TTL-bound) | `bench/cluster-gaps.sh` |
-| Cluster-wide version promote | 60 ms convergence, lossless mid-burst | `bench/cluster-promote.sh` |
+| Cluster: singleton failover | at most 2 s graceful / 4–5 s crash (TTL-bound) | `bench/cluster-gaps.sh` |
+| Cluster-wide version promote | 20 ms convergence, lossless mid-burst | `bench/cluster-promote.sh` |
 
 Every hop persisted in JetStream throughout — the guarantee never moved
 while these numbers were earned. Methodology, the five ceilings that fell

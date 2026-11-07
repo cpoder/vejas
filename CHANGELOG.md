@@ -7,6 +7,13 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Changed
+- Published numbers corrected against v0.5.1: cluster promote 20 ms, graceful handoff
+  at most 2 s, crash failover 4–5 s, image 40 MB to pull (100 MB unpacked), and against
+  Redpanda Connect ~20× less memory and a ~30× smaller binary. The README also said
+  port 8686 binds to localhost: that is the bundled compose, the raw binary listens on
+  `0.0.0.0:8686`.
+
 ## [0.5.1] — 2026-11-07
 
 If an `exec` recipe read a runtime credential by inheritance, it now has to declare

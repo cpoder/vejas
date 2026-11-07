@@ -286,6 +286,10 @@ fifth under load; if your numbers disagree, check `uptime` first.
 
 ## Clustering (ADR-0020, measured)
 
+The table below is v0.5.1 on `async-nats`, re-measured on 2026-11-07. Leave a few
+seconds between runs: each script frees its port on exit, and a run chained straight
+after another printed no result.
+
 Two instances, one NATS, `bench/cluster.sh` + `bench/cluster-gaps.sh` — and
 the same probe at **three** (`bench/cluster.sh 3 20000`): 20 000/20 000
 delivered, the singleton timer ticked 8 times in 8 seconds rather than 24,
@@ -294,12 +298,12 @@ them (8 243 and 7 611).
 
 | Invariant | Result |
 |---|---|
-| Flows under kill -9 (1.5s into load) | **20 000/20 000 exactly-all**, ~8 k/s aggregate |
+| Flows under kill -9 (1.5s into load) | **20 000/20 000 exactly-all**; what the dead instance held comes back after the ack wait, 31.5 s in all with the default 30 s, on v0.3.6 and v0.5.1 alike |
 | Singleton duplication (timer, 2 instances) | **eliminated** — 8 ticks/8 s (was 16 pre-lease) |
-| Graceful handoff (SIGTERM leader) | **2.6 s** ≈ tick interval + 1 s standby retry |
-| Crash failover (kill -9 leader, TTL 3 s) | **5.9 s** ≈ TTL + retry + tick (worst case) |
+| Graceful handoff (SIGTERM leader) | **at most 2 s** ≈ tick interval + standby retry (four runs: three under 1.5 s, one at 2.0 s) |
+| Crash failover (kill -9 leader, TTL 3 s) | **4–5 s** ≈ TTL + retry + tick (four runs: 5.0, 5.0, 4.0, 4.0 s) |
 | Split-brain guard | clustered instance answers 409 on local-file mutation, file untouched |
-| Live promote across the cluster (ADR-0021) | **60 ms convergence**, first new-version emit at 680 ms, zero interleave, 40 000/40 000 delivered mid-burst |
+| Live promote across the cluster (ADR-0021) | **20 ms convergence**, first new-version emit at 20–30 ms, zero interleave, 40 000/40 000 delivered mid-burst |
 
 ## Not measured yet
 

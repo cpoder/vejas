@@ -50,7 +50,7 @@ double-sending them.
 
 With `VEJAS_CLUSTER=1`, a local file write is refused — a promote instead
 publishes a **version** into a shared JetStream KV overlay that every
-instance converges on ([benchmarks](../reference/benchmarks.md): 60 ms
+instance converges on ([benchmarks](../reference/benchmarks.md): 20 ms
 convergence, lossless mid-burst). If a later git deploy moves the baseline
 the promote was made against, the overlay is **evicted loudly** (git wins;
 the promoted content is kept in version history to re-promote) — visible at
