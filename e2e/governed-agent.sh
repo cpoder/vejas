@@ -34,6 +34,9 @@ api_key = secret("demo/key")
 emit "vx.sdemo.out", {id: id, auth: f"Bearer {api_key}"}
 VJS
 echo '{"id": 1}' > "$R/flows/fixtures/sdemo.json"
+mkdir -p "$R/connectors"
+printf '# connector: exec_env\ndriver "exec-sink"\nSUBJECT = "vx.execenv"\nENV = {"DECLARED": secret("demo/key")}\nCMD = "cat > /dev/null; env > %s/child.env"\n' "$S" \
+  > "$R/connectors/exec_env.vjs"
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4278 > /dev/null 2>&1 & NP=$!
 sleep 0.5
@@ -142,6 +145,14 @@ AUDIT=$(for seq in 1 2 3 4 5 6; do
 done)
 echo "$AUDIT" | grep -q '"dlq-replay"' && ok "the replay is audited" || ko "no audit record for the replay"
 echo "$AUDIT" | grep -q '"dlq-purge"' && ok "the purge is audited" || ko "no audit record for the purge"
+
+echo "── an exec child gets what its manifest declares, not the runtime's credentials"
+nats -s $URL pub vx.execenv '{}' > /dev/null 2>&1
+for _ in $(seq 1 50); do [ -s "$S/child.env" ] && break; sleep 0.1; done
+[ -s "$S/child.env" ] || ko "the exec child never ran"
+grep -q "^DECLARED=$SECRET" "$S/child.env" && ok "a declared secret reaches it" || ko "the declared secret is gone"
+LEAKS=$(grep -cE "^VEJAS_(TOKEN|APPROVAL_TOKEN|SECRET_)|$HUMAN|$AGENT" "$S/child.env")
+[ "$LEAKS" = "0" ] && ok "no runtime credential by inheritance" || ko "$LEAKS credential line(s) inherited"
 
 echo "── the human can decide from the panel with both tokens set"
 C=$(code -X POST -H "X-Approval-Token: $HUMAN" "$H/proposals/nope/approve")

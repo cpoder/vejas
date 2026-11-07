@@ -110,10 +110,10 @@ purge destroys what the agent's work is judged on, and dead letters are
 untrusted content that agent reads. No proposal kind carries them, so in
 governed mode they sit on `VEJAS_APPROVAL_TOKEN`: refused over MCP, and
 `POST /dlq/replay|purge` want the `X-Approval-Token` header. On those routes
-and on approve/reject, a valid approval token also answers the write gate. The
-panel holds that token and never `VEJAS_TOKEN`, so with both set, the documented
-production posture, the human could not approve from the panel (401 from the
-write gate) until this change.
+and on approve/reject, a valid approval token also answers the write gate. A
+human approves with that token and not with `VEJAS_TOKEN`, so with both set, the
+documented production posture, approving from the panel failed with a 401 from
+the write gate until this change.
 
 ## The loop this enables (the acte-6 recipe)
 

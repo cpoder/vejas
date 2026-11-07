@@ -268,6 +268,14 @@ re-deriving these — they are fixed and regression-tested; instead, try to
   drop the connection. `e2e/emit-subject.sh` in CI. **Break it:** a subject that
   reaches the bus from outside without passing `valid_subject`.
 
+- **H — exec children inherited the runtime's credentials (MEDIUM, fixed).**
+  `sh -c` children and the agent CLI inherited `VEJAS_APPROVAL_TOKEN`,
+  `VEJAS_TOKEN`, `VAULT_TOKEN` and every `VEJAS_SECRET_*`, for an `env` in a log or
+  an agent reading its environment to send on. They are now removed, and a child
+  gets what its manifest declares in `ENV`. This is hygiene and not a sandbox: an
+  exec connector is trusted code, it runs as the same user, can read
+  `/proc/<ppid>/environ`, and reaches the same bus. `e2e/governed-agent.sh` in CI.
+
 ## Known minor points to confirm or harden (not blockers)
 
 - **M1 — poller URL in logs.** `http-poll`/`oauth-poll` log the full poll
@@ -287,6 +295,11 @@ re-deriving these — they are fixed and regression-tested; instead, try to
   `flowsevil/x.vjs` satisfies `starts_with("flows")`; the file stays under
   `root` (and unscanned, so inert), so this is not a traversal — a path-segment
   match would read cleaner. Hardening, not a bug.
+
+- **M4 — `tiny_http`'s own pool is unbounded.** `VEJAS_HTTP_MAX_INFLIGHT` bounds the
+  requests the runtime handles, not the connections the crate accepts: it holds a
+  thread per connection and panics when the OS has none. The port is local by
+  default, and the failure is loud: `/healthz` stops answering.
 
 ## Method note
 

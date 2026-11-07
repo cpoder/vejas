@@ -14,7 +14,8 @@ turns them into a flow developer.
   transcoding tables, queue names — is editable in place. Saving goes
   through the same audited write path agents use (`/surface/set`), and the
   unit restarts itself. Credential-shaped values are masked (single-sourced
-  pattern, [ADR-0017](../decisions.md)).
+  pattern, [ADR-0017](../decisions.md)). With `VEJAS_TOKEN` set, the panel asks
+  for it on the first write and keeps it in the page's memory only.
 - **Read the rules.** The rules view projects each flow's decision logic as
   faithful sentences — whole-sentence or verbatim code, never a half
   translation ([the rules view](../guides/rules-view.md)).

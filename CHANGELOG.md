@@ -7,6 +7,28 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **Exec children no longer inherit the runtime's credentials.** `sh -c` children of
+  the `exec-*` drivers and the agent CLI got `VEJAS_APPROVAL_TOKEN`, `VEJAS_TOKEN`,
+  `VAULT_TOKEN` and every `VEJAS_SECRET_*`. They now get what the manifest declares
+  in `ENV`, so a recipe that read one of these by inheritance has to declare it. An
+  exec connector stays trusted code: this is hygiene, not a sandbox.
+
+### Fixed
+- **The panel can write when `VEJAS_TOKEN` is set.** Only Approve and Reject worked
+  there: every other write got a 401, with no way to give the token. The panel now
+  asks once and keeps it in the page's memory.
+- `http-in` writes its response in one segment instead of one per piece of the
+  format string.
+- `bench/flow-only.sh` and `bench/detect.sh` no longer leave the runtime and NATS
+  running: under `set -e`, the status of the first killed process ended the trap.
+
+### Changed
+- `scripts/deploy-docs.sh` publishes the book from a commit, and `RELEASING.md` gains
+  the step: the book at vejas.dev/docs had not moved since 2026-08-24. A release now
+  pushes master first and tags once CI is green. Site and book backups stay outside
+  the served directory, where a stale page was reachable.
+
 ## [0.5.0] — 2026-11-07
 
 The runtime leaves the deprecated sync NATS client. If your NATS user has a publish

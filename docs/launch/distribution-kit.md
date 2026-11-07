@@ -49,7 +49,7 @@ Title alternates (kept for reference):
 > records the change with its actor).
 >
 > One Rust binary on NATS/JetStream, no other dependency. Measured, reproducible in
-> bench/: cold start 11–13ms, 6–8MB RSS, end-to-end p50 2ms uncongested, every hop
+> bench/: cold start 11–13ms, 10MB RSS, end-to-end p50 2ms uncongested, every hop
 > persisted, cluster promote 60ms lossless. Twenty-one connector recipes admitted
 > by CI (MQTT/RabbitMQ against real brokers; IBM MQ, Kafka).
 >

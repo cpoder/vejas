@@ -3,7 +3,7 @@
 There is no builder UI to click together — the flow-writing interface *is*
 an agent, and the runtime *is* the MCP server (`POST /mcp`, ADR-0006). No
 sidecar, no plugin: the platform's own write path, test path and telemetry
-are the [29 MCP tools](../reference/mcp-tools.md).
+are the [MCP tools](../reference/mcp-tools.md).
 
 The loop an agent follows (enforced by the tool descriptions themselves —
 the generation contract):
