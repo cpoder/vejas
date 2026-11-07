@@ -7,6 +7,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-07
+
+The runtime leaves the deprecated sync NATS client. If your NATS user has a publish
+allow-list, read the upgrade note under Changed first.
+
 ### Added
 - **Dead letters announce themselves** on `vx.dlq.events`, an ordinary subject,
   so that a flow or a sink can wake a person or an agent (ADR-0015 Amendment A).
@@ -372,7 +377,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cpoder/vejas/releases/tag/v0.5.0
 [0.4.0]: https://github.com/cpoder/vejas/releases/tag/v0.4.0
 [0.3.6]: https://github.com/cpoder/vejas/releases/tag/v0.3.6
 [0.3.5]: https://github.com/cpoder/vejas/releases/tag/v0.3.5
