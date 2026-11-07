@@ -1,6 +1,6 @@
 # HTTP API
 
-One listener (`VEJAS_HTTP_ADDR`, default `:8686`) serves the panel, the API
+One listener (`VEJAS_HTTP_ADDR`, default `127.0.0.1:8686`) serves the panel, the API
 and MCP. With `VEJAS_TOKEN` set, every mutating route requires
 `Authorization: Bearer <token>`. In governed mode (ADR-0024) mutating routes
 answer with a didactic refusal pointing at the proposal queue.

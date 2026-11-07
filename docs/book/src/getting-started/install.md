@@ -15,12 +15,16 @@ root, point `NATS_URL` at the bus, publish the ports.
 
 ```bash
 docker run --rm -v "$PWD/my-root:/root" -e VEJAS_ROOT=/root \
-    -e NATS_URL=nats://nats:4222 -p 8686:8686 -p 8787:8787 \
+    -e NATS_URL=nats://nats:4222 -p 127.0.0.1:8686:8686 -p 8787:8787 \
     ghcr.io/cpoder/vejas-runtime:latest
 ```
 
+Port 8686 writes flows and runs commands, so it is published on localhost here.
+Before publishing it wider, set `VEJAS_TOKEN`.
+
 The release also carries a stripped Linux binary and its SHA-256:
-<https://github.com/cpoder/vejas/releases/latest>.
+<https://github.com/cpoder/vejas/releases/latest>. It listens on
+`127.0.0.1:8686` until `VEJAS_HTTP_ADDR` says otherwise.
 
 ## Docker compose, to try it in one command
 

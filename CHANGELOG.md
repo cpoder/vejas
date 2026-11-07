@@ -7,6 +7,13 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **The binary listens on `127.0.0.1:8686` by default.** It was `0.0.0.0:8686`, with
+  no token, on a port that writes flows and runs commands. To reach a raw binary from
+  elsewhere, set `VEJAS_HTTP_ADDR`, and `VEJAS_TOKEN` with it. The image sets
+  `0.0.0.0:8686` itself, so containers do not change. Past loopback with no token, the
+  runtime now warns at boot.
+
 ### Changed
 - Published numbers corrected against v0.5.1: cluster promote 20 ms, graceful handoff
   at most 2 s, crash failover 4–5 s, image 40 MB to pull (100 MB unpacked), and against

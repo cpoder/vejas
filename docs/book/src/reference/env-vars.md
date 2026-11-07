@@ -10,7 +10,7 @@ directory is a complete system.
 |---|---|---|
 | `NATS_URL` | `nats://127.0.0.1:4222` | The bus. The only infrastructure dependency (ADR-0002). |
 | `VEJAS_ROOT` | `.` | Root directory: `flows/`, `connectors/`, `tables/`, `tests/`. |
-| `VEJAS_HTTP_ADDR` | `0.0.0.0:8686` | Panel + HTTP API + `/mcp` listen address. |
+| `VEJAS_HTTP_ADDR` | `127.0.0.1:8686` (the image sets `0.0.0.0:8686`) | Panel + HTTP API + `/mcp` listen address. Past loopback with no `VEJAS_TOKEN`, the runtime warns at boot. |
 | `VEJAS_TOKEN` | *(unset)* | When set, the whole mutating surface (including `/mcp`) requires `Authorization: Bearer`. |
 | `VEJAS_SUBJECT_ROOT` | `vx` | Bus subject prefix. |
 | `VEJAS_STREAM` | `VEJAS` | JetStream stream name the runtime creates/uses. |

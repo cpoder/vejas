@@ -86,5 +86,24 @@ echo "── HEAD never executes a flow → no bus write via HEAD"
 C=$(code -I "$H/api/audit")
 [ "$C" = "404" ] && ok "HEAD on GET route → 404, flow not executed (no emit)" || ko "HEAD on GET route unexpected ($C)"
 
+echo "── the listen address: loopback unless told otherwise, and loud about no token"
+kill $RT 2>/dev/null; wait $RT 2>/dev/null
+boot(){ # log, then the env for this run
+  L=$1; shift
+  env "$@" NATS_URL=nats://127.0.0.1:4276 VEJAS_ROOT="$R" "$BIN" > "$L" 2>&1 & RT=$!
+  for _ in $(seq 1 100); do grep -q 'panel + monitoring' "$L" 2>/dev/null && break; sleep 0.1; done
+}
+boot "$S/rt-default.log" -u VEJAS_HTTP_ADDR -u VEJAS_TOKEN
+curl -sf -o /dev/null http://127.0.0.1:8686/healthz && ok "no VEJAS_HTTP_ADDR: answers on 127.0.0.1:8686" || ko "no VEJAS_HTTP_ADDR: nothing on 127.0.0.1:8686"
+BOUND=$(ss -ltnH 'sport = :8686' | awk '{print $4}')
+[ "$BOUND" = "127.0.0.1:8686" ] && ok "bound to loopback only ($BOUND)" || ko "bound to '$BOUND'"
+grep -q WARNING "$S/rt-default.log" && ko "warned on loopback" || ok "no warning on loopback"
+kill $RT 2>/dev/null; wait $RT 2>/dev/null
+boot "$S/rt-open.log" -u VEJAS_TOKEN VEJAS_HTTP_ADDR=0.0.0.0:8747
+grep -q 'WARNING: 0.0.0.0:8747 with no VEJAS_TOKEN' "$S/rt-open.log" && ok "0.0.0.0 with no token warns" || ko "0.0.0.0 with no token is silent"
+kill $RT 2>/dev/null; wait $RT 2>/dev/null
+boot "$S/rt-token.log" VEJAS_TOKEN="$TOK" VEJAS_HTTP_ADDR=0.0.0.0:8747
+grep -q WARNING "$S/rt-token.log" && ko "warned despite the token" || ok "0.0.0.0 with a token does not warn"
+
 [ $fail -eq 0 ] && echo "WRITE GATE HOLDS" || echo "WRITE GATE REGRESSION — do not ship"
 exit $fail
