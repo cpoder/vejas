@@ -50,7 +50,7 @@ Title alternates (kept for reference):
 >
 > One Rust binary on NATS/JetStream, no other dependency. Measured, reproducible in
 > bench/: cold start 11–13ms, 10MB RSS, end-to-end p50 2ms uncongested, every hop
-> persisted, cluster promote 60ms lossless. Twenty-one connector recipes admitted
+> persisted, cluster promote 20ms lossless. Twenty-one connector recipes admitted
 > by CI (MQTT/RabbitMQ against real brokers; IBM MQ, Kafka).
 >
 > Young: it has run since August 2026 as the evidence-collection engine of a NIS2
@@ -82,7 +82,7 @@ questions come):
 
 The friendliest audience — they'll appreciate the dogfooding. Angle: *"a platform
 that uses JetStream as its entire substrate — transport, persistence, KV, leases,
-audit."* Show the clustering + the 60ms lossless promote.
+audit."* Show the clustering + the 20ms lossless promote.
 
 ## This Week in Rust (TWiR) — "Call for participation" / project spotlight
 

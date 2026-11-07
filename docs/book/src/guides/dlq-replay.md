@@ -59,7 +59,7 @@ runtime's user and reaches the same bus, far more than a proposal needs.
    ([time-travel](change-safely.md)), watch it shadow live traffic
    (canary).
 3. In governed mode it *proposes* with that evidence; you approve — the
-   promote fans out cluster-wide in 60 ms.
+   promote fans out cluster-wide in 20 ms.
 4. Replay from the panel, or `vejas_dlq_replay` outside governed mode — the
    dead messages pass under the new version, and their envelopes record the
    transition.

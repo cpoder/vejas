@@ -277,7 +277,7 @@ The agent's path, every step governed:
    changes the baseline under the canary stops it with a reason — never a
    silently stale diff.
 4. On your word: **promote**. In a cluster, that publishes a version every
-   instance converges on — measured at 60 ms, lossless mid-burst — with an
+   instance converges on — measured at 20 ms, lossless mid-burst — with an
    audit record (actor, from-hash → to-hash). Rollback is a promote to any
    previous version, forward-only, previewable the same way.
 

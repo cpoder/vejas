@@ -19,7 +19,7 @@ Three design commitments shape everything:
 3. **Measured, not claimed.** Every number in these docs comes from a
    reproducible benchmark in [`bench/`](reference/benchmarks.md): cold start
    11 ms, 10 MB RSS under load, end-to-end p50 2 ms uncongested, every hop
-   persisted, cluster promote in 60 ms — lossless.
+   persisted, cluster promote in 20 ms — lossless.
 
 ## Where to go
 
