@@ -7,6 +7,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-07
+
+If an `exec` recipe read a runtime credential by inheritance, it now has to declare
+it: see Security.
+
 ### Security
 - **Exec children no longer inherit the runtime's credentials.** `sh -c` children of
   the `exec-*` drivers and the agent CLI got `VEJAS_APPROVAL_TOKEN`, `VEJAS_TOKEN`,
@@ -399,7 +404,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/cpoder/vejas/releases/tag/v0.5.1
 [0.5.0]: https://github.com/cpoder/vejas/releases/tag/v0.5.0
 [0.4.0]: https://github.com/cpoder/vejas/releases/tag/v0.4.0
 [0.3.6]: https://github.com/cpoder/vejas/releases/tag/v0.3.6
