@@ -23,9 +23,37 @@ post-mortem knows *which* logic failed, even after a promote.
   and `vejas_dlq_purge` are refused, and the HTTP routes want the
   `X-Approval-Token` header, which the panel sends.
 
+## Being told
+
+Each dead letter is announced on `vx.dlq.events`, an ordinary subject, so what
+happens next is a flow or a sink like any other:
+
+```json
+{"transition": "dead-lettered", "ts": 1793980000, "unit": "flow:orders",
+ "subject": "vx.orders.in", "attempts": 5, "version": "d5768a2de6e8cbb0",
+ "count": 1}
+```
+
+- **Metadata only.** The payload and the error text stay in the DLQ: a dead
+  letter is untrusted content, and this event is what wakes a person or an
+  agent. Read the letter with `vejas_dlq`.
+- **One event per unit per window** (`VEJAS_DLQ_EVENT_SECS`, 60 s). The first
+  letter is news at once; `count` says how many letters the next event stands
+  for, so a burst wakes a reader once and loses nothing. Each instance of a
+  cluster keeps its own window.
+- **It cannot feed itself.** A reader of these events that keeps failing
+  dead-letters them, and those letters are not announced.
+
+[`dlq_webhook.vjs.example`](https://github.com/cpoder/vejas/blob/master/docs/examples/dlq_webhook.vjs.example)
+posts the event to a URL: a chat channel, or a runner that starts your agent
+with the agent's token alone. Do not start an agent from an `exec-*` connector:
+a child inherits the runtime's environment, `VEJAS_APPROVAL_TOKEN` and
+`VEJAS_SECRET_*` included.
+
 ## The loop that makes it self-healing
 
-1. A message dies; the envelope carries version `v3`.
+1. A message dies; the envelope carries version `v3`, and `vx.dlq.events` says
+   so.
 2. An agent reads `vejas_dlq`, drafts a candidate flow, proves it: replay
    yesterday's real traffic through it
    ([time-travel](change-safely.md)), watch it shadow live traffic

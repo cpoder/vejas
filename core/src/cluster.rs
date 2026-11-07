@@ -6,11 +6,11 @@
 //! instance, or N instances produce N× the events. Such a driver acquires a
 //! **lease** in a JetStream KV bucket before it runs:
 //!
-//!   - acquire  = `Store::create` (atomic create-if-absent — exactly one wins)
-//!   - renew    = `Store::update(key, id, revision)` (compare-and-set; a paused
+//!   - acquire  = `Kv::create` (atomic create-if-absent — exactly one wins)
+//!   - renew    = `Kv::update(key, id, revision)` (compare-and-set; a paused
 //!                leader that wakes with a stale revision fails and stands down —
 //!                fencing, so two instances never *keep* running the same unit)
-//!   - release  = `Store::delete` on graceful shutdown (instant handoff)
+//!   - release  = `Kv::delete` on graceful shutdown (instant handoff)
 //!   - failover = the bucket's `max_age` ages the value out after a crash, so a
 //!                stand-by's `create` then succeeds (bounded by the TTL)
 //!
@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+use crate::bus;
 
 const LEASE_BUCKET: &str = "VEJAS_LEASES";
 
@@ -75,22 +77,18 @@ pub fn lease_ttl() -> Duration {
 /// Open (or create) the shared lease bucket. Its own sibling root, like the DLQ
 /// and audit streams. Returns None if JetStream KV is unavailable — the caller
 /// then runs the driver unleased (single-instance behaviour, no worse than today).
-pub fn open_lease_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
-    let cfg = nats::kv::Config {
+pub fn open_lease_store(js: &bus::JetStream) -> Option<bus::Kv> {
+    js.key_value(&bus::KvConfig {
         bucket: LEASE_BUCKET.to_string(),
         max_age: lease_ttl(),
         history: 1,
-        ..Default::default()
-    };
-    js.create_key_value(&cfg)
-        .or_else(|_| js.key_value(LEASE_BUCKET))
-        .ok()
+    })
 }
 
 /// Held while this instance owns a singleton's lease. Dropping it stops the
 /// renewal thread and releases the lease (instant handoff on shutdown).
 pub struct LeaseGuard {
-    store: nats::kv::Store,
+    store: bus::Kv,
     key: String,
     stop_renew: Arc<AtomicBool>,
 }
@@ -112,7 +110,7 @@ impl Drop for LeaseGuard {
 /// and the supervisor re-enters standby. Returns None if `alive()` goes false
 /// before the lease is acquired (asked to stop while standing by).
 pub fn acquire_blocking(
-    store: &nats::kv::Store,
+    store: &bus::Kv,
     key: &str,
     running: Arc<AtomicBool>,
     alive: impl Fn() -> bool,

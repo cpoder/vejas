@@ -24,6 +24,7 @@
 //   POST /flows/new                agent CLI writes a VejasScript flow
 //   POST /reload                   rescan; restart changed files (mtime)
 
+mod bus;
 mod cluster;
 mod connectors;
 mod control;
@@ -234,8 +235,7 @@ fn replay_literal(
         let hydrated = before.source.as_deref().and_then(|subject| {
             let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
             let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
-            let nc = nats::connect(&url).ok()?;
-            let js = nats::jetstream::new(nc);
+            let js = bus::connect(&url).ok()?.jetstream();
             connectors::hydrate_recent(&js, &stream, subject, n).ok()
         });
         match hydrated {
@@ -313,8 +313,7 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
     let pkg = pkg_of_path(&path);
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     // diff against the CURRENT EFFECTIVE version (a live overlay if one is valid)
     let store = versions::open_store(&js);
     let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
@@ -401,8 +400,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
     let unit = flow_proc_name(&path);
     let pkg = pkg_of_path(&path);
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let store = versions::open_store(&js);
     let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
     let current = vjs::parse(&current_src)?;
@@ -443,17 +441,14 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
     let (root, pkg, path, unit_t, store_t) =
         (root.to_path_buf(), pkg, path.clone(), unit.clone(), store);
     thread::spawn(move || {
-        let cfg = nats::jetstream::ConsumerConfig {
-            deliver_policy: nats::jetstream::DeliverPolicy::New, // only the live tail
-            ack_policy: nats::jetstream::AckPolicy::Explicit,    // never acked (read-only)
-            filter_subject: subject.clone(),
+        let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+        // Only the live tail, and never acked: read-only.
+        let cfg = bus::EphemeralConfig {
+            filter: &subject,
+            start_seq: None,
             inactive_threshold: Duration::from_secs(30),
-            ..Default::default()
         };
-        let sub = match js.pull_subscribe_with_options(
-            &subject,
-            &nats::jetstream::PullSubscribeOptions::new().consumer_config(cfg),
-        ) {
+        let sub = match js.pull_ephemeral(&stream, &cfg) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -476,7 +471,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
                     continue;
                 };
-                let seq = m.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
+                let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 let b = shadow_emits(&current, &event, &root, &pkg);
                 let a = shadow_emits(&candidate, &event, &root, &pkg);
                 let ch = b != a;
@@ -551,8 +546,7 @@ fn promote_version(
     let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let unit = flow_proc_name(&path);
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let store = versions::open_store(&js).ok_or("version store unavailable")?;
     // current effective source: a prior overlay if valid, else the baseline
     let (current, _) = versions::resolve_source(Some(&store), &unit, &baseline, now_secs());
@@ -571,7 +565,7 @@ fn promote_version(
 /// The current effective-source hash of a flow file — the baseline a proposal is
 /// pinned to (the overlay-or-baseline the evidence saw, ADR-0021/0024).
 fn effective_source_hash(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     root: &Path,
     file: &str,
 ) -> Result<String, String> {
@@ -585,7 +579,7 @@ fn effective_source_hash(
 
 /// Emit a proposal transition on the bus so a notification flow can route it
 /// (Slack/PagerDuty/email) — the platform dogfoods its own connectors (ADR-0024).
-fn emit_proposal_event(js: &nats::jetstream::JetStream, transition: &str, proposal: &Value) {
+fn emit_proposal_event(js: &bus::JetStream, transition: &str, proposal: &Value) {
     let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
     let subject = format!("{subj_root}.proposals.events");
     let ev = json!({"transition": transition, "ts": now_secs(), "proposal": proposal});
@@ -690,8 +684,7 @@ fn submit_proposal(
     }
     let file = payload["file"].as_str().ok_or("payload.file required")?.to_string();
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let baseline = effective_source_hash(&js, root, &file)?;
     let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
     let id = proposals::new_id(now_secs());
@@ -705,8 +698,7 @@ fn submit_proposal(
 /// never shows an approvable change the evidence never saw (ADR-0024).
 fn reconcile_and_list(root: &Path) -> Result<Vec<Value>, String> {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
     let mut out = Vec::new();
     for p in proposals::list(&store) {
@@ -769,8 +761,7 @@ fn apply_approved(
             let baseline = fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let unit = flow_proc_name(&path);
             let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let js = nats::jetstream::new(nc);
+            let js = bus::connect(&url)?.jetstream();
             if cluster::clustered() {
                 let store = versions::open_store(&js).ok_or("version store unavailable")?;
                 let parent = versions::hash_content(&baseline);
@@ -799,8 +790,7 @@ fn decide_proposal(
     decided_by: &str,
 ) -> Result<Value, String> {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let store = proposals::open_store(&js).ok_or("proposal store unavailable")?;
     let proposal = proposals::get(&store, id).ok_or("proposal not found")?;
     if proposal["status"] != "pending" {
@@ -911,14 +901,14 @@ fn record_promote(
     let Some(path) = guard_path(root, file) else { return };
     let unit = flow_proc_name(&path);
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let Ok(nc) = nats::connect(&url) else {
+    let Ok(bus) = bus::connect(&url) else {
         eprintln!(
             "[vejas] audit: NATS unreachable — live promote of {name} not recorded \
              (git remains the trail for committed changes)"
         );
         return;
     };
-    let js = nats::jetstream::new(nc);
+    let js = bus.jetstream();
     let record = json!({
         "ts": now_secs(), "actor": actor, "unit": unit,
         "file": file, "name": name, "key": key,
@@ -944,8 +934,7 @@ fn rollback_literal(
     let path = guard_path(root, file).ok_or("path not allowed")?;
     let unit = flow_proc_name(&path);
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?.jetstream();
     let records = connectors::audit_recent(&js, &unit, 500)?;
     // newest first: the most recent promote of exactly this literal
     let target = records
@@ -1116,7 +1105,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // file iff it forked from exactly this baseline; a stale overlay
             // (baseline advanced / flow git-deleted) is evicted here — git wins.
             let src = {
-                let vconn = nats::connect(&url).ok().map(nats::jetstream::new);
+                let vconn = bus::connect(&url).ok().map(|bus| bus.jetstream());
                 let vstore = vconn.as_ref().and_then(versions::open_store);
                 let (s, outcome) = versions::resolve_source(
                     vstore.as_ref(),
@@ -1168,41 +1157,23 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 }
                 return Err("no `source` declaration".into());
             };
-            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            // Acks travel on their own connection. An ack is a publish to the
-            // message's reply subject, and any connection may send it. On the
-            // consuming connection the 64 acks of a round sat in front of the
-            // next round's PING, and every PONG waited for the server to work
-            // through them (~30 µs each, ~2 ms a round, measured). On a
-            // connection of their own they cost the server the same and this
-            // loop nothing. If that connection drops, un-acked messages simply
-            // redeliver (at-least-once, ADR-0002).
-            let ack_nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let js = nats::jetstream::new(nc.clone());
-            let _ = js.add_stream(&nats::jetstream::StreamConfig {
+            let nc = bus::connect(&url)?;
+            let js = nc.jetstream();
+            let _ = js.add_stream(&bus::StreamConfig {
                 name: stream.clone(),
                 subjects: vec![format!("{subj_root}.>")],
                 ..Default::default()
             });
             let durable = handle.spec.name.replace([':', '.'], "_");
             // create the durable pull consumer (idempotent-ish), then bind
-            let _ = js.add_consumer(
+            let _ = js.create_pull_consumer(
                 &stream,
-                nats::jetstream::ConsumerConfig {
-                    durable_name: Some(durable.clone()),
-                    deliver_subject: None,
-                    filter_subject: source.clone(),
-                    ack_wait: connectors::ack_wait(),
-                    ..Default::default()
-                },
+                &durable,
+                std::slice::from_ref(&source),
+                connectors::ack_wait(),
+                None,
             );
-            let sub = js
-                .pull_subscribe_with_options(
-                    &source,
-                    &nats::jetstream::PullSubscribeOptions::new()
-                        .durable_name(durable),
-                )
-                .map_err(|e| e.to_string())?;
+            let sub = js.pull_durable(&stream, &durable, Some(&source))?;
             set_state(&handle, |st| {
                 st.status = "running".into();
                 st.started_at = Some(now_secs());
@@ -1225,24 +1196,25 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // (`PULL_EXPIRES_MS`) and its round comes back empty. A stop
             // leaves at most one request outstanding, whose messages redeliver
             // un-acked after `ack_wait` — the same as stopping mid-batch.
-            let mut round = connectors::fetch_iter_flushed(&sub, &nc)?;
+            let mut round = sub.round()?;
+            let mut batch = nc.batch();
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 engine.invalidate(); // pick up live service edits
                 let round_t0 = Instant::now();
-                let next = connectors::fetch_iter_flushed(&sub, &nc)?;
-                // Messages are processed as the reader thread hands them over, not
-                // once the whole batch has landed, so the two threads overlap
-                // instead of taking turns (see `fetch_iter_flushed`).
+                let next = sub.round()?;
+                // Messages are processed as they arrive, not once the whole batch
+                // has landed, so reading and working overlap instead of taking
+                // turns.
                 let fetch = &mut round;
                 let mut fetched = 0usize;
                 let mut first_at: Option<Instant> = None;
-                // Emits are buffered (core publish) and confirmed by ONE flush per
+                // Emits are core publishes, held and confirmed by ONE barrier per
                 // batch before their source messages are acked — one round-trip a
                 // batch instead of one per emit, at-least-once preserved (ADR-0002).
-                let mut to_ack: Vec<nats::Message> = Vec::new();
+                let mut to_ack: Vec<bus::Message> = Vec::new();
                 for msg in fetch {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
@@ -1259,7 +1231,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let err = format!("bad json: {e}");
                             eprintln!("[vejas] {}: {err}", handle.spec.name);
                             let delivered =
-                                msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                msg.delivery().map(|i| i.delivered).unwrap_or(1);
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
                             metrics::observe(&handle.spec.name, false, 0, 0.0);
@@ -1273,7 +1245,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 Err(de) => {
                                     record_trace(&handle.spec.name, &msg.subject, false,
                                         Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None);
-                                    let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                    let _ = msg.nak();
                                 }
                             }
                             continue;
@@ -1281,26 +1253,25 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     };
                     let t0 = Instant::now();
                     let start_nanos = metrics::now_nanos();
-                    match vjs::run(&prog, &event, &mut engine) {
+                    // Holding an emit is local, so a refusal is final for this message:
+                    // it can never leave, however often it redelivers. That makes it
+                    // a failed run, capped by MAX_DELIVERIES and dead-lettered.
+                    let outcome = vjs::run(&prog, &event, &mut engine).and_then(|ctx| {
+                        for (subj, payload) in &ctx.emits {
+                            let bytes = serde_json::to_vec(payload).unwrap_or_default();
+                            // held; sent and confirmed once per batch below
+                            batch.publish(subj, bytes).map_err(|e| format!("publish {subj}: {e}"))?;
+                        }
+                        Ok(ctx)
+                    });
+                    match outcome {
                         Ok(ctx) => {
-                            let mut ok = true;
-                            for (subj, payload) in &ctx.emits {
-                                let bytes = serde_json::to_vec(payload).unwrap_or_default();
-                                // buffered core publish; flushed once per batch below
-                                if let Err(e) = nc.publish(subj, bytes) {
-                                    eprintln!(
-                                        "[vejas] {}: publish {subj}: {e}",
-                                        handle.spec.name
-                                    );
-                                    ok = false;
-                                }
-                            }
                             let emits = ctx.emits.len() as u64;
-                            metrics::observe(&handle.spec.name, ok, emits, t0.elapsed().as_secs_f64());
+                            metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
                             metrics::span(metrics::Span {
                                 unit: handle.spec.name.clone(),
                                 subject: msg.subject.clone(),
-                                ok,
+                                ok: true,
                                 error: None,
                                 start_nanos,
                                 end_nanos: metrics::now_nanos(),
@@ -1309,8 +1280,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             record_trace(
                                 &handle.spec.name,
                                 &msg.subject,
-                                ok,
-                                (!ok).then(|| "publish failed (will redeliver)".to_string()),
+                                true,
+                                None,
                                 ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
                                 // The preview is derived from the stored event when
                                 // /events is read; serialising it here cost every
@@ -1318,9 +1289,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 String::new(),
                                 Some(event),
                             );
-                            if ok {
-                                to_ack.push(msg); // acked after the batch flush
-                            }
+                            to_ack.push(msg); // acked after the batch flush
                         }
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
@@ -1338,7 +1307,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             // dead-lettered (ADR-0015) rather than dropped; publish
                             // before ack, nak if the DLQ write fails.
                             let delivered =
-                                msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                msg.delivery().map(|i| i.delivered).unwrap_or(1);
                             if delivered >= MAX_DELIVERIES {
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version) {
                                     Ok(()) => {
@@ -1352,7 +1321,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — DLQ publish failed: {de}")),
                                             vec![], String::new(), Some(event.clone()));
-                                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                        let _ = msg.nak();
                                     }
                                 }
                             } else {
@@ -1364,36 +1333,22 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                     }
                 }
-                // Publish-before-ack barrier for the batch: one flush confirms the
-                // server received every buffered emit, THEN ack the fully-published
-                // source messages. On flush failure, ack none — the batch
-                // redelivers (nothing is lost; at-least-once, ADR-0002).
+                // Publish-before-ack barrier for the batch: one round-trip confirms
+                // the server received every emit, THEN ack the fully-published
+                // source messages. On failure, ack none — the batch redelivers
+                // (nothing is lost; at-least-once, ADR-0002).
                 metrics::observe_fetch(&handle.spec.name, fetched);
                 let processed_at = Instant::now();
-                if !to_ack.is_empty() {
-                    match nc.flush() {
-                        Ok(_) => {
-                            for m in &to_ack {
-                                match m.reply.as_deref() {
-                                    Some(reply) => {
-                                        if let Err(e) = ack_nc.publish(reply, b"") {
-                                            eprintln!(
-                                                "[vejas] {}: ack: {e} (redelivers)",
-                                                handle.spec.name
-                                            );
-                                        }
-                                    }
-                                    None => {
-                                        let _ = m.ack();
-                                    }
-                                }
-                            }
+                match batch.confirm() {
+                    Ok(()) => {
+                        if let Err(e) = nc.ack_all(&to_ack) {
+                            eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                         }
-                        Err(e) => eprintln!(
-                            "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
-                            handle.spec.name
-                        ),
                     }
+                    Err(e) => eprintln!(
+                        "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
+                        handle.spec.name
+                    ),
                 }
                 round = next;
                 let first = first_at.unwrap_or(processed_at);
@@ -1503,10 +1458,9 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                 .next()
                 .unwrap_or(&handle.spec.name)
                 .to_string();
-            let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let ack_nc = nats::connect(&url).map_err(|e| e.to_string())?;
-            let js = nats::jetstream::new(nc.clone());
-            let _ = js.add_stream(&nats::jetstream::StreamConfig {
+            let nc = bus::connect(&url)?;
+            let js = nc.jetstream();
+            let _ = js.add_stream(&bus::StreamConfig {
                 name: stream.clone(),
                 subjects: vec![format!("{subj_root}.>")],
                 ..Default::default()
@@ -1521,7 +1475,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             // this attempt, so a restart never leaves a stale reader behind.
             let attempt_stop = Arc::new(AtomicBool::new(false));
             let _stop_reader = StopOnDrop(attempt_stop.clone());
-            let (tx, rx) = std::sync::mpsc::channel::<nats::Message>();
+            let (tx, rx) = std::sync::mpsc::channel::<bus::Message>();
             let durable = handle.spec.name.replace([':', '.'], "_");
             let filters: Vec<String> = sources.iter().map(|(s, _)| s.clone()).collect();
             // Snapshot and resume (ADR-0031 points 4-5), for a program with state
@@ -1570,33 +1524,24 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                 Some(seq) => {
                     // The server cannot move an existing consumer: re-create it after the snapshot.
                     let _ = js.delete_consumer(&stream, &durable);
-                    connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait(), Some(seq))?;
+                    js.create_pull_consumer(&stream, &durable, &filters, connectors::ack_wait(), Some(seq))?;
                     metrics::observe_restore(&handle.spec.name, seq);
                 }
-                None => connectors::create_pull_consumer(&nc, &stream, &durable, &filters, connectors::ack_wait(), None)?,
+                None => js.create_pull_consumer(&stream, &durable, &filters, connectors::ack_wait(), None)?,
             }
             // A first snapshot at the consumer's position, so a crash before the
             // first cadence still replays from here rather than resuming past
             // events the state never saw.
             if let (Some(store), None) = (&store, resume_seq) {
-                let floor = js
-                    .consumer_info(&stream, &durable)
-                    .map(|i| i.ack_floor.stream_seq)
-                    .unwrap_or(0);
+                let floor = js.ack_floor(&stream, &durable).unwrap_or(0);
                 if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, floor) {
                     eprintln!("[vejas] {}: first snapshot: {e}", handle.spec.name);
                 }
             }
             let sub = js
-                .pull_subscribe_with_options(
-                    &filters[0],
-                    &nats::jetstream::PullSubscribeOptions::new()
-                        .durable_name(durable.clone())
-                        .bind_stream(stream.clone()),
-                )
+                .pull_durable(&stream, &durable, None)
                 .map_err(|e| format!("{durable}: {e}"))?;
             {
-                let reader_nc = nc.clone();
                 let stop = attempt_stop.clone();
                 let unit = handle.clone();
                 let name = handle.spec.name.clone();
@@ -1605,7 +1550,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         && !unit.stop.load(Ordering::SeqCst)
                         && !stop.load(Ordering::SeqCst)
                     {
-                        match connectors::fetch_iter_flushed(&sub, &reader_nc) {
+                        match sub.round() {
                             Ok(round) => {
                                 let mut n = 0usize;
                                 for msg in round {
@@ -1642,6 +1587,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut acks_since_snapshot: u64 = 0;
             let mut last_snapshot = Instant::now();
+            let mut outbox = nc.batch();
             let result = (|| -> Result<(), String> {
                 loop {
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -1694,12 +1640,12 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                             Err(_) => break,
                         }
                     }
-                    let mut to_ack: Vec<(nats::Message, u64)> = Vec::new();
+                    let mut to_ack: Vec<(bus::Message, u64)> = Vec::new();
                     for msg in batch {
                         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                             return Ok(()); // un-acked: redelivers to whoever holds the durable next
                         }
-                        let seq = msg.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
+                        let seq = msg.delivery().map(|i| i.stream_seq).unwrap_or(0);
                         // The consumer's filters are the `.from()` subjects, so one
                         // matches; the first declared wins when two overlap.
                         let Some(event_type) = sources
@@ -1725,7 +1671,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 let err = format!("bad payload: {e}");
                                 eprintln!("[vejas] {}: {err}", handle.spec.name);
                                 let delivered =
-                                    msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                    msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 metrics::observe(&handle.spec.name, false, 0, 0.0);
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version) {
                                     Ok(()) => {
@@ -1734,7 +1680,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                         retrying.remove(&seq);
                                     }
                                     Err(_) => {
-                                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                        let _ = msg.nak();
                                         retrying.insert(seq);
                                     }
                                 }
@@ -1744,7 +1690,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 let mut subjects = Vec::with_capacity(emits.len());
                                 for emit in &emits {
                                     let subject = emit_subject(emit, &subj_root, &stem);
-                                    if let Err(e) = nc.publish(&subject, emit.to_payload()) {
+                                    if let Err(e) = outbox.publish(&subject, emit.to_payload()) {
                                         eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
                                         ok = false;
                                     }
@@ -1769,7 +1715,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 eprintln!("[vejas] {}: {e}", handle.spec.name);
                                 metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
                                 let delivered =
-                                    msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                                    msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 if delivered >= MAX_DELIVERIES {
                                     match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version) {
                                         Ok(()) => {
@@ -1778,7 +1724,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                             retrying.remove(&seq);
                                         }
                                         Err(_) => {
-                                            let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                            let _ = msg.nak();
                                             retrying.insert(seq);
                                         }
                                     }
@@ -1792,29 +1738,20 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         }
                     }
                     let processed_at = Instant::now();
-                    // Publish-before-ack barrier, one flush per batch (ADR-0002).
-                    if !to_ack.is_empty() {
-                        match nc.flush() {
-                            Ok(_) => {
-                                for (m, seq) in &to_ack {
-                                    match m.reply.as_deref() {
-                                        Some(reply) => {
-                                            let _ = ack_nc.publish(reply, b"");
-                                        }
-                                        None => {
-                                            let _ = m.ack();
-                                        }
-                                    }
-                                    retrying.remove(seq);
-                                    acked_max = acked_max.max(*seq);
-                                }
-                                acks_since_snapshot += to_ack.len() as u64;
+                    // Publish-before-ack barrier, one round-trip per batch (ADR-0002).
+                    match outbox.confirm() {
+                        Ok(()) => {
+                            let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
+                            for (_, seq) in &to_ack {
+                                retrying.remove(seq);
+                                acked_max = acked_max.max(*seq);
                             }
-                            Err(e) => eprintln!(
-                                "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
-                                handle.spec.name
-                            ),
+                            acks_since_snapshot += to_ack.len() as u64;
                         }
+                        Err(e) => eprintln!(
+                            "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
+                            handle.spec.name
+                        ),
                     }
                     metrics::observe_round(
                         &handle.spec.name,
@@ -1883,7 +1820,7 @@ fn program_is_stateful(program: &varpulis_engine::Program) -> bool {
 
 /// Take the unit's snapshot standing for stream sequence `seq` and store it.
 fn snapshot_unit(
-    store: &nats::object_store::ObjectStore,
+    store: &bus::Objects,
     unit: &str,
     version: &str,
     program: &varpulis_engine::Program,
@@ -1930,10 +1867,10 @@ fn contained(attempt: impl FnOnce() -> Result<(), String>) -> Result<(), String>
 }
 
 /// Start a background loop of the runtime itself, which no supervisor watches.
-/// `nats::connect` spawns threads and panics when the OS has none, and that used
-/// to end the loop for good with nothing to show for it: a burst of connections
-/// during boot took `version_watch`, and a promoted version no longer reached this
-/// instance. The thread carries a name, and a panic starts the loop again.
+/// A panic used to end such a loop for good with nothing to show for it: in v0.4.0
+/// a burst of connections during boot took `version_watch`, and a promoted version
+/// no longer reached that instance. The thread carries a name, and a panic starts
+/// the loop again.
 fn background(name: &'static str, body: impl Fn() + Send + 'static) {
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
         while RUNNING.load(Ordering::SeqCst) {
@@ -2062,8 +1999,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             // graceful stop. If the lease is lost mid-run, the renewal thread clears
             // `running`, the driver returns, and the supervisor re-enters standby.
             let _lease = if cluster::is_singleton(driver.kind()) {
-                let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-                let js = nats::jetstream::new(nc);
+                let js = bus::connect(&url)?.jetstream();
                 match cluster::open_lease_store(&js) {
                     Some(store) => {
                         let key = connectors::dlq_unit_token(&handle.spec.name);
@@ -2129,31 +2065,32 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
 fn version_watch(registry: Registry, root: PathBuf) {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     while RUNNING.load(Ordering::SeqCst) {
-        let store = nats::connect(&url)
+        let store = bus::connect(&url)
             .ok()
-            .map(nats::jetstream::new)
-            .and_then(|js| versions::open_store(&js));
+            .and_then(|bus| versions::open_store(&bus.jetstream()));
         let Some(store) = store else {
             thread::sleep(Duration::from_secs(2));
             continue;
         };
-        let watch = match store.watch_all() {
+        let mut watch = match store.watch_all() {
             Ok(w) => w,
             Err(_) => {
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
         };
-        for entry in watch {
-            if !RUNNING.load(Ordering::SeqCst) {
-                return;
-            }
+        while RUNNING.load(Ordering::SeqCst) {
+            let key = match watch.next_timeout(Duration::from_millis(500)) {
+                Ok(Some(key)) => key,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
             // map the KV key token back to a supervised flow unit and restart it
             // (it then re-resolves the overlay: apply on a promote, baseline on
             // an eviction/delete).
             let target = {
                 let reg = registry.lock().unwrap();
-                reg.keys().find(|n| versions::key_token(n) == entry.key).cloned()
+                reg.keys().find(|n| versions::key_token(n) == key).cloned()
             };
             if let Some(name) = target {
                 eprintln!("[vejas] version change for {name} → hot-reloading");
@@ -3056,19 +2993,18 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
         "no exec-rpc SAP connector found — add a manifest with driver \"exec-rpc\" and REQUEST_SUBJECT (see docs/examples/sap_rpc.vjs.example)",
     )?;
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| e.to_string())?;
+    let nc = bus::connect(&url)?;
     let payload = serde_json::to_vec(op).map_err(|e| e.to_string())?;
     let msg = nc
-        .request_timeout(&subject, payload, Duration::from_secs(30))
+        .request(&subject, payload, Duration::from_secs(30))
         .map_err(|e| format!("SAP connector did not answer on {subject}: {e}"))?;
     serde_json::from_slice::<Value>(&msg.data).map_err(|e| e.to_string())
 }
 
 // ───────────────────────── dead-letter queue (ADR-0015) ─────────────────────────
-fn dlq_js() -> Result<nats::jetstream::JetStream, String> {
+fn dlq_js() -> Result<bus::JetStream, String> {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    let nc = nats::connect(&url).map_err(|e| e.to_string())?;
-    let js = nats::jetstream::new(nc);
+    let js = bus::connect(&url)?.jetstream();
     connectors::ensure_dlq_stream(&js);
     Ok(js)
 }
@@ -3076,10 +3012,10 @@ fn dlq_js() -> Result<nats::jetstream::JetStream, String> {
 /// List dead letters, newest first (each carries its stream `seq` for replay/purge).
 fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
     let js = dlq_js()?;
-    let info = js.stream_info(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
-    let (first, last) = (info.state.first_seq, info.state.last_seq);
+    let state = js.stream_state(connectors::DLQ_STREAM)?;
+    let (first, last) = (state.first_seq, state.last_seq);
     let mut out = Vec::new();
-    if last == 0 || info.state.messages == 0 {
+    if last == 0 || state.messages == 0 {
         return Ok(out);
     }
     let mut seq = last;
@@ -3103,7 +3039,7 @@ fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
 /// Record a replay or a purge: one summary per call, best-effort like the
 /// live-promote path. A purge in particular leaves no other trace.
 fn dlq_audit(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     kind: &str,
     actor: &str,
     seq: Option<u64>,
@@ -3134,7 +3070,7 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
         )
     };
     if let Some(s) = seq {
-        let m = js.get_message(connectors::DLQ_STREAM, s).map_err(|e| e.to_string())?;
+        let m = js.get_message(connectors::DLQ_STREAM, s)?;
         let mut env: Value = serde_json::from_slice(&m.data).map_err(|e| e.to_string())?;
         if let Some(o) = env.as_object_mut() {
             o.insert("seq".into(), json!(m.sequence));
@@ -3168,13 +3104,13 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
 fn dlq_purge(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
     if seq.is_none() && unit.is_none() {
-        let r = js.purge_stream(connectors::DLQ_STREAM).map_err(|e| e.to_string())?;
-        dlq_audit(&js, "dlq-purge", actor, None, None, r.purged);
-        return Ok(json!({"purged": r.purged}));
+        let purged = js.purge_stream(connectors::DLQ_STREAM)?;
+        dlq_audit(&js, "dlq-purge", actor, None, None, purged);
+        return Ok(json!({"purged": purged}));
     }
     let mut n = 0u64;
     if let Some(s) = seq {
-        js.delete_message(connectors::DLQ_STREAM, s).map_err(|e| e.to_string())?;
+        js.delete_message(connectors::DLQ_STREAM, s)?;
         n = 1;
     } else if let Some(u) = unit {
         for env in dlq_list(100_000)? {
@@ -3416,11 +3352,12 @@ fn publish_emits(emits: &[(String, Value)]) {
         return;
     }
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if let Ok(nc) = nats::connect(&url) {
+    if let Ok(nc) = bus::connect(&url) {
+        let mut batch = nc.batch();
         for (subj, payload) in emits {
-            let _ = nc.publish(subj, serde_json::to_vec(payload).unwrap_or_default());
+            let _ = batch.publish(subj, serde_json::to_vec(payload).unwrap_or_default());
         }
-        let _ = nc.flush();
+        let _ = batch.confirm();
     }
 }
 

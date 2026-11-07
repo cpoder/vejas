@@ -98,9 +98,6 @@ else
     debian:trixie-slim vejas-runtime > /dev/null
   for _ in $(seq 1 100); do curl -sf -o /dev/null "$H2/healthz" && break; sleep 0.1; done
   wait_ingest $IN2 || ko "http-in never came up in the container"
-  # Past the boot: a burst that lands on the first NATS connections is another
-  # case, covered by background(), and it made this check flaky.
-  sleep 5
   hold $IN2 300 3; HOLD=$!
   sleep 1
   wait $HOLD 2>/dev/null

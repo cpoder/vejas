@@ -17,6 +17,11 @@
 //! broker with fault injection; real-queue-manager certification is the declared
 //! CI exception (ADR-0023, like SAP/ADR-0017).
 
+// The runtime's own bus module, compiled in as it is: one sync API over `async-nats`
+// on one small tokio runtime, and no NATS type anywhere else (ADR-0035).
+#[allow(dead_code)]
+#[path = "../../../core/src/bus.rs"]
+mod bus;
 mod lease;
 mod mqi;
 
@@ -86,50 +91,13 @@ fn load_config() -> Result<Config, String> {
 }
 
 // ───────────────────────── source: MQ → bus ─────────────────────────
-/// Publish and wait for the JetStream pub-ack, flushing DIRECTLY past nats 0.25's
-/// 5ms flusher floor (client.rs MIN_FLUSH_BETWEEN) — that floor caps every
-/// sequential pub-ack at ~200/s, and this get→publish→commit loop is exactly that.
-/// Reimplements the crate's request path (inbox, buffered publish-with-reply,
-/// no-responders guard) + a direct flush; Ok still means a real pub-ack (persisted),
-/// so the at-least-once ordering (publish-before-MQCMIT) is unchanged.
-fn publish_confirmed(
-    nc: &nats::Connection,
-    subject: &str,
-    payload: &[u8],
-    wait: Duration,
-) -> Result<(), String> {
-    let reply = nc.new_inbox();
-    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
-    nc.publish_request(subject, &reply, payload)
-        .map_err(|e| e.to_string())?;
-    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
-    let msg = sub
-        .next_timeout(wait)
-        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
-    if msg.is_no_responders() {
-        return Err("no JetStream responder for the subject (stream missing?)".into());
-    }
-    let ack: serde_json::Value =
-        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
-    if let Some(err) = ack.get("error") {
-        return Err(format!("JetStream rejected the publish: {err}"));
-    }
-    if ack.get("stream").is_none() {
-        return Err(format!(
-            "unexpected pub-ack (no stream): {}",
-            String::from_utf8_lossy(&msg.data)
-        ));
-    }
-    Ok(())
-}
-
 /// Get under syncpoint, publish to the bus awaiting the JetStream pub-ack, then —
 /// and only then — MQCMIT. Any failure before the commit is an MQBACK, so the
 /// message stays on the queue and is re-got: at-least-once, no loss. The broker is
 /// the durable cursor (no offset KV — contrast Kafka/ADR-0022).
 fn run_source(
     broker: &mut dyn Broker,
-    nc: &nats::Connection,
+    js: &bus::JetStream,
     subject: &str,
     wait: Duration,
     alive: impl Fn() -> bool,
@@ -141,7 +109,7 @@ fn run_source(
             .get_syncpoint(wait)
             .map_err(|e| format!("get: {e}"))?;
         let Some(msg) = got else { continue }; // idle: no message within the wait
-        match publish_confirmed(nc, subject, &msg.body, Duration::from_secs(5)) {
+        match js.publish(subject, &msg.body) {
             Ok(_) => {
                 // JetStream pub-ack received (message is durable on the bus) →
                 // safe to remove it from MQ.
@@ -176,13 +144,16 @@ fn run_source(
 /// CorrelId (VEJAS_MQ_DEDUP_FIELD) lets a downstream consumer dedup.
 fn run_sink(
     broker: &mut dyn Broker,
-    sub: &nats::jetstream::PullSubscription,
+    sub: &bus::Puller,
     dedup_field: Option<&str>,
     alive: impl Fn() -> bool,
 ) -> Result<(), String> {
     eprintln!("[vejas-mq] sink: bus → MQ (put→commit→ack)");
     while alive() {
-        for m in fetch_round(sub)? {
+        // One bounded round as a continuous long-poll: messages the instant they
+        // arrive, else the pull is held server-side for the window and comes back
+        // empty (no client sleep, no coverage gap, the shape the runtime uses).
+        for m in sub.round()? {
             if !alive() {
                 return Ok(()); // stopped mid-batch: leave un-acked, it redelivers
             }
@@ -190,7 +161,7 @@ fn run_sink(
                 .and_then(|f| dedup_key(&m.data, f))
                 .map(|k| mqi::correlid_from_key(&k))
                 .unwrap_or_default();
-            let out = MqMessage { body: m.data.clone(), correlid };
+            let out = MqMessage { body: m.data.to_vec(), correlid };
             match broker.put_syncpoint(&out) {
                 Ok(()) => match broker.commit() {
                     Ok(()) => {
@@ -209,21 +180,6 @@ fn run_sink(
         }
     }
     Ok(())
-}
-
-/// Pull one bounded batch as a continuous long-poll: messages the instant they
-/// arrive, else the pull is held server-side for the window and returns empty (no
-/// client sleep, no coverage gap — the same shape the core runtime uses).
-fn fetch_round(
-    sub: &nats::jetstream::PullSubscription,
-) -> Result<Vec<nats::Message>, String> {
-    let iter = sub
-        .timeout_fetch(
-            nats::jetstream::BatchOptions { batch: 64, expires: Some(500_000_000), no_wait: true },
-            Duration::from_millis(750),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(iter.map_while(|m| m.ok()).collect())
 }
 
 /// Pull a stringified idempotency key out of the JSON body at a top-level field.
@@ -251,14 +207,13 @@ fn main() {
         );
     }
 
-    let nc = match nats::connect(&cfg.nats_url) {
-        Ok(nc) => nc,
+    let js = match bus::connect(&cfg.nats_url) {
+        Ok(bus) => bus.jetstream(),
         Err(e) => {
             eprintln!("[vejas-mq] cannot connect to NATS at {}: {e}", cfg.nats_url);
             std::process::exit(1);
         }
     };
-    let js = nats::jetstream::new(nc.clone());
 
     let result = if cfg.mode == "source" {
         // Singleton by default (ADR-0023, "because order"): take the lease so one
@@ -282,27 +237,16 @@ fn main() {
         // stop getting if the lease is lost (fenced / aged out) as well as on signal
         let source_alive = || alive() && held.as_ref().map_or(true, |l| !l.lost());
         MqiQueue::open(&cfg.qmgr, &cfg.queue, false)
-            .and_then(|mut q| run_source(&mut q, &nc, &cfg.subject, cfg.wait, source_alive))
+            .and_then(|mut q| run_source(&mut q, &js, &cfg.subject, cfg.wait, source_alive))
     } else {
         // durable pull consumer, competing-safe by its own durable (SUBJECTS.md).
-        // pull_subscribe_with_options only BINDS an existing durable — the runtime
-        // owns the stream, but a standalone connector must declare the consumer
-        // first (idempotent), or binding 404s. VEJAS_STREAM names the stream.
+        // pull_durable only BINDS an existing durable — the runtime owns the
+        // stream, but a standalone connector must declare the consumer first
+        // (idempotent), or binding 404s. VEJAS_STREAM names the stream.
         let stream = env_or("VEJAS_STREAM", "VEJAS");
-        let _ = js.add_consumer(
-            &stream,
-            nats::jetstream::ConsumerConfig {
-                durable_name: Some(cfg.durable.clone()),
-                filter_subject: cfg.subject.clone(),
-                ..Default::default()
-            },
-        );
-        let sub = js
-            .pull_subscribe_with_options(
-                &cfg.subject,
-                &nats::jetstream::PullSubscribeOptions::new().durable_name(cfg.durable.clone()),
-            )
-            .map_err(|e| e.to_string());
+        let filter = [cfg.subject.clone()];
+        let _ = js.create_pull_consumer(&stream, &cfg.durable, &filter, Duration::ZERO, None);
+        let sub = js.pull_durable(&stream, &cfg.durable, Some(&cfg.subject));
         match (MqiQueue::open(&cfg.qmgr, &cfg.queue, true), sub) {
             (Ok(mut q), Ok(sub)) => run_sink(&mut q, &sub, cfg.dedup_field.as_deref(), alive),
             (Err(e), _) | (_, Err(e)) => Err(e),
@@ -436,20 +380,20 @@ mod tests {
     #[ignore]
     fn source_publishes_to_bus_e2e() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
-        let nc = nats::connect(&url).expect("connect");
-        let js = nats::jetstream::new(nc.clone());
+        let nc = bus::connect(&url).expect("connect");
+        let js = nc.jetstream();
         let pid = std::process::id();
         let stream = format!("MQPROBE_{pid}");
         let subject = format!("mqprobe.{pid}.in");
         let _ = js.delete_stream(&stream);
-        js.add_stream(nats::jetstream::StreamConfig {
+        js.add_stream(&bus::StreamConfig {
             name: stream.clone(),
             subjects: vec![format!("mqprobe.{pid}.>")],
             ..Default::default()
         })
         .expect("add_stream");
         // a plain subscriber to observe what lands on the bus
-        let sub = nc.subscribe(&subject).expect("sub");
+        let mut sub = nc.subscribe(&subject).expect("sub");
 
         let mut broker = FakeBroker::with(&["a1", "b2", "c3"]);
         // stop once the queue has drained (get returns None) — bounded, no globals.
@@ -468,7 +412,7 @@ mod tests {
             fn backout(&mut self) -> Result<(), mqi::MqError> { self.inner.backout() }
         }
         let mut draining = Draining { inner: std::mem::take(&mut broker), flag: &seen_empty };
-        run_source(&mut draining, &nc, &subject, Duration::from_millis(50), alive).expect("source");
+        run_source(&mut draining, &js, &subject, Duration::from_millis(50), alive).expect("source");
 
         let mut got = Vec::new();
         while let Ok(m) = sub.next_timeout(Duration::from_millis(300)) {

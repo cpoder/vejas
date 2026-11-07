@@ -13,6 +13,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::bus;
+
 const PROPOSALS_BUCKET: &str = "VEJAS_PROPOSALS";
 const PROPOSALS_HISTORY: i64 = 64; // bounded live queue; audit is the durable record
 
@@ -21,15 +23,12 @@ static SEQ: AtomicU64 = AtomicU64::new(1);
 /// Open (or create) the shared proposal bucket. None if JetStream KV is
 /// unavailable (proposals need the shared bus; a single dev instance without it
 /// simply has no queue).
-pub fn open_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
-    let cfg = nats::kv::Config {
+pub fn open_store(js: &bus::JetStream) -> Option<bus::Kv> {
+    js.key_value(&bus::KvConfig {
         bucket: PROPOSALS_BUCKET.to_string(),
         history: PROPOSALS_HISTORY,
         ..Default::default()
-    };
-    js.create_key_value(&cfg)
-        .or_else(|_| js.key_value(PROPOSALS_BUCKET))
-        .ok()
+    })
 }
 
 /// A fresh proposal id — `ts` is the wall-clock second (stamped by the caller;
@@ -41,7 +40,7 @@ pub fn new_id(ts: u64) -> String {
 /// Submit a proposal (status "pending"). Returns the stored record.
 #[allow(clippy::too_many_arguments)]
 pub fn submit(
-    store: &nats::kv::Store,
+    store: &bus::Kv,
     id: &str,
     kind: &str,
     payload: serde_json::Value,
@@ -66,7 +65,7 @@ pub fn submit(
     Ok(record)
 }
 
-pub fn get(store: &nats::kv::Store, id: &str) -> Option<serde_json::Value> {
+pub fn get(store: &bus::Kv, id: &str) -> Option<serde_json::Value> {
     store
         .get(id)
         .ok()
@@ -75,10 +74,10 @@ pub fn get(store: &nats::kv::Store, id: &str) -> Option<serde_json::Value> {
 }
 
 /// Every proposal, newest first (by created_at).
-pub fn list(store: &nats::kv::Store) -> Vec<serde_json::Value> {
+pub fn list(store: &bus::Kv) -> Vec<serde_json::Value> {
     let mut all: Vec<serde_json::Value> = store
         .keys()
-        .map(|keys| keys.filter_map(|k| get(store, &k)).collect())
+        .map(|keys| keys.iter().filter_map(|k| get(store, k)).collect())
         .unwrap_or_default();
     all.sort_by_key(|p| std::cmp::Reverse(p["created_at"].as_u64().unwrap_or(0)));
     all
@@ -87,7 +86,7 @@ pub fn list(store: &nats::kv::Store) -> Vec<serde_json::Value> {
 /// Transition a proposal's status (and stamp who/when for a human decision).
 /// Returns the updated record, or an error if it is gone.
 pub fn set_status(
-    store: &nats::kv::Store,
+    store: &bus::Kv,
     id: &str,
     status: &str,
     decided_by: Option<&str>,

@@ -8,10 +8,10 @@
 //!
 //! Same JetStream KV mechanism as the core runtime (create = acquire, update-CAS =
 //! renew/fence, delete = release, bucket max_age = crash failover) — reimplemented
-//! here because the connector is a standalone binary with its own NATS client, not
-//! linked to the core. The bucket is shared (VEJAS_LEASES), keys namespaced, so it
+//! here because the connector is a standalone binary, not linked to the core. The bucket is shared (VEJAS_LEASES), keys namespaced, so it
 //! coordinates with the fleet when they run on the same bus.
 
+use crate::bus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -56,23 +56,19 @@ pub fn source_key(queue: &str) -> String {
 
 /// Open (or create) the shared lease bucket. None if JetStream KV is unavailable —
 /// the caller then runs unleased (single-instance behaviour, no worse than today).
-pub fn open_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
-    let cfg = nats::kv::Config {
+pub fn open_store(js: &bus::JetStream) -> Option<bus::Kv> {
+    js.key_value(&bus::KvConfig {
         bucket: LEASE_BUCKET.to_string(),
         max_age: lease_ttl(),
         history: 1,
-        ..Default::default()
-    };
-    js.create_key_value(&cfg)
-        .or_else(|_| js.key_value(LEASE_BUCKET))
-        .ok()
+    })
 }
 
 /// Held while this instance owns the lease. Dropping it stops renewal and releases
 /// the lease (instant handoff on shutdown). `lost()` goes true if the renewal
 /// thread finds the lease fenced or aged out — the caller stops getting.
 pub struct Lease {
-    store: nats::kv::Store,
+    store: bus::Kv,
     key: String,
     stop_renew: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
@@ -100,7 +96,7 @@ impl Drop for Lease {
 /// thread. Returns None if `alive()` goes false before acquisition (asked to stop
 /// while standing by).
 pub fn acquire_blocking(
-    store: &nats::kv::Store,
+    store: &bus::Kv,
     key: &str,
     alive: impl Fn() -> bool,
 ) -> Option<Lease> {
@@ -167,8 +163,7 @@ mod tests {
     #[ignore]
     fn lease_is_mutually_exclusive() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
-        let nc = nats::connect(&url).expect("connect");
-        let js = nats::jetstream::new(nc);
+        let js = bus::connect(&url).expect("connect").jetstream();
         let store = open_store(&js).expect("lease store");
         let key = format!("amqp_test_{}", std::process::id());
         let _ = store.delete(&key);
@@ -192,8 +187,7 @@ mod tests {
     #[ignore]
     fn stale_revision_is_fenced() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
-        let nc = nats::connect(&url).expect("connect");
-        let js = nats::jetstream::new(nc);
+        let js = bus::connect(&url).expect("connect").jetstream();
         let store = open_store(&js).expect("lease store");
         let key = format!("amqp_fence_{}", std::process::id());
         let _ = store.delete(&key);

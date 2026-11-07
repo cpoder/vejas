@@ -16,12 +16,15 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
+
+use crate::bus;
 
 // ───────────────────────── config & context ─────────────────────────
 
@@ -89,23 +92,14 @@ impl Ctx {
     fn alive(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
-    fn jetstream(&self) -> Result<nats::jetstream::JetStream, String> {
-        Ok(self.jetstream_and_conn()?.0)
-    }
-    /// Like `jetstream()`, but also returns the raw `Connection` (a cheap clone —
-    /// `Connection` is `Arc` inside) so a driver can use `publish_confirmed`, which
-    /// needs the connection to flush directly past the 5ms flusher floor.
-    fn jetstream_and_conn(
-        &self,
-    ) -> Result<(nats::jetstream::JetStream, nats::Connection), String> {
-        let nc = nats::connect(&self.nats_url).map_err(|e| e.to_string())?;
-        let js = nats::jetstream::new(nc.clone());
-        let _ = js.add_stream(&nats::jetstream::StreamConfig {
+    fn jetstream(&self) -> Result<bus::JetStream, String> {
+        let js = bus::connect(&self.nats_url)?.jetstream();
+        let _ = js.add_stream(&bus::StreamConfig {
             name: self.stream.clone(),
             subjects: vec![format!("{}.>", self.subj_root)],
             ..Default::default()
         });
-        Ok((js, nc))
+        Ok(js)
     }
     /// Full subject from a config value that may be a bare suffix or a vx.* path.
     fn subject(&self, raw: &str) -> String {
@@ -197,10 +191,7 @@ impl Driver for HttpIn {
         let max_connections = ctx.config.u64_or("MAX_CONNECTIONS", 512).max(1) as usize;
         let open = Arc::new(AtomicUsize::new(0));
         let mut refused = 0u64;
-        // nc for publish_confirmed (direct flush past the 5ms flusher floor —
-        // measured: /ingest p50 5.2ms→0.77ms, no throughput regression at conc=32);
-        // _js keeps the stream ensured.
-        let (_js, nc) = ctx.jetstream_and_conn()?;
+        let js = ctx.jetstream()?;
         // Optional ALLOW: the subjects this unauthenticated surface may publish to.
         // Absent = any suffix (compat); set = only these (defence in depth, ADR-0029
         // R7 F2 — recommended when the port is reachable by anyone but the operator).
@@ -237,7 +228,7 @@ impl Driver for HttpIn {
                         refuse(sock);
                         continue;
                     };
-                    let nc = nc.clone();
+                    let js = js.clone();
                     let root = ctx.subj_root.clone();
                     let name = ctx.name.clone();
                     let allow = allow.clone();
@@ -248,7 +239,7 @@ impl Driver for HttpIn {
                     let spawned = thread::Builder::new().name(format!("{name}:conn")).spawn(
                         move || {
                             let _slot = slot;
-                            handle_http_in(&name, &mut sock, &nc, &root, &allow)
+                            handle_http_in(&name, &mut sock, &js, &root, &allow)
                         },
                     );
                     if let Err(e) = spawned {
@@ -314,7 +305,7 @@ const REQUEST_READ_LIMIT: Duration = Duration::from_secs(30);
 fn handle_http_in(
     name: &str,
     sock: &mut std::net::TcpStream,
-    nc: &nats::Connection,
+    js: &bus::JetStream,
     subj_root: &str,
     allow: &[String],
 ) {
@@ -394,7 +385,7 @@ fn handle_http_in(
                     ("403 Forbidden", format!("{{\"error\":\"subject {suffix:?} not permitted by ALLOW\"}}"))
                 } else {
                     let subject = format!("{subj_root}.{suffix}");
-                    match publish_confirmed(nc, &subject, body, Duration::from_secs(5)) {
+                    match js.publish(&subject, body) {
                         Ok(_) => {
                             trace_pub(name, &subject, body);
                             ("202 Accepted", format!("{{\"published\":\"{subject}\"}}"))
@@ -544,12 +535,6 @@ impl Driver for HttpPoll {
 
 // ───────────────────────── pull rounds ─────────────────────────
 
-/// One bounded pull round: up to 10 messages, and the server resolves the
-/// request within PULL_EXPIRES_NS (messages or a 408 timeout status), so the
-/// calling loop gets control back and can re-check its stop flag. A plain
-/// `fetch()` parks forever on an idle subject: a stopped flow's thread stayed
-/// wedged in `recv()`, reported "running", and processed one more message
-/// before dying (the zombie-consumer trap caught while rehearsing the demo).
 /// Consumer ack-wait (redelivery latency): a message not acked within this window
 /// redelivers (at-least-once, ADR-0002). `VEJAS_ACK_WAIT_SECS` tunes it; unset (or
 /// ≤0) keeps `Duration::ZERO`, which JetStream reads as its 30s default — the
@@ -566,141 +551,11 @@ pub fn ack_wait() -> Duration {
         .unwrap_or_default()
 }
 
-/// The idle poll window (`expires`). One outstanding pull covers this whole span,
-/// so a message arriving any time inside it is delivered at once — there is NO gap
-/// between rounds where a message would sit unpolled. It is therefore two things at
-/// once: the idle pull cadence (one pull per window when quiet) AND the worst-case
-/// stop-response latency (the loop re-checks its `alive` flag each time a pull
-/// returns). 500ms keeps idle chatter to ~2 pulls/s per consumer while leaving stop
-/// far inside the transport suite's 3s bound (T5).
-const PULL_EXPIRES_MS: u64 = 500;
-
-pub fn fetch_round(sub: &nats::jetstream::PullSubscription) -> Result<Vec<nats::Message>, String> {
-    Ok(fetch_iter_with(sub, None)?.collect())
-}
-
-/// [`fetch_round`] for a hot loop: the pull request leaves NOW, and the
-/// messages come back one by one as the reader thread hands them over.
-///
-/// Two things a hot loop needs that a one-off scan does not.
-///
-/// **The request leaves now.** A pull request is a publish, and the `nats`
-/// 0.25 client only *buffers* a publish: its flusher thread writes the buffer
-/// out, and it waits at least 5 ms between two writes (`MIN_FLUSH_BETWEEN` in
-/// its `client.rs`, a never-done `TODO(dlc)`). So every round of the consumer
-/// loop paid up to 5 ms before the server even saw the request. Measured on
-/// the flow loop under a backlog: 64 messages per round, ~7 ms per round,
-/// ~9 000 evt/s — with the interpreter itself at 10 µs per event. Flushing
-/// the request in the calling thread (`Connection::flush` writes a PING and
-/// flushes the writer directly, the same bypass `publish_confirmed` uses for
-/// pub-acks) turns that wait into one round-trip: 13 500 evt/s.
-///
-/// **Streaming, not collecting.** Collecting the whole batch into a `Vec`
-/// before processing meant the reader thread decoded 64 messages while this
-/// thread waited, then this thread processed 64 while the reader idled —
-/// two costs added instead of overlapped. Iterating as messages arrive lets
-/// both run at once. The batch boundary is unchanged: the caller still does
-/// its publish-before-ack barrier once the iterator ends.
-///
-/// One-off scans (replay hydration, the audit list, the shadow watch) keep
-/// [`fetch_round`]: they pull a handful of rounds and a few milliseconds each
-/// do not matter there.
-pub fn fetch_iter_flushed<'a>(
-    sub: &'a nats::jetstream::PullSubscription,
-    nc: &nats::Connection,
-) -> Result<FetchRound<'a>, String> {
-    fetch_iter_with(sub, Some(nc))
-}
-
-/// One pull round: the messages of one request, ending when the request is
-/// exhausted (batch filled, or the server's own timeout status).
-pub struct FetchRound<'a>(Box<dyn Iterator<Item = std::io::Result<nats::Message>> + 'a>);
-
-impl Iterator for FetchRound<'_> {
-    type Item = nats::Message;
-    fn next(&mut self) -> Option<nats::Message> {
-        self.0.next()?.ok()
-    }
-}
-
-fn fetch_iter_with<'a>(
-    sub: &'a nats::jetstream::PullSubscription,
-    flush_on: Option<&nats::Connection>,
-) -> Result<FetchRound<'a>, String> {
-    // A continuous long-poll. `no_wait` returns the instant messages are available
-    // (a single message is delivered at once — no batch-fill latency, and the
-    // benched high-rate drain still fills 64-batches in one round). When the subject
-    // is idle the pull is HELD server-side for `expires` and returns empty — so the
-    // loop paces itself on the server with no client sleep, and crucially no
-    // coverage gap: previously a 150ms idle sleep sat between rounds with no pull
-    // outstanding, and a message landing in that window waited it out (measured tail
-    // ~150ms — the connector-latency bug the MQTT bench surfaced). No pull parks in
-    // max_waiting: one is in flight at a time and each resolves within `expires`, so
-    // the anti-zombie invariant holds and stop is re-checked every round.
-    let expires_ns = (PULL_EXPIRES_MS * 1_000_000) as usize;
-    let iter = sub
-        .timeout_fetch(
-            nats::jetstream::BatchOptions {
-                batch: 64,
-                expires: Some(expires_ns),
-                no_wait: true,
-            },
-            // client-side backstop: comfortably past the server's `expires` so the
-            // server's own empty/timeout status ends the round, not this timeout.
-            Duration::from_millis(PULL_EXPIRES_MS + 250),
-        )
-        .map_err(|e| e.to_string())?;
-    // `timeout_fetch` has buffered the pull request; send it before waiting on it.
-    if let Some(nc) = flush_on {
-        nc.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(FetchRound(Box::new(iter)))
-}
-
-/// Publish to a JetStream subject and wait for the pub-ack, flushing the write
-/// DIRECTLY in this thread rather than via the shared flusher.
-///
-/// `nats` 0.25's flusher thread imposes a hard-coded 5ms floor between flushes
-/// (`client.rs` `MIN_FLUSH_BETWEEN`, a never-done `TODO(dlc)`). Since a JetStream
-/// pub-ack is a request/reply, EVERY sequential `js.publish` is capped at ~200/s by
-/// that floor — the ceiling the MQTT loopback bench surfaced (js.publish p50
-/// ≈5.1ms, dead on the tick). `Connection::flush()` does a direct writer flush +
-/// PING/PONG in the calling thread, bypassing the floor, which lifts sequential
-/// publish to ~1-2k/s. This reimplements `request_with_headers_or_timeout` (nats
-/// `lib.rs`) verbatim — inbox, buffered publish-with-reply, the **no-responders
-/// guard** — and only adds the direct flush, so the at-least-once contract is
-/// unchanged: a returned Ok still means the message was persisted (a real pub-ack
-/// with a `stream`/`seq`), never a mis-read of a 503 or an error ack.
-pub fn publish_confirmed(
-    nc: &nats::Connection,
-    subject: &str,
-    payload: &[u8],
-    wait: Duration,
-) -> Result<(), String> {
-    let reply = nc.new_inbox();
-    let sub = nc.subscribe(&reply).map_err(|e| e.to_string())?;
-    nc.publish_request(subject, &reply, payload)
-        .map_err(|e| e.to_string())?;
-    nc.flush().map_err(|e| e.to_string())?; // direct flush — bypass the 5ms floor
-    let msg = sub
-        .next_timeout(wait)
-        .map_err(|_| "timed out waiting for JetStream pub-ack".to_string())?;
-    if msg.is_no_responders() {
-        return Err("no JetStream responder for the subject (stream missing?)".into());
-    }
-    // ApiResponse<PublishAck>: an "error" key = rejected; a "stream" key = persisted.
-    let ack: serde_json::Value =
-        serde_json::from_slice(&msg.data).map_err(|e| format!("bad pub-ack: {e}"))?;
-    if let Some(err) = ack.get("error") {
-        return Err(format!("JetStream rejected the publish: {err}"));
-    }
-    if ack.get("stream").is_none() {
-        return Err(format!(
-            "unexpected pub-ack (no stream): {}",
-            String::from_utf8_lossy(&msg.data)
-        ));
-    }
-    Ok(())
+/// One whole pull round, collected: for one-off scans (replay hydration, the
+/// audit list, the shadow watch). A hot loop iterates `Puller::round` instead,
+/// so that it works on messages as they arrive.
+pub fn fetch_round(sub: &bus::Puller) -> Result<Vec<bus::Message>, String> {
+    Ok(sub.round()?.collect())
 }
 
 /// Hydrate up to `n` recent REAL events for `subject` from the persisted stream,
@@ -714,16 +569,13 @@ pub fn publish_confirmed(
 /// sequence rather than from the beginning: at most `window` messages are
 /// scanned, of which the last `n` matching `subject` are kept.
 pub fn hydrate_recent(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     stream: &str,
     subject: &str,
     n: usize,
 ) -> Result<Vec<(u64, String, serde_json::Value)>, String> {
     let n = n.clamp(1, 5000);
-    let last = js
-        .stream_info(stream)
-        .map(|si| si.state.last_seq)
-        .unwrap_or(0);
+    let last = js.stream_state(stream).map(|state| state.last_seq).unwrap_or(0);
     if last == 0 {
         return Ok(Vec::new()); // empty stream: nothing persisted yet
     }
@@ -731,24 +583,16 @@ pub fn hydrate_recent(
     // but keep it bounded (an operator action, not the hot path).
     let window = (n as u64).saturating_mul(8).max(256).min(200_000);
     let start = last.saturating_sub(window).max(1);
-    let cfg = nats::jetstream::ConsumerConfig {
-        deliver_policy: nats::jetstream::DeliverPolicy::ByStartSeq,
-        opt_start_seq: Some(start),
-        // Explicit but never acked: the consumer is ephemeral and discarded, so
-        // un-acked messages simply expire with it — nothing redelivers to the
-        // flow, nothing is consumed off the stream.
-        ack_policy: nats::jetstream::AckPolicy::Explicit,
-        filter_subject: subject.to_string(),
+    // Never acked: the consumer is ephemeral and discarded, so un-acked messages
+    // simply expire with it — nothing redelivers to the flow, nothing is consumed
+    // off the stream.
+    let cfg = bus::EphemeralConfig {
+        filter: subject,
+        start_seq: Some(start),
         // auto-reap the ephemeral consumer shortly after we stop pulling
         inactive_threshold: Duration::from_secs(30),
-        ..Default::default()
     };
-    let sub = js
-        .pull_subscribe_with_options(
-            subject,
-            &nats::jetstream::PullSubscribeOptions::new().consumer_config(cfg),
-        )
-        .map_err(|e| e.to_string())?;
+    let sub = js.pull_ephemeral(stream, &cfg)?;
     let mut ring: std::collections::VecDeque<(u64, String, serde_json::Value)> =
         std::collections::VecDeque::with_capacity(n);
     let mut scanned = 0u64;
@@ -762,7 +606,7 @@ pub fn hydrate_recent(
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data) {
                 // the stream sequence is the intrinsic join key for time-travel /
                 // canary diffs (ADR-0021) — no per-flow key to invent.
-                let seq = m.jetstream_message_info().map(|i| i.stream_seq).unwrap_or(0);
+                let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 ring.push_back((seq, m.subject.clone(), v));
                 while ring.len() > n {
                     ring.pop_front();
@@ -1010,7 +854,7 @@ impl Driver for OAuthPoll {
                 e
             })?;
             let publish_page =
-                |parsed: &Value, logical: &str, js: &nats::jetstream::JetStream| -> Result<(), String> {
+                |parsed: &Value, logical: &str, js: &bus::JetStream| -> Result<(), String> {
                     let envelope = serde_json::json!({
                         "endpoint": logical,
                         "fetched_at": iso8601_utc(crate::now_secs()),
@@ -1181,70 +1025,6 @@ pub fn subject_matches(pattern: &str, subject: &str) -> bool {
     }
 }
 
-/// Create (or verify) a durable pull consumer that delivers every one of
-/// `filters` in stream order, from the beginning or, with `start_seq`, from
-/// that stream sequence on. The sync `nats` client knows one filter subject
-/// per consumer; the JetStream API knows several since 2.10, so the request is
-/// sent raw. Idempotent: the same request on an existing consumer is accepted,
-/// and 2.10 updates the filters of an existing one in place (its ack floor
-/// stays). The reply's filters must be exactly the ones asked for — a server
-/// that ignored `filter_subjects` would deliver the whole stream.
-pub fn create_pull_consumer(
-    nc: &nats::Connection,
-    stream: &str,
-    durable: &str,
-    filters: &[String],
-    ack_wait: Duration,
-    start_seq: Option<u64>,
-) -> Result<(), String> {
-    let mut config = serde_json::json!({
-        "durable_name": durable,
-        "ack_policy": "explicit",
-        "ack_wait": ack_wait.as_nanos() as u64,
-        "deliver_policy": "all",
-        "replay_policy": "instant",
-    });
-    // Resuming after a snapshot: start at the sequence after it. The server
-    // cannot change an existing consumer's deliver policy, so the caller
-    // deletes the durable first.
-    if let Some(seq) = start_seq {
-        config["deliver_policy"] = Value::from("by_start_sequence");
-        config["opt_start_seq"] = Value::from(seq);
-    }
-    match filters {
-        [one] => config["filter_subject"] = Value::String(one.clone()),
-        many => config["filter_subjects"] = Value::from(many.to_vec()),
-    }
-    let body = serde_json::json!({ "stream_name": stream, "config": config }).to_string();
-    let reply = nc
-        .request(&format!("$JS.API.CONSUMER.DURABLE.CREATE.{stream}.{durable}"), body)
-        .map_err(|e| format!("consumer {durable}: {e}"))?;
-    let v: Value = serde_json::from_slice(&reply.data)
-        .map_err(|e| format!("consumer {durable}: unreadable reply: {e}"))?;
-    if let Some(err) = v.get("error") {
-        let what = err.get("description").and_then(Value::as_str).unwrap_or("error");
-        return Err(format!("consumer {durable}: {what}"));
-    }
-    let mut kept: Vec<String> = match v["config"].get("filter_subjects").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
-        None => v["config"]
-            .get("filter_subject")
-            .and_then(Value::as_str)
-            .map(|x| vec![x.to_string()])
-            .unwrap_or_default(),
-    };
-    let mut asked = filters.to_vec();
-    kept.sort();
-    asked.sort();
-    if kept != asked {
-        return Err(format!(
-            "consumer {durable}: the server kept the filters {kept:?}, not {asked:?} \
-             (several `.from()` subjects need NATS 2.10 or newer)"
-        ));
-    }
-    Ok(())
-}
-
 // ───────────────────────── detect snapshots ─────────────────────────
 
 pub const DETECT_STATE_BUCKET: &str = "VEJAS_DETECT_STATE";
@@ -1262,21 +1042,13 @@ pub struct Snapshot {
 
 /// The object store the detect units keep their snapshots in: one object per
 /// unit, the latest only. Create-or-open, like every bucket in this repo.
-pub fn open_state_store(
-    js: &nats::jetstream::JetStream,
-) -> Option<nats::object_store::ObjectStore> {
-    let cfg = nats::object_store::Config {
-        bucket: DETECT_STATE_BUCKET.to_string(),
-        ..Default::default()
-    };
-    js.create_object_store(&cfg)
-        .or_else(|_| js.object_store(DETECT_STATE_BUCKET))
-        .ok()
+pub fn open_state_store(js: &bus::JetStream) -> Option<bus::Objects> {
+    js.object_store(DETECT_STATE_BUCKET)
 }
 
 /// Store a snapshot: one JSON header line, then the engine's bytes as they are.
 pub fn snapshot_put(
-    store: &nats::object_store::ObjectStore,
+    store: &bus::Objects,
     unit: &str,
     snap: &Snapshot,
 ) -> Result<(), String> {
@@ -1290,34 +1062,14 @@ pub fn snapshot_put(
     .into_bytes();
     bytes.push(b'\n');
     bytes.extend_from_slice(&snap.state);
-    store
-        .put(unit, &mut bytes.as_slice())
-        .map(|_| ())
-        .map_err(|e| format!("snapshot put: {e}"))
+    store.put(unit, &bytes).map_err(|e| format!("snapshot put: {e}"))
 }
 
 /// The unit's snapshot, if it has one.
-pub fn snapshot_get(
-    store: &nats::object_store::ObjectStore,
-    unit: &str,
-) -> Result<Option<Snapshot>, String> {
-    let mut object = match store.get(unit) {
-        Ok(o) => o,
-        Err(e) => {
-            let text = e.to_string();
-            if e.kind() == std::io::ErrorKind::NotFound
-                || text.contains("not found")
-                || text.contains("no message")
-            {
-                return Ok(None);
-            }
-            return Err(format!("snapshot get: {e}"));
-        }
+pub fn snapshot_get(store: &bus::Objects, unit: &str) -> Result<Option<Snapshot>, String> {
+    let Some(bytes) = store.get(unit).map_err(|e| format!("snapshot get: {e}"))? else {
+        return Ok(None);
     };
-    let mut bytes = Vec::new();
-    object
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("snapshot read: {e}"))?;
     let nl = bytes
         .iter()
         .position(|b| *b == b'\n')
@@ -1374,12 +1126,12 @@ pub const DLQ_MAX_MSGS: i64 = 100_000;
 
 /// Ensure the dead-letter stream exists (idempotent). Bounded + discard-oldest:
 /// a full DLQ is itself an operator signal, never a silent unbounded growth.
-pub fn ensure_dlq_stream(js: &nats::jetstream::JetStream) {
-    let _ = js.add_stream(&nats::jetstream::StreamConfig {
+pub fn ensure_dlq_stream(js: &bus::JetStream) {
+    let _ = js.add_stream(&bus::StreamConfig {
         name: DLQ_STREAM.to_string(),
         subjects: vec![format!("{DLQ_ROOT}.>")],
         max_msgs: DLQ_MAX_MSGS,
-        discard: nats::jetstream::DiscardPolicy::Old,
+        discard: bus::Discard::Old,
         ..Default::default()
     });
 }
@@ -1402,7 +1154,7 @@ fn epoch_secs() -> u64 {
 /// JetStream has stored it — the caller must ack the original only on Ok.
 #[allow(clippy::too_many_arguments)]
 pub fn to_dlq(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     unit: &str,
     subject: &str,
     attempts: i64,
@@ -1429,7 +1181,125 @@ pub fn to_dlq(
     }))
     .map_err(|e| e.to_string())?;
     let dlq_subject = format!("{DLQ_ROOT}.{}", dlq_unit_token(unit));
-    js.publish(&dlq_subject, body).map(|_| ()).map_err(|e| e.to_string())
+    js.publish(&dlq_subject, body).map_err(|e| e.to_string())?;
+    announce_dead_letter(js, unit, subject, attempts, version);
+    Ok(())
+}
+
+// ───────────────────────── dead-letter events (ADR-0015, Amendment A) ─────────
+//
+// Nothing used to tell anyone that a message died: the self-healing loop waited
+// for someone to open a session. Each dead letter is now announced on
+// `<root>.dlq.events`, an ordinary subject, so waking a person or an agent is a
+// flow or a sink, like every other notification here (ADR-0024). The event holds
+// only what the runtime wrote itself, never the payload or the error text: a dead
+// letter is untrusted content, and this is what wakes things up. A reader that
+// needs the letter fetches it through `vejas_dlq`.
+
+/// Dead letters of one unit not announced yet, and the last one's coordinates.
+#[derive(Default)]
+struct DlqAnnouncement {
+    last_sent: u64,
+    count: u64,
+    subject: String,
+    attempts: i64,
+    version: String,
+}
+
+static DLQ_ANNOUNCEMENTS: OnceLock<Mutex<HashMap<String, DlqAnnouncement>>> = OnceLock::new();
+static DLQ_FLUSHER: AtomicBool = AtomicBool::new(false);
+
+fn dlq_announcements() -> &'static Mutex<HashMap<String, DlqAnnouncement>> {
+    DLQ_ANNOUNCEMENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dlq_events_subject() -> String {
+    let root = std::env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    format!("{root}.dlq.events")
+}
+
+/// At most one event per unit per this many seconds, so that a burst of poison
+/// wakes a reader once and not ten thousand times. 0 announces every letter.
+fn dlq_event_gap() -> u64 {
+    std::env::var("VEJAS_DLQ_EVENT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+}
+
+/// The events due now. Each carries `count`, the dead letters it stands for, so
+/// the window delays news without losing any.
+fn take_due_dlq_events(
+    pending: &mut HashMap<String, DlqAnnouncement>,
+    now: u64,
+    gap: u64,
+) -> Vec<Value> {
+    pending
+        .iter_mut()
+        .filter(|(_, a)| a.count > 0 && now.saturating_sub(a.last_sent) >= gap)
+        .map(|(unit, a)| {
+            let event = serde_json::json!({
+                "transition": "dead-lettered", "ts": now, "unit": unit,
+                "subject": a.subject, "attempts": a.attempts, "version": a.version,
+                "count": a.count,
+            });
+            a.last_sent = now;
+            a.count = 0;
+            event
+        })
+        .collect()
+}
+
+/// Best-effort, like the proposal events: the letter is stored and the caller
+/// goes on to ack, whatever happens to its announcement.
+fn publish_dlq_event(js: &bus::JetStream, event: &Value) {
+    let body = serde_json::to_vec(event).unwrap_or_default();
+    if let Err(e) = js.publish(&dlq_events_subject(), body) {
+        eprintln!("[vejas] dead-letter event not published: {e}");
+    }
+}
+
+fn announce_dead_letter(
+    js: &bus::JetStream,
+    unit: &str,
+    subject: &str,
+    attempts: i64,
+    version: &str,
+) {
+    // A reader of these events that keeps failing dead-letters them in turn. If
+    // that were announced too, the reader would feed itself forever.
+    if subject == dlq_events_subject() {
+        return;
+    }
+    let gap = dlq_event_gap();
+    let due = {
+        let mut pending = dlq_announcements().lock().unwrap();
+        let a = pending.entry(unit.to_string()).or_default();
+        a.count += 1;
+        a.subject = subject.to_string();
+        a.attempts = attempts;
+        a.version = version.to_string();
+        take_due_dlq_events(&mut pending, epoch_secs(), gap)
+    };
+    for event in &due {
+        publish_dlq_event(js, event);
+    }
+    // What the window held back must still go out if no letter follows it.
+    if gap > 0 && !DLQ_FLUSHER.swap(true, Ordering::SeqCst) {
+        let js = js.clone();
+        let flusher = thread::Builder::new().name("dlq-events".into()).spawn(move || {
+            while crate::RUNNING.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(1));
+                let due = {
+                    let mut pending = dlq_announcements().lock().unwrap();
+                    take_due_dlq_events(&mut pending, epoch_secs(), gap)
+                };
+                for event in &due {
+                    publish_dlq_event(&js, event);
+                }
+            }
+        });
+        if flusher.is_err() {
+            DLQ_FLUSHER.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 // ───────────────────────── exec-source offset resume (ADR-0011/0021) ─────────────────────────
@@ -1443,18 +1313,15 @@ pub fn to_dlq(
 
 pub const OFFSET_BUCKET: &str = "VEJAS_OFFSETS";
 
-pub fn open_offset_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
-    let cfg = nats::kv::Config {
+pub fn open_offset_store(js: &bus::JetStream) -> Option<bus::Kv> {
+    js.key_value(&bus::KvConfig {
         bucket: OFFSET_BUCKET.to_string(),
         history: 1,
         ..Default::default()
-    };
-    js.create_key_value(&cfg)
-        .or_else(|_| js.key_value(OFFSET_BUCKET))
-        .ok()
+    })
 }
 
-pub fn offset_get(store: &nats::kv::Store, key: &str) -> Option<String> {
+pub fn offset_get(store: &bus::Kv, key: &str) -> Option<String> {
     store
         .get(key)
         .ok()
@@ -1463,7 +1330,7 @@ pub fn offset_get(store: &nats::kv::Store, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn offset_put(store: &nats::kv::Store, key: &str, value: &str) {
+pub fn offset_put(store: &bus::Kv, key: &str, value: &str) {
     let _ = store.put(key, value.as_bytes());
 }
 
@@ -1477,12 +1344,12 @@ pub const AUDIT_ROOT: &str = "vxaudit";
 // `max_age` on the hot stream can touch it.
 pub const AUDIT_MAX_MSGS: i64 = 1_000_000;
 
-pub fn ensure_audit_stream(js: &nats::jetstream::JetStream) {
-    let _ = js.add_stream(&nats::jetstream::StreamConfig {
+pub fn ensure_audit_stream(js: &bus::JetStream) {
+    let _ = js.add_stream(&bus::StreamConfig {
         name: AUDIT_STREAM.to_string(),
         subjects: vec![format!("{AUDIT_ROOT}.>")],
         max_msgs: AUDIT_MAX_MSGS,
-        discard: nats::jetstream::DiscardPolicy::Old,
+        discard: bus::Discard::Old,
         ..Default::default()
     });
 }
@@ -1492,7 +1359,7 @@ pub fn ensure_audit_stream(js: &nats::jetstream::JetStream) {
 /// caller can trust the trail; the live-promote path logs but does not fail the
 /// promote if this errors (git remains the trail for committed changes).
 pub fn to_audit(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     unit: &str,
     record: &serde_json::Value,
 ) -> Result<(), String> {
@@ -1504,7 +1371,7 @@ pub fn to_audit(
 
 /// Recent audit records for a unit, oldest last (read-only, ephemeral consumer).
 pub fn audit_recent(
-    js: &nats::jetstream::JetStream,
+    js: &bus::JetStream,
     unit: &str,
     n: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -1525,29 +1392,17 @@ fn run_sink(
     subject: &str,
     handler: impl Fn(&[u8]) -> Result<Option<String>, String>,
 ) -> Result<(), String> {
-    let (js, nc) = ctx.jetstream_and_conn()?;
+    let js = ctx.jetstream()?;
     let durable = ctx.name.replace([':', '.', '-'], "_");
-    let _ = js.add_consumer(
-        &ctx.stream,
-        nats::jetstream::ConsumerConfig {
-            durable_name: Some(durable.clone()),
-            filter_subject: subject.to_string(),
-            ack_wait: ack_wait(),
-            ..Default::default()
-        },
-    );
-    let sub = js
-        .pull_subscribe_with_options(
-            subject,
-            &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
-        )
-        .map_err(|e| e.to_string())?;
+    let filter = [subject.to_string()];
+    let _ = js.create_pull_consumer(&ctx.stream, &durable, &filter, ack_wait(), None);
+    let sub = js.pull_durable(&ctx.stream, &durable, Some(subject))?;
     eprintln!("[{}] consuming {subject}", ctx.name);
     loop {
         if !ctx.alive() {
             return Ok(());
         }
-        for msg in fetch_iter_flushed(&sub, &nc)? {
+        for msg in sub.round()? {
             if !ctx.alive() {
                 // stopped mid-batch: leave the message un-acked, it redelivers
                 return Ok(());
@@ -1575,7 +1430,7 @@ fn run_sink(
                     });
                     // poison guard: give up after MAX_DELIVERIES attempts
                     let delivered =
-                        msg.jetstream_message_info().map(|i| i.delivered).unwrap_or(1);
+                        msg.delivery().map(|i| i.delivered).unwrap_or(1);
                     if delivered >= crate::MAX_DELIVERIES {
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
@@ -1597,7 +1452,7 @@ fn run_sink(
                                     Some(format!("{e} — DLQ publish failed: {de}")),
                                     vec![], preview, None, None,
                                 );
-                                let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                                let _ = msg.nak();
                             }
                         }
                     } else {
@@ -1605,7 +1460,7 @@ fn run_sink(
                         crate::record_trace_full(
                             &ctx.name, subject, false, Some(e), vec![], preview, None, None,
                         );
-                        let _ = msg.ack_kind(nats::jetstream::AckKind::Nak);
+                        let _ = msg.nak();
                     }
                 }
             }
@@ -1806,9 +1661,7 @@ impl Driver for ExecStreamSource {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let env = ctx.config.env_vars();
         let restart = ctx.config.u64_or("RESTART_SECS", 2).max(1);
-        // js for the offset KV store; nc for publish_confirmed (this streams stdout
-        // line-by-line sequentially — the exact ~200/s flusher-floor case).
-        let (js, nc) = ctx.jetstream_and_conn()?;
+        let js = ctx.jetstream()?;
         // Optional offset resume: when OFFSET_KV is set, hand the child the last
         // committed offset as $OFFSET at (re)start (e.g. `kcat -o $OFFSET`) and
         // commit each record's OFFSET_FIELD after publishing it.
@@ -1817,8 +1670,8 @@ impl Driver for ExecStreamSource {
         let offset_start = ctx.config.str("OFFSET_START").unwrap_or_else(|| "end".into());
         let offset_store = offset_kv.as_ref().and_then(|_| open_offset_store(&js));
         // Offset commit CADENCE (keeps the KV put out of the per-record hot path).
-        // A KV put is itself a throttled request/reply, so committing per record
-        // re-caps the stream at ~200/s even with the publish path lifted. Commit
+        // A KV put is itself a request/reply, and committing per record would
+        // add a round-trip to every record. Commit
         // every OFFSET_COMMIT_MS (default 100ms) and once more when the child
         // drains/exits: publish-before-commit still holds (an offset is committed
         // only for a record already on the bus), the crash duplicate window just
@@ -1890,7 +1743,7 @@ impl Driver for ExecStreamSource {
                             continue;
                         }
                         if let Ok(rec) = serde_json::from_str::<Value>(line) {
-                            match publish_confirmed(&nc, &subject, line.as_bytes(), Duration::from_secs(5)) {
+                            match js.publish(&subject, line) {
                                 Ok(_) => {
                                     trace_pub(&ctx.name, &subject, line.as_bytes());
                                     // publish-before-commit: advance the offset in
@@ -2049,9 +1902,7 @@ impl Driver for MqttIn {
         let client_id = mqtt_client_id(ctx);
         let user = ctx.config.str("USERNAME");
         let pass = ctx.config.str("PASSWORD");
-        // nc for publish_confirmed (direct flush past the 5ms flusher floor — the
-        // MQTT-loopback ceiling); _js keeps the stream ensured.
-        let (_js, nc) = ctx.jetstream_and_conn()?;
+        let js = ctx.jetstream()?;
         while ctx.alive() {
             let attempt = (|| -> Result<(), String> {
                 let mut client = mqtt_connect(
@@ -2066,7 +1917,7 @@ impl Driver for MqttIn {
                             // publish-before-ack: bus first (await JetStream pub-ack),
                             // THEN PUBACK — a crash before the bus write re-delivers
                             // from the broker (ADR-0025).
-                            publish_confirmed(&nc, &subject, &payload, Duration::from_secs(5))
+                            js.publish(&subject, &payload)
                                 .map_err(|e| format!("bus publish: {e}"))?;
                             trace_pub(&ctx.name, &subject, &payload);
                             if pq > 0 {
@@ -2175,7 +2026,7 @@ impl Driver for ExecRpc {
             ));
         }
         let env = ctx.config.env_vars();
-        let nc = nats::connect(&ctx.nats_url).map_err(|e| e.to_string())?;
+        let nc = bus::connect(&ctx.nats_url)?;
 
         let mut child = Command::new("sh")
             .arg("-c")
@@ -2197,9 +2048,7 @@ impl Driver for ExecRpc {
         // Queue group (not a plain subscribe) so N clustered instances share the
         // requests — exactly one answers each, load-balanced (ADR-0020). Each
         // instance keeps its own child process (e.g. its own SAP logon).
-        let sub = nc
-            .queue_subscribe(&subject, "vejas")
-            .map_err(|e| e.to_string())?;
+        let mut sub = nc.queue_subscribe(&subject, "vejas")?;
         loop {
             if !ctx.alive() {
                 let _ = child.kill();
@@ -2208,7 +2057,7 @@ impl Driver for ExecRpc {
             match sub.next_timeout(Duration::from_millis(300)) {
                 Ok(msg) => {
                     // One request line in, one reply line out (serialized).
-                    let mut req = msg.data.clone();
+                    let mut req = msg.data.to_vec();
                     req.push(b'\n');
                     if stdin.write_all(&req).is_err() {
                         return Err("child stdin closed".into());
@@ -2391,6 +2240,41 @@ fn next_url(base: &str, body: &serde_json::Value, field: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    fn letter(pending: &mut HashMap<String, DlqAnnouncement>, unit: &str) {
+        let a = pending.entry(unit.to_string()).or_default();
+        a.count += 1;
+        a.subject = "vx.in".into();
+    }
+
+    #[test]
+    fn a_burst_of_dead_letters_is_one_event_that_counts_them() {
+        let mut pending = HashMap::new();
+        letter(&mut pending, "flow:a");
+        let first = take_due_dlq_events(&mut pending, 1000, 60);
+        assert_eq!(first.len(), 1, "the first letter is news at once");
+        assert_eq!(first[0]["count"], 1);
+        for _ in 0..3 {
+            letter(&mut pending, "flow:a");
+        }
+        assert!(take_due_dlq_events(&mut pending, 1030, 60).is_empty(), "inside the window");
+        let held = take_due_dlq_events(&mut pending, 1060, 60);
+        assert_eq!(held[0]["count"], 3, "the window delays news, it loses none");
+        assert!(take_due_dlq_events(&mut pending, 2000, 60).is_empty(), "nothing pending");
+    }
+
+    #[test]
+    fn units_are_windowed_apart_and_zero_means_every_letter() {
+        let mut pending = HashMap::new();
+        letter(&mut pending, "flow:a");
+        take_due_dlq_events(&mut pending, 1000, 60);
+        letter(&mut pending, "flow:a");
+        letter(&mut pending, "flow:b");
+        let due = take_due_dlq_events(&mut pending, 1001, 60);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0]["unit"], "flow:b");
+        assert_eq!(take_due_dlq_events(&mut pending, 1001, 0).len(), 1, "gap 0 lets flow:a through");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -2486,51 +2370,40 @@ mod tests {
         assert!(Config::default().headers().is_empty());
     }
 
-    /// Verifies `publish_confirmed` clears the nats flusher throttle AND keeps the
-    /// at-least-once contract: messages actually persist, and a subject with no
-    /// stream errors (never a false Ok). Needs a live NATS on 127.0.0.1:4222;
-    /// excluded from CI. Run:
-    /// `cargo test publish_confirmed_beats_throttle -- --ignored --nocapture`
+    /// Verifies a confirmed publish keeps the at-least-once contract: messages
+    /// actually persist, and a subject with no stream errors (never a false Ok).
+    /// Needs a live NATS on 127.0.0.1:4222; excluded from CI. Run:
+    /// `cargo test confirmed_publish -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn publish_confirmed_beats_throttle_and_persists() {
+    fn confirmed_publish_persists_or_errors() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
-        let nc = nats::connect(&url).expect("connect");
-        let js = nats::jetstream::new(nc.clone());
+        let js = bus::connect(&url).expect("connect").jetstream();
         let pid = std::process::id();
         let stream = format!("PBFAST_{pid}");
         let subject = format!("pbfast.{pid}.in");
         let _ = js.delete_stream(&stream);
-        js.add_stream(nats::jetstream::StreamConfig {
+        js.add_stream(&bus::StreamConfig {
             name: stream.clone(),
             subjects: vec![format!("pbfast.{pid}.>")],
             ..Default::default()
         })
         .expect("add_stream");
 
-        const N: usize = 200;
-        // (A) baseline: throttled js.publish
+        const N: usize = 400;
         let t = Instant::now();
         for _ in 0..N {
             js.publish(&subject, b"x").expect("js.publish");
         }
-        let base = N as f64 / t.elapsed().as_secs_f64();
-        // (B) direct-flush publish_confirmed
-        let t = Instant::now();
-        for _ in 0..N {
-            publish_confirmed(&nc, &subject, b"x", Duration::from_secs(5)).expect("confirmed");
-        }
-        let fast = N as f64 / t.elapsed().as_secs_f64();
-        eprintln!("[pbfast] js.publish={base:.0}/s  publish_confirmed={fast:.0}/s  ({:.1}x)", fast / base);
-        assert!(fast > base * 2.0, "direct flush should clear the 5ms floor (got {fast:.0} vs {base:.0}/s)");
+        eprintln!("[pbfast] js.publish={:.0}/s", N as f64 / t.elapsed().as_secs_f64());
 
-        // (C) durability: all 2N messages actually landed on the stream
-        let msgs = js.stream_info(&stream).expect("info").state.messages;
-        assert!(msgs >= (2 * N) as u64, "every confirmed publish persisted (have {msgs})");
+        // durability: all N messages actually landed on the stream
+        let msgs = js.stream_state(&stream).expect("info").messages;
+        assert!(msgs >= N as u64, "every confirmed publish persisted (have {msgs})");
 
-        // (D) no-responders guard: a subject with no stream must ERROR, not false-Ok
+        // no-responders guard: a subject with no stream must ERROR, not false-Ok
         let orphan = format!("orphan.{pid}.no.stream");
-        let r = publish_confirmed(&nc, &orphan, b"x", Duration::from_secs(1));
+        let r = js.publish(&orphan, b"x");
         assert!(r.is_err(), "publish to a stream-less subject must error, got {r:?}");
 
         let _ = js.delete_stream(&stream);
@@ -2544,33 +2417,22 @@ mod tests {
     #[ignore]
     fn fetch_round_latency_probe() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "127.0.0.1:4222".into());
-        let nc = nats::connect(&url).expect("connect nats");
-        let js = nats::jetstream::new(nc.clone());
+        let nc = bus::connect(&url).expect("connect nats");
+        let js = nc.jetstream();
         let pid = std::process::id();
         let stream = format!("PROBE_{pid}");
         let subject = format!("probe.{pid}.in");
         let _ = js.delete_stream(&stream);
-        js.add_stream(nats::jetstream::StreamConfig {
+        js.add_stream(&bus::StreamConfig {
             name: stream.clone(),
             subjects: vec![format!("probe.{pid}.>")],
             ..Default::default()
         })
         .expect("add_stream");
         let durable = format!("probe_dur_{pid}");
-        let _ = js.add_consumer(
-            &stream,
-            nats::jetstream::ConsumerConfig {
-                durable_name: Some(durable.clone()),
-                filter_subject: subject.clone(),
-                ..Default::default()
-            },
-        );
-        let sub = js
-            .pull_subscribe_with_options(
-                &subject,
-                &nats::jetstream::PullSubscribeOptions::new().durable_name(durable),
-            )
-            .expect("pull_subscribe");
+        let filter = [subject.clone()];
+        js.create_pull_consumer(&stream, &durable, &filter, Duration::ZERO, None).expect("consumer");
+        let sub = js.pull_durable(&stream, &durable, Some(&subject)).expect("pull_subscribe");
 
         // (A) idle: how long does an empty round block?
         let mut empties = Vec::new();
@@ -2583,9 +2445,8 @@ mod tests {
         eprintln!("[probe] empty-round ms: {empties:?}");
 
         // (B) publish->receipt: a message lands at a SWEPT offset into an idle
-        // stretch (20..~300ms) so samples hit every phase of the poll cycle — most
-        // importantly the coverage GAP where no pull is outstanding (the current
-        // 150ms idle sleep). Detection latency = receipt - the publish offset.
+        // stretch (20..~300ms) so samples hit every phase of the poll cycle.
+        // Detection latency = receipt - the publish offset.
         let mut lat = Vec::new();
         for i in 0..30u32 {
             let delay_ms = 20 + (i as u64 * 23) % 280; // sweep across the ~252ms cycle
@@ -2593,8 +2454,7 @@ mod tests {
             let t0 = Instant::now();
             let pubber = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                ncp.publish(&subj, payload.as_bytes()).expect("publish");
-                ncp.flush().ok();
+                ncp.publish(&subj, payload).expect("publish");
             });
             let detected = loop {
                 let msgs = fetch_round(&sub).expect("fetch");

@@ -175,7 +175,7 @@ destructive, so competing instances never duplicate.
 > vault) and put every message on the bus as `vx.amqp.orders.in`.
 
 Like IBM MQ, a **first-class standalone binary** (`connectors/amqp`) — pure
-Rust, synchronous, no tokio, and TLS through rustls (no OpenSSL anywhere).
+Rust, a synchronous broker client, and TLS through rustls (no OpenSSL anywhere).
 The at-least-once contract is the platform's, spoken in AMQP: the source
 acks RabbitMQ only after the bus pub-ack; the sink acks the bus only after
 the publisher confirm. The agent fills the env recipe

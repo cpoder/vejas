@@ -1,0 +1,11 @@
+# connector: dlq_webhook — tell someone when a message dies (ADR-0015).
+# Each dead letter is announced on vx.dlq.events: unit, subject, attempts, version,
+# and count, the letters the event stands for. Metadata only: the payload stays in
+# the DLQ, so what this wakes reads it with vejas_dlq, as untrusted content.
+#
+# The URL is a chat webhook, or a runner of your own that starts your agent with
+# the agent's VEJAS_TOKEN alone. Keep the agent out of the runtime: a child of an
+# exec-* connector inherits its environment, VEJAS_APPROVAL_TOKEN included.
+driver "http-out"
+SUBJECT = "vx.dlq.events"
+URL = secret("ops/dlq_webhook_url")

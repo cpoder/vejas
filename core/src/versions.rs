@@ -15,6 +15,8 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use crate::bus;
+
 const VERSIONS_BUCKET: &str = "VEJAS_VERSIONS";
 const VERSIONS_HISTORY: i64 = 64; // bounded rollback/audit history per flow (ADR-0021)
 
@@ -44,19 +46,16 @@ fn key_of(flow: &str) -> String {
 /// Open (or create) the shared version bucket. None if JetStream KV is
 /// unavailable — the caller then uses the baseline file (single-instance, no
 /// overlay), no worse than before versioning existed.
-pub fn open_store(js: &nats::jetstream::JetStream) -> Option<nats::kv::Store> {
-    let cfg = nats::kv::Config {
+pub fn open_store(js: &bus::JetStream) -> Option<bus::Kv> {
+    js.key_value(&bus::KvConfig {
         bucket: VERSIONS_BUCKET.to_string(),
         history: VERSIONS_HISTORY,
         ..Default::default()
-    };
-    js.create_key_value(&cfg)
-        .or_else(|_| js.key_value(VERSIONS_BUCKET))
-        .ok()
+    })
 }
 
 /// The current overlay for a flow, if any (the parsed snapshot value).
-pub fn get_version(store: &nats::kv::Store, flow: &str) -> Option<serde_json::Value> {
+pub fn get_version(store: &bus::Kv, flow: &str) -> Option<serde_json::Value> {
     store
         .get(&key_of(flow))
         .ok()
@@ -68,7 +67,7 @@ pub fn get_version(store: &nats::kv::Store, flow: &str) -> Option<serde_json::Va
 /// its content hash, the actor, and a timestamp. `ts` is passed in (the language
 /// and this layer have no clock of their own — the caller stamps it).
 pub fn put_version(
-    store: &nats::kv::Store,
+    store: &bus::Kv,
     flow: &str,
     source: &str,
     parent_hash: &str,
@@ -124,7 +123,7 @@ pub fn recent_evictions() -> Vec<serde_json::Value> {
 /// is evicted here — git wins, loudly (logged + noted for the panel; the caller
 /// also writes an ADR-0018 audit record on `Evicted`). Returns (source, outcome).
 pub fn resolve_source(
-    store: Option<&nats::kv::Store>,
+    store: Option<&bus::Kv>,
     flow: &str,
     baseline: &str,
     ts: u64,

@@ -31,12 +31,12 @@ All five ceilings fell (#4+#3 `5cffb7b`, #2 `b34d9f3`, #1 `75fad83`,
 | Metric | v0 | all five fixes in |
 |---|---|---|
 | Cold start | 13–15 ms | **11–13 ms** |
-| Runtime RSS under load | 6–8 MB | **6–8 MB** |
-| Binary size | 3.9 MB | 6.2 MB (rustls) |
+| Runtime RSS under load | 6–8 MB | **10 MB** |
+| Binary size | 3.9 MB | 11.2 MB (rustls, async-nats) |
 | e2e sustained, paced ~1 900/s (`bench/paced.sh 2000 15`) | — | **p50 14 ms, p99 36 ms**, 20 000/20 000 |
 | e2e saturated (32 conns) | 65/s delivered | ~4 900/s ingest, **~2 650/s delivered** (sink-bound, queue absorbs the rest) |
 | e2e latency, uncongested (`bench/paced.sh 20 15`) | p50 859 ms | **p50 2 ms, p99 3 ms** |
-| MQTT broker loopback, QoS 1 both ways (`bench/broker-mqtt.sh 5000`) | — | **2 285 rt/s**, 5 000/5 000 |
+| MQTT broker loopback, QoS 1 both ways (`bench/broker-mqtt.sh 5000`) | — | **2 070 rt/s**, 5 000/5 000 |
 | Isolated flow hop | 171/s | **8 110/s** |
 
 The old "sustained (12 conns) 1 701/s, p50 18 ms" row died with ceiling #5:
@@ -46,6 +46,31 @@ any concurrency, so steady-state latency is now measured **paced**
 (`bench/paced.sh`, fixed event rate below the sink bound).
 
 Every hop persisted in JetStream throughout — the guarantee never moved.
+
+### Since ADR-0035
+
+The sync `nats` client left for `async-nats` behind `core/src/bus.rs`, so findings
+#5 and #6 below describe a client that is gone, along with `publish_confirmed`,
+`fetch_iter_flushed` and the second connection of #7. Against the v0.3.6 binary,
+alternating in one session on this box:
+
+| | v0.3.6 | now |
+|---|---:|---:|
+| Threads at 1 / 10 / 50 / 200 idle flows | 16 / 61 / 261 / 1 011 | 11 / 20 / 60 / 210 |
+| NATS connections, same | 3 / 21 / 101 / 401 | 1 |
+| RSS, same, MB | 8.9 / 16.7 / 46.9 / 139.8 | 9.6 / 10.5 / 14.2 / 26.4 |
+| Flow hop (`PUBS=16`, 64 000 events) | 13 100 – 13 700/s | 13 200 – 13 500/s |
+| Flow hop, `bench/pub.py` as publisher | 20 100 – 20 500/s | 19 400 – 21 400/s |
+| One detect unit | 30 800 – 35 400/s, 11 MB | 34 700 – 41 100/s, 12.7 MB |
+| MQTT loopback | 2 370 – 2 430 rt/s | 2 050 – 2 090 rt/s |
+| Spawn to a flow running | 1 714 ms | 10.9 ms |
+| Paced 2 000/s, p50 / p99 | 3–4 / 14–17 ms | 3 / 14–15 ms |
+| Binary | 9.9 MB | 11.2 MB |
+
+The paced row is why the p50 14 ms above stands as published: both binaries are far
+below it today, so this change did not move it. The detect tables further down
+predate this: add about 1.7 MB to their RSS. The method and the MQTT cost are in
+ADR-0035.
 
 The footprint numbers are the thesis, measured. The throughput and latency
 numbers are **known ceilings of the v0 I/O paths, not of the interpreter** —
@@ -134,13 +159,13 @@ they publish). Scaling the number of flows (`bench/multi-flow.sh`):
 
 | Flows | Aggregate rate | Runtime RSS |
 |---|---|---|
-| 1 | 7–8 k/s | 6 MB |
-| 10 | **13 746/s** | 16.6 MB |
-| 50 | 8 410/s | 49.3 MB |
+| 1 | 7–8 k/s | 10 MB |
+| 10 | **13 700 – 14 700/s** | 14.5 MB |
+| 50 | 11 100 – 12 100/s | 38 MB |
 
 Throughput *rises* with flow count (consumers parallelize; the bus, not the
-interpreter, is the bound) and memory stays ~1 MB per running flow — fifty
-live, persisted flows in under 50 MB.
+interpreter, is the bound) and memory stays around half a megabyte per running
+flow under load — fifty live, persisted flows in under 40 MB.
 
 ## Detect units (`bench/detect.sh`)
 
@@ -252,7 +277,7 @@ one unit handles that at around 25 000 events/s in 18 MB.
 - **One instance saturates near 44 000 events/s** whatever the unit count.
   Beyond it, add instances: they share the durable consumers and the work
   (see *Clustering*).
-- **Artefacts:** the binary is 8.2 MiB, the image 37.6 MiB, and a unit that is
+- **Artefacts:** the binary is 10.7 MiB, the image 37.6 MiB, and a unit that is
   idle costs nothing measurable.
 
 Measured on the dev box in this file's header — 8 cores, WSL2 — two runs of
