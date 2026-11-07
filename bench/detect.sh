@@ -41,8 +41,8 @@ STORE=$(mktemp -d); ROOT=$(mktemp -d)
 cleanup() {
   # wait for them, do not merely signal them: a run that leaves its port held
   # makes the NEXT run fail silently, which is how a matrix grows holes.
-  [ -n "${RUNTIME_PID:-}" ] && { kill "$RUNTIME_PID" 2>/dev/null; wait "$RUNTIME_PID" 2>/dev/null; }
-  [ -n "${NATS_PID:-}" ] && { kill "$NATS_PID" 2>/dev/null; wait "$NATS_PID" 2>/dev/null; }
+  [ -n "${RUNTIME_PID:-}" ] && { kill "$RUNTIME_PID" 2>/dev/null || true; wait "$RUNTIME_PID" 2>/dev/null || true; }
+  [ -n "${NATS_PID:-}" ] && { kill "$NATS_PID" 2>/dev/null || true; wait "$NATS_PID" 2>/dev/null || true; }
   rm -rf "$STORE" "$ROOT"
 }
 trap cleanup EXIT

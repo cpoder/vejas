@@ -2619,7 +2619,9 @@ const NO_AGENT_CLI: &str = "this deployment has no agent CLI (VEJAS_AGENT_CMD): 
 /// Ask the agent CLI for a file and return its content (markdown fences stripped).
 fn ask_agent(prompt: String) -> Result<String, String> {
     let agent = env::var("VEJAS_AGENT_CMD").unwrap_or_else(|_| "claude".into());
-    let out = Command::new(agent)
+    let mut command = Command::new(agent);
+    connectors::without_runtime_credentials(&mut command);
+    let out = command
         .arg("-p")
         .arg(prompt)
         .output()

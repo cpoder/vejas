@@ -16,7 +16,9 @@ STORE=$(mktemp -d)
 ROOT=$(mktemp -d)
 cleanup() {
   for pid in "${SUB_PID:-}" "${RUNTIME_PID:-}" "${NATS_PID:-}"; do
-    [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+    # `|| true`: under set -e the status of a killed process would end the trap
+    # at the first pid and leave the runtime and NATS running.
+    [ -n "$pid" ] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
   done
   rm -rf "$STORE" "$ROOT"
 }

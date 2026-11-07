@@ -275,9 +275,19 @@ const parseConst = t => { const s = t.trim();
   if (s === 'true') return true; if (s === 'false') return false;
   if (s !== '' && !isNaN(Number(s))) return Number(s); return s; };
 
+// With VEJAS_TOKEN set every write wants it. The panel asks once and keeps it in
+// this page's memory, never in storage: a reload asks again.
+let writeToken = '';
+const send = (url, payload, headers = {}) => fetch(url, { method: 'POST',
+  headers: {'Content-Type': 'application/json',
+    ...(writeToken ? {Authorization: `Bearer ${writeToken}`} : {}), ...headers},
+  body: JSON.stringify(payload) });
 async function post(url, payload) {
-  const res = await fetch(url, { method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+  let res = await send(url, payload);
+  if (res.status === 401 && !writeToken) {
+    writeToken = (prompt('Write token (VEJAS_TOKEN)') || '').trim();
+    if (writeToken) res = await send(url, payload);
+  }
   if (!res.ok) throw new Error(await res.text());
   return res;
 }
@@ -905,19 +915,17 @@ loadEvents();
 setInterval(loadEvents, 4000);
 
 // In governed mode a replay or a discard is a human act (ADR-0024): the server
-// answers 409 or 401 and the approval token goes with the retry.
+// answers 409 or 401 and the approval token goes with the retry. Outside it the
+// same prompt takes the write token, so the one value is sent as both.
 async function dlqAction(path, body) {
-  const send = tok => fetch(path, { method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(tok ? { 'X-Approval-Token': tok } : {}) },
-    body: JSON.stringify(body) });
   try {
     let tok = ($('#approval-token').value || '').trim();
-    let res = await send(tok);
+    let res = await send(path, body, tok ? {'X-Approval-Token': tok} : {});
     if ((res.status === 409 || res.status === 401) && !tok) {
-      tok = (prompt('Approval token (governed mode)') || '').trim();
+      tok = (prompt('Approval token in governed mode, otherwise the write token') || '').trim();
       if (!tok) return;
-      $('#approval-token').value = tok;
-      res = await send(tok);
+      res = await send(path, body, {'X-Approval-Token': tok, Authorization: `Bearer ${tok}`});
+      if (res.ok) $('#approval-token').value = tok;
     }
     if (!res.ok) throw new Error(await res.text());
     toast('Done — reloaded');

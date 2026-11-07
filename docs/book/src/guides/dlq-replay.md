@@ -47,8 +47,8 @@ happens next is a flow or a sink like any other:
 [`dlq_webhook.vjs.example`](https://github.com/cpoder/vejas/blob/master/docs/examples/dlq_webhook.vjs.example)
 posts the event to a URL: a chat channel, or a runner that starts your agent
 with the agent's token alone. Do not start an agent from an `exec-*` connector:
-a child inherits the runtime's environment, `VEJAS_APPROVAL_TOKEN` and
-`VEJAS_SECRET_*` included.
+the runtime's credentials are out of a child's environment, but it runs as the
+runtime's user and reaches the same bus, far more than a proposal needs.
 
 ## The loop that makes it self-healing
 

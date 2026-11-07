@@ -43,8 +43,8 @@ the `X-Approval-Token` header. The panel asks for the token when it needs it.
    lists the queue.
 2. **Human decides** — in the panel's **Approval queue** card, or
    `POST /proposals/{id}/approve|reject` with the `X-Approval-Token`
-   header, which is enough on its own even when `VEJAS_TOKEN` is set: the
-   panel never holds the agent's token. The card shows the evidence; a proposal with none is flagged
+   header, which is enough on its own even when `VEJAS_TOKEN` is set. The card
+   shows the evidence; a proposal with none is flagged
    **"⚠ No evidence"** loud — approving blind is a deliberate act.
 3. **On approve** — the change executes exactly as a normal promote would
    (hot-reload, or a [cluster-wide version](change-safely.md) in 60 ms) and

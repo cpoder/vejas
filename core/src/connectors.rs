@@ -272,6 +272,33 @@ fn suffix_allowed(suffix: &str, allow: &[String]) -> bool {
         .any(|e| suffix == e || suffix.starts_with(&format!("{e}.")))
 }
 
+/// Is this variable a credential of the runtime itself?
+fn is_runtime_credential(name: &str) -> bool {
+    matches!(name, "VEJAS_TOKEN" | "VEJAS_APPROVAL_TOKEN" | "VAULT_TOKEN")
+        || name.starts_with("VEJAS_SECRET_")
+}
+
+/// Keep the runtime's own credentials out of a child's environment. A child gets
+/// what its manifest declares in `ENV`, and an agent CLI what it needs, not the
+/// approval token or every secret by inheritance, where an `env` in a log or an
+/// agent reading its environment sends them on. This is hygiene and not a
+/// sandbox: a child runs as the same user and reaches the same bus.
+pub fn without_runtime_credentials(cmd: &mut std::process::Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_runtime_credential) {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+/// `sh -c <cmd>` for an exec driver.
+fn shell(cmd: &str) -> std::process::Command {
+    let mut child = std::process::Command::new("sh");
+    child.arg("-c").arg(cmd);
+    without_runtime_credentials(&mut child);
+    child
+}
+
 /// One place in a bounded pool of per-connection or per-request threads, given
 /// back when the thread ends, a panic included.
 pub struct Slot(Arc<AtomicUsize>);
@@ -398,11 +425,13 @@ fn handle_http_in(
                 }
             }
         };
-        let _ = write!(
-            sock,
+        // One buffer, one write: with TCP_NODELAY `write!` puts each piece of the
+        // format string in a segment of its own.
+        let response = format!(
             "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{json}",
             json.len()
         );
+        let _ = sock.write_all(response.as_bytes());
         if eof {
             break; // client sent its last request, then closed
         }
@@ -1576,9 +1605,7 @@ impl Driver for ExecSource {
             waited += 250;
             if waited >= interval * 1000 {
                 waited = 0;
-                let out = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
+                let out = shell(&cmd)
                     .output()
                     .map_err(|e| e.to_string())?;
                 if !out.status.success() {
@@ -1617,9 +1644,7 @@ impl Driver for ExecSink {
         let name = ctx.name.clone();
         let env = ctx.config.env_vars();
         run_sink(ctx, &subject, move |data| {
-            let mut child = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
+            let mut child = shell(&cmd)
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -1654,7 +1679,7 @@ impl Driver for ExecStreamSource {
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 
         let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
@@ -1688,9 +1713,7 @@ impl Driver for ExecStreamSource {
                 eprintln!("[{}] resuming at OFFSET={start}", ctx.name);
                 run_env.push(("OFFSET".to_string(), start));
             }
-            let mut child = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
+            let mut child = shell(&cmd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit()) // child status/errors flow to our logs
@@ -2012,7 +2035,7 @@ impl Driver for ExecRpc {
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         use std::io::{BufRead, BufReader, Write};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
         let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
         let subject = ctx
@@ -2028,9 +2051,7 @@ impl Driver for ExecRpc {
         let env = ctx.config.env_vars();
         let nc = bus::connect(&ctx.nats_url)?;
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+        let mut child = shell(&cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -2084,12 +2105,10 @@ impl Driver for ExecRpc {
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         use std::io::{BufRead, BufReader, Write};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         let cmd = ctx.config.str("CMD").ok_or("CMD required")?;
         let env = ctx.config.env_vars();
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+        let mut child = shell(&cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -2240,6 +2259,18 @@ fn next_url(base: &str, body: &serde_json::Value, field: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_child_inherits_no_runtime_credential() {
+        std::env::set_var("VEJAS_APPROVAL_TOKEN", "the-approval-token");
+        std::env::set_var("VEJAS_SECRET_DEMO_KEY", "a-secret");
+        std::env::set_var("VEJAS_UNRELATED", "kept");
+        let out = shell("env").env("DECLARED", "from-the-manifest").output().unwrap();
+        let env = String::from_utf8_lossy(&out.stdout);
+        assert!(!env.contains("the-approval-token") && !env.contains("a-secret"), "{env}");
+        assert!(env.contains("VEJAS_UNRELATED=kept"), "{env}");
+        assert!(env.contains("DECLARED=from-the-manifest"), "{env}");
+    }
+
     fn letter(pending: &mut HashMap<String, DlqAnnouncement>, unit: &str) {
         let a = pending.entry(unit.to_string()).or_default();
         a.count += 1;

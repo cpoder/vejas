@@ -93,8 +93,8 @@ untrusted content and this event is what wakes things up. One event per unit per
 `VEJAS_DLQ_EVENT_SECS` (default 60), with `count` for the letters it stands for,
 so that a burst wakes a reader once and loses nothing. A letter whose subject is
 the event subject is not announced, so a failing reader cannot feed itself. An
-agent started from an `exec-*` connector would inherit the runtime's environment,
-so the documented route out is `http-out`.
+agent started from an `exec-*` connector would run as the runtime's user, on the
+same bus, so the documented route out is `http-out`.
 
 ## Alternatives considered
 
