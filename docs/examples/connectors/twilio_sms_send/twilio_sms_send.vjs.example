@@ -1,0 +1,20 @@
+# connector: twilio_sms_send — Send SMS via Twilio
+# Consumes vx.twilio.sms.send and sends SMS messages
+# Expected payload: {to: "+33612345678", from: "+15551234567", body: "Your message"}
+# Auth: Account SID and Auth Token via secrets
+# Docs: https://www.twilio.com/docs/sms/api/message-resource#create-a-message-resource
+# Rate limits: Twilio supports 100 messages/s per account (can be increased)
+# Secrets: twilio/account_sid, twilio/auth_token
+
+driver "http-out"
+SUBJECT = "vx.twilio.sms.send"
+URL = "https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"Basic {secret('twilio/basic_auth')}",
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+
+# Note: Basic auth = base64(account_sid:auth_token)
+# Store the pre-encoded value in secret('twilio/basic_auth')
+# Twilio expects form-encoded data: To=+33...&From=+15...&Body=message

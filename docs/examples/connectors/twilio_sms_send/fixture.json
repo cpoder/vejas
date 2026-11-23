@@ -1,0 +1,24 @@
+{
+  "sid": "SM12345678901234567890123456789012",
+  "date_created": "Sat, 23 Nov 2026 12:00:00 +0000",
+  "date_updated": "Sat, 23 Nov 2026 12:00:00 +0000",
+  "date_sent": "Sat, 23 Nov 2026 12:00:01 +0000",
+  "account_sid": "ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "to": "+33612345678",
+  "from": "+15551234567",
+  "messaging_service_sid": null,
+  "body": "Your message",
+  "status": "sent",
+  "num_segments": "1",
+  "num_media": "0",
+  "direction": "outbound-api",
+  "api_version": "2010-04-01",
+  "price": "-0.00750",
+  "price_unit": "USD",
+  "error_code": null,
+  "error_message": null,
+  "uri": "/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/Messages/SM12345678901234567890123456789012.json",
+  "subresource_uris": {
+    "media": "/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/Messages/SM12345678901234567890123456789012/Media.json"
+  }
+}
