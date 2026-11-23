@@ -1,0 +1,22 @@
+// PostgreSQL RPC connector (exec-rpc driver)
+// Runs a long-running request/reply process for PostgreSQL operations
+// Supports: queries, execute, transactions
+
+driver "exec-rpc"
+
+// Request subject (NOT under vx.* - must be outside JetStream)
+REQUEST_SUBJECT = "vxrpc.postgres"
+
+// Command to run the PostgreSQL connector binary
+CMD = "./connectors/postgres/target/release/vejas-postgres"
+
+// Environment variables (secrets passed via ENV, never argv - ADR-0008)
+ENV = {
+    "POSTGRES_URL": secret("postgres/url")
+}
+
+// Operations supported:
+// 1. ping: {"op": "ping"} -> {"ok": true, "result": {"pong": true}}
+// 2. query: {"op": "query", "sql": "SELECT * FROM users WHERE id = $1", "params": [42]}
+// 3. execute: {"op": "execute", "sql": "INSERT INTO users (name) VALUES ($1)", "params": ["Alice"]}
+// 4. transaction: {"op": "transaction", "statements": [{"sql": "...", "params": [...]}, ...]}
