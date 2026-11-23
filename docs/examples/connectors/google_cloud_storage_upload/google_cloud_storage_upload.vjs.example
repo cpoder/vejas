@@ -1,0 +1,20 @@
+# connector: google_cloud_storage_upload — Upload files to Google Cloud Storage
+# Consumes vx.gcp.storage.upload and uploads to GCS bucket
+# Expected payload: {bucket: "my-bucket", object: "path/file.txt", data: "base64content", content_type: "text/plain"}
+# Auth: Service account JSON key via secret or Application Default Credentials
+# Docs: https://cloud.google.com/storage/docs/json_api/v1/objects/insert
+# Rate limits: GCS supports 1000 writes/s per bucket
+# Secrets: gcp/service_account_json (full JSON key) or gcp/access_token (OAuth2 token)
+
+driver "http-out"
+SUBJECT = "vx.gcp.storage.upload"
+URL = "https://storage.googleapis.com/upload/storage/v1/b"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"Bearer {secret('gcp/access_token')}",
+    "Content-Type": "application/json"
+}
+
+# Note: For production, use oauth-poll to refresh access tokens
+# Or use exec-sink with gsutil/gcloud CLI
+# Service account JSON should be converted to OAuth2 token via token endpoint

@@ -1,0 +1,17 @@
+{
+  "kind": "storage#object",
+  "id": "my-bucket/path/file.txt/1700000000000000",
+  "selfLink": "https://www.googleapis.com/storage/v1/b/my-bucket/o/path%2Ffile.txt",
+  "name": "path/file.txt",
+  "bucket": "my-bucket",
+  "generation": "1700000000000000",
+  "metageneration": "1",
+  "contentType": "text/plain",
+  "timeCreated": "2026-11-23T12:00:00.000Z",
+  "updated": "2026-11-23T12:00:00.000Z",
+  "storageClass": "STANDARD",
+  "size": "1024",
+  "md5Hash": "rL0Y20zC+Fzt72VPzMSk2A==",
+  "mediaLink": "https://storage.googleapis.com/download/storage/v1/b/my-bucket/o/path%2Ffile.txt?generation=1700000000000000&alt=media",
+  "crc32c": "AAAAAA=="
+}
