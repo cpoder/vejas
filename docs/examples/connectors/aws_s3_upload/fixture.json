@@ -1,0 +1,6 @@
+{
+  "ETag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+  "VersionId": "null",
+  "ServerSideEncryption": "AES256",
+  "Location": "https://my-bucket.s3.amazonaws.com/path/file.txt"
+}

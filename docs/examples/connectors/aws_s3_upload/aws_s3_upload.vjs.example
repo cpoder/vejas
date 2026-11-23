@@ -1,0 +1,21 @@
+# connector: aws_s3_upload — Upload files to AWS S3
+# Consumes vx.aws.s3.upload and uploads to S3 bucket
+# Expected payload: {bucket: "my-bucket", key: "path/file.txt", body: "content", content_type: "text/plain"}
+# Auth: AWS credentials via secret (access_key_id + secret_access_key) or IAM role
+# Docs: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+# Rate limits: S3 supports 3,500 PUT/s per prefix
+# Secrets: aws/access_key_id, aws/secret_access_key, aws/region (optional, default us-east-1)
+
+driver "http-out"
+SUBJECT = "vx.aws.s3.upload"
+URL = "https://s3.amazonaws.com"  # Will be constructed per-request in flow
+METHOD = "PUT"
+HEADERS = {
+    "Authorization": f"AWS4-HMAC-SHA256 Credential={secret('aws/access_key_id')}",
+    "x-amz-date": "20261123T120000Z",
+    "x-amz-content-sha256": "UNSIGNED-PAYLOAD"
+}
+
+# Note: AWS Signature V4 is complex - this is simplified
+# Production use should use exec-sink with aws-cli or boto3
+# Or use the oauth-poll driver with AWS STS for temporary credentials
