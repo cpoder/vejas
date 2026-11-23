@@ -1,0 +1,4 @@
+{
+  "BASE_URL": "http://localhost:8085/storage/v1",
+  "SUBJECT": "vx.gcp.test.upload"
+}

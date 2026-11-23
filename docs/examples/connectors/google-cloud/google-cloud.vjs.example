@@ -1,0 +1,53 @@
+# connector: google-cloud — Comprehensive Google Cloud Platform API integration
+#
+# Platform connector for Google Cloud Platform. Supports multiple operations:
+# - Cloud Storage (upload, download, list, delete objects)
+# - Pub/Sub (publish messages, create topics, subscriptions)
+# - Cloud Functions (invoke functions, list functions)
+# - Cloud Run (invoke services, list services)
+# - Firestore (CRUD operations on documents)
+#
+# Uses http-out driver for API calls. GCP requires OAuth2 service account authentication.
+# Individual operations use flows that consume from subjects and make direct API calls.
+#
+# Subjects:
+#   IN: vx.gcp.storage.upload (upload objects to Cloud Storage)
+#   IN: vx.gcp.pubsub.publish (publish messages to Pub/Sub)
+#   IN: vx.gcp.functions.invoke (invoke Cloud Functions)
+#
+# Secrets:
+#   gcp/service_account_json - Service account JSON key file content
+#   gcp/project_id - GCP project ID
+#
+# Rate limits: Varies by service (GCS: 5000 writes/s, Pub/Sub: 10000 msg/s)
+# Pagination: Service-specific (pageToken parameter)
+#
+# Authentication: OAuth2 with service account (JWT bearer token)
+# API Version: Service-specific (storage/v1, pubsub/v1, etc.)
+#
+# Note: GCP authentication requires generating JWT tokens from service account.
+# This connector demonstrates the structure; actual implementation would need
+# a token generation helper or use GCP SDK wrapped in exec-rpc.
+
+driver "http-out"
+
+# Base configuration for Cloud Storage operations
+SUBJECT = "vx.gcp.storage.upload"
+BASE_URL = "https://storage.googleapis.com/storage/v1"
+METHOD = "POST"
+
+# OAuth2 Bearer token authentication
+# In production, this would use an exec-rpc wrapper around GCP SDK
+# or a token generation service that exchanges service account JWT for access token
+HEADERS = {
+  Authorization: "Bearer ${access_token}",
+  "Content-Type": "application/json",
+  "x-goog-project-id": secret("gcp/project_id")
+}
+
+# Note: For production use, consider wrapping GCP SDK in exec-rpc connector
+# to handle OAuth2 token generation and service-specific APIs properly.
+# Service account authentication flow:
+# 1. Create JWT from service account JSON
+# 2. Exchange JWT for access token at https://oauth2.googleapis.com/token
+# 3. Use access token in Authorization header

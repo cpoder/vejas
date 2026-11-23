@@ -1,0 +1,19 @@
+{
+  "kind": "storage#object",
+  "id": "my-bucket/uploads/document.pdf/1732368000000000",
+  "selfLink": "https://www.googleapis.com/storage/v1/b/my-bucket/o/uploads%2Fdocument.pdf",
+  "mediaLink": "https://storage.googleapis.com/download/storage/v1/b/my-bucket/o/uploads%2Fdocument.pdf?generation=1732368000000000&alt=media",
+  "name": "uploads/document.pdf",
+  "bucket": "my-bucket",
+  "generation": "1732368000000000",
+  "metageneration": "1",
+  "contentType": "application/pdf",
+  "storageClass": "STANDARD",
+  "size": "2048",
+  "md5Hash": "1B2M2Y8AsgTpgAmY7PhCfg==",
+  "crc32c": "AAAAAA==",
+  "etag": "CKiG9oDEhvQCEAE=",
+  "timeCreated": "2023-11-23T12:00:00.000Z",
+  "updated": "2023-11-23T12:00:00.000Z",
+  "timeStorageClassUpdated": "2023-11-23T12:00:00.000Z"
+}
