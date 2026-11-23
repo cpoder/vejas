@@ -10,6 +10,12 @@ ignore = [
     # operator configures, never untrusted input. Leaves with amiquip.
     "RUSTSEC-2024-0421",
     
+    # url 1.7.2 has stack overflow in Url::origin() on nested blob: URLs.
+    # Locked by amq-protocol 1.4 <- amiquip 0.4.2 (unmaintained since 2020).
+    # Only used in connectors/amqp to parse operator-configured broker URLs,
+    # never untrusted input. Leaves with amiquip replacement.
+    "RUSTSEC-2026-0592",
+    
     # proc-macro-error2 2.0.1 is unmaintained. Used by mysql_async through
     # mysql_common. The crate is a proc-macro helper with no runtime security
     # impact. Leaves when mysql_async updates its dependencies.
