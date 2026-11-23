@@ -1,0 +1,9 @@
+{
+  "topic": "orders",
+  "partition": 0,
+  "offset": 12345,
+  "timestamp": 1700000000000,
+  "key": "order-123",
+  "value": "{\"order_id\": 123, \"amount\": 99.99}",
+  "headers": []
+}

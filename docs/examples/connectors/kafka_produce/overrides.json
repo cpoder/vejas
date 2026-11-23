@@ -1,0 +1,7 @@
+{
+  "VEJAS_SECRET_KAFKA_BROKERS": "localhost:9092",
+  "VEJAS_SECRET_KAFKA_SASL_USERNAME": "testuser",
+  "VEJAS_SECRET_KAFKA_SASL_PASSWORD": "testpass",
+  "VEJAS_SECRET_KAFKA_SASL_MECHANISM": "PLAIN",
+  "_note": "STATED EXCEPTION: Kafka exec-sink requires real broker for testing. See ADR-0022 and ADR-0017."
+}

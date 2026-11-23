@@ -1,0 +1,23 @@
+# connector: kafka_produce — Produce messages to Kafka topics
+# Consumes vx.kafka.produce and sends messages to Kafka
+# Expected payload: {topic: "orders", key: "order-123", value: {"order_id": 123, "amount": 99.99}, partition: 0}
+# Auth: SASL/PLAIN, SASL/SCRAM, or mTLS via secrets
+# Docs: https://kafka.apache.org/documentation/#producerapi
+# Rate limits: Depends on broker configuration, typically 10k+ msgs/s per partition
+# Secrets: kafka/brokers, kafka/sasl_username, kafka/sasl_password, kafka/sasl_mechanism
+
+driver "exec-sink"
+PROGRAM = "kafka-console-producer"
+ARGS = [
+    "--bootstrap-server", secret("kafka/brokers"),
+    "--topic", "default-topic",
+    "--property", "parse.key=true",
+    "--property", "key.separator=:"
+]
+SUBJECT = "vx.kafka.produce"
+
+# Note: Uses kafka-console-producer for simplicity
+# Production should use the native Kafka connector (ADR-0022)
+# Or use exec-sink with a Python/Node.js script using kafka-python/kafkajs
+# Supports SASL authentication via --command-config with properties file
+# For mTLS, use --producer.config with SSL properties
