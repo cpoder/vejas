@@ -1,0 +1,51 @@
+# connector: mongodb — Comprehensive MongoDB database integration
+#
+# Platform connector for MongoDB database. Supports multiple operations:
+# - Document operations (insertOne, insertMany, findOne, find, updateOne, updateMany, deleteOne, deleteMany)
+# - Aggregation pipeline (aggregate with stages)
+# - Index management (createIndex, listIndexes, dropIndex)
+# - Collection management (listCollections, createCollection, dropCollection)
+# - Bulk operations (bulkWrite)
+#
+# Uses exec-rpc driver wrapping a MongoDB client process. The process accepts
+# JSON requests on stdin and returns JSON responses on stdout.
+#
+# Subjects:
+#   REQUEST: vxrpc.mongodb (outside vx.* namespace for request/reply)
+#
+# Secrets:
+#   mongodb/uri - MongoDB connection URI (mongodb://... or mongodb+srv://...)
+#   mongodb/database - Database name
+#
+# Rate limits: Depends on server configuration and connection pool size
+# Connection pooling: Managed by the exec process
+#
+# Request format (JSON on stdin):
+# {"op":"findOne","collection":"users","filter":{"id":123}}
+# {"op":"insertOne","collection":"users","document":{"name":"John","email":"john@example.com"}}
+# {"op":"updateMany","collection":"users","filter":{"active":false},"update":{"$set":{"status":"inactive"}}}
+# {"op":"aggregate","collection":"orders","pipeline":[{"$match":{"status":"completed"}},{"$group":{"_id":"$customer","total":{"$sum":"$amount"}}}]}
+#
+# Response format (JSON on stdout):
+# {"ok":true,"document":{"_id":"507f1f77bcf86cd799439011","name":"John"}}
+# {"ok":true,"insertedId":"507f1f77bcf86cd799439011"}
+# {"ok":true,"modifiedCount":5}
+# {"ok":false,"error":"Collection not found"}
+#
+# Note: This connector requires a MongoDB client wrapper binary (e.g., vejas-mongodb)
+# that implements the exec-rpc protocol. The binary would use a MongoDB driver
+# (e.g., mongodb crate in Rust) to execute operations.
+
+driver "exec-rpc"
+
+# Request/reply subject (outside vx.* namespace)
+REQUEST_SUBJECT = "vxrpc.mongodb"
+
+# MongoDB client wrapper command
+CMD = "/opt/vejas/vejas-mongodb"
+
+# Environment variables for connection
+ENV = {
+  MONGODB_URI: secret("mongodb/uri"),
+  MONGODB_DATABASE: secret("mongodb/database")
+}

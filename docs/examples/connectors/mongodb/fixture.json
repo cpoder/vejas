@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "documents": [
+    {
+      "_id": "507f1f77bcf86cd799439011",
+      "name": "John Doe",
+      "email": "john.doe@example.com",
+      "age": 32,
+      "role": "admin",
+      "active": true,
+      "createdAt": "2023-11-23T12:00:00.000Z",
+      "updatedAt": "2023-11-23T12:00:00.000Z",
+      "tags": ["premium", "verified"],
+      "address": {
+        "street": "123 Main St",
+        "city": "San Francisco",
+        "state": "CA",
+        "zip": "94103"
+      }
+    },
+    {
+      "_id": "507f1f77bcf86cd799439012",
+      "name": "Jane Smith",
+      "email": "jane.smith@example.com",
+      "age": 28,
+      "role": "user",
+      "active": true,
+      "createdAt": "2023-11-23T11:30:00.000Z",
+      "updatedAt": "2023-11-23T11:30:00.000Z",
+      "tags": ["verified"],
+      "address": {
+        "street": "456 Oak Ave",
+        "city": "New York",
+        "state": "NY",
+        "zip": "10001"
+      }
+    }
+  ],
+  "count": 2
+}
