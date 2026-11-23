@@ -1,0 +1,59 @@
+# connector: azure — Comprehensive Microsoft Azure API integration
+#
+# Platform connector for Microsoft Azure. Supports multiple operations:
+# - Blob Storage (upload, download, list, delete blobs)
+# - Service Bus (send messages, receive messages, queues/topics)
+# - Azure Functions (invoke functions, list functions)
+# - Event Grid (publish events, create topics)
+# - Cosmos DB (CRUD operations on documents)
+#
+# Uses http-out driver for API calls. Azure requires OAuth2 Azure AD authentication.
+# Individual operations use flows that consume from subjects and make direct API calls.
+#
+# Subjects:
+#   IN: vx.azure.blob.upload (upload blobs to Blob Storage)
+#   IN: vx.azure.servicebus.send (send messages to Service Bus)
+#   IN: vx.azure.functions.invoke (invoke Azure Functions)
+#
+# Secrets:
+#   azure/storage_account - Azure Storage account name
+#   azure/storage_key - Azure Storage account access key
+#   azure/tenant_id - Azure AD tenant ID
+#   azure/client_id - Azure AD application (client) ID
+#   azure/client_secret - Azure AD client secret
+#
+# Rate limits: Varies by service (Blob Storage: 20000 req/s, Service Bus: varies by tier)
+# Pagination: Service-specific (continuation tokens)
+#
+# Authentication: Shared Key for Storage, OAuth2 Bearer token for other services
+# API Version: Service-specific (2021-08-06 for Blob Storage, etc.)
+#
+# Note: Azure authentication varies by service. Storage uses Shared Key,
+# other services use OAuth2 tokens from Azure AD. This connector demonstrates
+# the structure; actual implementation would need service-specific auth helpers
+# or use Azure SDK wrapped in exec-rpc.
+
+driver "http-out"
+
+# Base configuration for Blob Storage operations
+SUBJECT = "vx.azure.blob.upload"
+BASE_URL = "https://" + secret("azure/storage_account") + ".blob.core.windows.net"
+METHOD = "PUT"
+
+# Shared Key authentication for Blob Storage
+# In production, this would use an exec-rpc wrapper around Azure SDK
+# or a signing service that generates proper Authorization headers
+HEADERS = {
+  "x-ms-date": "${timestamp}",
+  "x-ms-version": "2021-08-06",
+  Authorization: "SharedKey " + secret("azure/storage_account") + ":${signature}",
+  "x-ms-blob-type": "BlockBlob",
+  "Content-Type": "application/octet-stream"
+}
+
+# Note: For production use, consider wrapping Azure SDK in exec-rpc connector
+# to handle OAuth2 token generation and service-specific APIs properly.
+# Azure AD authentication flow (for non-storage services):
+# 1. POST to https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+# 2. Use client credentials grant (client_id, client_secret, scope)
+# 3. Use access token in Authorization: Bearer header
