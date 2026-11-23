@@ -1,0 +1,11 @@
+# connector: stripe_create_payment — Create Stripe payment intents via exec-sink
+# Consumes vx.stripe.create_payment and creates payment intents via Stripe API
+# Expected payload: {amount: 5000, currency: "eur", customer: "cus_...", description: "..."}
+# Auth: secret("stripe/api_key") = sk_live_... or sk_test_...
+
+driver "exec-sink"
+SUBJECT = "vx.stripe.create_payment"
+CMD = "./connectors/stripe/target/release/vejas-stripe payment"
+ENV = {
+    "STRIPE_API_KEY": secret("stripe/api_key")
+}

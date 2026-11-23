@@ -1,0 +1,22 @@
+[package]
+name = "vejas-stripe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Vejas Stripe connector: webhook receiver + payment intent creation via Stripe API. Native Rust; HTTP via curl (argv-safe)."
+
+# Built as an isolated exec process (ADR-0011) and bridged to the bus by the
+# runtime's exec-stream-source (webhook) or exec-sink (payment creation) drivers.
+# HTTP goes through curl with a 0600 config file so the API key never touches
+# argv (ADR-0008).
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "vejas-stripe"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
