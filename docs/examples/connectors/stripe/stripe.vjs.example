@@ -7,7 +7,7 @@
 # - Invoices (create, retrieve, finalize, pay)
 # - Events (webhook processing via polling)
 #
-# Uses oauth-poll driver for event streaming. Individual operations use http-out
+# Uses http-poll driver for event streaming. Individual operations use http-out
 # in flows that consume from vx.stripe.events or make direct API calls.
 #
 # Subjects:
@@ -22,26 +22,15 @@
 # Authentication: Bearer token in Authorization header
 # API Version: 2023-10-16 (specified in Stripe-Version header)
 
-driver "oauth-poll"
+driver "http-poll"
 
 # Event polling configuration
+URL = "https://api.stripe.com/v1/events?limit=100"
 SUBJECT = "vx.stripe.events"
-BASE_URL = "https://api.stripe.com/v1"
-POLL_ENDPOINT = "/events"
-POLL_INTERVAL = 60
-CURSOR_PATH = "data[-1].id"
-CURSOR_PARAM = "starting_after"
+INTERVAL_SECS = 60
 
 # Authentication
-HEADERS = {
-  Authorization: "Bearer " + secret("stripe/api_key"),
-  "Stripe-Version": "2023-10-16"
-}
+HEADERS = {"Authorization": "Bearer " + secret("stripe/api_key"), "Stripe-Version": "2023-10-16"}
 
-# Pagination
-LIMIT_PARAM = "limit"
-LIMIT_VALUE = 100
-
-# Response handling
-DATA_PATH = "data"
-HAS_MORE_PATH = "has_more"
+# Response envelope
+ENVELOPE = true
