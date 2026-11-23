@@ -1,0 +1,43 @@
+# connector: twilio — Comprehensive Twilio API integration
+#
+# Platform connector for Twilio communications. Supports multiple operations:
+# - SMS (send, retrieve, list messages)
+# - Voice (make calls, retrieve call logs)
+# - WhatsApp (send messages via WhatsApp Business API)
+# - Verify (send verification codes, check verification)
+# - Programmable Messaging (send bulk messages)
+#
+# Uses http-out driver for outbound API calls. Flows consume from subjects
+# and make direct API calls to Twilio endpoints.
+#
+# Subjects:
+#   IN: vx.twilio.sms.send (send SMS messages)
+#   IN: vx.twilio.voice.call (initiate voice calls)
+#   IN: vx.twilio.whatsapp.send (send WhatsApp messages)
+#
+# Secrets:
+#   twilio/account_sid - Twilio Account SID (ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX)
+#   twilio/auth_token - Twilio Auth Token
+#
+# Rate limits: Varies by account type (default: 1 req/s for trial accounts)
+# Pagination: Cursor-based via PageToken parameter
+#
+# Authentication: HTTP Basic Auth (Account SID as username, Auth Token as password)
+# API Version: 2010-04-01 (in URL path)
+
+driver "http-out"
+
+# Base configuration
+SUBJECT = "vx.twilio.sms.send"
+BASE_URL = "https://api.twilio.com/2010-04-01"
+METHOD = "POST"
+
+# Authentication - Basic Auth with Account SID and Auth Token
+HEADERS = {
+  Authorization: "Basic " + base64(secret("twilio/account_sid") + ":" + secret("twilio/auth_token")),
+  "Content-Type": "application/x-www-form-urlencoded"
+}
+
+# SMS endpoint template
+# Actual endpoint: /Accounts/{AccountSid}/Messages.json
+# Body parameters: To, From, Body (URL-encoded form data)
