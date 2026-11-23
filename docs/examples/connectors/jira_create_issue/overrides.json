@@ -1,8 +1,5 @@
 {
-  "literals": {
-    "URL": "http://127.0.0.1:{PORT}/rest/api/3/issue"
-  },
-  "secrets": {
-    "jira/basic": "ZHVtbXk6ZHVtbXk="
-  }
+  "URL": "http://127.0.0.1:9212/rest/api/3/issue",
+  "VEJAS_SECRET_JIRA_URL": "http://127.0.0.1:9212",
+  "VEJAS_SECRET_JIRA_BASIC_AUTH": "dGVzdEBleGFtcGxlLmNvbTp0ZXN0X2FwaV90b2tlbg=="
 }

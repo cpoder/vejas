@@ -1,7 +1,21 @@
-# connector: jira_create_issue — create a Jira issue (Cloud REST API v3).
-# A flow emits an issue body ({fields: {project, summary, issuetype, ...}}) on SUBJECT.
+# connector: jira_create_issue — Create Jira issues
+# Consumes vx.jira.issues.create and creates issues in Jira projects
+# Expected payload: {project: "PROJ", summary: "Bug report", description: "Details", issuetype: "Bug", priority: "High"}
+# Auth: Jira API token or OAuth 2.0 via secret
+# Docs: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post
+# Rate limits: Jira Cloud supports 10 requests/s per user (can be increased)
+# Secrets: jira/url, jira/email, jira/api_token
+
 driver "http-out"
-SUBJECT = "vx.jira.create"
-URL = "https://YOURSITE.atlassian.net/rest/api/3/issue"
-HEADERS = {"Authorization": f"Basic {secret("jira/basic")}", "Content-Type": "application/json", "Accept": "application/json"}
-TEST_BODY = {"fields": {"project": {"key": "OPS"}, "summary": "Vejas connector test", "issuetype": {"name": "Task"}}}
+SUBJECT = "vx.jira.issues.create"
+URL = f"{secret('jira/url')}/rest/api/3/issue"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"Basic {secret('jira/basic_auth')}",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
+
+# Note: Basic auth = base64(email:api_token)
+# Store the pre-encoded value in secret('jira/basic_auth')
+# Supports custom fields, components, labels, assignee, etc.
