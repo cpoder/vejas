@@ -1,0 +1,4 @@
+{
+  "VEJAS_SECRET_MONGODB_CONNECTION_STRING": "mongodb://testuser:testpass@localhost:27017/testdb",
+  "_note": "STATED EXCEPTION: MongoDB exec-rpc requires real database for testing. See ADR-0017."
+}

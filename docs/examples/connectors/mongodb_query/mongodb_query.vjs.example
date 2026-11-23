@@ -1,0 +1,17 @@
+# connector: mongodb_query — Execute MongoDB queries
+# Consumes vx.mongodb.query and executes MongoDB operations
+# Expected payload: {database: "mydb", collection: "users", operation: "find", query: {"status": "active"}, options: {}}
+# Auth: MongoDB connection string via secret (mongodb://user:pass@host:27017/dbname)
+# Docs: https://www.mongodb.com/docs/manual/reference/command/
+# Rate limits: Depends on MongoDB cluster configuration
+# Secrets: mongodb/connection_string
+
+driver "exec-rpc"
+PROGRAM = "mongosh"
+ARGS = [secret("mongodb/connection_string"), "--quiet", "--eval"]
+SUBJECT = "vx.mongodb.query"
+
+# Note: Uses mongosh CLI for simplicity
+# Production should use a proper MongoDB driver
+# Or use exec-rpc with a Python/Node.js script using pymongo/mongodb driver
+# Response format: JSON output from mongosh
