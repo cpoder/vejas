@@ -1,0 +1,55 @@
+# connector: postgresql — Comprehensive PostgreSQL database integration
+#
+# Platform connector for PostgreSQL database. Supports multiple operations:
+# - Query execution (SELECT, INSERT, UPDATE, DELETE)
+# - Transaction management (BEGIN, COMMIT, ROLLBACK)
+# - Prepared statements (parameterized queries)
+# - Bulk operations (COPY, batch inserts)
+# - Schema introspection (list tables, columns, indexes)
+#
+# Uses exec-rpc driver wrapping a PostgreSQL client process. The process accepts
+# JSON requests on stdin and returns JSON responses on stdout.
+#
+# Subjects:
+#   REQUEST: vxrpc.postgresql (outside vx.* namespace for request/reply)
+#
+# Secrets:
+#   postgresql/host - PostgreSQL server host
+#   postgresql/port - PostgreSQL server port (default: 5432)
+#   postgresql/database - Database name
+#   postgresql/user - Database user
+#   postgresql/password - Database password
+#
+# Rate limits: Depends on server configuration and connection pool size
+# Connection pooling: Managed by the exec process
+#
+# Request format (JSON on stdin):
+# {"op":"query","sql":"SELECT * FROM users WHERE id = $1","params":[123]}
+# {"op":"execute","sql":"INSERT INTO users (name, email) VALUES ($1, $2)","params":["John","john@example.com"]}
+# {"op":"transaction","queries":[{"sql":"...","params":[]}]}
+#
+# Response format (JSON on stdout):
+# {"ok":true,"rows":[{"id":123,"name":"John"}],"rowCount":1}
+# {"ok":false,"error":"relation \"users\" does not exist"}
+#
+# Note: This connector requires a PostgreSQL client wrapper binary (e.g., vejas-postgresql)
+# that implements the exec-rpc protocol. The binary would use a PostgreSQL driver
+# (e.g., tokio-postgres in Rust) to execute queries.
+
+driver "exec-rpc"
+
+# Request/reply subject (outside vx.* namespace)
+REQUEST_SUBJECT = "vxrpc.postgresql"
+
+# PostgreSQL client wrapper command
+CMD = "/opt/vejas/vejas-postgresql"
+
+# Environment variables for connection
+ENV = {
+  PGHOST: secret("postgresql/host"),
+  PGPORT: secret("postgresql/port"),
+  PGDATABASE: secret("postgresql/database"),
+  PGUSER: secret("postgresql/user"),
+  PGPASSWORD: secret("postgresql/password"),
+  PGSSLMODE: "prefer"
+}
