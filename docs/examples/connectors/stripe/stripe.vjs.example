@@ -1,0 +1,47 @@
+# connector: stripe — Comprehensive Stripe API integration
+#
+# Platform connector for Stripe payment processing. Supports multiple operations:
+# - Payment Intents (create, retrieve, confirm, cancel)
+# - Subscriptions (create, update, cancel, retrieve)
+# - Customers (create, update, retrieve, list)
+# - Invoices (create, retrieve, finalize, pay)
+# - Events (webhook processing via polling)
+#
+# Uses oauth-poll driver for event streaming. Individual operations use http-out
+# in flows that consume from vx.stripe.events or make direct API calls.
+#
+# Subjects:
+#   OUT: vx.stripe.events (all Stripe webhook events)
+#
+# Secrets:
+#   stripe/api_key - Stripe secret API key (sk_test_... or sk_live_...)
+#
+# Rate limits: Stripe allows 100 req/s in test mode, 1000 req/s in live mode
+# Pagination: Cursor-based via 'starting_after' parameter
+#
+# Authentication: Bearer token in Authorization header
+# API Version: 2023-10-16 (specified in Stripe-Version header)
+
+driver "oauth-poll"
+
+# Event polling configuration
+SUBJECT = "vx.stripe.events"
+BASE_URL = "https://api.stripe.com/v1"
+POLL_ENDPOINT = "/events"
+POLL_INTERVAL = 60
+CURSOR_PATH = "data[-1].id"
+CURSOR_PARAM = "starting_after"
+
+# Authentication
+HEADERS = {
+  Authorization: "Bearer " + secret("stripe/api_key"),
+  "Stripe-Version": "2023-10-16"
+}
+
+# Pagination
+LIMIT_PARAM = "limit"
+LIMIT_VALUE = 100
+
+# Response handling
+DATA_PATH = "data"
+HAS_MORE_PATH = "has_more"
