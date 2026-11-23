@@ -1,0 +1,20 @@
+# connector: elasticsearch_index — Index documents in Elasticsearch
+# Consumes vx.elasticsearch.index and indexes documents
+# Expected payload: {index: "logs-2026.11", id: "doc123", document: {"message": "log entry", "timestamp": "2026-11-23T12:00:00Z"}}
+# Auth: Basic auth or API key via secret
+# Docs: https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-index_.html
+# Rate limits: Depends on cluster configuration, typically 1000s of docs/s
+# Secrets: elasticsearch/url, elasticsearch/api_key or elasticsearch/basic_auth
+
+driver "http-out"
+SUBJECT = "vx.elasticsearch.index"
+URL = f"{secret('elasticsearch/url')}"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"ApiKey {secret('elasticsearch/api_key')}",
+    "Content-Type": "application/json"
+}
+
+# Note: URL will be constructed per-request: {base_url}/{index}/_doc/{id}
+# Or use /_bulk endpoint for batch indexing
+# API key format: base64(id:api_key)
