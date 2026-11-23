@@ -1,0 +1,22 @@
+{
+  "ETag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+  "ServerSideEncryption": "AES256",
+  "VersionId": "null",
+  "Location": "https://my-bucket.s3.us-east-1.amazonaws.com/uploads/document.pdf",
+  "Bucket": "my-bucket",
+  "Key": "uploads/document.pdf",
+  "ResponseMetadata": {
+    "RequestId": "EXAMPLE123456789",
+    "HostId": "EXAMPLEHOSTID123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "HTTPStatusCode": 200,
+    "HTTPHeaders": {
+      "x-amz-id-2": "EXAMPLEHOSTID123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+      "x-amz-request-id": "EXAMPLE123456789",
+      "date": "Mon, 23 Nov 2026 12:00:00 GMT",
+      "etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+      "server": "AmazonS3",
+      "content-length": "0"
+    },
+    "RetryAttempts": 0
+  }
+}

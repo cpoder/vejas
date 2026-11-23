@@ -1,0 +1,51 @@
+# connector: aws — Comprehensive AWS API integration
+#
+# Platform connector for Amazon Web Services. Supports multiple operations:
+# - S3 (upload, download, list, delete objects)
+# - Lambda (invoke functions, list functions)
+# - SQS (send messages, receive messages, delete messages)
+# - SNS (publish messages, create topics, subscribe)
+# - DynamoDB (put item, get item, query, scan)
+#
+# Uses http-out driver for API calls. AWS requires Signature Version 4 authentication.
+# Individual operations use flows that consume from subjects and make direct API calls.
+#
+# Subjects:
+#   IN: vx.aws.s3.upload (upload objects to S3)
+#   IN: vx.aws.lambda.invoke (invoke Lambda functions)
+#   IN: vx.aws.sqs.send (send messages to SQS)
+#   IN: vx.aws.sns.publish (publish to SNS topics)
+#
+# Secrets:
+#   aws/access_key_id - AWS Access Key ID
+#   aws/secret_access_key - AWS Secret Access Key
+#   aws/region - AWS region (e.g., us-east-1)
+#
+# Rate limits: Varies by service (S3: 3500 PUT/s, Lambda: 1000 concurrent, SQS: unlimited)
+# Pagination: Service-specific (S3: marker-based, DynamoDB: LastEvaluatedKey)
+#
+# Authentication: AWS Signature Version 4 (complex signing process)
+# API Version: Service-specific (S3: 2006-03-01, Lambda: 2015-03-31, etc.)
+#
+# Note: AWS SigV4 requires computing HMAC-SHA256 signatures with request details.
+# This connector demonstrates the structure; actual implementation would need
+# a signing helper or use AWS SDK wrapped in exec-rpc.
+
+driver "http-out"
+
+# Base configuration for S3 operations
+SUBJECT = "vx.aws.s3.upload"
+BASE_URL = "https://s3." + secret("aws/region") + ".amazonaws.com"
+METHOD = "PUT"
+
+# AWS Signature v4 headers (simplified - actual implementation needs signing)
+# In production, this would use an exec-rpc wrapper around AWS SDK
+HEADERS = {
+  "x-amz-date": "${timestamp}",
+  "x-amz-content-sha256": "${content_hash}",
+  Authorization: "AWS4-HMAC-SHA256 Credential=" + secret("aws/access_key_id") + "/${date}/" + secret("aws/region") + "/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}",
+  "Content-Type": "application/octet-stream"
+}
+
+# Note: For production use, consider wrapping AWS SDK in exec-rpc connector
+# to handle complex authentication and service-specific APIs properly.
