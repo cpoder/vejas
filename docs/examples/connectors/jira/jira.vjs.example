@@ -1,0 +1,53 @@
+# connector: jira — Comprehensive Jira API integration
+#
+# Platform connector for Atlassian Jira. Supports multiple operations:
+# - Issues (create, update, list, search, transitions, comments)
+# - Projects (list, get details, components, versions)
+# - Workflows (get transitions, execute transitions)
+# - Users (search, get user details)
+# - Webhooks (register, list, delete)
+#
+# Uses oauth-poll driver for issue updates polling. Individual operations use http-out
+# in flows that consume from vx.jira.issues or make direct API calls.
+#
+# Subjects:
+#   OUT: vx.jira.issues (issue updates via JQL search polling)
+#
+# Secrets:
+#   jira/email - Jira user email for Basic Auth
+#   jira/api_token - Jira API token (generated from Atlassian account settings)
+#   jira/domain - Jira instance domain (e.g., yourcompany.atlassian.net)
+#
+# Rate limits: 10 requests per second per user (Cloud), varies for Server/Data Center
+# Pagination: Offset-based via startAt and maxResults parameters
+#
+# Authentication: Basic Auth (email + API token, base64 encoded)
+# API Version: 3 (in URL path /rest/api/3/)
+
+driver "oauth-poll"
+
+# Issue polling configuration - polls for recently updated issues
+SUBJECT = "vx.jira.issues"
+BASE_URL = "https://" + secret("jira/domain") + "/rest/api/3"
+POLL_ENDPOINT = "/search"
+POLL_INTERVAL = 300
+CURSOR_PATH = "issues[-1].fields.updated"
+CURSOR_PARAM = "jql"
+
+# Authentication - Basic Auth with email and API token
+HEADERS = {
+  Authorization: "Basic " + base64(secret("jira/email") + ":" + secret("jira/api_token")),
+  Accept: "application/json",
+  "Content-Type": "application/json"
+}
+
+# Pagination
+LIMIT_PARAM = "maxResults"
+LIMIT_VALUE = 50
+
+# Response handling
+DATA_PATH = "issues"
+HAS_MORE_PATH = "total"
+
+# JQL query for polling (updated in last 5 minutes)
+# In actual use, CURSOR_PARAM would be: "jql=updated > '2023-11-23 12:00' ORDER BY updated ASC"

@@ -1,0 +1,5 @@
+{
+  "BASE_URL": "http://localhost:8083/rest/api/3",
+  "POLL_ENDPOINT": "/search?jql=updated > -5m ORDER BY updated ASC",
+  "POLL_INTERVAL": 5
+}
