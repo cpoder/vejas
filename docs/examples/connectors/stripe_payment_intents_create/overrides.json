@@ -1,0 +1,4 @@
+{
+  "URL": "http://127.0.0.1:9201/v1/payment_intents",
+  "VEJAS_SECRET_STRIPE_API_KEY": "sk_test_mock_key_for_admission_test_only"
+}

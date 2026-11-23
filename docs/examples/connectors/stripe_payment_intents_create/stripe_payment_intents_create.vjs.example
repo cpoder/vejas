@@ -1,0 +1,21 @@
+# connector: stripe_payment_intents_create — Create Stripe Payment Intents
+# Consumes vx.stripe.payment_intents.create and creates payment intents
+# Expected payload: {amount: 2000, currency: "usd", customer: "cus_123", metadata: {order_id: "order_123"}}
+# Auth: Stripe secret key via secret (sk_test_... or sk_live_...)
+# Docs: https://stripe.com/docs/api/payment_intents/create
+# Rate limits: Stripe supports 100 requests/s per account (can be increased)
+# Secrets: stripe/secret_key
+
+driver "http-out"
+SUBJECT = "vx.stripe.payment_intents.create"
+URL = "https://api.stripe.com/v1/payment_intents"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"Bearer {secret('stripe/secret_key')}",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Stripe-Version": "2023-10-16"
+}
+
+# Note: Stripe expects form-encoded data: amount=2000&currency=usd&customer=cus_123
+# Response includes client_secret for frontend confirmation
+# Supports automatic payment methods, 3D Secure, and more

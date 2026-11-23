@@ -1,0 +1,14 @@
+{
+  "id": "pi_3QABCDabcdef123456",
+  "object": "payment_intent",
+  "amount": 5000,
+  "amount_capturable": 0,
+  "amount_received": 0,
+  "currency": "eur",
+  "customer": "cus_QABCDabcdef123",
+  "description": "Test payment from Vejas",
+  "status": "requires_payment_method",
+  "created": 1700000000,
+  "livemode": false,
+  "client_secret": "pi_3QABCDabcdef123456_secret_abcdefghijklmnop"
+}
