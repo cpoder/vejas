@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "took": 5,
+  "timed_out": false,
+  "_shards": {
+    "total": 1,
+    "successful": 1,
+    "skipped": 0,
+    "failed": 0
+  },
+  "hits": {
+    "total": {
+      "value": 2,
+      "relation": "eq"
+    },
+    "max_score": 1.0,
+    "hits": [
+      {
+        "_index": "users",
+        "_id": "1",
+        "_score": 1.0,
+        "_source": {
+          "name": "John Doe",
+          "email": "john.doe@example.com",
+          "age": 32,
+          "role": "admin",
+          "active": true,
+          "created_at": "2023-11-23T12:00:00.000Z"
+        }
+      },
+      {
+        "_index": "users",
+        "_id": "2",
+        "_score": 0.8,
+        "_source": {
+          "name": "Jane Smith",
+          "email": "jane.smith@example.com",
+          "age": 28,
+          "role": "user",
+          "active": true,
+          "created_at": "2023-11-23T11:30:00.000Z"
+        }
+      }
+    ]
+  }
+}

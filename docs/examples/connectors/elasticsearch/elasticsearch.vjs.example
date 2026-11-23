@@ -1,0 +1,53 @@
+# connector: elasticsearch — Comprehensive Elasticsearch search engine integration
+#
+# Platform connector for Elasticsearch. Supports multiple operations:
+# - Document operations (index, get, update, delete, bulk)
+# - Search operations (search with query DSL, multi-search)
+# - Index management (create index, delete index, update mappings)
+# - Aggregations (terms, stats, date histogram, etc.)
+# - Cluster operations (health, stats, nodes info)
+#
+# Uses exec-rpc driver wrapping an Elasticsearch client process. The process accepts
+# JSON requests on stdin and returns JSON responses on stdout.
+#
+# Subjects:
+#   REQUEST: vxrpc.elasticsearch (outside vx.* namespace for request/reply)
+#
+# Secrets:
+#   elasticsearch/url - Elasticsearch cluster URL (http://localhost:9200 or https://...)
+#   elasticsearch/username - Elasticsearch username (optional, for auth)
+#   elasticsearch/password - Elasticsearch password (optional, for auth)
+#   elasticsearch/api_key - Elasticsearch API key (optional, alternative to username/password)
+#
+# Rate limits: Depends on cluster configuration and resources
+# Connection pooling: Managed by the exec process
+#
+# Request format (JSON on stdin):
+# {"op":"index","index":"users","id":"123","document":{"name":"John","email":"john@example.com"}}
+# {"op":"search","index":"users","query":{"match":{"name":"John"}}}
+# {"op":"bulk","operations":[{"index":{"_index":"users","_id":"1"}},{"name":"John"},{"index":{"_index":"users","_id":"2"}},{"name":"Jane"}]}
+# {"op":"aggregate","index":"orders","aggs":{"total_sales":{"sum":{"field":"amount"}}}}
+#
+# Response format (JSON on stdout):
+# {"ok":true,"_id":"123","_index":"users","_version":1,"result":"created"}
+# {"ok":true,"hits":{"total":{"value":1},"hits":[{"_source":{"name":"John"}}]}}
+# {"ok":false,"error":"index_not_found_exception"}
+#
+# Note: This connector requires an Elasticsearch client wrapper binary (e.g., vejas-elasticsearch)
+# that implements the exec-rpc protocol. The binary would use an Elasticsearch driver
+# (e.g., elasticsearch crate in Rust) to execute operations.
+
+driver "exec-rpc"
+
+# Request/reply subject (outside vx.* namespace)
+REQUEST_SUBJECT = "vxrpc.elasticsearch"
+
+# Elasticsearch client wrapper command
+CMD = "/opt/vejas/vejas-elasticsearch"
+
+# Environment variables for connection
+ENV = {
+  ELASTICSEARCH_URL: secret("elasticsearch/url"),
+  ELASTICSEARCH_USERNAME: secret("elasticsearch/username"),
+  ELASTICSEARCH_PASSWORD: secret("elasticsearch/password")
+}
