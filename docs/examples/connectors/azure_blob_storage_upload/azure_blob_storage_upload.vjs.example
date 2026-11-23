@@ -1,0 +1,21 @@
+# connector: azure_blob_storage_upload — Upload files to Azure Blob Storage
+# Consumes vx.azure.blob.upload and uploads to Azure Storage container
+# Expected payload: {container: "my-container", blob: "path/file.txt", data: "base64content", content_type: "text/plain"}
+# Auth: Storage account key or SAS token via secret
+# Docs: https://docs.microsoft.com/en-us/rest/api/storageservices/put-blob
+# Rate limits: Azure Storage supports 20,000 requests/s per storage account
+# Secrets: azure/storage_account, azure/storage_key or azure/sas_token
+
+driver "http-out"
+SUBJECT = "vx.azure.blob.upload"
+URL = "https://mystorageaccount.blob.core.windows.net"
+METHOD = "PUT"
+HEADERS = {
+    "x-ms-version": "2021-08-06",
+    "x-ms-blob-type": "BlockBlob",
+    "Authorization": f"SharedKey mystorageaccount:{secret('azure/storage_key')}"
+}
+
+# Note: Azure Shared Key signature is complex - this is simplified
+# Production use should use exec-sink with az CLI or Azure SDK
+# Or use SAS token for simpler auth: ?{secret('azure/sas_token')}

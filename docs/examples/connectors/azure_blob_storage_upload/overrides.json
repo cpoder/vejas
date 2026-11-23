@@ -1,0 +1,5 @@
+{
+  "URL": "http://127.0.0.1:9204",
+  "VEJAS_SECRET_AZURE_STORAGE_ACCOUNT": "mystorageaccount",
+  "VEJAS_SECRET_AZURE_STORAGE_KEY": "mock_storage_key_base64_for_admission_test_only=="
+}
