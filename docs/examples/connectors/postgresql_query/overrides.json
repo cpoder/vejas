@@ -1,0 +1,4 @@
+{
+  "VEJAS_SECRET_POSTGRESQL_CONNECTION_STRING": "postgresql://testuser:testpass@localhost:5432/testdb",
+  "_note": "STATED EXCEPTION: PostgreSQL exec-rpc requires real database for testing. See ADR-0017."
+}

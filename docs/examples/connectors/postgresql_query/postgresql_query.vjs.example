@@ -1,0 +1,17 @@
+# connector: postgresql_query — Execute PostgreSQL queries
+# Consumes vx.postgresql.query and executes SQL queries
+# Expected payload: {query: "SELECT * FROM users WHERE id = $1", params: [123]}
+# Auth: Connection string via secret (postgresql://user:pass@host:5432/dbname)
+# Docs: https://www.postgresql.org/docs/current/protocol.html
+# Rate limits: Depends on database configuration and connection pool
+# Secrets: postgresql/connection_string
+
+driver "exec-rpc"
+PROGRAM = "psql"
+ARGS = [secret("postgresql/connection_string"), "-t", "-A", "-F", ",", "-c"]
+SUBJECT = "vx.postgresql.query"
+
+# Note: This uses psql CLI for simplicity
+# Production should use a proper PostgreSQL driver (libpq bindings)
+# Or use exec-rpc with a Python/Node.js script using pg/psycopg2
+# Response format: CSV output from psql -t -A -F ","

@@ -1,0 +1,14 @@
+{
+  "rows": [
+    {"id": 123, "name": "John Doe", "email": "john@example.com", "created_at": "2026-11-23T12:00:00Z"},
+    {"id": 124, "name": "Jane Smith", "email": "jane@example.com", "created_at": "2026-11-22T10:30:00Z"}
+  ],
+  "rowCount": 2,
+  "command": "SELECT",
+  "fields": [
+    {"name": "id", "dataTypeID": 23},
+    {"name": "name", "dataTypeID": 1043},
+    {"name": "email", "dataTypeID": 1043},
+    {"name": "created_at", "dataTypeID": 1184}
+  ]
+}
