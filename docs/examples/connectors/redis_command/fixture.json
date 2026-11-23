@@ -1,0 +1,5 @@
+{
+  "command": "GET",
+  "result": "myvalue",
+  "type": "string"
+}

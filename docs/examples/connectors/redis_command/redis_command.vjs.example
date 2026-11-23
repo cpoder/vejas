@@ -1,0 +1,18 @@
+# connector: redis_command — Execute Redis commands
+# Consumes vx.redis.command and executes Redis operations
+# Expected payload: {command: "GET", args: ["mykey"]} or {command: "SET", args: ["mykey", "myvalue"]}
+# Auth: Redis connection string via secret (redis://user:pass@host:6379/0)
+# Docs: https://redis.io/commands/
+# Rate limits: Depends on Redis server configuration
+# Secrets: redis/connection_string or redis/password
+
+driver "exec-rpc"
+PROGRAM = "redis-cli"
+ARGS = ["-u", secret("redis/connection_string"), "--raw"]
+SUBJECT = "vx.redis.command"
+
+# Note: Uses redis-cli for simplicity
+# Production should use a proper Redis driver (redis-rs or similar)
+# Or use exec-rpc with a Python/Node.js script using redis-py/ioredis
+# Response format: Raw output from redis-cli
+# Supports all Redis commands: GET, SET, HGET, LPUSH, ZADD, etc.

@@ -1,0 +1,4 @@
+{
+  "VEJAS_SECRET_REDIS_CONNECTION_STRING": "redis://localhost:6379/0",
+  "_note": "STATED EXCEPTION: Redis exec-rpc requires real instance for testing. See ADR-0017."
+}
