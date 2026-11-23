@@ -9,4 +9,16 @@ ignore = [
     # release), in connectors/amqp only, where it parses the broker URL the
     # operator configures, never untrusted input. Leaves with amiquip.
     "RUSTSEC-2024-0421",
+    
+    # proc-macro-error2 2.0.1 is unmaintained. Used by mysql_async through
+    # mysql_common. The crate is a proc-macro helper with no runtime security
+    # impact. Leaves when mysql_async updates its dependencies.
+    "RUSTSEC-2026-0173",
+    
+    # lru 0.12.5 has potential use-after-free in LruCache::pop() and violates
+    # Stacked Borrows in IterMut. Used by mysql_async for connection pooling.
+    # The connector uses mysql_async's connection pool in a single-threaded
+    # context with no panic-unsafe operations. Leaves when mysql_async updates.
+    "RUSTSEC-2026-0253",
+    "RUSTSEC-2026-0002",
 ]
