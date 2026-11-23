@@ -1,0 +1,56 @@
+# connector: redis — Comprehensive Redis database integration
+#
+# Platform connector for Redis in-memory data store. Supports multiple operations:
+# - Key-value operations (GET, SET, DEL, EXISTS, EXPIRE, TTL)
+# - Data structures (HGET, HSET, LPUSH, RPUSH, SADD, ZADD)
+# - Pub/Sub (PUBLISH, SUBSCRIBE, UNSUBSCRIBE)
+# - Transactions (MULTI, EXEC, DISCARD)
+# - Lua scripting (EVAL, EVALSHA)
+#
+# Uses exec-rpc driver wrapping a Redis client process. The process accepts
+# JSON requests on stdin and returns JSON responses on stdout.
+#
+# Subjects:
+#   REQUEST: vxrpc.redis (outside vx.* namespace for request/reply)
+#
+# Secrets:
+#   redis/host - Redis server host
+#   redis/port - Redis server port (default: 6379)
+#   redis/password - Redis password (optional)
+#   redis/database - Redis database number (default: 0)
+#
+# Rate limits: Depends on server configuration and network latency
+# Connection pooling: Managed by the exec process
+#
+# Request format (JSON on stdin):
+# {"op":"get","key":"user:123"}
+# {"op":"set","key":"user:123","value":"John Doe","ex":3600}
+# {"op":"hgetall","key":"user:123:profile"}
+# {"op":"publish","channel":"notifications","message":"New order"}
+# {"op":"eval","script":"return redis.call('get', KEYS[1])","keys":["mykey"]}
+#
+# Response format (JSON on stdout):
+# {"ok":true,"value":"John Doe"}
+# {"ok":true,"result":"OK"}
+# {"ok":true,"fields":{"name":"John","email":"john@example.com"}}
+# {"ok":false,"error":"WRONGTYPE Operation against a key holding the wrong kind of value"}
+#
+# Note: This connector requires a Redis client wrapper binary (e.g., vejas-redis)
+# that implements the exec-rpc protocol. The binary would use a Redis driver
+# (e.g., redis crate in Rust) to execute commands.
+
+driver "exec-rpc"
+
+# Request/reply subject (outside vx.* namespace)
+REQUEST_SUBJECT = "vxrpc.redis"
+
+# Redis client wrapper command
+CMD = "/opt/vejas/vejas-redis"
+
+# Environment variables for connection
+ENV = {
+  REDIS_HOST: secret("redis/host"),
+  REDIS_PORT: secret("redis/port"),
+  REDIS_PASSWORD: secret("redis/password"),
+  REDIS_DATABASE: secret("redis/database")
+}
