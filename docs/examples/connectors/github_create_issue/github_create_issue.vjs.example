@@ -1,0 +1,22 @@
+# connector: github_create_issue — Create GitHub issues
+# Consumes vx.github.issues.create and creates issues in repositories
+# Expected payload: {owner: "myorg", repo: "myrepo", title: "Bug report", body: "Description", labels: ["bug"], assignees: ["user1"]}
+# Auth: GitHub Personal Access Token or GitHub App token via secret
+# Docs: https://docs.github.com/en/rest/issues/issues#create-an-issue
+# Rate limits: 5000 requests/hour for authenticated requests
+# Secrets: github/token
+
+driver "http-out"
+SUBJECT = "vx.github.issues.create"
+URL = "https://api.github.com/repos"
+METHOD = "POST"
+HEADERS = {
+    "Authorization": f"Bearer {secret('github/token')}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "Vejas-Integration"
+}
+
+# Note: URL will be constructed per-request: https://api.github.com/repos/{owner}/{repo}/issues
+# Supports labels, assignees, milestone, projects
+# Response includes issue number, URL, and full issue object
