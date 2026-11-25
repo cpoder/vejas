@@ -31,8 +31,13 @@ OTEL_SERVICE_NAME=vejas          # optional label
 ```
 
 Unset, it is a genuine no-op — no exporter thread, no overhead. Each flow
-execution becomes a span (subject, ok/error, emit count, timing), so an
-end-to-end request shows up as a trace across the pipeline.
+execution becomes one span (subject, ok/error, emit count, timing).
+
+Today every span is its own trace. The runtime does not yet propagate a
+trace context across hops, so a request that crosses three flows shows up in
+the collector as three unrelated traces, correlated by time and subject only.
+One trace per business event, with parent spans across hops, is decided in
+ADR-0034 and will be claimed here once its CI test is green.
 
 ## The event ring — what just happened
 
@@ -53,7 +58,8 @@ landed.
 - Anything that *failed* past its retries is not lost — it is parked with a
   verdict in the [DLQ](dlq-replay.md), which is its own inspectable surface.
 
-Everything here is a read; none of it changes what runs. The performance
-cost of all three, measured, is in the [benchmarks](../reference/benchmarks.md)
-— the hot path stays a few-MB, few-thousand-per-second runtime with the
-windows open.
+Everything here is a read; none of it changes what runs. The
+[benchmarks](../reference/benchmarks.md) are taken with metrics on, since the
+counters cannot be switched off, so their numbers include that cost. The cost
+of the OTLP exporter and of the event ring has not been measured separately
+yet; ADR-0034 adds that measurement.
