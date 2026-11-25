@@ -7,6 +7,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Corrected
+- The observability guide said an end-to-end request shows up as a trace across the
+  pipeline. It does not: every span carries a fresh trace id and no parent, so a
+  request that crosses three flows is three unrelated traces in the collector. The
+  guide now says so, and says the cost of the OTLP exporter and of the event ring has
+  not been measured separately. ADR-0034 (Proposed) decides how one trace per event
+  gets built; the guide will claim it once its CI test passes.
+
 ### Security
 - **url 2.5.8 → 2.5.9** in the runtime and in the `mq` and `amqp` connectors, for
   RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).
