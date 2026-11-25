@@ -9,4 +9,10 @@ ignore = [
     # release), in connectors/amqp only, where it parses the broker URL the
     # operator configures, never untrusted input. Leaves with amiquip.
     "RUSTSEC-2024-0421",
+    # url 1.7.2 overflows the stack in Url::origin() on nested blob: URLs. Same
+    # path as above (amq-protocol 1.4 <- amiquip 0.4.2, connectors/amqp only):
+    # it only calls Url::parse on the operator's broker URL and never calls
+    # origin(). The runtime and the other connectors are on url 2.5.9, which
+    # fixes it. Leaves with amiquip.
+    "RUSTSEC-2026-0592",
 ]
