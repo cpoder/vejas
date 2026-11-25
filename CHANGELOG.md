@@ -7,6 +7,13 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Security
+- **url 2.5.8 → 2.5.9** in the runtime and in the `mq` and `amqp` connectors, for
+  RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).
+  The `amqp` connector still carries url 1.7.2 through amiquip, which only parses
+  the broker URL the operator configures and never calls `origin()`; that one is
+  ignored in `.cargo/audit.toml` with this reason, and leaves with amiquip.
+
 ## [0.6.0] — 2026-11-07
 
 If you reach a raw binary from another machine, set `VEJAS_HTTP_ADDR` before you
