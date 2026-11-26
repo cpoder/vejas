@@ -268,7 +268,7 @@ impl Driver for ExecRpc {
         "rpc:exec"
     }
     fn about(&self) -> &'static str {
-        "Runs CMD as a long-running request/reply process (one JSON request per line on stdin -> one JSON reply per line on stdout) and serves it over NATS request/reply on REQUEST_SUBJECT — so MCP tools (and flows) can drive an interactive connector like SAP (sap_list / sap_describe / sap_call). Keep REQUEST_SUBJECT OUTSIDE the vx.* JetStream subjects (e.g. \"vxrpc.sap\"). ENV = {\"KEY\": secret(\"…\")} is handed to the child environment (secrets never touch argv). One SAP logon is held open and requests are serialized. Config: CMD, REQUEST_SUBJECT, ENV (optional)."
+        "Runs CMD as a long-running request/reply process (one JSON request per line on stdin -> one JSON reply per line on stdout) and serves it over NATS request/reply on REQUEST_SUBJECT — so MCP tools can drive an interactive connector like SAP (sap_list / sap_describe / sap_call). Keep REQUEST_SUBJECT OUTSIDE the vx.* JetStream subjects (e.g. \"vxrpc.sap\"). ENV = {\"KEY\": secret(\"…\")} is handed to the child environment (secrets never touch argv). One SAP logon is held open and requests are serialized. Config: CMD, REQUEST_SUBJECT, ENV (optional)."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         use std::io::{BufRead, BufReader, Write};

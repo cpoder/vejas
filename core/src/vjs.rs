@@ -212,6 +212,53 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
     Ok(out)
 }
 
+/// One escape in a string, the backslash at `at`: what it stands for goes to
+/// `out`, and its length comes back. These are JSON's escapes, since a literal
+/// set live is written back as JSON (`set_literal`), and `\{` `\}` for a brace
+/// in an f-string. Any other is an error: it used to keep its letter alone, so
+/// a CR set live came back as an `r`.
+fn unescape(src: &str, at: usize, out: &mut Vec<u8>) -> Result<usize, String> {
+    let b = src.as_bytes();
+    let byte = match b.get(at + 1) {
+        Some(b'n') => b'\n',
+        Some(b't') => b'\t',
+        Some(b'r') => b'\r',
+        Some(b'b') => 0x08,
+        Some(b'f') => 0x0c,
+        Some(&c @ (b'"' | b'\\' | b'/' | b'{' | b'}')) => c,
+        Some(b'u') => {
+            let unit = |i: usize| {
+                src.get(i..i + 4)
+                    .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+            };
+            let alone = || {
+                err_at(at, src, "a \\u surrogate stands alone: a character above U+FFFF is written as a pair of \\u escapes")
+            };
+            let hi = unit(at + 2).ok_or_else(|| err_at(at, src, "\\u takes four hex digits"))?;
+            let (code, len) = if (0xD800..0xDC00).contains(&hi) {
+                let lo = (b.get(at + 6..at + 8) == Some(&b"\\u"[..]))
+                    .then(|| unit(at + 8))
+                    .flatten()
+                    .filter(|lo| (0xDC00..0xE000).contains(lo))
+                    .ok_or_else(alone)?;
+                (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 12)
+            } else {
+                (hi, 6)
+            };
+            let c = char::from_u32(code).ok_or_else(alone)?;
+            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            return Ok(len);
+        }
+        _ => {
+            let c = src[at + 1..].chars().next().unwrap_or(' ');
+            return Err(err_at(at, src, &format!("unknown escape \\{c} in a string: a backslash is written \\\\")));
+        }
+    };
+    out.push(byte);
+    Ok(2)
+}
+
 fn lex_string(src: &str, start: usize) -> Result<(String, usize), String> {
     let b = src.as_bytes();
     let mut s: Vec<u8> = Vec::new();
@@ -219,14 +266,7 @@ fn lex_string(src: &str, start: usize) -> Result<(String, usize), String> {
     while i < b.len() {
         match b[i] {
             b'"' => return Ok((String::from_utf8_lossy(&s).into_owned(), i + 1)),
-            b'\\' if i + 1 < b.len() => {
-                s.push(match b[i + 1] {
-                    b'n' => b'\n',
-                    b't' => b'\t',
-                    other => other,
-                });
-                i += 2;
-            }
+            b'\\' if i + 1 < b.len() => i += unescape(src, i, &mut s)?,
             other => {
                 s.push(other);
                 i += 1;
@@ -281,14 +321,7 @@ fn lex_fstring(src: &str, quote: usize) -> Result<(Vec<FPart>, usize), String> {
                 parts.push(FPart::Expr(inner));
                 i = j;
             }
-            b'\\' if i + 1 < b.len() => {
-                lit.push(match b[i + 1] {
-                    b'n' => b'\n',
-                    b't' => b'\t',
-                    other => other,
-                });
-                i += 2;
-            }
+            b'\\' if i + 1 < b.len() => i += unescape(src, i, &mut lit)?,
             other => {
                 lit.push(other);
                 i += 1;
@@ -3179,6 +3212,38 @@ end\n";
         assert!(set_literal(src, "N", "bloquante", &json!("x")).is_err());
         assert!(set_literal(src, "L", "bloquante", &json!("x")).is_err());
         assert!(set_literal(src, "NOPE", "-", &json!(1)).is_err());
+    }
+
+    /// A JSON escape spelled out: a backslash, a u, four hex digits.
+    fn esc(hex: &str) -> String {
+        format!("{}u{hex}", '\\')
+    }
+
+    #[test]
+    fn a_literal_set_live_reads_back_as_it_was_set() {
+        // `set_literal` writes JSON: a CR, a control character, a quote and a
+        // backslash come back as they were set, not as their letter.
+        for v in ["a\r\nb", "\u{1}bell", "say \"hi\"", "back\\slash", "tab\there", "é😀"] {
+            let src = set_literal("V = \"x\"\nemit \"vx.t\", {v: V}\n", "V", "-", &json!(v)).unwrap();
+            assert_eq!(one_emit(&src, json!({}))["v"], v, "{src}");
+        }
+        // JSON's escapes written by hand, in a string and in an f-string.
+        let src = format!(
+            "emit \"vx.t\", {{a: \"{e}{pair}\\/\\b\\f\", b: f\"{e}\\{{x\\}}\"}}",
+            e = esc("00e9"),
+            pair = esc("d83d") + &esc("de00"),
+        );
+        let p = one_emit(&src, json!({}));
+        assert_eq!(p["a"], "é😀/\u{8}\u{c}");
+        assert_eq!(p["b"], "é{x}");
+        // An escape that stands for nothing says how a backslash is written.
+        let e = eval_flow("emit \"vx.t\", {v: \"C:\\qa\"}", json!({})).unwrap_err();
+        assert!(e.contains("line 1") && e.contains("unknown escape \\q") && e.contains("\\\\"), "{e}");
+        // A surrogate alone, or a \u without its four digits.
+        for bad in [esc("d83d") + "x", esc("de00"), esc("12") + "\""] {
+            let e = eval_flow(&format!("emit \"vx.t\", {{v: \"{bad}\"}}"), json!({})).unwrap_err();
+            assert!(e.contains("\\u"), "{bad}: {e}");
+        }
     }
 
     struct MapStore(std::collections::HashMap<String, String>);

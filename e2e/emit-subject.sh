@@ -9,8 +9,8 @@ cd "$(dirname "$0")/.."
 BIN="$PWD/core/target/release/vejas-runtime"
 [ -x "$BIN" ] || { echo "build first" >&2; exit 1; }
 S=$(mktemp -d); R=$(mktemp -d)
-RT=""; NP=""; SUB=""; EVIL=""
-trap 'kill $RT $NP $SUB $EVIL 2>/dev/null; wait $RT $NP $SUB $EVIL 2>/dev/null; rm -rf "$S" "$R"' EXIT
+RT=""; NP=""; SUB=""; EVIL=""; FIRST=""
+trap 'kill $RT $NP $SUB $EVIL $FIRST 2>/dev/null; wait $RT $NP $SUB $EVIL $FIRST 2>/dev/null; rm -rf "$S" "$R"' EXIT
 fail=0
 ok(){ echo "  ✓ $1"; }
 ko(){ echo "  ✗ $1"; fail=1; }
@@ -22,6 +22,9 @@ printf '# connector: http_in\ndriver "http-in"\nPORT = %s\n' $IN > "$R/connector
 # an emit over the server's 1 MB limit: 16 bytes doubled seventeen times
 printf '# flow: big\nsource "vx.big.in"\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.big.out", {s: s}\n' \
   > "$R/flows/big.vjs"
+# the same, after an emit that the refusal must take back with it
+printf '# flow: pair\nsource "vx.pair.in"\nemit "vx.pair.first", {n: 1}\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.pair.big", {s: s}\n' \
+  > "$R/flows/pair.vjs"
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4281 > /dev/null 2>&1 & NP=$!
 sleep 0.5
@@ -68,6 +71,18 @@ import json, sys
 print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:big"]))'; }
 for _ in $(seq 1 150); do [ "$(big_letters)" = "1" ] && break; sleep 0.1; done
 [ "$(big_letters)" = "1" ] && ok "an oversized emit reached the DLQ" || ko "the oversized emit never reached the DLQ"
+
+echo "── what the refused run emitted before the refusal never leaves"
+nats -s $URL sub vx.pair.first --raw > "$S/first" 2>/dev/null & FIRST=$!
+sleep 0.5
+curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' \
+  -d '{"items":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]}' "http://127.0.0.1:$IN/ingest/pair.in"
+pair_letters(){ curl -s -m 5 "$H/dlq" | python3 -c '
+import json, sys
+print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:pair"]))'; }
+for _ in $(seq 1 150); do [ "$(pair_letters)" = "1" ] && break; sleep 0.1; done
+[ "$(pair_letters)" = "1" ] && ok "the run reached the DLQ after its deliveries" || ko "the run never reached the DLQ"
+[ -s "$S/first" ] && ko "the first emit left $(wc -l < "$S/first") times" || ok "the first emit never left"
 
 echo "── a shadow run shows the same error"
 curl -s -m 10 -H 'Content-Type: application/json' -d \

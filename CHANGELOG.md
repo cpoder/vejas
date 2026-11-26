@@ -89,6 +89,28 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   chunked body was refused the same way.
 
 ### Fixed
+- **An `api` flow answers 503 when the bus does not confirm its emits.** It
+  answered 200, or what the flow said, without knowing whether its emits had
+  left: with the bus down, the caller was told the event was taken and it was
+  lost. The emits now leave before the answer, and when the bus does not
+  confirm them the caller gets 503, with the reason and "send the request
+  again"; the hop is recorded as failed. `http-in` answers the same 503 where it
+  answered 502.
+- **A run's emits leave all together or not at all.** When the bus refused one
+  emit of a run (a payload over the server's limit), the emits held before it
+  still left, at every delivery of the message, until it was dead-lettered:
+  five copies of the first emit and none of the others. They now go back out
+  of the batch with the run.
+- **Strings read JSON's escapes.** A string read only `\n` and `\t`, and kept
+  the letter of any other escape: a business value set live to a CR came back
+  as an `r`, since `/surface/set` writes JSON. `\r`, `\b`, `\f`, `\/` and
+  `\u` with four hex digits (a pair for a character above U+FFFF) now read as
+  JSON reads them, and `\{` `\}` give a brace in an f-string. Any other escape
+  is an error that says how a backslash is written: a flow that relied on one
+  must write `\\` instead (breaking).
+- **Docs**: a dead letter lands on `vxdlq.<unit>`, not on its original subject;
+  the runtime reads no `tables/` folder; `rpc:exec` serves the MCP tools, and
+  no flow can read its answer yet (ADR-0032).
 - **A dead letter's replay runs again only in the unit whose letter it is**
   (ADR-0015 Amendment C). It went back on the subject the letter came from,
   where every consumer of that subject ran it again: a flow that had handled

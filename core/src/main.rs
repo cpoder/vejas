@@ -1513,7 +1513,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     engine.record_steps(record::on());
                     // Holding an emit is local, so a refusal is final for this message:
                     // it can never leave, however often it redelivers. That makes it
-                    // a failed run, capped by MAX_DELIVERIES and dead-lettered.
+                    // a failed run, capped by MAX_DELIVERIES and dead-lettered, and
+                    // the emits it held before the refusal go back out of the batch:
+                    // a run's emits leave all together or not at all (ADR-0032).
+                    let held = batch.held();
                     let outcome = vjs::run(&prog, &event, &mut engine).and_then(|ctx| {
                         for (subj, payload) in &ctx.emits {
                             let bytes = serde_json::to_vec(payload).unwrap_or_default();
@@ -1524,6 +1527,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                         Ok(ctx)
                     });
+                    if outcome.is_err() {
+                        batch.rollback(held);
+                    }
                     if traced {
                         for invoked in engine.take_spans() {
                             metrics::span(invoke_span(&handle.spec.name, invoked));
@@ -4046,21 +4052,22 @@ fn parse_query(url: &str) -> Value {
     Value::Object(q)
 }
 
-/// Run a flow and return its full context (emits + response).
-/// Publish an API flow's side-effect emits to the bus (best-effort), carrying
-/// the request's trace.
-fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) {
+/// Publish an API flow's emits to the bus, carrying the request's trace. An
+/// error means the bus did not confirm them all, so the caller must not take
+/// the request as done: it is answered 503 and sends it again (ADR-0002).
+fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) -> Result<(), String> {
     if emits.is_empty() {
-        return;
+        return Ok(());
     }
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if let Ok(nc) = bus::connect(&url) {
-        let mut batch = nc.batch();
-        for (subj, payload) in emits {
-            let _ = batch.publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried);
-        }
-        let _ = batch.confirm();
+    let nc = bus::connect(&url).map_err(|e| format!("NATS unreachable: {e}"))?;
+    let mut batch = nc.batch();
+    for (subj, payload) in emits {
+        batch
+            .publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried)
+            .map_err(|e| format!("publish {subj}: {e}"))?;
     }
+    batch.confirm()
 }
 
 /// The trace context an HTTP request carries, if any (ADR-0034).
@@ -4132,28 +4139,31 @@ fn run_api_flow(
         steps = engine.take_steps();
         run
     })();
-    let ok = result.is_ok();
+    // The emits leave before the answer: a caller told 2xx can count on them.
+    let unconfirmed = result.as_ref().ok().and_then(|ctx| publish_emits(&ctx.emits, &hop.context()).err());
+    let failed = result.is_err() || unconfirmed.is_some();
     let emits = result.as_ref().map(|c| c.emits.len() as u64).unwrap_or(0);
-    metrics::observe(&unit, ok, emits, t0.elapsed().as_secs_f64());
-    let (code, body) = match &result {
-        Ok(ctx) => {
-            publish_emits(&ctx.emits, &hop.context());
-            match &ctx.response {
-                Some((status, body)) => (vjs::http_status(status), body.to_string()),
-                None => (
-                    200,
-                    json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
-                ),
-            }
-        }
-        Err(e) => (500, json!({"error": e}).to_string()),
+    metrics::observe(&unit, !failed, emits, t0.elapsed().as_secs_f64());
+    let (code, body) = match (&result, &unconfirmed) {
+        (Ok(_), Some(e)) => (
+            503,
+            json!({"error": format!("the bus did not confirm this request's events ({e}), so some may be missing: send the request again")}).to_string(),
+        ),
+        (Ok(ctx), None) => match &ctx.response {
+            Some((status, body)) => (vjs::http_status(status), body.to_string()),
+            None => (
+                200,
+                json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
+            ),
+        },
+        (Err(e), _) => (500, json!({"error": e}).to_string()),
     };
-    if traced || (metrics::tracing() && result.is_err()) {
+    if traced || (metrics::tracing() && failed) {
         for span in invoked {
             metrics::span(invoke_span(&unit, span));
         }
     }
-    if metrics::wants(hop.sampled, result.is_err()) {
+    if metrics::wants(hop.sampled, failed) {
         let subjects: Vec<String> = match &result {
             Ok(ctx) => ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
             Err(_) => Vec::new(),
@@ -4171,7 +4181,7 @@ fn run_api_flow(
         if let Some(path) = &path {
             span = span.attr("code.file.path", metrics::Attr::Computed(relative_to(root, path).into()));
         }
-        if let Err(e) = result {
+        if let Some(e) = result.err().or(unconfirmed) {
             span = span.failed(e);
         }
         record::end(

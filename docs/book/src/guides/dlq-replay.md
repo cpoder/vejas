@@ -7,8 +7,9 @@ or it is **parked with a verdict** — never silently dropped (ADR-0015).
 
 A flow error → redelivery (after `VEJAS_ACK_WAIT_SECS`) → up to 5 attempts
 → the dead-letter queue. Unparseable input (bad JSON) is direct poison —
-no pointless retries. The dead letter lands on `vxdlq.<original subject>`
-wrapped in a **death envelope**: original payload, error, attempt count,
+no pointless retries. The dead letter lands on `vxdlq.<unit>`, the unit that
+gave up on it, wrapped in a **death envelope**: original subject and
+payload, error, attempt count,
 timestamps, and the **flow version** that killed it (ADR-0021) — so a
 post-mortem knows *which* logic failed, even after a promote. The envelope
 also keeps the `traceparent` of the event, and a replay continues that

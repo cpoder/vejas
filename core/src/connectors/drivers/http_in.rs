@@ -300,7 +300,15 @@ fn handle_http_in(
                                             hop.trace_hex()
                                         ),
                                     ),
-                                    (_, Err(e)) => ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}")),
+                                    // The bus did not confirm the event: the sender keeps
+                                    // it and sends it again, as a 503 says.
+                                    (_, Err(e)) => (
+                                        "503 Service Unavailable",
+                                        serde_json::json!({
+                                            "error": format!("the bus did not confirm the event ({e}): send it again")
+                                        })
+                                        .to_string(),
+                                    ),
                                 }
                             }
                         },
