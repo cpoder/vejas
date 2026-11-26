@@ -341,6 +341,11 @@ fn refuse(mut sock: TcpStream) {
 /// every byte, so without this a client trickling bytes keeps its slot for good.
 const REQUEST_READ_LIMIT: Duration = Duration::from_secs(30);
 
+/// The largest request `http-in` takes, head and body: past it, 413 and the
+/// connection closes, rather than a body cut short that would fail its JSON or
+/// its signature with a reason that is not the real one.
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+
 fn handle_http_in(
     name: &str,
     sock: &mut std::net::TcpStream,
@@ -383,12 +388,14 @@ fn handle_http_in(
                     }
                     if let Some(he) = header_end {
                         let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
-                        // Saturating: a forged Content-Length must not wrap.
-                        if buf.len() >= he.saturating_add(clen) {
+                        // Saturating: a forged Content-Length must not wrap. A
+                        // request declared past the bound is not read any further.
+                        let end = he.saturating_add(clen);
+                        if buf.len() >= end || end > MAX_REQUEST_BYTES {
                             break;
                         }
                     }
-                    if buf.len() > 1_048_576 {
+                    if buf.len() > MAX_REQUEST_BYTES {
                         break;
                     }
                 }
@@ -401,21 +408,28 @@ fn handle_http_in(
         if header_end.is_none() {
             break; // no complete request (client closed or idled out)
         }
+        // The head is decoded on its own: an index into the lossy text of the
+        // whole buffer could fall inside a character.
+        let he = header_end.unwrap_or(0).min(buf.len());
+        let head = String::from_utf8_lossy(&buf[..he]);
+        let end = he.saturating_add(content_length(&head));
+        let too_big = end > MAX_REQUEST_BYTES;
         let (code, json): (&str, String) = {
-            // The head is decoded on its own: an index into the lossy text of the
-            // whole buffer could fall inside a character.
-            let he = header_end.unwrap_or(0).min(buf.len());
-            let head = String::from_utf8_lossy(&buf[..he]);
             let mut parts = head.split("\r\n").next().unwrap_or("").split(' ');
             let method = parts.next().unwrap_or("");
             let path = parts.next().unwrap_or("");
             // The body is what Content-Length says: a signature covers those
             // bytes, and nothing read past them.
-            let body = &buf[he..he.saturating_add(content_length(&head)).min(buf.len())];
+            let body = &buf[he..end.min(buf.len())];
             if method == "GET" && path == "/healthz" {
                 ("200 OK", "{\"ok\":true}".to_string())
             } else if method != "POST" || !path.starts_with("/ingest/") {
                 ("404 Not Found", "{\"error\":\"POST /ingest/<subject-suffix>\"}".to_string())
+            } else if too_big {
+                (
+                    "413 Payload Too Large",
+                    format!("{{\"error\":\"a request is at most {MAX_REQUEST_BYTES} bytes, head and body\"}}"),
+                )
             } else if let Some((verifier, refusal)) = signature.and_then(|v| {
                 // Before anything else is read from the request, so a caller without
                 // the secret learns nothing of the subjects ALLOW lets through.
@@ -470,8 +484,31 @@ fn handle_http_in(
             json.len()
         );
         let _ = sock.write_all(response.as_bytes());
+        if too_big {
+            // The rest of an oversized request is still on the wire, and it is
+            // not a next request.
+            linger_close(sock);
+            break;
+        }
         if eof {
             break; // client sent its last request, then closed
+        }
+    }
+}
+
+/// Close after an answer the client may still be sending into: the write side
+/// first, then what keeps coming is read and dropped for at most two seconds.
+/// Closed at once, the socket would answer the unread bytes with a reset, and
+/// the client could lose the answer before it reads it.
+fn linger_close(sock: &mut TcpStream) {
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut dropped = [0u8; 8192];
+    while Instant::now() < deadline {
+        match sock.read(&mut dropped) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }

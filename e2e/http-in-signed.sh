@@ -139,15 +139,21 @@ curl -s -m 2 -o /dev/null "http://127.0.0.1:$BAD/healthz" && ko "a port that ask
 BADU=$(unit bad_in)
 [[ "$BADU" == *SIGNING_SECRET* ]] && ok "its unit says SIGNING_SECRET is missing" || ko "bad_in: $BADU"
 
-echo "── a forged Content-Length"
-# The largest length there is: the end of the body must not wrap around. The
-# read gives up after its 5 s timeout and the request is judged on what came.
+echo "── lengths"
+# The largest length there is: the end of the body must not wrap around, and a
+# request declared past the 1 MiB bound is refused at once, unread.
 FIRST=$(python3 -c '
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=15)
 s.sendall(b"POST /ingest/gh HTTP/1.1\r\nHost: e2e\r\nContent-Length: 18446744073709551615\r\n\r\n{}")
 print(s.recv(200).split(b"\r\n")[0].decode())' $GH 2>&1)
-[[ "$FIRST" == *" 401 "* ]] && ok "it gets an answer: $FIRST" || ko "a forged Content-Length got: $FIRST"
+[[ "$FIRST" == *" 413 "* ]] && ok "a forged Content-Length gets: $FIRST" || ko "a forged Content-Length got: $FIRST"
+python3 -c 'import json; print(json.dumps({"commits": ["x" * 1000] * 1200}))' > "$S/big.json"
+BIG_SIG=$(python3 -c 'import hashlib, hmac, sys; print(hmac.new(sys.argv[1].encode(), open(sys.argv[2], "rb").read(), hashlib.sha256).hexdigest())' "$GH_SECRET" "$S/big.json")
+BIG=$(curl -s -m 10 -o "$S/answer" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -H "X-Hub-Signature-256: sha256=$BIG_SIG" --data-binary @"$S/big.json" "http://127.0.0.1:$GH/ingest/gh")
+[ "$BIG" = 413 ] && grep -q 'at most' "$S/answer" \
+  && ok "a signed body over 1 MiB gets 413, not a signature that does not match" || ko "a 1.2 MB body got $BIG $(cat "$S/answer")"
 expect 202 '"published":"vx.gh"' "and the port still takes a signed request" $GH gh "$BODY" "X-Hub-Signature-256: sha256=$SIG"
 
 [ $fail -eq 0 ] && echo "SIGNED WEBHOOKS HOLD" || echo "SIGNED WEBHOOKS REGRESSION — do not ship"

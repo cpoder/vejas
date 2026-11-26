@@ -23,7 +23,9 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ### Changed
 - `http-in` takes a request's body as long as its `Content-Length` says;
-  bytes read after it are no longer part of the body.
+  bytes read after it are no longer part of the body. A request over 1 MiB,
+  head and body, gets 413 and the connection closes; it used to be cut at
+  1 MiB and refused as JSON that does not parse.
 
 ## [0.7.0] — 2026-11-26
 
