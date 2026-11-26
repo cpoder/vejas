@@ -2444,8 +2444,22 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let mut entry = json!({"name": name, "driver": driver, "kind": kind});
             if kind.starts_with("source") {
-                let subj = cfg.get("SUBJECT").and_then(|v| v.as_str()).unwrap_or("vx.*");
-                entry["subjects_out"] = json!([subj]);
+                // NATS patterns: `*` is one token, `>` the rest. A webhook
+                // publishes on vx.<what the caller asked for>, within its ALLOW
+                // list when it has one (an entry allows itself and below).
+                let allow: Vec<&str> = cfg
+                    .get("ALLOW")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let subjects: Vec<String> = match cfg.get("SUBJECT").and_then(|v| v.as_str()) {
+                    Some(s) => vec![s.to_string()],
+                    None if driver == "http-in" && !allow.is_empty() => {
+                        allow.iter().flat_map(|a| [format!("vx.{a}"), format!("vx.{a}.>")]).collect()
+                    }
+                    None => vec!["vx.>".to_string()],
+                };
+                entry["subjects_out"] = json!(subjects);
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                 entry["subjects_in"] = json!([s]);
             }
@@ -5312,6 +5326,23 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_source_lists_the_subjects_it_can_publish_as_nats_patterns() {
+        let root = std::env::temp_dir().join(format!("vejas-cgraph-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("connectors")).unwrap();
+        let write = |name: &str, src: &str| fs::write(root.join("connectors").join(name), src).unwrap();
+        write("open_hook.vjs", "driver \"http-in\"\nPORT = 8787\n");
+        write("shop_hook.vjs", "driver \"http-in\"\nPORT = 8788\nALLOW = [\"shop\"]\n");
+        write("tick.vjs", "driver \"timer\"\nSUBJECT = \"vx.ops.ping\"\nINTERVAL_SECS = 30\n");
+        let graph = connector_graph(&root);
+        let out = |name: &str| graph.iter().find(|c| c["name"] == name).unwrap()["subjects_out"].clone();
+        assert_eq!(out("open_hook"), json!(["vx.>"]), "without ALLOW a webhook reaches any vx subject");
+        assert_eq!(out("shop_hook"), json!(["vx.shop", "vx.shop.>"]), "an ALLOW entry allows itself and below");
+        assert_eq!(out("tick"), json!(["vx.ops.ping"]));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     // NOTE: TRACES is process-global and tests run in parallel — every test
     // must use its own unique flow name.

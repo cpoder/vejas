@@ -814,10 +814,10 @@ pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)])
             continue; // a business literal
         }
         let text = statement_text(&src_lines, starts, i);
-        let uses = |e: &Expr| {
-            // every name it reads: event fields, values made before, literals
-            let (mut used, mut literals) = (Vec::new(), Vec::new());
-            collect_reads(e, &[], &mut used);
+        // every name a statement reads (event fields, values made before,
+        // literals), the literals apart: the page edits them in place
+        let split = |mut used: Vec<String>| {
+            let mut literals = Vec::new();
             used.retain(|n| {
                 let root = n.split('.').next().unwrap_or(n);
                 if surface.iter().any(|s| s == root) {
@@ -830,6 +830,11 @@ pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)])
                 }
             });
             (used, literals)
+        };
+        let uses = |e: &Expr| {
+            let mut used = Vec::new();
+            collect_reads(e, &[], &mut used);
+            split(used)
         };
         match s {
             Stmt::Assign(path, e) => {
@@ -849,7 +854,10 @@ pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)])
                 let mut builds = Vec::new();
                 collect_own(body, &mut builds);
                 builds.retain(|n| n != var);
-                let (used, literals) = uses(iter);
+                let mut read = Vec::new();
+                collect_reads(iter, &[], &mut read);
+                reads_of_stmts(body, std::slice::from_ref(var), &mut read);
+                let (used, literals) = split(read);
                 steps.push(json!({"kind": "each", "line": line, "var": var, "over": render_atom(iter),
                                   "builds": builds, "code": text, "uses": used, "literals": literals}));
             }
@@ -2734,6 +2742,7 @@ end\n";
         assert_eq!(steps[4]["var"], "line");
         assert_eq!(steps[4]["over"], "line_items");
         assert_eq!(steps[4]["builds"], json!(["positions"]));
+        assert_eq!(steps[4]["literals"], json!([]));
         assert_eq!(steps[5]["line"], 21);
         let sends = shape["sends"].as_array().unwrap();
         assert_eq!(sends.len(), 1);
@@ -2746,6 +2755,16 @@ end\n";
             json!({"COUNTRY_CODES": "The shop sends country names (\"France\"); the ERP wants ISO codes (\"FR\")."}),
             "a literal's comment is its label; a blank line or the file header ends it"
         );
+    }
+
+    #[test]
+    fn a_literal_a_loop_uses_belongs_to_the_loop() {
+        let src = "source \"vx.in\"\nUNITS = {\"kg\": 1000}\nout = []\nfor l in lines:\n  out = out + [l.qty * UNITS[l.unit]]\nend\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[]);
+        assert_eq!(shape["steps"][0]["kind"], "each");
+        assert_eq!(shape["steps"][0]["literals"], json!(["UNITS"]));
+        assert_eq!(shape["reads"], json!(["lines"]), "a loop variable's fields are no event field");
     }
 
     #[test]
