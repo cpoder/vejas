@@ -24,6 +24,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   were in it already. e2e `http-in-signed.sh` checks it in CI.
 
 ### Changed
+- **The credential mask reads camelCase as snake_case.** `accessToken`,
+  `refreshToken`, `idToken` and their kind were shown in the clear in trace
+  records; they are masked as `ACCESS_TOKEN` is, in the record, the panel
+  and the admission lint alike. On 43 labelled camelCase names, credentials
+  missed go from 18 to 3, against 9 false masks, pagination tokens such as
+  `nextPageToken` among them, as `next_page_token` already was (ADR-0017,
+  decided by the founder). The record also masks the value of a pair whose
+  name names a credential: `{"name":"Authorization","value":"…"}` in a
+  header list, an environment list or tags.
 - `http-in` takes a request's body as long as its `Content-Length` says;
   bytes read after it are no longer part of the body. A request without
   `Content-Length` is taken as before, its body what came with its head. A

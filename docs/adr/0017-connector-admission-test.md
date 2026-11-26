@@ -60,6 +60,23 @@ CI admission job:
    and ADR-0008 as the documented rule. The lint also descends into
    doc-literal sub-keys (`ENV = {SAP_PASSWD: …}`), matching the panel's
    masking scope.
+
+   **camelCase, decided on 2026-11-26.** The benchmark held only UPPER_SNAKE
+   names, and `(^|[_-])token$` needs a separator: `accessToken`,
+   `refreshToken` or `idToken` in a JSON payload passed the record's mask in
+   the clear. Every reader of the pattern now reads a key with an underscore
+   where a lowercase letter or a digit meets an uppercase one
+   (`secrets::key_as_read`: `accessToken` reads `access_Token`), so a name is
+   masked the same in either convention. On 43 labelled camelCase names, as
+   JSON APIs spell them, credentials missed went from 18 to 3 (`privateKey`,
+   `accessKey`, `masterKey`: the floor above), against 9 false masks: the
+   pagination tokens (`nextPageToken`, `pageToken`, `NextToken`,
+   `continuationToken`, `syncToken`), push addresses (`deviceToken`,
+   `registrationToken`) and `authType`, `authMethod`, which their snake_case
+   spellings already gave. The founder took the trade-off; the benchmark now
+   holds the 43 names and pins it. The record also masks the value of a
+   pair whose name names a credential, `{"name":"Authorization","value":…}`
+   in a header list, an environment list or tags.
 3. **A golden fixture** (`fixture.json`) — one real-shaped sample of what
    the connector publishes (source) or consumes (sink), envelope included
    when the driver adds one. This is what downstream flows are golden-tested

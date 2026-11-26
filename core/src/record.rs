@@ -941,7 +941,16 @@ impl Scrub {
     }
 
     fn hides(&self, key: &str) -> bool {
-        self.keys.is_match(key)
+        self.keys.is_match(&crate::secrets::key_as_read(key))
+    }
+
+    /// Does the value of a pair's name, `"Authorization"` in
+    /// `{"name":"Authorization","value":"Bearer …"}`, name a credential? Only
+    /// a name shaped like a key counts: one word, no space, as a header or an
+    /// environment variable is, so a product called "Secret Santa" keeps its
+    /// price.
+    fn names_credential(&self, name: &str) -> bool {
+        name.len() <= PAIR_NAME_MAX && !name.contains(char::is_whitespace) && self.hides(name)
     }
 
     /// Does a JSON text hold, as it is, a value handed out that is a JSON
@@ -1633,6 +1642,13 @@ impl<'de> Visitor<'de> for Json<'_> {
         }
         self.out.push('{');
         let mut comma = false;
+        // A pair, {"name":"Authorization","value":"Bearer …"}, names its
+        // credential in a value, not in a key: a header list, an environment
+        // list, tags. A `value` is written as it comes, and masked when the
+        // object is read whole if its `name` named a credential, in whichever
+        // order the two came.
+        let mut named = false;
+        let mut values = Vec::new();
         while let Some(key) = map.next_key_seed(KeySeed)? {
             if comma {
                 self.out.push(',');
@@ -1643,12 +1659,79 @@ impl<'de> Visitor<'de> for Json<'_> {
             self.out.push(':');
             if self.scrub.hides(key) {
                 map.next_value_seed(Hidden(&mut *self.out))?;
+            } else if PAIR_NAMES.iter().any(|name| key.eq_ignore_ascii_case(name)) {
+                named |= map.next_value_seed(Name(self.inner()))?;
+            } else if PAIR_VALUES.iter().any(|value| key.eq_ignore_ascii_case(value)) {
+                let from = self.out.len();
+                map.next_value_seed(self.inner())?;
+                values.push(from..self.out.len());
             } else {
                 map.next_value_seed(self.inner())?;
             }
         }
+        if named {
+            let mut masked = String::new();
+            json_string(&mut masked, MASKED);
+            // From the last, so that the earlier places stay where they are.
+            for place in values.into_iter().rev() {
+                if &self.out[place.clone()] != "null" {
+                    self.out.replace_range(place, &masked);
+                }
+            }
+        }
         self.out.push('}');
         Ok(())
+    }
+}
+
+/// The keys that name the other half of a pair, and the keys of that half
+/// (HAR, Kubernetes and ECS environments, AWS tags and parameters, Postman).
+const PAIR_NAMES: [&str; 6] = ["name", "key", "header", "field", "parameterkey", "parametername"];
+const PAIR_VALUES: [&str; 2] = ["value", "parametervalue"];
+
+/// The longest pair name read as a key: past it, a name is a text.
+const PAIR_NAME_MAX: usize = 128;
+
+/// The value of a key that names the other half of a pair: written as any value
+/// is, and read for whether it names a credential.
+struct Name<'a>(Json<'a>);
+
+impl<'de> DeserializeSeed<'de> for Name<'_> {
+    type Value = bool;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Name<'_> {
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
+        self.0.visit_unit().map(|()| false)
+    }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
+        self.0.visit_bool(v).map(|()| false)
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
+        self.0.visit_i64(v).map(|()| false)
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
+        self.0.visit_u64(v).map(|()| false)
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<bool, E> {
+        self.0.visit_f64(v).map(|()| false)
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+        let named = self.0.scrub.names_credential(v);
+        self.0.visit_str(v).map(|()| named)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<bool, A::Error> {
+        self.0.visit_seq(seq).map(|()| false)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<bool, A::Error> {
+        self.0.visit_map(map).map(|()| false)
     }
 }
 
@@ -2258,6 +2341,57 @@ mod tests {
         assert_eq!(i["refresh_token"], Value::Null);
         // a key spelled with an escape is read as the name it spells
         assert!(!serde_json::to_string(&i).unwrap().contains("escaped"));
+    }
+
+    #[test]
+    fn camel_case_names_are_masked_as_snake_case_ones_are() {
+        let i = input_of(
+            br#"{"accessToken":"at-1","refreshToken":"rt-1","idToken":"jwt","apiKey":"k","XAuthToken":"x",
+               "nextPageToken":"p2","maxTokens":512,"tokenUrl":"https://idp","author":"ana","publicKey":"pk"}"#,
+            &[],
+        );
+        for key in ["accessToken", "refreshToken", "idToken", "apiKey", "XAuthToken"] {
+            assert_eq!(i[key], MASKED, "{key}");
+        }
+        // the trade-off decided on 2026-11-26: a pagination token is masked,
+        // as next_page_token already was
+        assert_eq!(i["nextPageToken"], MASKED);
+        assert_eq!(i["maxTokens"], 512);
+        assert_eq!(i["tokenUrl"], "https://idp");
+        assert_eq!(i["author"], "ana");
+        assert_eq!(i["publicKey"], "pk");
+        // in a text too: a query string
+        let t = input_of(br#"{"url":"https://h/cb?accessToken=at-2&state=s"}"#, &[]);
+        assert_eq!(t["url"], "https://h/cb?accessToken=<masked>&state=s");
+    }
+
+    #[test]
+    fn a_pair_that_names_a_credential_hides_its_value() {
+        let i = input_of(
+            br#"{"headers":[{"name":"Authorization","value":"Bearer abc"},{"name":"Accept","value":"*/*"},
+               {"value":"sk_live_1","name":"x-api-key"},{"name":"Cookie","value":"sid=1"}],
+               "env":[{"name":"DB_PASSWORD","value":{"from":"vault","v":"pw"}},{"name":"DB_HOST","value":"db"},
+                      {"name":"API_TOKEN","value":null}],
+               "Tags":[{"Key":"clientSecret","Value":"cs"},{"Key":"team","Value":"ops"}],
+               "params":[{"ParameterKey":"MasterPassword","ParameterValue":"mp"}],
+               "products":[{"name":"Secret Santa kit","value":12.5},{"name":"secret","value":"x","note":"kept"}]}"#,
+            &[],
+        );
+        assert_eq!(i["headers"][0], json!({"name": "Authorization", "value": MASKED}));
+        assert_eq!(i["headers"][1], json!({"name": "Accept", "value": "*/*"}));
+        // the value first, the name after: masked all the same
+        assert_eq!(i["headers"][2], json!({"value": MASKED, "name": "x-api-key"}));
+        assert_eq!(i["headers"][3]["value"], "sid=1");
+        // an object or an array goes whole, and nothing hides in a null
+        assert_eq!(i["env"][0]["value"], MASKED);
+        assert_eq!(i["env"][1]["value"], "db");
+        assert_eq!(i["env"][2]["value"], Value::Null);
+        assert_eq!(i["Tags"][0], json!({"Key": "clientSecret", "Value": MASKED}));
+        assert_eq!(i["Tags"][1]["Value"], "ops");
+        assert_eq!(i["params"][0]["ParameterValue"], MASKED);
+        // a name with a space is a text, not a key
+        assert_eq!(i["products"][0]["value"], 12.5);
+        assert_eq!(i["products"][1], json!({"name": "secret", "value": MASKED, "note": "kept"}));
     }
 
     #[test]

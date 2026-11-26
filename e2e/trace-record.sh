@@ -96,7 +96,8 @@ except Exception: print(0)' "$1"; }
 
 echo "── one event, three hops, one trace"
 TA=4bf92f3577b34da6a3ce929d0e0e4736; PA=00f067aa0ba902b7
-curl -s -X POST -H "traceparent: 00-$TA-$PA-01" -d '{"order":"4711","password":"hunter2"}' \
+curl -s -X POST -H "traceparent: 00-$TA-$PA-01" \
+  -d '{"order":"4711","password":"hunter2","accessToken":"at_canary_77","headers":[{"name":"Authorization","value":"Bearer pair_canary_88"},{"name":"Accept","value":"*/*"}]}' \
   "http://127.0.0.1:$IN/ingest/rec.in" > /dev/null
 for _ in $(seq 1 100); do
   curl -s "$H/traces/$TA" > "$S/a.json"
@@ -122,6 +123,9 @@ need(h[1]["attributes"].get("vejas.delivery.attempt") == 1, "no delivery attempt
 need(h[1]["attributes"].get("vejas.flow.version"), "no flow version")
 need(h[1]["input"]["order"] == "4711", "the payload is not kept")
 need(h[0]["input"]["password"] == "<masked>" and h[1]["input"]["password"] == "<masked>", "a password in the clear")
+need(all(x["input"]["accessToken"] == "<masked>" for x in h[:2]), "a camelCase token in the clear")
+need(all(x["input"]["headers"] == [{"name": "Authorization", "value": "<masked>"}, {"name": "Accept", "value": "*/*"}]
+         for x in h[:2]), f"a pair that names a credential: {h[0]['input'].get('headers')}")
 need(h[2]["input"]["key"] == "<secret>", f"the vault value is not taken out: {h[2]['input']}")
 need(h[1]["attributes"].get("code.file.path") == "flows/rec_check.vjs", f"no file: {h[1]['attributes']}")
 need(h[1].get("steps") == [{"line": 2, "emit": "vx.rec.checked",
@@ -195,8 +199,9 @@ PY
 TR_DIR=$(find "$S/n" -type d -name VEJAS_TRACES | head -1)
 for _ in $(seq 1 50); do grep -rqa '4711' "$TR_DIR" 2>/dev/null && break; sleep 0.1; done
 grep -rqa '4711' "$TR_DIR" 2>/dev/null && ok "the records are in the stream's files" || ko "no record on disk under $TR_DIR"
-if grep -rqa -e "$VAULT_VALUE" -e hunter2 -e sk_live_canary "$TR_DIR"; then ko "a secret reached the stream's files"
-else ok "no password, vault value or API key in the stream's files"; fi
+if grep -rqa -e "$VAULT_VALUE" -e hunter2 -e sk_live_canary -e at_canary_77 -e pair_canary_88 "$TR_DIR"; then
+  ko "a secret reached the stream's files"
+else ok "no password, vault value, API key, camelCase token or pair value in the stream's files"; fi
 
 echo "── found by what it carries, over HTTP and MCP"
 curl -s "$H/traces?search=4711" | grep -q "\"trace_id\":\"$TA\"" && ok "GET /traces?search finds it" \
