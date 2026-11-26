@@ -14,7 +14,9 @@
 // value is read from `{mount}/data/{path}` and the `{key}` field. For env it is
 // the whole reference uppercased with separators turned into underscores.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -81,17 +83,119 @@ impl SecretStore for RedactedStore {
 }
 
 /// The store the runtime uses, selected at startup: Vault if configured, else
-/// the writable file backend if configured, else the dev env backend.
+/// the writable file backend if configured, else the dev env backend. Every
+/// value it hands out or takes in is remembered, so the trace record can take
+/// it back out of what it writes (ADR-0034).
 pub fn default_store() -> Arc<dyn SecretStore> {
-    if std::env::var("VAULT_ADDR").map(|v| !v.is_empty()).unwrap_or(false) {
-        Arc::new(VaultStore::from_env())
-    } else if let Ok(path) = std::env::var("VEJAS_SECRETS_FILE") {
-        if !path.is_empty() {
-            return Arc::new(FileStore::new(path.into()));
+    let store: Arc<dyn SecretStore> =
+        if std::env::var("VAULT_ADDR").map(|v| !v.is_empty()).unwrap_or(false) {
+            Arc::new(VaultStore::from_env())
+        } else if let Ok(path) = std::env::var("VEJAS_SECRETS_FILE") {
+            if !path.is_empty() {
+                Arc::new(FileStore::new(path.into()))
+            } else {
+                Arc::new(EnvStore)
+            }
+        } else {
+            Arc::new(EnvStore)
+        };
+    Arc::new(Remembered(store))
+}
+
+/// The values the stores of this process have handed out, each with the last
+/// time it was, on a counter. A rotation adds the new value and keeps the old
+/// one. Past the cap, the value handed out least recently goes first, so a
+/// credential that is read on every use stays however many others come and go.
+static HANDED_OUT: OnceLock<Mutex<Handed>> = OnceLock::new();
+/// Bumped each time a value joins: a reader learns of a change without a lock.
+static HANDED_OUT_GENERATION: AtomicU64 = AtomicU64::new(0);
+const HANDED_OUT_MAX: usize = 4096;
+/// Shorter than this is no credential, and taking it out of every string a
+/// record holds would leave nothing to read.
+const HANDED_OUT_MIN: usize = 4;
+
+#[derive(Default)]
+struct Handed {
+    last_use: HashMap<String, u64>,
+    clock: u64,
+}
+
+impl Handed {
+    /// Note a value handed out; true when it is new.
+    fn note(&mut self, value: &str, cap: usize) -> bool {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(last) = self.last_use.get_mut(value) {
+            *last = now;
+            return false;
         }
-        Arc::new(EnvStore)
-    } else {
-        Arc::new(EnvStore)
+        if self.last_use.len() >= cap {
+            let oldest = self
+                .last_use
+                .iter()
+                .min_by_key(|(_, last)| **last)
+                .map(|(v, _)| v.clone());
+            if let Some(oldest) = oldest {
+                self.last_use.remove(&oldest);
+            }
+        }
+        self.last_use.insert(value.to_string(), now);
+        true
+    }
+}
+
+fn remember(value: &str) {
+    if value.len() < HANDED_OUT_MIN {
+        return;
+    }
+    let new = HANDED_OUT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .note(value, HANDED_OUT_MAX);
+    if new {
+        HANDED_OUT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Every value handed out and still remembered, longest first.
+pub fn handed_out() -> Vec<String> {
+    let Some(handed) = HANDED_OUT.get() else {
+        return Vec::new();
+    };
+    let mut values: Vec<String> = handed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .last_use
+        .keys()
+        .cloned()
+        .collect();
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values
+}
+
+/// Changes when a value joins `handed_out()`: the trace record rebuilds its
+/// index of them only then.
+pub fn handed_out_generation() -> u64 {
+    HANDED_OUT_GENERATION.load(Ordering::Relaxed)
+}
+
+/// A store whose values are remembered on their way through.
+struct Remembered(Arc<dyn SecretStore>);
+
+impl SecretStore for Remembered {
+    fn kind(&self) -> &'static str {
+        self.0.kind()
+    }
+    fn get(&self, reference: &str) -> Result<String, String> {
+        let value = self.0.get(reference)?;
+        remember(&value);
+        Ok(value)
+    }
+    fn set(&self, reference: &str, value: &str) -> Result<(), String> {
+        self.0.set(reference, value)?;
+        remember(value);
+        Ok(())
     }
 }
 
@@ -267,6 +371,48 @@ impl SecretStore for VaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fixed(&'static str);
+    impl SecretStore for Fixed {
+        fn kind(&self) -> &'static str {
+            "fixed"
+        }
+        fn get(&self, _reference: &str) -> Result<String, String> {
+            Ok(self.0.to_string())
+        }
+        fn set(&self, _reference: &str, _value: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn what_a_store_hands_out_or_takes_in_is_remembered_longest_first() {
+        let store = Remembered(Arc::new(Fixed("remembered-value-one")));
+        assert_eq!(store.get("a/b").unwrap(), "remembered-value-one");
+        store.set("a/b", "remembered-rotation-two-longer").unwrap();
+        // too short to be a credential: not taken out of anything
+        Remembered(Arc::new(Fixed("abc"))).get("c/d").unwrap();
+        let values = handed_out();
+        let one = values.iter().position(|v| v == "remembered-value-one").unwrap();
+        let two = values.iter().position(|v| v == "remembered-rotation-two-longer").unwrap();
+        assert!(two < one, "longest first: {values:?}");
+        assert!(!values.iter().any(|v| v == "abc"));
+        assert_eq!(store.kind(), "fixed");
+    }
+
+    #[test]
+    fn past_the_cap_the_value_handed_out_least_recently_goes() {
+        let mut handed = Handed::default();
+        assert!(handed.note("read-at-start", 3));
+        assert!(handed.note("token-1", 3));
+        assert!(handed.note("token-2", 3));
+        // the credential read again is fresh; the first token is now the oldest
+        assert!(!handed.note("read-at-start", 3));
+        assert!(handed.note("token-3", 3));
+        let mut kept: Vec<&str> = handed.last_use.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["read-at-start", "token-2", "token-3"]);
+    }
 
     #[test]
     fn file_store_set_get_rotate_merge_and_mode() {

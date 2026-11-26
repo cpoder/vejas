@@ -42,7 +42,7 @@ the old one.
 | [0029](0029-failure-mode-guardrails.md) | The failure-mode guardrails | Accepted |
 | [0030](0030-enterprise-repo-architecture.md) | How the enterprise tier attaches: seams, not plugins | Proposed |
 | [0031](0031-pattern-detection-unit-varpulis-engine.md) | Pattern detection as a unit type: the Varpulis engine embedded | Proposed |
-| [0034](0034-observability-as-the-trust-surface.md) | Observability as the trust surface: one trace per event, an end-to-end view with provenance | Accepted (partial): one trace per event built, the panel view not |
+| [0034](0034-observability-as-the-trust-surface.md) | Observability as the trust surface: one trace per event, an end-to-end view with provenance | Accepted (partial): one trace per event and the trace record built; statement snapshots and provenance not |
 | [0035](0035-async-nats-bus-island.md) | The NATS client moves to async-nats, behind one synchronous module | Accepted |
 | [0036](0036-integration-agent-separate-binary.md) | The integration agent is a separate binary, a client of `/mcp` | Accepted, not built |
 | [0037](0037-how-the-connector-catalog-grows.md) | How the connector catalog grows: vendors as certified recipes on protocol drivers | Proposed |

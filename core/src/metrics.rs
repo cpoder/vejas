@@ -302,6 +302,14 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
         "vejas_spans_dropped_total{{reason=\"export_failed\"}} {}\n",
         SPANS_DROPPED_EXPORT.load(Ordering::Relaxed)
     ));
+    let (kept, queue_full, publish_failed) = crate::record::counters();
+    out.push_str("# HELP vejas_trace_records_total Hop records the VEJAS_TRACES stream acknowledged (ADR-0034).\n");
+    out.push_str("# TYPE vejas_trace_records_total counter\n");
+    out.push_str(&format!("vejas_trace_records_total {kept}\n"));
+    out.push_str("# HELP vejas_trace_records_dropped_total Hop records lost: the record's queue was full (by count or by bytes), or the stream did not take them.\n");
+    out.push_str("# TYPE vejas_trace_records_dropped_total counter\n");
+    out.push_str(&format!("vejas_trace_records_dropped_total{{reason=\"queue_full\"}} {queue_full}\n"));
+    out.push_str(&format!("vejas_trace_records_dropped_total{{reason=\"publish_failed\"}} {publish_failed}\n"));
 
     out.push_str("# HELP vejas_event_duration_seconds In-process per-event processing time.\n");
     out.push_str("# TYPE vejas_event_duration_seconds histogram\n");
@@ -349,6 +357,20 @@ pub enum Kind {
     Consumer = 5,
 }
 
+impl Kind {
+    /// The kind as the trace record writes it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Internal => "internal",
+            Kind::Server => "server",
+            Kind::Client => "client",
+            Kind::Producer => "producer",
+            Kind::Consumer => "consumer",
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum Attr {
     Str(String),
     /// A constant: no allocation on the hot path.
@@ -383,7 +405,9 @@ impl From<bool> for Attr {
     }
 }
 
-/// One finished span, queued for the background exporter.
+/// One finished span, queued for the background exporter and, for a hop, the
+/// trace record (crate::record).
+#[derive(Clone)]
 pub struct Span {
     pub name: String,
     pub kind: Kind,
@@ -445,16 +469,22 @@ static SPANS_EXPORTED: AtomicU64 = AtomicU64::new(0);
 static SPANS_DROPPED_QUEUE: AtomicU64 = AtomicU64::new(0);
 static SPANS_DROPPED_EXPORT: AtomicU64 = AtomicU64::new(0);
 
-/// Is an exporter configured? Call sites test this before building a span, so
-/// that without one the hot path builds nothing (ADR-0016).
+/// Is an exporter configured? The spans of `invoke`s go only there, so their
+/// call sites test this; without one the hot path builds none (ADR-0016).
 pub fn tracing() -> bool {
     matches!(TX.get(), Some(Some(_)))
 }
 
-/// Is this hop's span worth building: an exporter is configured, and the
-/// sampler kept the trace or the hop failed (errors are always exported).
+/// Does anything take a hop's span: the exporter or the trace record
+/// (ADR-0034)? Hop call sites test this before building one.
+pub fn observing() -> bool {
+    tracing() || crate::record::on()
+}
+
+/// Is this hop's span worth building: the exporter or the record takes it, and
+/// the sampler kept the trace or the hop failed (failures are always kept).
 pub fn wants(sampled: bool, failed: bool) -> bool {
-    (sampled || failed) && tracing()
+    (sampled || failed) && observing()
 }
 
 /// Where and how spans go: the OTEL_* variables the specification defines for
@@ -566,7 +596,7 @@ fn shown(url: &str) -> String {
     }
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -859,23 +889,32 @@ fn attribute(out: &mut String, key: &str, value: &Attr) {
     out.push_str("}}");
 }
 
-/// A JSON string literal, escaped as RFC 8259 requires.
-fn json_string(out: &mut String, s: &str) {
+/// A JSON string literal, escaped as RFC 8259 requires. The runs between two
+/// escapes are copied whole: every byte it escapes is ASCII, so a cut there is
+/// always on a character boundary.
+pub(crate) fn json_string(out: &mut String, s: &str) {
     use std::fmt::Write as _;
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
+    let mut from = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let escaped = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0..=0x1f => "",
+            _ => continue,
+        };
+        out.push_str(&s[from..i]);
+        if escaped.is_empty() {
+            let _ = write!(out, "\\u{b:04x}");
+        } else {
+            out.push_str(escaped);
         }
+        from = i + 1;
     }
+    out.push_str(&s[from..]);
     out.push('"');
 }
 

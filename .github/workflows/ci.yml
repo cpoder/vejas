@@ -98,6 +98,8 @@ jobs:
         run: e2e/http-in-bound.sh
       - name: Dead letters announce themselves, without feeding themselves
         run: e2e/dlq-events.sh
+      - name: The trace record keeps each hop, masked (ADR-0034 lot B)
+        run: e2e/trace-record.sh
       - name: Docs book builds (broken includes fail here, not on deploy)
         run: |
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz

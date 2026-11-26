@@ -101,6 +101,10 @@ Synchronously test one connector instance: evaluate its manifest with the real s
 
 Instantiate a tenant package from a template (templates/`<name>`/, ${param} substitution, every file parse-checked, hot-started). Returns created files, started units and the secret references left to write. Refuses an existing package unless force (which overwrites template-rendered files).
 
+## `vejas_trace`
+
+What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.
+
 ## `vejas_dlq`
 
 List dead letters â poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.

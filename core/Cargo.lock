@@ -1582,12 +1582,15 @@ dependencies = [
 name = "vejas-runtime"
 version = "0.6.0"
 dependencies = [
+ "aho-corasick",
  "async-nats",
  "bytes",
  "ctrlc",
  "futures-util",
  "getrandom 0.2.17",
+ "regex",
  "rustls",
+ "serde",
  "serde_json",
  "tiny_http",
  "tokio",

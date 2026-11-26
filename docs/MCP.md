@@ -21,6 +21,7 @@ Prompt-to-flow recipes — what to say and what lands: [COOKBOOK.md](COOKBOOK.md
 | `vejas_preview` | run a flow on its fixture, return emits + final pipeline |
 | `vejas_run_flow` | run any flow on a supplied input, return emits (bus untouched) |
 | `vejas_events` | the last events the flows processed (subject, ok/error, emits, preview) |
+| `vejas_trace` | one event end to end from the trace record, by `trace_id`, or the traces whose payloads mention a `search` text |
 | `vejas_new_flow` | agent writes a new VejasScript flow from a prompt; it lands running |
 | `vejas_new_connector` | agent writes a new connector manifest from a prompt (picks a driver, uses `secret()`); it lands running |
 | `vejas_reload` | rescan flows/packages |

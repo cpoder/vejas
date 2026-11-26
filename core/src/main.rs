@@ -31,6 +31,7 @@ mod control;
 mod metrics;
 mod mqtt;
 mod proposals;
+mod record;
 mod secrets;
 mod trace;
 mod versions;
@@ -1245,6 +1246,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 // batch before their source messages are acked — one round-trip a
                 // batch instead of one per emit, at-least-once preserved (ADR-0002).
                 let mut to_ack: Vec<bus::Message> = Vec::new();
+                // A success is recorded once the barrier confirms its emits left.
+                let mut done: Vec<(metrics::Span, record::Extras)> = Vec::new();
                 for msg in fetch {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
@@ -1257,9 +1260,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     // one; its emits and its dead letter carry it on (ADR-0034).
                     let hop = trace::Hop::begin(trace::of(&msg));
                     let carried = hop.context();
-                    let exporting = metrics::tracing();
-                    // A sampled-out hop builds no span, unless it fails.
-                    let traced = exporting && hop.sampled;
+                    // The hop's span goes to the exporter and the record; its
+                    // invokes' spans to the exporter alone. A sampled-out hop
+                    // builds no span, unless it fails.
+                    let observing = metrics::observing();
+                    let traced = metrics::tracing() && hop.sampled;
                     let start_nanos = metrics::now_nanos();
                     let event: Value = match serde_json::from_slice(&msg.data) {
                         Ok(v) => v,
@@ -1287,9 +1292,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     let _ = msg.nak();
                                 }
                             }
-                            if exporting {
+                            if observing {
                                 let span = hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos);
-                                metrics::span(if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err));
+                                record::end(
+                                    if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
+                                    record::Extras::new().input(&msg.data),
+                                );
                             }
                             continue;
                         }
@@ -1319,18 +1327,20 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         Ok(ctx) => {
                             let emits = ctx.emits.len() as u64;
                             metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
-                            if traced {
-                                metrics::span(
+                            let subjects: Vec<String> = ctx.emits.iter().map(|(s, _)| s.clone()).collect();
+                            if observing && hop.sampled {
+                                done.push((
                                     hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos)
                                         .attr("vejas.emits", emits),
-                                );
+                                    record::Extras::new().emits(subjects.clone()).input(&msg.data),
+                                ));
                             }
                             record_trace(
                                 &handle.spec.name,
                                 &msg.subject,
                                 true,
                                 None,
-                                ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+                                subjects,
                                 // The preview is derived from the stored event when
                                 // /events is read; serialising it here cost every
                                 // message a second walk of its JSON.
@@ -1371,10 +1381,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     vec![], String::new(), Some(event.clone()), Some(&hop));
                                 // no ack -> redelivery after ack_wait
                             }
-                            if exporting {
+                            if observing {
                                 let span = hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos);
                                 let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                                metrics::span(span.failed(e.clone()));
+                                record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
                             }
                             set_state(&handle, |st| st.last_error = Some(e));
                         }
@@ -1386,7 +1396,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 // (nothing is lost; at-least-once, ADR-0002).
                 metrics::observe_fetch(&handle.spec.name, fetched);
                 let processed_at = Instant::now();
-                match batch.confirm() {
+                let confirmed = batch.confirm();
+                match &confirmed {
                     Ok(()) => {
                         if let Err(e) = nc.ack_all(&to_ack) {
                             eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
@@ -1397,6 +1408,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         handle.spec.name
                     ),
                 }
+                end_confirmed(done, &confirmed);
                 round = next;
                 let first = first_at.unwrap_or(processed_at);
                 metrics::observe_round(
@@ -1424,6 +1436,17 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     set_state(&handle, |st| {
         st.status = "stopped".into();
     });
+}
+
+/// End the successful hops of a batch once its barrier has answered: a hop
+/// whose emits did not leave is recorded as failed, and its message redelivers.
+fn end_confirmed(done: Vec<(metrics::Span, record::Extras)>, confirmed: &Result<(), String>) {
+    for (span, extras) in done {
+        match confirmed {
+            Ok(()) => record::end(span, extras),
+            Err(e) => record::end(span.failed(format!("flush before ack failed: {e} (redelivers)")), extras),
+        }
+    }
 }
 
 /// The span of one hop of a flow or detect unit on the bus (ADR-0034): kind
@@ -1706,18 +1729,30 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                         let hop = trace::Hop::begin(None);
                                         let carried = hop.context();
                                         let start_nanos = metrics::now_nanos();
+                                        let mut subjects = Vec::with_capacity(emits.len());
+                                        let mut lost: Option<String> = None;
                                         for emit in &emits {
                                             let subject = emit_subject(emit, &subj_root, &stem);
-                                            if let Err(e) = nc.publish_traced(&subject, emit.to_payload(), &carried) {
-                                                eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
+                                            match nc.publish_traced(&subject, emit.to_payload(), &carried) {
+                                                Ok(()) => subjects.push(subject),
+                                                Err(e) => {
+                                                    eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
+                                                    // nothing redelivers a tick: these emits are gone
+                                                    lost.get_or_insert(format!("publish {subject}: {e}"));
+                                                }
                                             }
                                         }
                                         metrics::observe_tick_emits(&handle.spec.name, emits.len() as u64);
-                                        if metrics::tracing() && hop.sampled {
-                                            metrics::span(
-                                                metrics::Span::hop(&hop, metrics::Kind::Producer, &handle.spec.name, start_nanos)
-                                                    .attr("vejas.flow.version", version.as_str())
-                                                    .attr("vejas.emits", emits.len() as u64),
+                                        if metrics::wants(hop.sampled, lost.is_some()) {
+                                            let span = metrics::Span::hop(&hop, metrics::Kind::Producer, &handle.spec.name, start_nanos)
+                                                .attr("vejas.flow.version", version.as_str())
+                                                .attr("vejas.emits", emits.len() as u64);
+                                            record::end(
+                                                match lost {
+                                                    Some(e) => span.failed(e),
+                                                    None => span,
+                                                },
+                                                record::Extras::new().emits(subjects),
                                             );
                                         }
                                     }
@@ -1740,6 +1775,8 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         }
                     }
                     let mut to_ack: Vec<(bus::Message, u64)> = Vec::new();
+                    // A success is recorded once the barrier confirms its emits left.
+                    let mut done: Vec<(metrics::Span, record::Extras)> = Vec::new();
                     for msg in batch {
                         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                             return Ok(()); // un-acked: redelivers to whoever holds the durable next
@@ -1763,8 +1800,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         // or fed a window; what it emits carries it on (ADR-0034).
                         let hop = trace::Hop::begin(trace::of(&msg));
                         let carried = hop.context();
-                        let exporting = metrics::tracing();
-                        let traced = exporting && hop.sampled;
+                        let observing = metrics::observing();
                         let start_nanos = metrics::now_nanos();
                         // The program decodes the payload itself: its decoder
                         // interns field names and event types once per program,
@@ -1791,9 +1827,12 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                         retrying.insert(seq);
                                     }
                                 }
-                                if exporting {
+                                if observing {
                                     let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos);
-                                    metrics::span(if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err));
+                                    record::end(
+                                        if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
+                                        record::Extras::new().input(&msg.data),
+                                    );
                                 }
                             }
                             Ok(emits) => {
@@ -1808,10 +1847,15 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                     subjects.push(subject);
                                 }
                                 metrics::observe(&handle.spec.name, ok, emits.len() as u64, t0.elapsed().as_secs_f64());
-                                if traced || (exporting && !ok) {
+                                if observing && (hop.sampled || !ok) {
                                     let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos)
                                         .attr("vejas.emits", emits.len() as u64);
-                                    metrics::span(if ok { span } else { span.failed("publish failed (will redeliver)") });
+                                    let extras = record::Extras::new().emits(subjects.clone()).input(&msg.data);
+                                    if ok {
+                                        done.push((span, extras));
+                                    } else {
+                                        record::end(span.failed("publish failed (will redeliver)"), extras);
+                                    }
                                 }
                                 record_trace(
                                     &handle.spec.name,
@@ -1850,10 +1894,10 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 } else {
                                     retrying.insert(seq); // left un-acked: redelivers after ack_wait
                                 }
-                                if exporting {
+                                if observing {
                                     let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos);
                                     let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                                    metrics::span(span.failed(e.clone()));
+                                    record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
                                 }
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
                                     vec![], connectors::trace_preview(&msg.data), None, Some(&hop));
@@ -1863,7 +1907,8 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                     }
                     let processed_at = Instant::now();
                     // Publish-before-ack barrier, one round-trip per batch (ADR-0002).
-                    match outbox.confirm() {
+                    let confirmed = outbox.confirm();
+                    match &confirmed {
                         Ok(()) => {
                             let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
                             for (_, seq) in &to_ack {
@@ -1877,6 +1922,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                             handle.spec.name
                         ),
                     }
+                    end_confirmed(done, &confirmed);
                     metrics::observe_round(
                         &handle.spec.name,
                         0.0,
@@ -3135,6 +3181,54 @@ fn dlq_js() -> Result<bus::JetStream, String> {
     Ok(js)
 }
 
+/// The trace record's stream, read on the runtime's shared connection: an
+/// operator's or an agent's question, a few requests. Writing it has a
+/// connection of its own (record.rs).
+fn record_js() -> Result<bus::JetStream, String> {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    Ok(bus::connect(&url)?.jetstream())
+}
+
+/// What the record says when it has nothing to say.
+fn record_absent(e: &str) -> bool {
+    e.contains("stream not found")
+}
+
+/// One trace from the record (ADR-0034): every hop kept, in the order they
+/// started. A 404 says why a trace can be missing.
+fn trace_view(id: &str) -> Result<Value, (u16, String)> {
+    let Some(key) = record::trace_key(id) else {
+        return Err((400, "a trace id is 32 hexadecimal digits".into()));
+    };
+    let js = record_js().map_err(|e| (503, e))?;
+    match record::read(&js, &key) {
+        Ok(hops) if hops.is_empty() => Err((
+            404,
+            format!("no hop of trace {key} is in the record: sampled out, past the retention limits, or never seen by this cell"),
+        )),
+        Ok(hops) => Ok(json!({"trace_id": key, "hops": hops})),
+        Err(e) if record_absent(&e) => Err((
+            404,
+            "the trace record holds nothing: VEJAS_TRACES is off, or no hop has ended yet".into(),
+        )),
+        Err(e) => Err((500, e)),
+    }
+}
+
+/// The latest traces whose recorded hops mention `text`, newest first.
+fn trace_search(text: &str, limit: usize) -> Result<Value, (u16, String)> {
+    if text.trim().is_empty() {
+        return Err((400, "nothing to search for".into()));
+    }
+    let js = record_js().map_err(|e| (503, e))?;
+    let (traces, searched) = match record::search(&js, text, limit.clamp(1, 100), record::SEARCH_WINDOW) {
+        Ok(found) => found,
+        Err(e) if record_absent(&e) => (Vec::new(), 0),
+        Err(e) => return Err((500, e)),
+    };
+    Ok(json!({"search": text.trim(), "searched_hops": searched, "traces": traces}))
+}
+
 /// List dead letters, newest first (each carries its stream `seq` for replay/purge).
 fn dlq_list(limit: usize) -> Result<Vec<Value>, String> {
     let js = dlq_js()?;
@@ -3218,15 +3312,18 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
         }
         let hop = trace::Hop::begin(died_in);
         let start_nanos = metrics::now_nanos();
-        let published = js.publish_traced(&subj, payload, &hop.context());
+        let published = js.publish_traced(&subj, &payload, &hop.context());
         if metrics::wants(hop.sampled, published.is_err()) {
             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, "dlq:replay", start_nanos)
                 .messaging("send", &subj)
                 .attr("vejas.dlq.seq", s);
-            metrics::span(match &published {
-                Ok(_) => span,
-                Err(e) => span.failed(e.clone()),
-            });
+            record::end(
+                match &published {
+                    Ok(_) => span,
+                    Err(e) => span.failed(e.clone()),
+                },
+                record::Extras::new().emits(vec![subj.clone()]).input(&payload),
+            );
         }
         match published {
             Ok(_) => {
@@ -3586,6 +3683,12 @@ fn run_api_flow(
         for span in invoked {
             metrics::span(invoke_span(&unit, span));
         }
+    }
+    if metrics::wants(hop.sampled, result.is_err()) {
+        let subjects: Vec<String> = match &result {
+            Ok(ctx) => ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+            Err(_) => Vec::new(),
+        };
         let mut span = metrics::Span::hop(&hop, metrics::Kind::Server, &unit, start_nanos)
             .attr("http.request.method", method)
             .attr("http.response.status_code", code as i64)
@@ -3599,7 +3702,10 @@ fn run_api_flow(
         if let Err(e) = result {
             span = span.failed(e);
         }
-        metrics::span(span);
+        record::end(
+            span,
+            record::Extras::new().emits(subjects).input_value(input).answer(Some(&body)),
+        );
     }
     (code, body)
 }
@@ -3733,6 +3839,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_describe", "description": "Describe a SAP function module's interface: every parameter's name, direction (import/export/changing/tables), type and length. Read this before sap_call.", "inputSchema": obj(json!({"func": {"type": "string"}}), vec!["func"])}),
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
+        json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
@@ -3956,6 +4063,16 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
             text(json!({"dead_letters": dlq_list(limit)?}).to_string())
         }
+        "vejas_trace" => {
+            let found = match (args["trace_id"].as_str(), args["search"].as_str()) {
+                (Some(id), _) => trace_view(id),
+                (None, Some(search)) => {
+                    trace_search(search, args["limit"].as_u64().unwrap_or(20) as usize)
+                }
+                (None, None) => Err((400, "give a trace_id, or a search".into())),
+            };
+            text(found.map_err(|(_, e)| e)?.to_string())
+        }
         "vejas_dlq_replay" => {
             dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
@@ -4112,6 +4229,28 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 "application/json",
             ),
         };
+    }
+
+    // The trace record (ADR-0034, lot B): one trace by its id, or the traces a
+    // search finds. Reads, open like /events and /dlq.
+    if method == tiny_http::Method::Get {
+        let found = if path_only == "/traces" {
+            Some(match qparam(&url, "search") {
+                Some(text) => trace_search(
+                    &metrics::percent_decode(&text.replace('+', " ")),
+                    qparam(&url, "limit").and_then(|l| l.parse().ok()).unwrap_or(20),
+                ),
+                None => Err((400, "GET /traces/{trace id}, or GET /traces?search=<text>".into())),
+            })
+        } else {
+            path_only.strip_prefix("/traces/").map(trace_view)
+        };
+        if let Some(found) = found {
+            return match found {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err((code, e)) => respond(request, code, e, "text/plain"),
+            };
+        }
     }
 
     // Proposal approve/reject (ADR-0024): dynamic /proposals/{id}/{approve|reject},
@@ -4838,6 +4977,9 @@ fn main() {
     // Traces to an OTLP collector iff OTEL_EXPORTER_OTLP_ENDPOINT is set; metrics
     // are always scrapeable at GET /metrics. No-op (no thread) when unset.
     metrics::otlp_init();
+    // The trace record, on unless VEJAS_TRACES=off: each hop kept in the
+    // VEJAS_TRACES stream for the panel and `vejas_trace` (ADR-0034, lot B).
+    record::init(&env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into()));
 
     // Clustering (ADR-0020): singleton sources take a KV lease so exactly one
     // instance runs them; announce this instance's identity for the operator.
@@ -4884,6 +5026,7 @@ fn main() {
     drop(reg);
     thread::sleep(Duration::from_millis(800));
     // The units have stopped: what they traced last leaves before the process.
+    record::flush(Duration::from_secs(3));
     metrics::otlp_flush(Duration::from_secs(3));
 }
 

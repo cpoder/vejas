@@ -1,9 +1,11 @@
 # 0034 — Observability as the trust surface
 
 - Status: Accepted (partial): lot A is built and T6 gates it in CI (points 1
-  to 6, and 12 with them); lot B (points 7 to 11) is not
+  to 6, and 12 with them); of lot B, the trace record and its screen are
+  built (point 7, points 8 and 9 in part), the statement snapshots, the
+  replay actions on the trace screen and provenance (point 10) are not
 - Date: 2026-10-24; measured state re-read on v0.6.0 on 2026-11-26; lot A
-  built 2026-11-26
+  built 2026-11-26; lot B first part built 2026-11-26
 
 ## Context
 
@@ -263,6 +265,98 @@ the build departs from the text above, the reason is stated here.
   for the collector: the 200 000 spans of the exporting runs all arrived,
   none dropped. The numbers are in `bench/README.md` and on the benchmarks
   page.
+
+## What is built (2026-11-26): lot B, first part
+
+Point 7 is built, points 8 and 9 in part, and `e2e/trace-record.sh` gates
+them in CI. Where the build departs from the text above, the reason is
+stated here.
+
+- **A subject per trace, measured.** The subject index costs the NATS server
+  200 to 450 bytes per trace kept (2.10.24 and 2.15.3, 100 000 hops: 20 to 45
+  MB when traces have one hop, 7 to 15 MB when they have three, at rest and
+  at peak). The KV fallback would not save it, since a KV bucket stores each
+  key as a subject of its own. The defaults are 100 000 hops, 256 MB and
+  seven days, whichever comes first, each set by an environment variable.
+- **One builder for the span and the record.** A hop's record is the span
+  the exporter sends, plus the subjects it emitted, the payload it received
+  and the downstream answer, so the two never disagree. `invoke` spans go to
+  the exporter only. The exporter's sampler decides, and failures are always
+  kept.
+- **On by default, payloads included.** The record feeds the screen of point
+  9, and a record that is off is empty the day it is needed. A deployment
+  whose events carry personal data reads the limits as its retention policy,
+  or keeps payloads out with `VEJAS_TRACES_PAYLOADS=off`.
+- **The scrub covers text as well as JSON, off the hot path.** Point 8 named
+  the panel's mask and the vault rule. An error, a payload that is not JSON
+  and an answer cut short are text, so the record masks the values of
+  credential-named keys in JSON at any depth and in text that names a key and
+  gives its value: a query or a form, JSON that was cut, a header line, XML,
+  the password in a URL. Every value a secret store handed out (the last
+  4 096, the one read least recently going first) is taken out of any string,
+  key or number, in one pass however many there are, overlapping values as
+  one. JSON is read and written again with no tree in between. The first
+  draft cut a sink's answer to 200 characters before masking it, so a longer
+  JSON answer no longer parsed and kept its credentials. The record now
+  receives the whole answer, scrubs it, then cuts it.
+- **The scrub was attacked before it shipped.** A second review generated
+  payloads with credentials and vault values planted in every shape claimed
+  above, sent them down eight paths (payload whole, pretty, cut, not JSON,
+  held in a string; error; answer, answer as a JSON string) and found them
+  leaking. A URL with no password swallowed the key after it, JSON held in a
+  string was read one level deep, a vault value at the start of a
+  credential's value hid it from the mask, a vault value escaped by the JSON
+  around it was not found, and a long error took quadratic time. The scrub
+  now finds every value's extent on the original text and replaces them in
+  one pass, reads JSON held in a string as JSON to any depth and JSON escaped
+  inside a text at any level, reads a text's escapes (JSON's, a URL's, XML's,
+  one inside the other) before it looks for vault values, and scrubs at most
+  16 KB of an error. A third review found the key mask still read only the
+  raw text, so `&lt;Password&gt;` in SOAP or `access_token%3D` in a nested
+  query went through; it now reads each level of escapes for keys too, and
+  covers YAML blocks, PHP's var_dump, HCL, command lines, values with spaces
+  and a vault value that is a JSON document. Reading where a value ends is
+  linear per credential, so past 64 credentials in one text the rest of it is
+  masked. The generator is a unit
+  test: no planted value survives any path. The key pattern is the panel's
+  and the lint's (ADR-0017) and was left as it is, so a camelCase
+  `accessToken` is not masked; changing it is a decision for all three.
+- **The hot path hands over and goes on.** The queue holds 4 096 hops and
+  32 MB at most, and the payload is cut to 16 KB before it is copied; the last
+  bytes of a cut text go too, since they could start a vault value. The
+  record's thread reads the queue on a 25 ms tick while records wait, writes
+  on a NATS connection of its own, sends each batch as core publishes behind
+  one barrier, and sends the last record through the stream's
+  acknowledgement, which confirms the batch and that the stream is there. A
+  stream removed by hand comes back on the next batch. What the queue or the
+  stream did not take is counted on `/metrics`.
+- **A success is recorded once its emits have left.** The flow and detect
+  loops hold their successful hops until the batch barrier answers, and a
+  barrier that fails records them as failed. A detect tick that loses an
+  emit, which nothing redelivers, records a failed hop whatever the sampler
+  said.
+- **Read and search.** `GET /traces/{id}`, `GET /traces?search=` (the last
+  50 000 hops; ids and timings are not searched), the MCP tool `vejas_trace`
+  and the panel's Trace card, opened from Recent events. The routes are open
+  reads like `GET /events`; MCP needs the token when one is set. Building the
+  search showed that read-only cursors stopped at 1 000 messages, the
+  server's default limit of pending acks for a consumer that asks for acks
+  and never gives one. The shadow replay's history and the canary had the
+  same limit. All of them now take no acks.
+- **Not built yet:** the statements executed and the pipeline snapshots of
+  point 8, which need line numbers in the AST and a hook in the interpreter;
+  the replay actions on the trace screen of point 9 (DLQ replay stays in the
+  DLQ card); the projection ADR; point 10.
+- **Cost:** `bench/trace-cost.sh`, the same hop and method as lot A, the
+  record's configurations interleaved with lot A's: 75.5 µs of runtime CPU
+  per event with the record off, 93.0 with it, 87.5 without payloads, 79.5 at
+  one trace in ten, 99.0 recording and exporting every span. A second series,
+  on the scrub as it shipped, gave 74.0, 94.0, 87.5, 77.5 and 102.5: the
+  record costs 17.5 to 20 µs per event. NATS spends 2.5 to 8.5 µs more per
+  event storing the hops. The first build cost 25.5 µs per event, most of it
+  building and freeing a `serde_json::Value` tree per record; writing the
+  JSON directly brought it to 17.5, of which about 13 run on the record's own
+  thread. The numbers are in `bench/README.md` and on the benchmarks page.
 
 ## Consequences
 
