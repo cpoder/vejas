@@ -25,12 +25,14 @@ nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4291 > /dev/null 2>&1 & NP=$!
 sleep 0.5
 NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:8762 \
   "$BIN" > "$S/rt.log" 2>&1 & RT=$!
-until curl -sf -o /dev/null "$H/healthz"; do sleep 0.1; done
+for _ in $(seq 1 300); do curl -sf -o /dev/null "$H/healthz" && break; sleep 0.1; done
+curl -sf -o /dev/null "$H/healthz" || { echo "the runtime never came up"; tail -20 "$S/rt.log"; exit 1; }
 order(){ curl -s -m 15 -o "$S/answer" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
   -d "{\"id\":$1}" "$H/api/orders"; }
 ingest(){ curl -s -m 15 -o "$S/answer" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
   -d '{"id":1}' "http://127.0.0.1:$IN/ingest/orders.raw"; }
 for _ in $(seq 1 100); do [ "$(ingest)" = "202" ] && break; sleep 0.1; done
+[ "$(ingest)" = "202" ] || { echo "http-in never took an event"; tail -20 "$S/rt.log"; exit 1; }
 nats -s $URL sub vx.orders.new --raw > "$S/bus" 2>/dev/null & SUB=$!
 sleep 0.5
 

@@ -103,10 +103,18 @@ fn err_at(pos: usize, src: &str, msg: &str) -> String {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
+    // a byte-order mark, which some editors write, is not code
+    let from = if src.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    lex_from(src, from)
+}
+
+/// The tokens of `src` from `from` to its end, at their places in `src`. An
+/// f-string's `{…}` is lexed in place, `src` cut at its closing brace, so that
+/// an error in it, and the parser's after it, say the line of the file.
+fn lex_from(src: &str, from: usize) -> Result<Vec<Spanned>, String> {
     let b = src.as_bytes();
     let mut out = Vec::new();
-    // a byte-order mark, which some editors write, is not code
-    let mut i = if b.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    let mut i = from;
     while i < b.len() {
         let c = b[i] as char;
         match c {
@@ -317,7 +325,7 @@ fn lex_fstring(src: &str, quote: usize) -> Result<(Vec<FPart>, usize), String> {
                 if depth != 0 {
                     return Err(err_at(i, src, "unterminated { in f-string"));
                 }
-                let inner = lex(&src[start..j - 1])?;
+                let inner = lex_from(&src[..j - 1], start)?;
                 parts.push(FPart::Expr(inner));
                 i = j;
             }
@@ -2773,18 +2781,19 @@ pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Resul
     // DATA extension (N1, ADR-0019) — a new transcoding row, not a structural
     // change — so the expert does it from the panel without an agent. Only a
     // dict/table can gain a key; a constant or list cannot.
-    let (vstart, vend) = entry.value_span;
-    let vend = vend.min(src.len());
-    let val_text = src[vstart..vend].trim_end();
-    let parsed: Value = serde_json::from_str(val_text)
-        .map_err(|_| format!("{name} has no key {key:?} and is not an editable table"))?;
-    let obj = parsed
+    let obj = entry
+        .value
         .as_object()
         .ok_or_else(|| format!("{name} has no key {key:?} and is not a table — cannot add a key"))?;
-    let close = vstart
-        + val_text
-            .rfind('}')
-            .ok_or_else(|| format!("{name}: malformed table literal"))?;
+    // The table's own closing brace is its last `}` token: a brace in one of
+    // its strings, or in a comment after it, is no token.
+    let (vstart, vend) = entry.value_span;
+    let close = lex(src)?
+        .iter()
+        .filter(|t| (vstart..vend).contains(&t.pos) && matches!(t.tok, Tok::RBrace))
+        .map(|t| t.pos)
+        .last()
+        .ok_or_else(|| format!("{name}: malformed table literal"))?;
     let k = serde_json::to_string(&Value::String(key.to_string())).unwrap();
     let v = serde_json::to_string(new_value).map_err(|e| e.to_string())?;
     // span-exact insert before the closing brace; no leading comma into an empty {}
@@ -3217,6 +3226,28 @@ end\n";
     /// A JSON escape spelled out: a backslash, a u, four hex digits.
     fn esc(hex: &str) -> String {
         format!("{}u{hex}", '\\')
+    }
+
+    #[test]
+    fn an_error_in_an_fstring_says_the_line_it_is_on() {
+        let e = parse("x = 1\ny = 2\nz = f\"{x ?? \"C:\\q\"}\"\n").err().unwrap();
+        assert!(e.starts_with("line 3: unknown escape"), "{e}");
+        let e = parse("x = 1\n\nz = f\"a {x +} b\"\n").err().unwrap();
+        assert!(e.starts_with("line 3: "), "{e}");
+        // what the f-string's {…} holds still runs
+        assert_eq!(one_emit("a = 2\nz = f\"{a + 1}{{x}}\"\nemit \"vx.t\", {z: z}\n", json!({})), json!({"z": "3{x}"}));
+    }
+
+    #[test]
+    fn a_table_gains_a_key_whatever_its_text_holds() {
+        // an escape JSON does not read, bare keys, and a brace in a comment after it
+        let src = "T = {\"a\": \"x\\{y\", b: \"}\"}  # rows like {a: b}\n";
+        let out = set_literal(src, "T", "c", &json!("z")).unwrap();
+        assert_eq!(get_literal(&out, "T", "-").unwrap(), json!({"a": "x{y", "b": "}", "c": "z"}));
+        assert!(out.ends_with("# rows like {a: b}\n"), "{out}");
+        let empty = set_literal("T = {}\n", "T", "k", &json!(1)).unwrap();
+        assert_eq!(get_literal(&empty, "T", "-").unwrap(), json!({"k": 1}));
+        assert!(set_literal("N = 5\n", "N", "k", &json!(1)).unwrap_err().contains("not a table"));
     }
 
     #[test]

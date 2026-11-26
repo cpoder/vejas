@@ -72,6 +72,9 @@ jobs:
 
   admission:
     runs-on: ubuntu-latest
+    # a suite that waits on something that never comes fails the run in an
+    # hour, not in the six of GitHub's default
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Build the runtime
