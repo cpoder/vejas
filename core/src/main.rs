@@ -24,7 +24,6 @@
 //   POST /flows/new                agent CLI writes a VejasScript flow
 //   POST /reload                   rescan; restart changed files (mtime)
 
-mod bus;
 mod cluster;
 mod connectors;
 mod control;
@@ -34,7 +33,6 @@ mod proposals;
 mod record;
 mod secrets;
 mod signature;
-mod trace;
 mod versions;
 mod vjs;
 
@@ -47,6 +45,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use serde_json::{json, Value};
+
+// The bus, the trace context and what a unit shares with every connector
+// come from the connector crate (ADR-0038).
+use vejas_connector::{bus, trace, MAX_DELIVERIES, RUNNING};
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -81,8 +83,6 @@ struct Handle {
 
 type Registry = Arc<Mutex<HashMap<String, Arc<Handle>>>>;
 
-static RUNNING: AtomicBool = AtomicBool::new(true);
-
 // ───────────────────────── event trace ─────────────────────────
 //
 // The last events each flow processed, in memory (ring of 50 per flow) — the
@@ -92,10 +92,6 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static TRACES: OnceLock<Mutex<HashMap<String, VecDeque<Value>>>> = OnceLock::new();
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// After this many failed deliveries of the same message, a unit stops
-/// retrying and drops it (acked, visible in the trace) — redelivery is the
-/// retry mechanism, not an infinite loop for poison messages.
-pub const MAX_DELIVERIES: i64 = 5;
 
 /// Secret references the operator asked to rotate (`rotate_requested` over
 /// the control channel, CONTROL.md). A flag, nothing more: the value is typed
@@ -2168,6 +2164,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
                 subj_root: subj_root.clone(),
                 config: connectors::Config(config),
                 running: running.clone(),
+                host: connectors::host(),
             };
             // watch the handle's stop flag in a sidecar thread → clears ctx.running.
             // Also exits if `running` was cleared elsewhere (a lost singleton lease),
@@ -3126,6 +3123,7 @@ fn probe_connector(root: &Path, file: &str) -> Value {
             subj_root: env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into()),
             config: connectors::Config(config),
             running: Arc::new(AtomicBool::new(true)),
+            host: connectors::host(),
         };
         driver.probe(&ctx)
     })();

@@ -9,10 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use vejas_connector::clock::epoch_secs;
+use vejas_connector::{publish, Host};
 
 use crate::bus;
-use crate::connectors::clock::epoch_secs;
-use crate::connectors::hops::source_publish;
 use crate::connectors::slot::Slot;
 use crate::connectors::{Ctx, Driver};
 use crate::metrics::Kind;
@@ -84,6 +84,7 @@ impl Driver for HttpIn {
                     let name = ctx.name.clone();
                     let allow = allow.clone();
                     let signature = signature.clone();
+                    let host = ctx.host.clone();
                     // `thread::spawn` panics when the OS has no thread to give (a
                     // pids limit, memory), which here killed the connector and left
                     // it reported as running. The closure drops with the error,
@@ -91,7 +92,7 @@ impl Driver for HttpIn {
                     let spawned = thread::Builder::new().name(format!("{name}:conn")).spawn(
                         move || {
                             let _slot = slot;
-                            handle_http_in(&name, &mut sock, &js, &root, &allow, signature.as_deref())
+                            handle_http_in(&*host, &name, &mut sock, &js, &root, &allow, signature.as_deref())
                         },
                     );
                     if let Err(e) = spawned {
@@ -142,6 +143,7 @@ const REQUEST_READ_LIMIT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 fn handle_http_in(
+    host: &dyn Host,
     name: &str,
     sock: &mut std::net::TcpStream,
     js: &bus::JetStream,
@@ -290,7 +292,7 @@ fn handle_http_in(
                                 let incoming = header_value(&head, trace::TRACEPARENT).and_then(|tp| {
                                     trace::Context::parse(tp, header_value(&head, trace::TRACESTATE))
                                 });
-                                match source_publish(name, js, &subject, body, incoming, Kind::Server) {
+                                match publish(host, name, js, &subject, body, incoming, Kind::Server) {
                                     (hop, Ok(_)) => (
                                         "202 Accepted",
                                         format!(

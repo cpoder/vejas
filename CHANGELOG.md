@@ -24,6 +24,17 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   were in it already. e2e `http-in-signed.sh` checks it in CI.
 
 ### Changed
+- **Connectors are written against one crate, `vejas-connector`** (`sdk/`,
+  ADR-0038): the bus, the trace context, `Config`, `Ctx`, the `Driver` trait,
+  and the services every driver shares (a source's publish as the first hop of
+  its trace, the sink loop with its retries and dead-letter queue, offsets).
+  Each hop a driver makes is reported to a `Host`, which in the runtime writes
+  the events ring, the trace record and the metrics, as before. The runtime,
+  the IBM MQ connector and the AMQP connector build on it; MQ and AMQP no
+  longer compile the runtime's `bus.rs` through a path. No change for a
+  manifest or a recipe. One detail of the trace record: a source's publish
+  that fails no longer lists its subject under `emits` (nothing was
+  published; the subject is still on the span).
 - **The credential mask reads camelCase as snake_case.** `accessToken`,
   `refreshToken`, `idToken` and their kind were shown in the clear in trace
   records; they are masked as `ACCESS_TOKEN` is, in the record, the panel

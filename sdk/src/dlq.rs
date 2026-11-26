@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::bus;
-use crate::connectors::clock::epoch_secs;
+use crate::clock::epoch_secs;
 use crate::trace;
 
 // Poison messages are parked, not dropped, in a DEDICATED JetStream stream on a

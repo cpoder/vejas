@@ -18,8 +18,9 @@
 //   * What the sync client gave for free is rebuilt here on purpose, because
 //     `async-nats` does not give it: see `Batch::confirm`.
 //
-// The AMQP and MQ connectors compile this file as it is (`#[path]`), so it
-// names no other module of the runtime: no `crate::` import.
+// It lives in the connector crate (ADR-0038), which the runtime and the
+// standalone connectors (IBM MQ, AMQP) depend on, and it names no other module
+// of it: no `crate::` import.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -958,7 +959,9 @@ impl JetStream {
         }
     }
 
-    #[cfg(test)]
+    /// Tests only: their own tests, and a connector's through the `test-support`
+    /// feature. Nothing in a build that runs deletes a stream.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delete_stream(&self, stream: &str) -> Result<(), String> {
         self.api(format!("STREAM.DELETE.{stream}"), Bytes::new())
             .map(|_| ())

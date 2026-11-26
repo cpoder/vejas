@@ -11,12 +11,10 @@ serde_json = "1"
 # `termination` so SIGTERM/SIGHUP (a k8s rolling restart) hit the graceful drain
 # path, not default immediate kill — needed for lease handoff (ADR-0020).
 ctrlc = { version = "3.4", features = ["termination"] }
-# The NATS client and what it runs on. All four stay inside src/bus.rs (ADR-0035):
-# the rest of the runtime is synchronous and sees neither tokio nor a NATS type.
-async-nats = { version = "0.52", default-features = false, features = ["jetstream", "kv", "object-store", "ring", "server_2_10"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
-bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The connector contract (ADR-0038): the bus, the trace context, the Driver
+# trait and the services drivers share. The NATS client and tokio come with it
+# and stay inside its bus module (ADR-0035): the runtime sees neither.
+vejas-connector = { path = "../sdk" }
 # Pooled, blocking HTTP(S) client for the http-out/http-poll/oauth-poll drivers
 # (replaces one curl process per request). Pure-Rust TLS (rustls), self-contained.
 ureq = "2"
@@ -24,9 +22,6 @@ ureq = "2"
 # the hand-rolled MQTT client can wrap its stream in TLS. No new binary weight.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
-# Seeds the trace and span ids (ADR-0034). Already in the tree through ring, so
-# no new binary weight.
-getrandom = "0.2"
 # The trace record's scrub (ADR-0034): the credential mask, compiled from the
 # one pattern the panel and the admission lint use; the values the secret
 # stores handed out, found in one pass however many there are; and JSON read

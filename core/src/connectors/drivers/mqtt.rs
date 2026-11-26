@@ -3,8 +3,6 @@
 use std::thread;
 use std::time::Duration;
 
-use crate::connectors::hops::{source_publish, trace_fail};
-use crate::connectors::sink::run_sink;
 use crate::connectors::{Ctx, Driver};
 use crate::metrics::Kind;
 
@@ -125,7 +123,7 @@ impl Driver for MqttIn {
                             // publish-before-ack: bus first (await JetStream pub-ack),
                             // THEN PUBACK — a crash before the bus write re-delivers
                             // from the broker (ADR-0025).
-                            source_publish(&ctx.name, &js, &subject, &payload, None, Kind::Producer)
+                            ctx.publish(&js, &subject, &payload, None, Kind::Producer)
                                 .1
                                 .map_err(|e| format!("bus publish: {e}"))?;
                             if pq > 0 {
@@ -142,7 +140,7 @@ impl Driver for MqttIn {
             match attempt {
                 Ok(()) => break,
                 Err(e) => {
-                    trace_fail(&ctx.name, &subject, e.clone());
+                    ctx.failed(&subject, e.clone());
                     eprintln!("[{}] mqtt: {e}; reconnect in 2s", ctx.name);
                     let mut slept = 0;
                     while slept < 2000 && ctx.alive() {
@@ -178,7 +176,7 @@ impl Driver for MqttOut {
         let slot: std::sync::Mutex<Option<crate::mqtt::Client<MqttTransport>>> =
             std::sync::Mutex::new(None);
         // MQTT 3.1.1 has no headers: the trace stops at the broker.
-        run_sink(ctx, &subject, move |data, _trace| {
+        ctx.consume(&subject, move |data, _trace| {
             let mut guard = slot.lock().unwrap();
             if guard.is_none() {
                 *guard = Some(mqtt_connect(

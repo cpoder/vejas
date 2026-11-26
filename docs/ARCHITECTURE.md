@@ -6,12 +6,21 @@ yet implemented are marked _(planned)_ and specified in the ADRs and ROADMAP.
 ## Repository layout
 
 ```
+sdk/                      the connector crate, vejas-connector (ADR-0038): what every driver is
+                          written against, the runtime's and the standalone ones alike
+  src/lib.rs              Config, Ctx, the Driver trait
+  src/hop.rs              the Host and the hop event: what a connector reports of each hop
+  src/sink.rs             the sink loop (ack, retries, dead-letter queue)
+  src/bus.rs              the bus (ADR-0035)
+  src/trace.rs            the trace context (ADR-0034)
+  src/span.rs             a hop's span
+  src/dlq.rs, offsets.rs, pull.rs, clock.rs
 core/                     the runtime (Rust, one binary)
   Cargo.toml
   src/main.rs             supervision, HTTP surface, panel, MCP server, CLI
   src/vjs.rs              VejasScript: lexer, parser, interpreter, editing, tests
-  src/connectors.rs       the driver contract: Config, Ctx, the Driver trait
-  src/connectors/         what drivers share: hop record, sink loop, pull rounds, DLQ, offsets, HTTP client
+  src/connectors.rs       what the runtime adds to the connector crate, and the host that records hops
+  src/connectors/         what in-process drivers share: HTTP client, child processes, thread pool
   src/connectors/drivers/ the bundled drivers, one module per protocol (sources, sinks, exec bridges)
   src/control.rs          the remote-control channel (leaf-node collectors, ADR-0013)
   src/secrets.rs          the SecretStore trait + Vault/File/Env backends
@@ -50,7 +59,7 @@ The runtime is a single OS process. Inside it:
   endpoints, the editing endpoints, and the MCP endpoint. One request = one
   thread (so a slow `/flows/new` never blocks monitoring), at most
   `VEJAS_HTTP_MAX_INFLIGHT` at once; past it the request gets a 503.
-- **the bus** (`core/src/bus.rs`, ADR-0035) — the only thread that speaks NATS.
+- **the bus** (`sdk/src/bus.rs`, ADR-0035) — the only thread that speaks NATS.
   One tokio worker runs the `async-nats` client on one connection, shared by the
   whole process. Everything above stays synchronous: a thread that needs the bus
   calls a blocking function and parks until it returns. No other module sees

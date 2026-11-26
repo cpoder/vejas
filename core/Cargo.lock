@@ -1579,25 +1579,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "vejas-connector"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "bytes",
+ "futures-util",
+ "getrandom 0.2.17",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "vejas-runtime"
 version = "0.7.0"
 dependencies = [
  "aho-corasick",
- "async-nats",
  "base64",
- "bytes",
  "ctrlc",
- "futures-util",
- "getrandom 0.2.17",
  "regex",
  "ring",
  "rustls",
  "serde",
  "serde_json",
  "tiny_http",
- "tokio",
  "ureq",
  "varpulis-engine",
+ "vejas-connector",
  "webpki-roots 0.26.11",
 ]
 

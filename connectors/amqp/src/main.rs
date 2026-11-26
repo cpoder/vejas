@@ -15,11 +15,9 @@
 //! path. The transactional ordering is exercised against a fake below with fault
 //! injection; real-RabbitMQ certification is the declared CI exception (ADR-0017).
 
-// The runtime's own bus module, compiled in as it is: one sync API over `async-nats`
+// The bus, from the connector crate (ADR-0038): one sync API over `async-nats`
 // on one small tokio runtime, and no NATS type anywhere else (ADR-0035).
-#[allow(dead_code)]
-#[path = "../../../core/src/bus.rs"]
-mod bus;
+use vejas_connector::bus;
 mod lease;
 mod tls;
 

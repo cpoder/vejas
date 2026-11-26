@@ -1,0 +1,23 @@
+[package]
+name = "vejas-connector"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The contract a Vejas connector is written against (ADR-0038): the bus, the trace context, the Driver trait, and the services a driver uses behind a Host."
+publish = false
+
+[dependencies]
+# The NATS client and what it runs on. All four stay inside src/bus.rs (ADR-0035):
+# a connector, like the runtime, is synchronous and sees neither tokio nor a NATS type.
+async-nats = { version = "0.52", default-features = false, features = ["jetstream", "kv", "object-store", "ring", "server_2_10"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde_json = "1"
+# Seeds the trace and span ids (ADR-0034).
+getrandom = "0.2"
+
+[features]
+# What a connector's own tests need of the bus and nothing in a build that runs
+# does: deleting a stream. Enabled from [dev-dependencies] only.
+test-support = []

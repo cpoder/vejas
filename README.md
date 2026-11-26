@@ -130,6 +130,7 @@ Develop and test:
 
 ```bash
 cargo test --manifest-path core/Cargo.toml     # language unit tests
+cargo test --manifest-path sdk/Cargo.toml      # the connector crate (bus, trace, sink loop)
 core/target/release/vejas-runtime vjs-test tests/vjs   # golden end-to-end cases
 ```
 
