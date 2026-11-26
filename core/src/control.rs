@@ -105,7 +105,8 @@ fn supervise(registry: Registry, root: PathBuf, tenant: String) {
 }
 
 fn status_payload(registry: &Registry, tenant: &str) -> Value {
-    let topo = crate::topology_json(registry);
+    // a unit's last error, masked as the panel and the agents read it
+    let topo = crate::as_shown(crate::topology_json(registry));
     let mut units = Vec::new();
     for pool in ["flows", "connectors"] {
         for u in topo[pool].as_array().cloned().unwrap_or_default() {
@@ -174,7 +175,7 @@ pub fn dispatch(registry: &Registry, root: &std::path::Path, req: &Value) -> (Va
         }
         "probe" => match args["file"].as_str() {
             Some(file) => {
-                let verdict = crate::probe_connector(root, file);
+                let verdict = crate::as_shown(crate::probe_connector(root, file));
                 let s = format!(
                     "{} {}",
                     file,
@@ -219,6 +220,31 @@ mod tests {
 
     fn empty_registry() -> Registry {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn the_control_status_masks_a_units_error() {
+        crate::secrets::hand_out("ctl-s3cr3t-HANDED-9931");
+        let handle = Arc::new(crate::Handle {
+            spec: crate::Spec {
+                name: "connector:ctl_probe".into(),
+                path: std::path::PathBuf::from("connectors/ctl_probe.vjs"),
+                pkg: "default".into(),
+                kind: crate::Kind::Connector,
+                mtime: 0,
+            },
+            state: Mutex::new(crate::ProcState {
+                status: "running (sink)".into(),
+                restarts: 1,
+                started_at: None,
+                last_error: Some("POST https://hooks.example/ctl-s3cr3t-HANDED-9931 failed: 500".into()),
+            }),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reg: Registry = Arc::new(Mutex::new(HashMap::from([("connector:ctl_probe".to_string(), handle)])));
+        let (reply, _) = dispatch(&reg, &std::env::temp_dir(), &json!({"id": "1", "cmd": "status"}));
+        let shown = reply.to_string();
+        assert!(!shown.contains("ctl-s3cr3t-HANDED-9931") && shown.contains("connector:ctl_probe"), "{shown}");
     }
 
     #[test]

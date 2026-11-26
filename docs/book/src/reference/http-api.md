@@ -5,6 +5,13 @@ and MCP. With `VEJAS_TOKEN` set, every mutating route requires
 `Authorization: Bearer <token>`. In governed mode (ADR-0024) mutating routes
 answer with a didactic refusal pointing at the proposal queue.
 
+What the API gives of the bus (`/events`, `/dlq`, the last errors in
+`/topology`, shadow replays, time travel and canary results, the evidence of
+proposals, `/connectors/test`) is masked as the trace record is:
+credential-named keys and pairs, and every value the secret stores handed
+out ([Secrets](../concepts/secrets.md)). A dead letter's payload past 16 KB
+is given as its start.
+
 ## Request headers
 
 | Header | On | Purpose |

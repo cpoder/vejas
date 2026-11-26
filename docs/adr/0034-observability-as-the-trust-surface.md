@@ -432,6 +432,80 @@ that fails and of an `api` call that invokes a service.
   flows into, through assignments and invoked services, and write
   `<secret>` in their place.
 
+## What is built (2026-11-26): the runtime's answers, masked as the record
+
+- **The record was masked; the other answers were not.** The events ring
+  (`/events`, `vejas_events`) kept each hop's preview, a sink's answer and
+  an error as they came. A dead letter (`/dlq`, `vejas_dlq`) kept its payload
+  and its last error, `/topology` each unit's last error. Shadow replays,
+  time travel and canary results showed the events they replayed, and a
+  proposal kept the evidence an agent attached. The panel masked what it
+  shows, case by case, and each review of the panel found a case it missed.
+  An agent reading the MCP tools saw it all.
+- **One function at each answer.** `as_shown` scrubs the fields that carry
+  what went through the bus, by their names in the runtime's answers: a
+  preview and a sink's answer as the start of a longer text, an error and a
+  last error as the record scrubs an error, a subject as a text, a dead
+  letter's payload as the record keeps a payload (past 16 KB, its start), an
+  emitted event's payload whole, and the emits one by one, so that one event
+  too deep to read stays an event among the others. The rest stays as it
+  is: units, sequences, times, trace ids. Pages find events and letters by
+  them, and a value handed out that is a number would otherwise turn a
+  sequence into `<secret>`. A new field that carries bus data has to be
+  named there. The control channel's status and probe go through it too. A
+  proposal's evidence is masked whole; the change it proposes is not, since
+  it goes into the repository as it is and an agent may revise it.
+- **A shadow run never reads a credential.** Time travel and the canary run
+  an agent's candidate on real events, the shadow replay runs the flow with
+  a value changed (and a literal can name the field a flow reads,
+  `event[FIELD]`), and a golden case records a run into the repository. A
+  candidate that copies `event.password` under another name carried the
+  value past any mask on names. The events these runs read are now masked
+  first, as `secret()` already was in shadow: the value never enters the
+  run. A flag and a null stay as they are, whatever their name. A number
+  stays as the record shows it: masked when named as a credential (a code
+  often is one, `mfa_token: 482913`), taken out when it holds a value handed
+  out, since a candidate is any code and `18443 - 10000` gives `8443` back.
+  A branch on a masked field can still go another way than live: a replay
+  that branched on `auth_level` reported that nothing would change. So
+  each result names in `hidden` the fields its code may read that the run
+  did not see, and the panel says so under its verdict.
+- **A cut JSON text is read as JSON as far as it goes.** A preview is the
+  first 160 characters of the event, so the pair rule of the JSON path
+  (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
+  the record's preview of a payload past 16 KB. The text is now closed where
+  it stops (the arrays and objects open), scrubbed as JSON, and shown
+  without what closed it. The string it stops in is read apart, as a text
+  cut short, so an XML element or a query in it is masked to its end; when
+  it is the name of a pair, the pair rule reads that name first. A key, a
+  number or a literal the cut fell in is dropped from a text cut here. A
+  text that came cut, a payload a producer truncated, ends there for real:
+  a number or a literal that runs to its end is a value, so the pair in
+  `{"name":"DB_PASSWORD","value":12345678` is masked, and a key it stops in
+  follows, scrubbed as a text. `[WARN` stays `[WARN`, and the pair in
+  `{"headers": [...], "amount":12` is masked, in the record too. Escapes
+  that do not read are scrubbed as a text where they are. Text that is not
+  JSON keeps the text rules. A test cuts documents with a credential in
+  each shape at every point, and none shows three characters of it.
+- **A shadow run's placeholder stays readable.** The text rules read
+  `<secret:demo/key>`, what a shadow run makes of `secret("demo/key")`, as a
+  `secret:` pair. They now skip a complete one, so a replay shows where a
+  secret is used. An element prefixed `secret` is still read as an element.
+- **One gap is left.** A pair whose value comes before its name is masked
+  once the name is read whole, its closing quote cut or not. Cut before
+  that, the value cannot be told
+  from any other `value` field, and sensor events carry one at their top.
+  A flow's preview lists an event's keys in alphabetical order, so the name
+  comes first; a connector's preview keeps the order it received.
+- **An instance of its own.** The answers use a scrub of their own, so the
+  record's thread is never slowed by a page. Its lock is held to learn of
+  new values handed out, never while an answer is scrubbed. `vejas_dlq`
+  gives 200 letters at most, as the panel reads them.
+- **What it does not cover.** A flow's preview on its sample and
+  `vejas_run_flow` run in the shadow engine on a sample from the repository;
+  `/surface`, `/file` and `/fixture` give the repository's files. The
+  panel's own mask stays, as a second line.
+
 ## Consequences
 
 - The guide is honest today. The "future extension" of ADR-0016 has a design

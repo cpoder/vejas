@@ -20,8 +20,15 @@ What keeps the rule real, rather than aspirational:
   was chosen on a labeled benchmark of 98 names, 43 of them camelCase, and a
   CI test pins the exact profile: changing it reopens the decision with
   data, never silently.
-- **Pairs.** In a trace record, a value whose sibling names a credential is
-  masked too: `{"name": "Authorization", "value": "…"}` in a header list,
+- **What the runtime shows is masked as the trace record is.** The events
+  in Activity and `/events` (a hop's preview, a sink's answer, an error),
+  dead letters, a unit's last error, the events a shadow replay, a time
+  travel or a canary replays, a proposal's evidence and a connector test's
+  detail leave the runtime with credential-named keys and pairs masked and
+  every value a secret store handed out taken out, for the panel and for
+  agents alike. The panel masks what it shows on top of that.
+- **Pairs.** In a trace record and in what the runtime shows, a value whose
+  sibling names a credential is masked too: `{"name": "Authorization", "value": "…"}` in a header list,
   `{"name": "DB_PASSWORD", "value": "…"}` in an environment list,
   `{"Key": "clientSecret", "Value": "…"}` in tags.
 - **Standalone binaries** follow the deployment's own machinery (env from a
@@ -33,7 +40,14 @@ What keeps the rule real, rather than aspirational:
   it (preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel,
   canary, golden capture) resolves `secret()` to the placeholder
   `<secret:path/key>`. It stays fail-closed: a missing secret still aborts.
-  A candidate is arbitrary code, so it cannot be left to a filter on the
-  output, and the value never enters the run. One consequence to know when
+  The real events a shadow replay, time travel, the canary or a golden
+  capture reads are masked first: a credential-named field or a pair reads
+  `<masked>`, a value a store handed out `<secret>`. Flags and nulls stay
+  as they are, so a branch on them goes as it goes live. A result names in
+  `hidden` the fields its code reads that the run did not see, and the
+  panel says so under its verdict: a rule on one of them may go another way
+  live. A candidate is
+  arbitrary code, so it cannot be left to a filter on the output, and the
+  value never enters the run. One consequence to know when
   reading a diff: a branch that compares with a secret takes the not-equal
   path in shadow.

@@ -234,7 +234,7 @@ is cut to 256 bytes once scrubbed.
   `<masked>`: in JSON at any depth, JSON held in a string included, and in
   text that names a key and gives its value. That covers a query, a form or a
   connection string (`api_key=…`, `Password=my pass;`, a percent-encoded key
-  too), JSON that was cut or escaped in a string (`"password": "…`), a header
+  too), JSON escaped in a string (`"password": "…`), a header
   or a YAML line or block (`Authorization: …`, `password: |`), a Python, Ruby
   or PHP dump (`'password': '…'`, `"password" => "…"`, `[password] => …`,
   var_dump's `["password"]=>`), HCL (`"password" = "…"`), a command line
@@ -243,6 +243,11 @@ is cut to 256 bytes once scrubbed.
   text's escapes are read before its keys are looked for: XML sent as
   entities inside SOAP, a query percent-encoded inside a query, a
   `password=\"…\"` inside a JSON log line.
+- A value whose sibling names a credential is masked too:
+  `{"name": "Authorization", "value": "…"}` in a header list,
+  `{"name": "DB_PASSWORD", "value": "…"}` in an environment list. JSON that
+  was cut is read as JSON as far as it goes, so a pair is masked in it as in
+  the whole.
 - Every value a secret store handed out in this process becomes `<secret>`,
   wherever it appears: in a string, an object key or a number, as it is or
   once a text's escapes are read (JSON's and `\'`, a URL's `%XX`, XML's
@@ -259,10 +264,15 @@ is cut to 256 bytes once scrubbed.
 Masking works on key names and on exact values. A secret that a flow
 transforms (encodes, splits, parses and rebuilds) before emitting it is not
 recognised, and neither is a credential under a key the pattern does not
-name: a camelCase `accessToken`, a `{"name": "DB_PASSWORD", "value": …}`
-pair, a key worded for people (`Invalid API key: …`), a SQL statement
+name: a key worded for people (`Invalid API key: …`), a SQL statement
 (`WITH PASSWORD '…'`), a multipart form field. Keep secrets in
 credential-named fields.
+
+The runtime's other answers about the bus are masked the same way before
+they leave it: the events of Activity and `/events`, dead letters, a unit's
+last error in `/topology`, the events a shadow replay, a time travel or a
+canary replays, a proposal's evidence, a connector test's detail. Units,
+sequence numbers, times and trace ids are given as they are.
 
 **What is kept.** The exporter's sampler decides: by default every trace the
 runtime starts is kept, and a caller that sends `traceparent` with the

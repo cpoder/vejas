@@ -5,7 +5,9 @@
 # the placeholder <secret:path/key>, while a real run still gets the value. A
 # time-travel candidate is arbitrary code, so this cannot be a filter on the
 # output (v0.3.6 returned the value in the diff, and over GET /preview with no
-# token at all).
+# token at all). The answers also mask a credential-named field (ADR-0034), so
+# the flow echoes the secret under a plain name as well, where the placeholder
+# stays readable.
 #   e2e/governed-agent.sh                    (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -31,7 +33,7 @@ source "vx.sdemo.in"
 tool "secret demo"
 CUTOFF = 1
 api_key = secret("demo/key")
-emit "vx.sdemo.out", {id: id, auth: f"Bearer {api_key}"}
+emit "vx.sdemo.out", {id: id, auth: f"Bearer {api_key}", echo: api_key}
 VJS
 echo '{"id": 1}' > "$R/flows/fixtures/sdemo.json"
 mkdir -p "$R/connectors"
@@ -58,6 +60,8 @@ for _ in $(seq 1 100); do
 done
 shadowed(){ # label, output: the placeholder is there, the value is not
   if echo "$2" | grep -q "$SECRET"; then ko "$1 returned the secret VALUE"
+  # the run read the value, and only the answer's mask took it out
+  elif echo "$2" | grep -qF "<secret>"; then ko "$1 read the secret VALUE (masked in the answer)"
   elif echo "$2" | grep -q "$PLACEHOLDER"; then ok "$1 shows the placeholder"
   else ko "$1 answered neither value nor placeholder: $(echo "$2" | cut -c1-160)"; fi
 }

@@ -1455,7 +1455,8 @@ function diffLine(r, hide) {
   }
   const parts = [];
   be.forEach((e, i) => diffValues(e.payload, ae[i].payload, '', parts));
-  if (!parts.length) return '<span class="muted">the same output</span>';
+  // a changed event whose fields all read the same: what changes is masked
+  if (!parts.length) return '<span class="muted">a hidden value changes</span>';
   const val = (k, v, veiled) => v === undefined ? '<span class="muted">nothing</span>'
     : hide || veiled || secretPath(k) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
   return parts.slice(0, 3).map(([k, x, y, veiled]) => `<code>${esc(k)}</code> ${val(k, x, veiled)} ${sep} <b>${val(k, y, veiled)}</b>`).join('; ');
@@ -1466,7 +1467,19 @@ function replayHtml(res, hide) {
   const changed = (res.results || []).filter(r => r.changed);
   const head = res.changed ? `<b>${res.changed} of ${lastN} would change.</b>` : `<b>None of ${lastN} would change.</b>`;
   const list = changed.slice(0, 5).map(r => `<li><span class="time num">${esc(eventLabel(r))}</span><span>${diffLine(r, hide)}</span></li>`).join('');
-  return `<p>${head}</p>${list ? `<ul>${list}</ul>` : ''}${changed.length > 5 ? `<p class="muted">And ${changed.length - 5} more.</p>` : ''}`;
+  return `<p>${head}</p>${unseen(res.results)}${list ? `<ul>${list}</ul>` : ''}${changed.length > 5 ? `<p class="muted">And ${changed.length - 5} more.</p>` : ''}`;
+}
+// The fields the flow reads that the check ran without: the runtime hides
+// what may hold a credential, so a rule on one of them may decide otherwise live.
+function unseen(results) {
+  // a path names its top field; one of an array event, or of an unnamed key, names the event
+  const names = [...new Set((results || []).flatMap(r => (r.hidden || []).map(p => String(p).split(/[.[]/)[0] || 'event')))];
+  if (!names.length) return '';
+  const shown = names.slice(0, 3).map(n => `<code>${esc(n)}</code>`);
+  const rest = names.length > 3 ? ` and ${plural(names.length - 3, 'other')}` : '';
+  const listed = rest ? shown.join(', ') + rest : shown.length > 1 ? `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}` : shown[0];
+  const one = names.length === 1;
+  return `<p class="muted">This check did not see ${listed}, which may hold ${one ? 'a credential' : 'credentials'}. A rule on ${one ? 'it' : 'them'} may go another way live.</p>`;
 }
 
 // The whole script, or a flow's sample event, in a plain editor.

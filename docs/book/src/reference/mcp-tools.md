@@ -43,7 +43,7 @@ Roll a business-surface literal back to the value it held before its most recent
 
 ## `vejas_time_travel`
 
-Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed}]}.
+Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.
 
 ## `vejas_canary_start`
 
@@ -51,7 +51,7 @@ Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candid
 
 ## `vejas_canary_status`
 
-Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed}]}.
+Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.
 
 ## `vejas_canary_stop`
 
@@ -67,7 +67,7 @@ List the proposal queue with status (pending/approved/rejected/expired) and evid
 
 ## `vejas_replay_literal`
 
-Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.
+Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live. Nothing is written — promote with vejas_set_literal.
 
 ## `vejas_preview`
 
@@ -111,7 +111,7 @@ What happened to one business event, end to end, from the trace record (ADR-0034
 
 ## `vejas_dlq`
 
-List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.
+List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.
 
 ## `vejas_dlq_replay`
 

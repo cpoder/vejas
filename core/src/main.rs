@@ -197,6 +197,104 @@ fn events_with_paths_json(unit: &str) -> String {
 /// The other hops `/events?paths=1` gives with a unit's events, the newest.
 const PATH_HOPS_MAX: usize = 200;
 
+/// What a page or an agent is shown of the bus (ADR-0017), masked as the
+/// trace record masks it: credential-named keys and pairs, and the values the
+/// secret stores handed out. Only the fields that carry what went through the
+/// bus, by their names in the runtime's answers; units, sequences, times and
+/// trace ids stay as they are, since pages find events and letters by them.
+fn as_shown(mut v: Value) -> Value {
+    fn walk(v: &mut Value, scrub: &record::Shown) {
+        match v {
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    match (k.as_str(), &mut *x) {
+                        // the start of a longer text: a hop's payload, a sink's answer
+                        ("preview" | "response", Value::String(s)) => *s = scrub.text(s, true),
+                        // what failed, which may quote the start of an answer
+                        ("error" | "last_error" | "detail", Value::String(s)) => *s = scrub.error(s),
+                        // where it went: a subject can carry a value of the event
+                        ("subject" | "original_subject", Value::String(s)) => *s = scrub.text(s, false),
+                        // what went through: a dead letter's payload, as the
+                        // record keeps a payload; an emitted event's, whole
+                        ("payload", Value::String(s)) => *s = scrub.payload(s),
+                        ("payload" | "event", x) => {
+                            let shown = scrub.json(x);
+                            *x = shown;
+                        }
+                        // what a hop or a run emitted, one by one: one event
+                        // too deep to read stays an event among the others
+                        ("emits", Value::Array(emits)) => {
+                            for e in emits {
+                                match e {
+                                    Value::String(subject) => *subject = scrub.text(subject, false),
+                                    e => walk(e, scrub),
+                                }
+                            }
+                        }
+                        (_, x) => walk(x, scrub),
+                    }
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, scrub)),
+            _ => {}
+        }
+    }
+    walk(&mut v, &record::shown());
+    v
+}
+
+/// Proposals as pages and agents are shown them: the change as it was
+/// proposed, since it goes into the repository as it is and an agent may
+/// revise it; the evidence, events of the bus, masked (ADR-0034).
+fn proposals_shown(list: Vec<Value>) -> Vec<Value> {
+    let scrub = record::shown();
+    list.into_iter().map(|p| proposal_shown(p, &scrub)).collect()
+}
+
+/// One proposal, or a decision's answer that holds it under `proposal`.
+fn proposal_shown(mut p: Value, scrub: &record::Shown) -> Value {
+    if let Some(inner) = p.get_mut("proposal") {
+        let shown = proposal_shown(inner.take(), scrub);
+        *inner = shown;
+    }
+    if let Some(evidence) = p.get_mut("evidence") {
+        let shown = scrub.json(evidence);
+        *evidence = shown;
+    }
+    p
+}
+
+/// What a shadow run reads of a real event (time travel, the canary, a
+/// replay, a golden case), and the fields it reads that it does not see
+/// (ADR-0034). A candidate is any code, and a replay's literal can name the
+/// field a flow reads (`event[FIELD]`), so a credential must not enter the
+/// run: `{pw: event.password}` would carry it out under a name no mask reads.
+/// As with `secret()`, its value never enters. Flags and nulls do
+/// (`record::Shown::shadow_input`), and so does a number neither named as a
+/// credential nor holding a value handed out. A branch on a masked field may
+/// go another way than live, and the answer names that field. `reads` are what the run's code reads of the
+/// event (`vjs::event_reads`): a field it does not read changes nothing, and
+/// is not named.
+fn shadow_input(event: &Value, scrub: &record::Shown, reads: &[String]) -> (Value, Vec<String>) {
+    let (read, mut hidden) = scrub.shadow_input(event);
+    if !reads.iter().any(|r| r == "event") {
+        hidden.retain(|path| path == "event" || reads.iter().any(|r| path.split(['.', '[']).next() == Some(r.as_str())));
+    }
+    hidden.truncate(HIDDEN_MAX);
+    (read, hidden)
+}
+
+/// The most fields a shadow run's result names as hidden.
+const HIDDEN_MAX: usize = 20;
+
+/// A shadow run's result, naming the fields it read hidden, when there are.
+fn with_hidden(mut result: Value, hidden: Vec<String>) -> Value {
+    if !hidden.is_empty() {
+        result["hidden"] = json!(hidden);
+    }
+    result
+}
+
 fn events_out(flow: Option<&str>, paths: bool) -> String {
     let newest_first = |hops: &mut Vec<&Value>| {
         hops.sort_unstable_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)))
@@ -250,7 +348,7 @@ fn events_out(flow: Option<&str>, paths: bool) -> String {
             })
             .collect()
     };
-    json!({ "events": events }).to_string()
+    as_shown(json!({ "events": events })).to_string()
 }
 
 /// A unit's file as traces and the panel name it: relative to the project
@@ -343,21 +441,24 @@ fn replay_literal(
     };
     let mut results = Vec::new();
     let mut changed_count = 0;
+    let scrub = record::shown();
+    let reads = [vjs::event_reads(&before), vjs::event_reads(&after)].concat();
     for entry in &events {
-        let ev = entry.get("event").cloned().unwrap_or(Value::Null);
-        if ev.is_null() {
+        let Some(ev) = entry.get("event").filter(|ev| !ev.is_null()) else {
             continue; // unparseable event of a bad-json trace: nothing to replay
-        }
+        };
+        let (ev, hidden) = shadow_input(ev, &scrub, &reads);
         let b = run_one(&before, &ev);
         let a = run_one(&after, &ev);
         let changed = b != a;
         if changed {
             changed_count += 1;
         }
-        results.push(json!({
+        let result = json!({
             "ts": entry["ts"], "subject": entry["subject"], "preview": trace_preview(entry),
             "before": b, "after": a, "changed": changed,
-        }));
+        });
+        results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "name": name, "key": key, "value": value,
@@ -403,17 +504,21 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
     };
     let mut results = Vec::new();
     let mut changed = 0;
+    let scrub = record::shown();
+    let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
     for (seq, subject, event) in &rows {
-        let b = run_one(&current, event);
-        let a = run_one(&candidate, event);
+        let (event, hidden) = shadow_input(event, &scrub, &reads);
+        let b = run_one(&current, &event);
+        let a = run_one(&candidate, &event);
         let ch = b != a;
         if ch {
             changed += 1;
         }
-        results.push(json!({
-            "seq": seq, "subject": subject, "preview": preview_of(event),
+        let result = json!({
+            "seq": seq, "subject": subject, "preview": preview_of(&event),
             "before": b, "after": a, "changed": ch,
-        }));
+        });
+        results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "flow": unit, "candidate_hash": versions::hash_content(candidate_src),
@@ -472,6 +577,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
     let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
     let current = vjs::parse(&current_src)?;
     let candidate = vjs::parse(candidate_src)?;
+    let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
     let subject = current.source.clone().ok_or("flow has no bus source to shadow")?;
     let candidate_hash = versions::hash_content(candidate_src);
     // the effective version this canary diffs against — snapshotted so we can
@@ -534,10 +640,12 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 }
             }
             let batch = connectors::fetch_round(&sub).unwrap_or_default();
+            let scrub = record::shown();
             for m in &batch {
                 let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
                     continue;
                 };
+                let (event, hidden) = shadow_input(&event, &scrub, &reads);
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 let b = shadow_emits(&current, &event, &root, &pkg);
                 let a = shadow_emits(&candidate, &event, &root, &pkg);
@@ -547,7 +655,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                     changed.fetch_add(1, Ordering::SeqCst);
                 }
                 let mut r = ring.lock().unwrap();
-                r.push_back(json!({"seq": seq, "changed": ch, "before": b, "after": a}));
+                r.push_back(with_hidden(json!({"seq": seq, "changed": ch, "before": b, "after": a}), hidden));
                 while r.len() > 500 {
                     r.pop_front();
                 }
@@ -3761,6 +3869,10 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
         .unwrap_or(&file)
         .to_string_lossy()
         .to_string();
+    // the case goes into the repository: a credential of the event does not,
+    // and the run it records reads the event as every shadow run does
+    let prog = vjs::parse(&fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let (event, hidden) = shadow_input(&event, &record::shown(), &vjs::event_reads(&prog));
     // re-run to capture the real emits (deterministic — the flow is pure)
     let expect_emits = run_flow_on_input(root, &rel, &event)?;
     let stem = file
@@ -3776,7 +3888,7 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
         serde_json::to_string_pretty(&case).unwrap_or_default(),
     )
     .map_err(|e| e.to_string())?;
-    Ok(json!({"ok": true, "case": name, "flow": rel, "expect_emits": expect_emits.len()}))
+    Ok(with_hidden(json!({"ok": true, "case": name, "flow": rel, "expect_emits": expect_emits.len()}), hidden))
 }
 
 fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value>, String> {
@@ -4179,13 +4291,13 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
-        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
+        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
         json!({"name": "vejas_canary_start", "description": "Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candidate version against the current effective version as events arrive, accumulating a diff. Read-only (shadow — no real emit). Refuses if a canary is already running for the flow. Auto-stops if the live version changes under it (reason in status).", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}}), vec!["file", "candidate"])}),
-        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_canary_stop", "description": "Stop a running canary for a flow (its shadow consumer exits; the last diff stays readable).", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_propose", "description": "Submit a governed change PROPOSAL for a human to approve in the panel (ADR-0024) — you can propose but never approve. kind='set_literal' (payload {file, name, key, value}) or kind='version' (payload {file, candidate: whole source}). Attach `evidence` you gathered (vejas_time_travel results, vejas_canary stats) — the panel shows it next to Approve, and flags 'no evidence' loudly. The proposal is pinned to the current baseline and auto-expires if a deploy/promote moves it. Returns the stored proposal (id, status:pending).", "inputSchema": obj(json!({"kind": {"type": "string"}, "payload": {"type": "object"}, "evidence": {"type": "object"}}), vec!["kind", "payload"])}),
         json!({"name": "vejas_proposals", "description": "List the proposal queue with status (pending/approved/rejected/expired) and evidence. Read-only. Approve/reject are human panel actions, not tools.", "inputSchema": obj(json!({}), vec![])}),
-        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live. Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
@@ -4200,7 +4312,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
+        json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
@@ -4224,7 +4336,7 @@ fn mcp_tools(root: &Path) -> Value {
 fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Result<Value, String> {
     let text = |v: String| Ok(json!({"content": [{"type": "text", "text": v}]}));
     match name {
-        "vejas_topology" => text(topology_json(registry).to_string()),
+        "vejas_topology" => text(as_shown(topology_json(registry)).to_string()),
         "vejas_graph" => text(graph_json(root).to_string()),
         "vejas_surface" => text(surface_json(root).to_string()),
         "vejas_read" => {
@@ -4296,26 +4408,26 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
             let n = args["n"].as_u64().unwrap_or(20) as usize;
-            text(replay_literal(root, file, lname, key, &args["value"], n)?.to_string())
+            text(as_shown(replay_literal(root, file, lname, key, &args["value"], n)?).to_string())
         }
         "vejas_time_travel" => {
             let file = args["file"].as_str().ok_or("file required")?;
             let candidate = args["candidate"].as_str().ok_or("candidate required")?;
             let n = args["n"].as_u64().unwrap_or(20) as usize;
-            text(time_travel(root, file, candidate, n)?.to_string())
+            text(as_shown(time_travel(root, file, candidate, n)?).to_string())
         }
         "vejas_canary_start" => {
             let file = args["file"].as_str().ok_or("file required")?;
             let candidate = args["candidate"].as_str().ok_or("candidate required")?;
-            text(canary_start(root, file, candidate)?.to_string())
+            text(as_shown(canary_start(root, file, candidate)?).to_string())
         }
         "vejas_canary_status" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(canary_read(root, file)?.to_string())
+            text(as_shown(canary_read(root, file)?).to_string())
         }
         "vejas_canary_stop" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(canary_stop(root, file)?.to_string())
+            text(as_shown(canary_stop(root, file)?).to_string())
         }
         "vejas_propose" => {
             let kind = args["kind"].as_str().ok_or("kind required")?;
@@ -4323,7 +4435,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let evidence = args.get("evidence").cloned().unwrap_or(Value::Null);
             text(submit_proposal(root, kind, payload, "mcp", evidence)?.to_string())
         }
-        "vejas_proposals" => text(json!({"proposals": reconcile_and_list(root)?}).to_string()),
+        "vejas_proposals" => text(json!({"proposals": proposals_shown(reconcile_and_list(root)?)}).to_string()),
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
             text(preview_json(root, file)?)
@@ -4380,7 +4492,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_test_connector" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(probe_connector(root, file).to_string())
+            text(as_shown(probe_connector(root, file)).to_string())
         }
         "vejas_provision" => {
             approval_gate()?;
@@ -4420,8 +4532,8 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(sap_rpc_request(root, &op)?.to_string())
         }
         "vejas_dlq" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            text(json!({"dead_letters": dlq_list(limit)?}).to_string())
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(200) as usize;
+            text(as_shown(json!({"dead_letters": dlq_list(limit)?})).to_string())
         }
         "vejas_trace" => {
             let found = match (args["trace_id"].as_str(), args["search"].as_str()) {
@@ -4637,7 +4749,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Some(_) => {}
             }
             return match decide_proposal(&registry, &root, id, approve, &actor) {
-                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Ok(v) => respond(request, 200, proposal_shown(v, &record::shown()).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             };
         }
@@ -4645,7 +4757,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
 
     match (method, path_only.as_str()) {
         (tiny_http::Method::Get, "/proposals") => match reconcile_and_list(&root) {
-            Ok(list) => respond(request, 200, json!({"proposals": list}).to_string(), "application/json"),
+            Ok(list) => respond(request, 200, json!({"proposals": proposals_shown(list)}).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
@@ -4689,7 +4801,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/topology") => respond(
             request,
             200,
-            topology_json(&registry).to_string(),
+            as_shown(topology_json(&registry)).to_string(),
             "application/json",
         ),
         (tiny_http::Method::Get, "/graph") => respond(
@@ -4731,7 +4843,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Get, "/dlq") => match dlq_list(200) {
-            Ok(l) => respond(request, 200, json!({"dead_letters": l}).to_string(), "application/json"),
+            Ok(l) => respond(request, 200, as_shown(json!({"dead_letters": l})).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Post, "/dlq/replay") => {
@@ -4803,7 +4915,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let Some(file) = body["file"].as_str() else {
                 return respond(request, 400, "need file".into(), "text/plain");
             };
-            respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
+            respond(request, 200, as_shown(probe_connector(&root, file)).to_string(), "application/json")
         }
         (tiny_http::Method::Post, "/provision") => {
             if let Err(e) = approval_gate() {
@@ -4949,7 +5061,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let key = body["key"].as_str().unwrap_or("-").to_string();
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match replay_literal(&root, &file, &name, &key, &body["value"], n) {
-                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Ok(diff) => respond(request, 200, as_shown(diff).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4961,7 +5073,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let candidate = body["candidate"].as_str().unwrap_or("").to_string();
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match time_travel(&root, &file, &candidate, n) {
-                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Ok(diff) => respond(request, 200, as_shown(diff).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4970,7 +5082,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let file = body["file"].as_str().unwrap_or("").to_string();
             let candidate = body["candidate"].as_str().unwrap_or("").to_string();
             match canary_start(&root, &file, &candidate) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 // a double-start is refused, not silently replaced
                 Err(e) if e.contains("already running") => respond(request, 409, e, "text/plain"),
                 Err(e) => respond(request, 422, e, "text/plain"),
@@ -4981,7 +5093,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "missing file".into(), "text/plain");
             };
             match canary_read(&root, &file) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4989,7 +5101,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             match canary_stop(&root, &file) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -5690,6 +5802,151 @@ mod tests {
         }
         assert!(entries.iter().any(|e| e["name"] == "SUBJECT"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn what_pages_and_agents_are_shown_of_the_bus_is_masked() {
+        crate::secrets::hand_out("hooks-s3cr3t-T0K3N-7f1");
+        record_trace_full(
+            "connector:mask_probe",
+            "vx.mask.out",
+            false,
+            Some("POST https://hooks.example/hooks-s3cr3t-T0K3N-7f1 failed: 500".into()),
+            vec![],
+            r#"{"id":7,"password":"hunter2","header":{"name":"Authorization","value":"Bearer abc"}}"#.into(),
+            Some(json!({"id": 7, "password": "hunter2"})),
+            Some(r#"{"echo":"hooks-s3cr3t-T0K3N-7f1"}"#.into()),
+            None,
+            Some(bus::Delivery { delivered: 2, stream_seq: 41, replay_of: None }),
+        );
+        let out = events_json(Some("connector:mask_probe"));
+        for leak in ["hunter2", "Bearer abc", "hooks-s3cr3t-T0K3N-7f1"] {
+            assert!(!out.contains(leak), "{leak} in {out}");
+        }
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let hop = &v["events"][0];
+        assert!(hop["preview"].as_str().unwrap().contains(r#""id":7"#), "{hop}");
+        assert!(hop["error"].as_str().unwrap().starts_with("POST https://hooks.example/"), "{hop}");
+        // what a page finds an event by stays as it was
+        assert_eq!(hop["flow"], "connector:mask_probe");
+        assert_eq!(hop["subject"], "vx.mask.out");
+        assert_eq!((hop["stream_seq"].as_u64(), hop["attempt"].as_u64()), (Some(41), Some(2)));
+
+        // a dead letter: its payload and its error; its sequence and unit stay
+        let letters = as_shown(json!({"dead_letters": [{
+            "seq": 12, "unit": "flow:orders", "original_seq": 40, "attempts": 5,
+            "original_subject": "vx.orders",
+            "payload": r#"{"order":1,"api_key":"k-123456","note":"hooks-s3cr3t-T0K3N-7f1"}"#,
+            "last_error": "refused: hooks-s3cr3t-T0K3N-7f1",
+        }]}));
+        let shown = letters.to_string();
+        for leak in ["k-123456", "hooks-s3cr3t-T0K3N-7f1"] {
+            assert!(!shown.contains(leak), "{leak} in {shown}");
+        }
+        let letter = &letters["dead_letters"][0];
+        assert_eq!((letter["seq"].as_u64(), letter["original_seq"].as_u64()), (Some(12), Some(40)));
+        assert_eq!(letter["unit"], "flow:orders");
+        assert!(letter["payload"].as_str().unwrap().contains(r#""order":1"#), "{letter}");
+
+        // a shadow replay's results, and a proposal that changes a credential
+        let replay = as_shown(json!({"results": [{"seq": 3, "preview": "{\"token\":\"t-998877\"}",
+            "before": {"emits": [{"subject": "vx.a", "payload": {"secret": "s-1"}}], "error": null}}]}));
+        let shown = replay.to_string();
+        assert!(!shown.contains("t-998877") && !shown.contains("s-1"), "{shown}");
+        assert_eq!(replay["results"][0]["before"]["emits"][0]["subject"], "vx.a");
+        // a proposal: its evidence is masked, the change it proposes is not
+        let candidate = "password = event.password\nemit \"vx.a\" { password }\n";
+        let proposals = proposals_shown(vec![json!({"id": "p1", "kind": "version",
+            "payload": {"file": "flows/a.vjs", "candidate": candidate},
+            "evidence": {"results": [{"seq": 3, "after": {"emits": [{"subject": "vx.a", "payload": {"password": "pw-4455"}}]}}]}})]);
+        assert!(!proposals[0]["evidence"].to_string().contains("pw-4455"), "{}", proposals[0]);
+        assert_eq!(proposals[0]["payload"]["candidate"], candidate);
+        assert_eq!(proposals[0]["id"], "p1");
+
+        // a letter past 16 KB is shown as its start, as the record keeps one
+        let big = format!(r#"{{"api_key":"k-998877","blob":"{}"}}"#, "x".repeat(40_000));
+        let letters = as_shown(json!({"dead_letters": [{"seq": 13, "payload": big}]}));
+        let payload = letters["dead_letters"][0]["payload"].as_str().unwrap();
+        assert!(payload.len() < 17_000 && payload.ends_with('…'), "{}", payload.len());
+        assert!(!payload.contains("k-998877") && payload.contains("<masked>"), "{}", &payload[..60]);
+    }
+
+    #[test]
+    fn a_shadow_run_never_reads_a_credential_of_a_real_event() {
+        let root = std::env::temp_dir().join(format!("vejas-shadow-mask-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("rename_probe.vjs"),
+            "source \"vx.rn.test\"\nTH = 1\nif n > TH:\n  emit \"vx.out\", {pw: password, h: headers}\nend\n",
+        )
+        .unwrap();
+        let event = json!({"n": 5, "password": "pw-rename-7731", "headers": [{"name": "Authorization", "value": "Bearer rn-55"}]});
+        record_trace("flow:rename_probe", "vx.rn.test", true, None, vec![], "{}".into(), Some(event), None, None);
+        let diff = as_shown(replay_literal(&root, "flows/rename_probe.vjs", "TH", "-", &json!(2), 20).unwrap());
+        let shown = diff.to_string();
+        // a name no mask reads would carry it out: it never enters the run
+        assert!(!shown.contains("pw-rename-7731") && !shown.contains("rn-55"), "{shown}");
+        assert_eq!(diff["results"][0]["after"]["emits"][0]["payload"]["pw"], "<masked>", "{shown}");
+        // and the result names what the run read hidden
+        assert_eq!(diff["results"][0]["hidden"], json!(["headers[0].value", "password"]), "{shown}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replay_reads_flags_and_numbers_and_names_what_it_did_not_see() {
+        let root = std::env::temp_dir().join(format!("vejas-shadow-branch-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        let flow = |name: &str, cond: &str| {
+            let src = format!("source \"vx.{name}.test\"\nTH = 10\nif {cond}:\n  emit \"vx.out\", {{id: id}}\nend\n");
+            std::fs::write(root.join("flows").join(format!("{name}.vjs")), src).unwrap();
+            let event = json!({"id": 4, "amount": 30, "password_expired": true, "auth_level": 30, "auth_type": "sso"});
+            record_trace(&format!("flow:{name}"), &format!("vx.{name}.test"), true, None, vec![], "{}".into(), Some(event), None, None);
+            replay_literal(&root, &format!("flows/{name}.vjs"), "TH", "-", &json!(50), 20).unwrap()
+        };
+        // a flag named like a credential and a plain number: read as live, so
+        // event 4, sent with TH = 10, would not be with TH = 50
+        let diff = flow("shadow_flags", "amount > TH and password_expired");
+        assert_eq!(diff["changed"], 1, "{diff}");
+        // the fields it hides are ones this flow does not read: none named
+        assert!(diff["results"][0].get("hidden").is_none(), "{diff}");
+        // a number named as a credential is not read, and the answer says so
+        let diff = flow("shadow_level", "auth_level > TH");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((&diff["changed"], &diff["results"][0]["hidden"]), (&json!(0), &json!(["auth_level"])), "{diff}");
+    }
+
+    #[test]
+    fn a_golden_case_keeps_no_credential_of_its_event() {
+        let root = std::env::temp_dir().join(format!("vejas-golden-mask-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("golden_probe.vjs"),
+            "source \"vx.gp.test\"\nemit \"vx.out\", {id: id, pw: password}\n",
+        )
+        .unwrap();
+        let event = json!({"id": 3, "password": "pw-golden-4417"});
+        record_trace("flow:golden_probe", "vx.gp.test", true, None, vec![], "{}".into(), Some(event), None, None);
+        let events: Value = serde_json::from_str(&events_json(Some("flow:golden_probe"))).unwrap();
+        let seq = events["events"][0]["seq"].as_u64().unwrap();
+        let out = golden_from_event(&root, "flow:golden_probe", seq).unwrap();
+        let case = std::fs::read_to_string(root.join("tests").join("vjs").join(out["case"].as_str().unwrap())).unwrap();
+        assert!(!case.contains("pw-golden-4417") && case.contains("<masked>"), "{case}");
+        assert_eq!((&out["expect_emits"], &out["hidden"]), (&json!(1), &json!(["password"])), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_event_too_deep_to_read_leaves_the_others_their_shape() {
+        let mut deep = json!("leaf");
+        for _ in 0..120 {
+            deep = json!({ "d": deep });
+        }
+        let shown = as_shown(json!({"results": [{"after": {"error": null, "emits": [
+            {"subject": "vx.a", "payload": deep}, {"subject": "vx.b", "payload": {"id": 1}}]}}]}));
+        let emits = &shown["results"][0]["after"]["emits"];
+        assert!(emits.is_array(), "{emits}");
+        assert_eq!((emits[0]["subject"].as_str(), emits[0]["payload"].as_str()), (Some("vx.a"), Some("<secret>")));
+        assert_eq!(emits[1]["payload"], json!({"id": 1}));
     }
 
     #[test]
