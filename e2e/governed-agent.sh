@@ -60,6 +60,8 @@ for _ in $(seq 1 100); do
 done
 shadowed(){ # label, output: the placeholder is there, the value is not
   if echo "$2" | grep -q "$SECRET"; then ko "$1 returned the secret VALUE"
+  # the run read the value, and only the answer's mask took it out
+  elif echo "$2" | grep -qF "<secret>"; then ko "$1 read the secret VALUE (masked in the answer)"
   elif echo "$2" | grep -q "$PLACEHOLDER"; then ok "$1 shows the placeholder"
   else ko "$1 answered neither value nor placeholder: $(echo "$2" | cut -c1-160)"; fi
 }

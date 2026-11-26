@@ -457,25 +457,40 @@ that fails and of an `api` call that invokes a service.
   it goes into the repository as it is and an agent may revise it.
 - **A shadow run never reads a credential.** Time travel and the canary run
   an agent's candidate on real events, the shadow replay runs the flow with
-  a value changed, and a golden case records a run into the repository. A
+  a value changed (and a literal can name the field a flow reads,
+  `event[FIELD]`), and a golden case records a run into the repository. A
   candidate that copies `event.password` under another name carried the
   value past any mask on names. The events these runs read are now masked
   first, as `secret()` already was in shadow: the value never enters the
-  run, and a branch that reads a masked field reads `<masked>`.
+  run. A flag and a null stay as they are, and so does a number, unless it
+  is named as a credential (a code often is one, `mfa_token: 482913`) or is
+  a value handed out, whole (`18443` is not `8443`). A branch on a masked
+  field can still go another way than live: a replay that branched on
+  `auth_level` reported that nothing would change. So each result names in
+  `hidden` the fields its code reads that the run did not see, and the
+  panel says so under its verdict.
 - **A cut JSON text is read as JSON as far as it goes.** A preview is the
   first 160 characters of the event, so the pair rule of the JSON path
   (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
   the record's preview of a payload past 16 KB. The text is now closed where
   it stops (the arrays and objects open), scrubbed as JSON, and shown
   without what closed it. The string it stops in is read apart, as a text
-  cut short, so an XML element or a query in it is masked to its end. A key,
-  a number or a literal the cut fell in is dropped. A text that was not cut
-  is read so only when none of it would be lost: `[WARN` stays `[WARN`. Text
-  that is not JSON keeps the text rules. A test cuts documents with a
-  credential in each shape at every point, and none shows three characters
-  of it.
+  cut short, so an XML element or a query in it is masked to its end; when
+  it is the name of a pair, the pair rule reads that name first. A key, a
+  number or a literal the cut fell in is dropped from a text cut here. A
+  text that came cut, a payload a producer truncated, keeps it, scrubbed as
+  a text after the rest: `[WARN` stays `[WARN`, and the pair in
+  `{"headers": [...], "amount":12` is masked, in the record too. Escapes
+  that do not read are scrubbed as a text where they are. Text that is not
+  JSON keeps the text rules. A test cuts documents with a credential in
+  each shape at every point, and none shows three characters of it.
+- **A shadow run's placeholder stays readable.** The text rules read
+  `<secret:demo/key>`, what a shadow run makes of `secret("demo/key")`, as a
+  `secret:` pair. They now skip a complete one, so a replay shows where a
+  secret is used. An element prefixed `secret` is still read as an element.
 - **One gap is left.** A pair whose value comes before its name is masked
-  once the name is read whole. Cut before that, the value cannot be told
+  once the name is read whole, its closing quote cut or not. Cut before
+  that, the value cannot be told
   from any other `value` field, and sensor events carry one at their top.
   A flow's preview lists an event's keys in alphabetical order, so the name
   comes first; a connector's preview keeps the order it received.

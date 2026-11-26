@@ -732,6 +732,54 @@ fn is_upper_name(name: &str) -> bool {
 /// A branch or a loop body starts from what was set before it, and what it
 /// sets counts after it. An invoke gives back its arguments and what the
 /// service sets (`makes`, keyed by the name the invoke uses).
+/// The top-level fields of its event a flow reads, or `event` alone when it
+/// reads the event whole (`event[KEY]`, `emit "x", event`): what a field
+/// hidden from a shadow run can change (ADR-0034). A value a service it
+/// invokes makes counts as read, which errs on the side of naming a field.
+pub fn event_reads(prog: &Program) -> Vec<String> {
+    if stmts_read_whole_event(&prog.stmts) {
+        return vec!["event".to_string()];
+    }
+    let mut set: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
+    let mut reads = Vec::new();
+    reads_in_order(&prog.stmts, &mut set, &[], &mut reads);
+    let mut top: Vec<String> = Vec::new();
+    for r in reads {
+        let name = r.split('.').next().unwrap_or(&r).to_string();
+        if !top.contains(&name) {
+            top.push(name);
+        }
+    }
+    top
+}
+
+fn stmts_read_whole_event(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Assign(_, e) => reads_whole_event(e),
+        Stmt::For(_, iter, body) => reads_whole_event(iter) || stmts_read_whole_event(body),
+        Stmt::If(arms, otherwise) => {
+            arms.iter().any(|(cond, _, body)| reads_whole_event(cond) || stmts_read_whole_event(body))
+                || otherwise.as_ref().is_some_and(|body| stmts_read_whole_event(body))
+        }
+        Stmt::Emit(a, b) | Stmt::Respond(a, b) => reads_whole_event(a) || reads_whole_event(b),
+        Stmt::InvokeMerge(_, args) => args.iter().any(|(_, v)| reads_whole_event(v)),
+    })
+}
+
+/// Does `e` read the event whole? `event.total` reads one field of it.
+fn reads_whole_event(e: &Expr) -> bool {
+    match e {
+        Expr::Var(name) => name == "event",
+        Expr::Lit(_) => false,
+        Expr::FString(parts) => parts.iter().any(|p| matches!(p, FStringPart::Expr(e) if reads_whole_event(e))),
+        Expr::Doc(pairs) | Expr::Invoke(_, pairs) => pairs.iter().any(|(_, e)| reads_whole_event(e)),
+        Expr::Array(es) | Expr::Call(_, es) => es.iter().any(reads_whole_event),
+        Expr::Field(base, _, _) => !matches!(**base, Expr::Var(_)) && reads_whole_event(base),
+        Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => reads_whole_event(a) || reads_whole_event(b),
+        Expr::Projection(b) | Expr::Unary(_, b) => reads_whole_event(b),
+    }
+}
+
 fn reads_in_order(stmts: &[Stmt], set: &mut Vec<String>, makes: &[(String, Vec<String>)], out: &mut Vec<String>) {
     fn add(set: &mut Vec<String>, name: &str) {
         if !set.iter().any(|n| n == name) {

@@ -264,13 +264,35 @@ fn proposal_shown(mut p: Value, scrub: &record::Shown) -> Value {
     p
 }
 
-/// A real event as a shadow run is given it (ADR-0034), masked as the trace
-/// record masks it. A candidate is any code, so what it emits cannot be left
-/// to a mask on names: `{pw: event.password}` would carry the value out
-/// under a name no mask reads. As with `secret()`, the value never enters
-/// the run, and a branch that reads a masked field reads `<masked>`.
-fn shadow_input(event: &Value, scrub: &record::Shown) -> Value {
-    scrub.json(event)
+/// What a shadow run reads of a real event (time travel, the canary, a
+/// replay, a golden case), and the fields it reads that it does not see
+/// (ADR-0034). A candidate is any code, and a replay's literal can name the
+/// field a flow reads (`event[FIELD]`), so a credential must not enter the
+/// run: `{pw: event.password}` would carry it out under a name no mask reads.
+/// As with `secret()`, its value never enters. What holds none does
+/// (`record::Shown::shadow_input`): a flag, a null, a number not named as a
+/// credential. A branch on a masked field may go another way than live, and
+/// the answer names that field. `reads` are what the run's code reads of the
+/// event (`vjs::event_reads`): a field it does not read changes nothing, and
+/// is not named.
+fn shadow_input(event: &Value, scrub: &record::Shown, reads: &[String]) -> (Value, Vec<String>) {
+    let (read, mut hidden) = scrub.shadow_input(event);
+    if !reads.iter().any(|r| r == "event") {
+        hidden.retain(|path| path == "event" || reads.iter().any(|r| path.split(['.', '[']).next() == Some(r.as_str())));
+    }
+    hidden.truncate(HIDDEN_MAX);
+    (read, hidden)
+}
+
+/// The most fields a shadow run's result names as hidden.
+const HIDDEN_MAX: usize = 20;
+
+/// A shadow run's result, naming the fields it read hidden, when there are.
+fn with_hidden(mut result: Value, hidden: Vec<String>) -> Value {
+    if !hidden.is_empty() {
+        result["hidden"] = json!(hidden);
+    }
+    result
 }
 
 fn events_out(flow: Option<&str>, paths: bool) -> String {
@@ -420,21 +442,23 @@ fn replay_literal(
     let mut results = Vec::new();
     let mut changed_count = 0;
     let scrub = record::shown();
+    let reads = [vjs::event_reads(&before), vjs::event_reads(&after)].concat();
     for entry in &events {
         let Some(ev) = entry.get("event").filter(|ev| !ev.is_null()) else {
             continue; // unparseable event of a bad-json trace: nothing to replay
         };
-        let ev = shadow_input(ev, &scrub);
+        let (ev, hidden) = shadow_input(ev, &scrub, &reads);
         let b = run_one(&before, &ev);
         let a = run_one(&after, &ev);
         let changed = b != a;
         if changed {
             changed_count += 1;
         }
-        results.push(json!({
+        let result = json!({
             "ts": entry["ts"], "subject": entry["subject"], "preview": trace_preview(entry),
             "before": b, "after": a, "changed": changed,
-        }));
+        });
+        results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "name": name, "key": key, "value": value,
@@ -481,18 +505,20 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
     let mut results = Vec::new();
     let mut changed = 0;
     let scrub = record::shown();
+    let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
     for (seq, subject, event) in &rows {
-        let event = &shadow_input(event, &scrub);
-        let b = run_one(&current, event);
-        let a = run_one(&candidate, event);
+        let (event, hidden) = shadow_input(event, &scrub, &reads);
+        let b = run_one(&current, &event);
+        let a = run_one(&candidate, &event);
         let ch = b != a;
         if ch {
             changed += 1;
         }
-        results.push(json!({
-            "seq": seq, "subject": subject, "preview": preview_of(event),
+        let result = json!({
+            "seq": seq, "subject": subject, "preview": preview_of(&event),
             "before": b, "after": a, "changed": ch,
-        }));
+        });
+        results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "flow": unit, "candidate_hash": versions::hash_content(candidate_src),
@@ -551,6 +577,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
     let (current_src, _) = versions::resolve_source(store.as_ref(), &unit, &baseline, now_secs());
     let current = vjs::parse(&current_src)?;
     let candidate = vjs::parse(candidate_src)?;
+    let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
     let subject = current.source.clone().ok_or("flow has no bus source to shadow")?;
     let candidate_hash = versions::hash_content(candidate_src);
     // the effective version this canary diffs against — snapshotted so we can
@@ -618,7 +645,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
                     continue;
                 };
-                let event = shadow_input(&event, &scrub);
+                let (event, hidden) = shadow_input(&event, &scrub, &reads);
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 let b = shadow_emits(&current, &event, &root, &pkg);
                 let a = shadow_emits(&candidate, &event, &root, &pkg);
@@ -628,7 +655,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                     changed.fetch_add(1, Ordering::SeqCst);
                 }
                 let mut r = ring.lock().unwrap();
-                r.push_back(json!({"seq": seq, "changed": ch, "before": b, "after": a}));
+                r.push_back(with_hidden(json!({"seq": seq, "changed": ch, "before": b, "after": a}), hidden));
                 while r.len() > 500 {
                     r.pop_front();
                 }
@@ -3831,9 +3858,6 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
             .filter(|v| !v.is_null())
             .ok_or("no stored event for that flow/seq (ring rotated, or a non-JSON event)")?
     };
-    // the case goes into the repository: a credential of the event does not,
-    // and the run it records reads the mask, as every shadow run does
-    let event = shadow_input(&event, &record::shown());
     // map the unit back to its flow file (repo-relative)
     let file = vjs_files(root)
         .into_iter()
@@ -3845,6 +3869,10 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
         .unwrap_or(&file)
         .to_string_lossy()
         .to_string();
+    // the case goes into the repository: a credential of the event does not,
+    // and the run it records reads the event as every shadow run does
+    let prog = vjs::parse(&fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let (event, hidden) = shadow_input(&event, &record::shown(), &vjs::event_reads(&prog));
     // re-run to capture the real emits (deterministic — the flow is pure)
     let expect_emits = run_flow_on_input(root, &rel, &event)?;
     let stem = file
@@ -3860,7 +3888,7 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
         serde_json::to_string_pretty(&case).unwrap_or_default(),
     )
     .map_err(|e| e.to_string())?;
-    Ok(json!({"ok": true, "case": name, "flow": rel, "expect_emits": expect_emits.len()}))
+    Ok(with_hidden(json!({"ok": true, "case": name, "flow": rel, "expect_emits": expect_emits.len()}), hidden))
 }
 
 fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value>, String> {
@@ -4263,13 +4291,13 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
-        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
+        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, except flags, nulls and numbers not named as a credential: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
         json!({"name": "vejas_canary_start", "description": "Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candidate version against the current effective version as events arrive, accumulating a diff. Read-only (shadow — no real emit). Refuses if a canary is already running for the flow. Auto-stops if the live version changes under it (reason in status).", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}}), vec!["file", "candidate"])}),
-        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed}]}.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, except flags, nulls and numbers not named as a credential: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_canary_stop", "description": "Stop a running canary for a flow (its shadow consumer exits; the last diff stays readable).", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_propose", "description": "Submit a governed change PROPOSAL for a human to approve in the panel (ADR-0024) — you can propose but never approve. kind='set_literal' (payload {file, name, key, value}) or kind='version' (payload {file, candidate: whole source}). Attach `evidence` you gathered (vejas_time_travel results, vejas_canary stats) — the panel shows it next to Approve, and flags 'no evidence' loudly. The proposal is pinned to the current baseline and auto-expires if a deploy/promote moves it. Returns the stored proposal (id, status:pending).", "inputSchema": obj(json!({"kind": {"type": "string"}, "payload": {"type": "object"}, "evidence": {"type": "object"}}), vec!["kind", "payload"])}),
         json!({"name": "vejas_proposals", "description": "List the proposal queue with status (pending/approved/rejected/expired) and evidence. Read-only. Approve/reject are human panel actions, not tools.", "inputSchema": obj(json!({}), vec![])}),
-        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). The replayed events are masked as the record masks them, except flags, nulls and numbers not named as a credential: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live. Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
@@ -5859,7 +5887,32 @@ mod tests {
         // a name no mask reads would carry it out: it never enters the run
         assert!(!shown.contains("pw-rename-7731") && !shown.contains("rn-55"), "{shown}");
         assert_eq!(diff["results"][0]["after"]["emits"][0]["payload"]["pw"], "<masked>", "{shown}");
+        // and the result names what the run read hidden
+        assert_eq!(diff["results"][0]["hidden"], json!(["headers[0].value", "password"]), "{shown}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replay_reads_flags_and_numbers_and_names_what_it_did_not_see() {
+        let root = std::env::temp_dir().join(format!("vejas-shadow-branch-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        let flow = |name: &str, cond: &str| {
+            let src = format!("source \"vx.{name}.test\"\nTH = 10\nif {cond}:\n  emit \"vx.out\", {{id: id}}\nend\n");
+            std::fs::write(root.join("flows").join(format!("{name}.vjs")), src).unwrap();
+            let event = json!({"id": 4, "amount": 30, "password_expired": true, "auth_level": 30, "auth_type": "sso"});
+            record_trace(&format!("flow:{name}"), &format!("vx.{name}.test"), true, None, vec![], "{}".into(), Some(event), None, None);
+            replay_literal(&root, &format!("flows/{name}.vjs"), "TH", "-", &json!(50), 20).unwrap()
+        };
+        // a flag named like a credential and a plain number: read as live, so
+        // event 4, sent with TH = 10, would not be with TH = 50
+        let diff = flow("shadow_flags", "amount > TH and password_expired");
+        assert_eq!(diff["changed"], 1, "{diff}");
+        // the fields it hides are ones this flow does not read: none named
+        assert!(diff["results"][0].get("hidden").is_none(), "{diff}");
+        // a number named as a credential is not read, and the answer says so
+        let diff = flow("shadow_level", "auth_level > TH");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((&diff["changed"], &diff["results"][0]["hidden"]), (&json!(0), &json!(["auth_level"])), "{diff}");
     }
 
     #[test]
@@ -5878,7 +5931,7 @@ mod tests {
         let out = golden_from_event(&root, "flow:golden_probe", seq).unwrap();
         let case = std::fs::read_to_string(root.join("tests").join("vjs").join(out["case"].as_str().unwrap())).unwrap();
         assert!(!case.contains("pw-golden-4417") && case.contains("<masked>"), "{case}");
-        assert_eq!(out["expect_emits"], 1);
+        assert_eq!((&out["expect_emits"], &out["hidden"]), (&json!(1), &json!(["password"])), "{out}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -967,6 +967,18 @@ impl Scrub {
     }
 
     /// Does `text` hold a value handed out?
+    /// Is `text` a value handed out, whole? A number is compared as JSON
+    /// reads it too.
+    fn hands_out(&self, text: &str) -> bool {
+        match &self.vault {
+            Vault::Empty => false,
+            Vault::Unusable => true,
+            Vault::Values { values, numbers, .. } => {
+                values.iter().any(|v| v == text) || text.parse::<f64>().is_ok_and(|f| numbers.contains(&f.to_bits()))
+            }
+        }
+    }
+
     fn holds_secret(&self, text: &str) -> bool {
         match &self.vault {
             Vault::Empty => false,
@@ -1166,6 +1178,14 @@ impl Scrub {
     /// The same, for a text `nest` JSON documents deep: one that is JSON
     /// itself is read and scrubbed as JSON, until `NEST_MAX`.
     fn write_text_in(&self, out: &mut String, text: &str, cut: bool, max: usize, nest: u8) {
+        self.write_text_as(out, text, cut, cut, max, nest);
+    }
+
+    /// The same, `drop` saying what becomes of the key, the number or the
+    /// literal a JSON text stops in: a text cut here loses it, since it may be
+    /// cut short however it reads; one that came cut keeps it, scrubbed as a
+    /// text, and so does what the end of its last string holds.
+    fn write_text_as(&self, out: &mut String, text: &str, cut: bool, drop: bool, max: usize, nest: u8) {
         if matches!(self.vault, Vault::Unusable) {
             json_string(out, TAKEN_OUT);
             return;
@@ -1184,11 +1204,11 @@ impl Scrub {
                     json_string(out, &clip(&json, max));
                     return;
                 }
-            } else if let Some(w) = whole.filter(|w| cut || w.keep == text.len()) {
+            } else if let Some(w) = whole {
                 // JSON that stops before its end: read as JSON as far as it
-                // goes, so that a pair is masked in it as in the whole. One
-                // that was not cut here is read so only if none of it is lost.
-                if self.write_cut_json(out, text, &w, max, nest) {
+                // goes, so that a pair is masked in it as in the whole
+                if let Some(json) = self.cut_json(text, &w, cut, drop, nest) {
+                    json_string(out, &clip(&json, max));
                     return;
                 }
             }
@@ -1197,35 +1217,64 @@ impl Scrub {
     }
 
     /// `text`, JSON that stops before its end, as `made_whole` closes it:
-    /// scrubbed as JSON, the string it stops in read apart as a text cut
-    /// short, and written without what closed it. False, and `out` as it
-    /// was, when it does not read as JSON.
-    fn write_cut_json(&self, out: &mut String, text: &str, w: &Whole, max: usize, nest: u8) -> bool {
-        // the string it stops in is left empty, and read apart below
+    /// scrubbed as JSON and given back without what closed it. The string it
+    /// stops in is read apart, as a text cut short; when it is the name of a
+    /// pair, the pair rule reads that name first. Unless `drop`, what the
+    /// closing left out follows, scrubbed as a text. None when it does not
+    /// read as JSON.
+    fn cut_json(&self, text: &str, w: &Whole, cut: bool, drop: bool, nest: u8) -> Option<String> {
+        // the string it stops in, as the text has it and as it reads
+        let (raw, content) = match w.string {
+            Some(start) => {
+                let raw = &text[start..w.keep];
+                (raw, serde_json::from_str::<String>(&format!("\"{raw}\"")).ok())
+            }
+            None => ("", None),
+        };
+        // a pair's name stays in the string, for the pair rule to mask the
+        // value before it by (its key read as the JSON reader reads it,
+        // escapes and all); any other string is left empty, read apart below
+        let names_pair = content.is_some()
+            && w.key.is_some_and(|(s, e)| {
+                let key = serde_json::from_str::<String>(&format!("\"{}\"", &text[s..e])).unwrap_or_default();
+                PAIR_NAMES.iter().any(|n| key.eq_ignore_ascii_case(n))
+            });
+        let placed = if names_pair { raw } else { "" };
         let head = &text[..w.string.unwrap_or(w.keep)];
-        let whole = [head, if w.string.is_some() { "\"" } else { "" }, &w.closers].concat();
+        let quote = if w.string.is_some() { "\"" } else { "" };
+        let whole = [head, placed, quote, &w.closers].concat();
         let mut json = String::with_capacity(whole.len() + 16);
         if self.spans_json(whole.as_bytes()) || !scrubbed_json(whole.as_bytes(), &mut json, self, nest + 1) {
-            return false;
+            return None;
         }
         // what closed it is not shown, unless a mask took it in
-        if let Some(body) = json.strip_suffix(w.closers.as_str()) {
-            json.truncate(body.len());
-            // the string still empty: no mask took it in, so it is read apart;
-            // one a mask took in shows as the mask, in its quotes
-            if let Some(start) = w.string.filter(|_| json.ends_with("\"\"")) {
-                let Ok(content) = serde_json::from_str::<String>(&format!("\"{}\"", &text[start..w.keep])) else {
-                    return false;
-                };
-                let mut read = String::with_capacity(content.len() + 16);
-                self.write_text_in(&mut read, &content, true, usize::MAX, nest + 1);
-                // its opening quote is there already, and it stays open
-                json.pop();
-                json.push_str(&read[1..read.len() - 1]);
+        let Some(body) = json.strip_suffix(w.closers.as_str()) else { return Some(json) };
+        json.truncate(body.len());
+        if w.string.is_some() {
+            // the string as it was placed, which no mask took in, is read
+            // apart; one a mask took in shows as the mask, in its quotes, and
+            // what it stops in goes with it
+            let mut held = String::new();
+            json_string(&mut held, if names_pair { content.as_deref().unwrap_or_default() } else { "" });
+            if !json.ends_with(&held) {
+                return Some(json);
+            }
+            // its opening quote stays, and it stays open
+            json.truncate(json.len() - held.len() + 1);
+            match &content {
+                Some(content) => {
+                    let mut read = String::with_capacity(content.len() + 16);
+                    self.write_text_as(&mut read, content, true, drop, usize::MAX, nest + 1);
+                    json.push_str(&read[1..read.len() - 1]);
+                }
+                // escapes that do not read: kept as they are, scrubbed as a text
+                None => json.push_str(&self.scrubbed(raw, true)),
             }
         }
-        json_string(out, &clip(&json, max));
-        true
+        if !drop {
+            json.push_str(&self.scrubbed(&text[w.keep..], cut));
+        }
+        Some(json)
     }
 
     /// An error, as text. One past `INPUT_MAX` is cut there. One that ends in
@@ -1329,6 +1378,9 @@ struct Whole {
     /// Where the string it stops in starts, past its quote, when it stops in
     /// one that is a value: that string is read apart, as a text cut short.
     string: Option<usize>,
+    /// The key that string is the value of, in an object: where its text
+    /// starts and ends, inside its quotes.
+    key: Option<(usize, usize)>,
 }
 
 /// `text`, JSON that may stop anywhere, made whole. It closes after a value,
@@ -1346,6 +1398,8 @@ fn made_whole(text: &str) -> Option<Whole> {
     // the closer of each array and object open, the outermost first
     let mut open: Vec<u8> = Vec::new();
     let mut key_next = false;
+    // the last key read, which the string it stops in is the value of
+    let mut key = None;
     // where the text can stop and be closed, and how many are open there
     let mut safe = (at, 0);
     while at < bytes.len() {
@@ -1363,7 +1417,7 @@ fn made_whole(text: &str) -> Option<Whole> {
                 at += 1;
                 if open.is_empty() {
                     let rest_blank = bytes[at..].iter().all(u8::is_ascii_whitespace);
-                    return rest_blank.then(|| Whole { keep: bytes.len(), closers: String::new(), string: None });
+                    return rest_blank.then(|| Whole { keep: bytes.len(), closers: String::new(), string: None, key: None });
                 }
                 safe = (at, open.len());
             }
@@ -1377,12 +1431,17 @@ fn made_whole(text: &str) -> Option<Whole> {
             }
             b'"' => match string_at(bytes, at) {
                 Ok(end) => {
-                    at = end;
-                    if !key_next {
-                        safe = (at, open.len());
+                    if key_next {
+                        key = Some((at + 1, end - 1));
+                    } else {
+                        safe = (end, open.len());
                     }
+                    at = end;
                 }
-                Err(keep) if !key_next => return Some(Whole { keep, closers: close(&open), string: Some(at + 1) }),
+                Err(keep) if !key_next => {
+                    let key = key.filter(|_| open.last() == Some(&b'}'));
+                    return Some(Whole { keep, closers: close(&open), string: Some(at + 1), key });
+                }
                 Err(_) => break,
             },
             b if b.is_ascii_whitespace() => at += 1,
@@ -1401,7 +1460,7 @@ fn made_whole(text: &str) -> Option<Whole> {
         }
     }
     let (keep, depth) = safe;
-    Some(Whole { keep, closers: close(&open[..depth]), string: None })
+    Some(Whole { keep, closers: close(&open[..depth]), string: None, key: None })
 }
 
 /// The JSON string that opens at `at`: Ok(where it ends, past its quote), or,
@@ -2085,6 +2144,65 @@ impl Shown {
         let mut shown = shown_text(&self.0, &text[..floor_boundary(text, INPUT_MAX)], true);
         shown.push('…');
         shown
+    }
+
+    /// A real event as a shadow run reads it, and the paths of what it does
+    /// not see (`event` for the whole). Masked as `json` masks it, with what
+    /// holds no credential put back, so a branch on it goes as it goes live:
+    /// a flag, a null, and a number that only holds a value handed out
+    /// (`18443` for `8443`). A number named as a credential stays masked: a
+    /// code often is one (`mfa_token: 482913`), and a candidate is any code.
+    pub fn shadow_input(&self, event: &Value) -> (Value, Vec<String>) {
+        let mut hidden = Vec::new();
+        let read = restored(&self.0, event, shown_json(&self.0, event), "", &mut hidden);
+        (read, hidden)
+    }
+}
+
+/// `orig` as `shown` masks it, with what holds no credential put back
+/// (`Shown::shadow_input`); the path of each value that still differs goes
+/// to `hidden`, `event` for the whole.
+fn restored(scrub: &Scrub, orig: &Value, shown: Value, path: &str, hidden: &mut Vec<String>) -> Value {
+    let below = |key: &str| if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+    let read = match (orig, shown) {
+        (Value::Object(o), Value::Object(s)) => {
+            let read = s.into_iter().map(|(k, sv)| match o.get(&k) {
+                Some(ov) => {
+                    let v = restored(scrub, ov, sv, &below(&k), hidden);
+                    (k, v)
+                }
+                // a key the scrub changed: what it holds stays as shown
+                None => {
+                    hidden.push(below(&k));
+                    (k, sv)
+                }
+            });
+            return Value::Object(read.collect());
+        }
+        (Value::Array(o), Value::Array(s)) if o.len() == s.len() => {
+            let read = s.into_iter().zip(o).enumerate();
+            return Value::Array(read.map(|(i, (sv, ov))| restored(scrub, ov, sv, &format!("{path}[{i}]"), hidden)).collect());
+        }
+        // a flag or a null holds no credential, whatever its name
+        (Value::Bool(_) | Value::Null, _) => orig.clone(),
+        // a number taken out for holding a value handed out, not one masked
+        // for its name
+        (Value::Number(n), Value::String(taken)) if taken == TAKEN_OUT => kept_number(scrub, n),
+        (_, shown) => shown,
+    };
+    if read != *orig {
+        hidden.push(if path.is_empty() { "event".to_string() } else { path.to_string() });
+    }
+    read
+}
+
+/// A number as a shadow run reads it: as it is, unless it is a value handed
+/// out, whole. A number that only holds one (`18443` for `8443`) is another.
+fn kept_number(scrub: &Scrub, n: &serde_json::Number) -> Value {
+    if scrub.hands_out(&n.to_string()) {
+        Value::String(TAKEN_OUT.to_string())
+    } else {
+        Value::Number(n.clone())
     }
 }
 
@@ -2952,7 +3070,7 @@ mod tests {
         let mut leaks = Vec::new();
         for (doc, token) in docs {
             let n = if token == VAULT { PREFIX_MIN } else { 3 };
-            let from = if token == "HWQZXJ2275" { doc.find("Authorization\"").unwrap() + 14 } else { 1 };
+            let from = if token == "HWQZXJ2275" { doc.find("Authorization\"").unwrap() + 13 } else { 1 };
             for k in (from..=doc.len()).filter(|&k| doc.is_char_boundary(k)) {
                 let shown = shown_text(&s, &doc[..k], true);
                 if token.as_bytes().windows(n).any(|w| shown.contains(std::str::from_utf8(w).unwrap())) {
@@ -2961,6 +3079,67 @@ mod tests {
             }
         }
         assert!(leaks.is_empty(), "{} leaks:\n{}", leaks.len(), leaks.join("\n"));
+    }
+
+    #[test]
+    fn a_value_first_pair_cut_after_its_name_is_masked() {
+        for t in [
+            r#"{"headers":[{"value":"Bearer HWQZXJ2275","name":"Authorization"#,
+            r#"{"headers":[{"value":"Bearer HWQZXJ2275","name":"Auth"#,
+            r#"{"tags":[{"Value":"HWQZXJ2275","Key":"api_key"#,
+            r#"{"headers":[{"value":"Bearer HWQZXJ2275","n\u0061me":"Authorization"#,
+        ] {
+            for cut in [true, false] {
+                let shown = text(t, &[], cut);
+                assert!(!shown.contains("HWQZXJ2275") && shown.ends_with(&t[t.len() - 4..]), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_that_came_cut_keeps_its_end_and_its_pairs_masked() {
+        let t = r#"{"headers":[{"name":"Authorization","value":"Bearer HVQZXJ1164"}],"amount":12"#;
+        let shown = text(t, &[], false);
+        assert!(!shown.contains("HVQZXJ1164") && shown.ends_with(r#""amount":12"#), "{shown}");
+        let shown = shown_json(&scrub(&[]), &serde_json::json!({ "body": t })).to_string();
+        assert!(!shown.contains("HVQZXJ1164"), "{shown}");
+        // what its last string holds keeps its end too
+        assert_eq!(text(r#"{"note":"[1,2,3"#, &[], false), r#"{"note":"[1,2,3"#);
+        assert_eq!(text(r#"{"a":[1,{"b":tru"#, &[], false), r#"{"a":[1,{"b":tru"#);
+        // escapes that do not read leave the rest of it read as JSON
+        for t in [r#"{"name":"Authorization","value":"Bearer HXQZXJ3375","n":"a\x"#, "{\"name\":\"Authorization\",\"value\":\"Bearer HXQZXJ3375\",\"n\":\"a\tb"] {
+            for cut in [true, false] {
+                let shown = text(t, &[], cut);
+                assert!(!shown.contains("HXQZXJ3375"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shadow_run_reads_what_holds_no_credential() {
+        let shown = Shown(Arc::new(scrub(&["8443", "tok-HANDED-7741"])));
+        let event = json!({
+            "auth_level": 3, "password_expired": true, "auth_type": "basic", "amount": 18443, "port": 8443,
+            "auth": {"user": "bob", "mfa": false}, "next_token": null, "note": "tok-HANDED-7741",
+            "headers": [{"name": "Authorization", "value": "Bearer x-1"}], "id": 5, "mfa_token": 482913,
+            "pair": {"name": "api_key", "value": 77120},
+        });
+        let (read, hidden) = shown.shadow_input(&event);
+        assert_eq!(read, json!({
+            "auth_level": MASKED, "password_expired": true, "auth_type": MASKED, "amount": 18443, "port": TAKEN_OUT,
+            "auth": MASKED, "next_token": null, "note": TAKEN_OUT,
+            "headers": [{"name": "Authorization", "value": MASKED}], "id": 5, "mfa_token": MASKED,
+            "pair": {"name": "api_key", "value": MASKED},
+        }));
+        let paths = ["auth", "auth_level", "auth_type", "headers[0].value", "mfa_token", "note", "pair.value", "port"];
+        assert_eq!(hidden, paths);
+        // what it cannot read at all, it does not read
+        let mut deep = json!("leaf");
+        for _ in 0..120 {
+            deep = json!({ "d": deep });
+        }
+        let (read, hidden) = shown.shadow_input(&deep);
+        assert_eq!((read, hidden), (json!(TAKEN_OUT), vec!["event".to_string()]));
     }
 
     #[test]
