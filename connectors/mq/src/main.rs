@@ -155,6 +155,12 @@ fn run_sink(
             if !alive() {
                 return Ok(()); // stopped mid-batch: leave un-acked, it redelivers
             }
+            // a dead letter's replay is for the unit the letter died in, never
+            // this bridge, which writes none (ADR-0015 Amendment C)
+            if m.replay_for().is_some() {
+                let _ = m.ack();
+                continue;
+            }
             let correlid = dedup_field
                 .and_then(|f| dedup_key(&m.data, f))
                 .map(|k| mqi::correlid_from_key(&k))

@@ -1991,7 +1991,11 @@ async function dlqAction(path, body) {
       if (res.ok) approvalToken = tok;
     }
     if (!res.ok) throw new Error(await res.text());
-    toast(path.endsWith('replay') ? 'Replayed.' : 'Discarded.');
+    // a replay answers 200 with what it could not do: a letter that stayed says why
+    const r = path.endsWith('replay') ? await res.json().catch(() => ({})) : {};
+    const errs = r.errors || [];
+    if (errs.length) toast((r.replayed ? `Replayed ${r.replayed}. ` : 'Not replayed. ') + errs[0], true);
+    else toast(path.endsWith('replay') ? 'Replayed.' : 'Discarded.');
     await pollReview();
     reviewRefresh(true);
   } catch (e) { fail(e); }

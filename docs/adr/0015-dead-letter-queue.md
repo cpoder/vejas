@@ -107,6 +107,20 @@ is left out when it would push the message past the server's limit, as the
 trace headers are, and a letter written before this amendment replays without
 it.
 
+**Amendment C (2026-11-26, normative):** a replay runs again only in the unit
+whose letter it is. It goes back on the subject the letter came from, where
+every consumer of that subject read it: a flow that had handled the event the
+first time ran it again and sent it on again. The replay now names its unit in
+a `Vejas-Replay-For` header, and every other consumer acks it unread: the
+runtime's flows and sinks, and the MQ and AMQP bridges, which write no dead
+letter, and the `rpc:exec` responders. Shadow-replay (ADR-0018) leaves
+replays out, as copies of events the stream already holds. A letter now keeps
+the durable consumer its unit read it with (`consumer`). A replay that no one
+would take is not sent and its letter stays, with the reason: its unit is no
+longer declared, or its consumer no longer takes the letter's subject (a fix
+that moved the unit), or the replay cannot carry its unit within the server's
+limit.
+
 ## Alternatives considered
 
 - **Keep dropping after the cap** — rejected: the failed work is lost and

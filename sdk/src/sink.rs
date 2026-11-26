@@ -69,6 +69,11 @@ impl Ctx {
                     // stopped mid-batch: leave the message un-acked, it redelivers
                     return Ok(());
                 }
+                // the replay of another unit's dead letter (ADR-0015 Amendment C)
+                if msg.replay_elsewhere(&ctx.name) {
+                    let _ = msg.ack();
+                    continue;
+                }
                 let hop = trace::Hop::begin(trace::of(&msg));
                 let carried = hop.context();
                 let preview = trace_preview(&msg.data);
@@ -104,7 +109,7 @@ impl Ctx {
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
                         let parked = (delivered >= MAX_DELIVERIES)
-                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried), delivery.as_ref().map(bus::Delivery::message)));
+                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried), delivery.as_ref().map(bus::Delivery::message), &durable));
                         let (ring_error, dead_lettered) = match &parked {
                             Some(Ok(())) => {
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);

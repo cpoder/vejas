@@ -1347,6 +1347,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         // redelivers to whoever holds the durable next
                         return Ok(());
                     }
+                    // the replay of another unit's dead letter (ADR-0015 Amendment C)
+                    if msg.replay_elsewhere(&handle.spec.name) {
+                        let _ = msg.ack();
+                        continue;
+                    }
                     // The hop continues the trace the message carries, or starts
                     // one; its emits and its dead letter carry it on (ADR-0034).
                     let hop = trace::Hop::begin(trace::of(&msg));
@@ -1369,7 +1374,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
                             metrics::observe(&handle.spec.name, false, 0, 0.0);
-                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()));
+                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()), &durable);
                             match &dead {
                                 Ok(()) => {
                                     metrics::inc_dead_letter(&handle.spec.name);
@@ -1455,7 +1460,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 msg.delivery().map(|i| i.delivered).unwrap_or(1);
                             let mut dead_lettered = false;
                             if delivered >= MAX_DELIVERIES {
-                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message())) {
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
                                     Ok(()) => {
                                         dead_lettered = true;
                                         metrics::inc_dead_letter(&handle.spec.name);
@@ -1766,6 +1771,12 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                 let mut n = 0usize;
                                 for msg in round {
                                     n += 1;
+                                    // the replay of another unit's dead letter
+                                    // (ADR-0015 Amendment C)
+                                    if msg.replay_elsewhere(&name) {
+                                        let _ = msg.ack();
+                                        continue;
+                                    }
                                     if tx.send(msg).is_err() {
                                         return;
                                     }
@@ -1916,7 +1927,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                 let delivered =
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 metrics::observe(&handle.spec.name, false, 0, 0.0);
-                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()));
+                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable);
                                 match &dead {
                                     Ok(()) => {
                                         metrics::inc_dead_letter(&handle.spec.name);
@@ -1981,7 +1992,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 let mut dead_lettered = false;
                                 if delivered >= MAX_DELIVERIES {
-                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message())) {
+                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
                                         Ok(()) => {
                                             dead_lettered = true;
                                             metrics::inc_dead_letter(&handle.spec.name);
@@ -3584,21 +3595,33 @@ fn dlq_audit(
 /// Replay dead letters: re-publish each to its ORIGINAL subject (where the
 /// corrected flow reprocesses it), then remove it from the DLQ. Publish-before-
 /// delete, so a failed re-inject keeps the dead letter. By `seq`, by `unit`, or
-/// all (both None).
-fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
+/// all (both None). A replay goes to the unit whose letter it is, and to no
+/// other consumer of the subject (ADR-0015 Amendment C): a letter whose unit
+/// is no longer declared stays, as nothing would take its replay.
+fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
-    type Target = (u64, String, Vec<u8>, Option<trace::Context>, Option<u64>);
-    let mut targets: Vec<Target> = Vec::new();
-    let take = |env: &Value| -> Target {
-        (
-            env["seq"].as_u64().unwrap_or(0),
-            env["original_subject"].as_str().unwrap_or("").to_string(),
-            env["payload"].as_str().unwrap_or("").as_bytes().to_vec(),
-            // The trace the letter died in (ADR-0034): the replay continues it.
-            env["traceparent"].as_str().and_then(|tp| trace::Context::parse(tp, None)),
-            // The message that died: the replay names it, the same event.
-            env["original_seq"].as_u64(),
-        )
+    struct Letter {
+        seq: u64,
+        subject: String,
+        payload: Vec<u8>,
+        // The trace the letter died in (ADR-0034): the replay continues it.
+        died_in: Option<trace::Context>,
+        // The message that died: the replay names it, the same event.
+        original: Option<u64>,
+        // The unit it died in: the replay is for it alone.
+        unit: String,
+        // The durable it read the message with; none in a letter written before.
+        consumer: Option<String>,
+    }
+    let mut targets: Vec<Letter> = Vec::new();
+    let take = |env: &Value| Letter {
+        seq: env["seq"].as_u64().unwrap_or(0),
+        subject: env["original_subject"].as_str().unwrap_or("").to_string(),
+        payload: env["payload"].as_str().unwrap_or("").as_bytes().to_vec(),
+        died_in: env["traceparent"].as_str().and_then(|tp| trace::Context::parse(tp, None)),
+        original: env["original_seq"].as_u64(),
+        unit: env["unit"].as_str().unwrap_or("").to_string(),
+        consumer: env["consumer"].as_str().map(str::to_string),
     };
     if let Some(s) = seq {
         let m = js.get_message(connectors::DLQ_STREAM, s)?;
@@ -3615,13 +3638,41 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
         }
     }
     let (mut n, mut errs) = (0u64, Vec::new());
-    for (s, subj, payload, died_in, original) in targets {
+    // the units declared now: a removed one stays in the registry, stopped
+    let units: HashSet<String> = scan_all(root).into_iter().map(|spec| spec.name).collect();
+    let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    for letter in targets {
+        let Letter { seq: s, subject: subj, payload, died_in, original, unit: of_unit, consumer } = letter;
         if subj.is_empty() || s == 0 {
+            errs.push(format!("seq {s}: the letter names no subject. Discard it."));
             continue;
+        }
+        if !units.contains(&of_unit) {
+            errs.push(if of_unit.is_empty() {
+                format!("seq {s}: the letter names no unit. Discard it, or publish its payload by hand.")
+            } else {
+                format!("seq {s}: no unit {of_unit} to take it. Restore the unit, or discard the letter.")
+            });
+            continue;
+        }
+        // A fix that moved the unit to another subject would leave the replay to
+        // no one: the other consumers of this one ack it unread.
+        if let Some(consumer) = consumer {
+            match js.consumer_filters(&stream, &consumer) {
+                Ok(f) if f.is_empty() || f.iter().any(|p| connectors::subject_matches(p, &subj)) => {}
+                Ok(_) => {
+                    errs.push(format!("seq {s}: {of_unit} no longer reads {subj}. Discard the letter, or publish its payload where it reads now."));
+                    continue;
+                }
+                Err(e) => {
+                    errs.push(format!("seq {s}: {of_unit} has no consumer to take it ({e}). Start the unit, then replay."));
+                    continue;
+                }
+            }
         }
         let hop = trace::Hop::begin(died_in);
         let start_nanos = metrics::now_nanos();
-        let published = js.publish_replay(&subj, &payload, &hop.context(), original);
+        let published = js.publish_replay(&subj, &payload, &hop.context(), &of_unit, original);
         if metrics::wants(hop.sampled, published.is_err()) {
             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, "dlq:replay", start_nanos)
                 .messaging("send", &subj)
@@ -4150,7 +4201,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
@@ -4386,7 +4437,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             dlq_agent_gate()?;
             let seq = args.get("seq").and_then(|v| v.as_u64());
             let unit = args.get("unit").and_then(|v| v.as_str());
-            text(dlq_replay(seq, unit, "mcp")?.to_string())
+            text(dlq_replay(root, seq, unit, "mcp")?.to_string())
         }
         "vejas_dlq_purge" => {
             dlq_agent_gate()?;
@@ -4688,7 +4739,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, code, e, "text/plain");
             }
             let body = read_body(&mut request);
-            let r = dlq_replay(body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
+            let r = dlq_replay(&root, body.get("seq").and_then(|v| v.as_u64()), body.get("unit").and_then(|v| v.as_str()), &actor);
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
