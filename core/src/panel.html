@@ -632,9 +632,13 @@ function mappingSection(card, file, entry, previewEntries, direct) {
 // A literal whose KEY names a credential is never shown in the clear (ADR-0008
 // spirit): the panel renders it masked, editing stays write-only. The pattern is
 // injected at serve time from secrets::SECRET_KEY_PATTERN — one definition, so
-// the mask and the admission lint (ADR-0017) can never drift apart.
+// the mask and the admission lint (ADR-0017) can never drift apart. A key is
+// read as secrets::key_as_read reads it, camelCase as snake_case (accessToken
+// as access_Token): an underscore where a lowercase letter or a digit meets an
+// uppercase one.
 const SECRET_KEY_PATTERN = "{{SECRET_PATTERN}}";
-const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(String(k));
+const keyAsRead = k => String(k).replace(/([a-z0-9])(?=[A-Z])/g, '$1_');
+const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(keyAsRead(k));
 function maskInput(input) {
   input.type = 'password'; input.autocomplete = 'off';
   input.title = 'hidden — credential-named value, masked on screen';

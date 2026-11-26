@@ -41,8 +41,40 @@ use serde_json::Value;
 /// DATABASE_URL, SERVICE_ACCOUNT_JSON) is covered by the generation contract, not
 /// this regex. Keep it free of `"`/`\` so it injects verbatim into a JS
 /// double-quoted string.
+///
+/// A key is matched as [`key_as_read`] reads it, camelCase as snake_case, so
+/// that `accessToken` is masked as `ACCESS_TOKEN` is (decided on 2026-11-26 on
+/// 43 labelled camelCase names: 18 credentials missed before, 3 after, against 9
+/// false masks, the pagination tokens that `page_token` already gave; ADR-0017).
 pub const SECRET_KEY_PATTERN: &str =
     "pass(wd|word)|secret|(^|[_-])token$|api[_-]?key|^auth$|[_-]auth$|^auth[_-]|authorization|webhook_url";
+
+/// A key as [`SECRET_KEY_PATTERN`] reads it: an underscore where a lowercase
+/// letter or a digit meets an uppercase one, so camelCase reads as snake_case
+/// (`accessToken` as `access_Token`, `apiKey` as `api_Key`) and a name means the
+/// same in either convention. Upper-case, snake_case and kebab-case names read
+/// as they are. Every reader of the pattern applies this first, with the same
+/// rule: the record here, the panel (`isSecretKey`), the admission lint and its
+/// bench (`e2e/admission/`), each pinned by its own test.
+pub fn key_as_read(key: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = key.as_bytes();
+    let boundary = |i: usize| {
+        i > 0
+            && bytes[i].is_ascii_uppercase()
+            && (bytes[i - 1].is_ascii_lowercase() || bytes[i - 1].is_ascii_digit())
+    };
+    if !(1..bytes.len()).any(boundary) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut read = String::with_capacity(key.len() + 4);
+    for (i, c) in key.char_indices() {
+        if boundary(i) {
+            read.push('_');
+        }
+        read.push(c);
+    }
+    std::borrow::Cow::Owned(read)
+}
 
 pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -371,6 +403,31 @@ impl SecretStore for VaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camel_case_reads_as_snake_case() {
+        for (key, read) in [
+            ("accessToken", "access_Token"),
+            ("XAuthToken", "XAuth_Token"),
+            ("aB1C", "a_B1_C"),
+            ("oauth2Token", "oauth2_Token"),
+            ("ACCESS_TOKEN", "ACCESS_TOKEN"),
+            ("x-api-key", "x-api-key"),
+            ("ID", "ID"),
+            ("", ""),
+            ("éToken", "éToken"),
+        ] {
+            assert_eq!(key_as_read(key), read, "{key}");
+        }
+        let pattern = regex::RegexBuilder::new(SECRET_KEY_PATTERN).case_insensitive(true).build().unwrap();
+        let masked = |key: &str| pattern.is_match(&key_as_read(key));
+        for key in ["accessToken", "refreshToken", "idToken", "apiKey", "clientSecret", "xAuthToken"] {
+            assert!(masked(key), "{key}");
+        }
+        for key in ["maxTokens", "tokenUrl", "author", "oauthScope", "keyboardLayout", "publicKey"] {
+            assert!(!masked(key), "{key}");
+        }
+    }
 
     struct Fixed(&'static str);
     impl SecretStore for Fixed {

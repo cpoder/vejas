@@ -15,9 +15,15 @@ What keeps the rule real, rather than aspirational:
   pattern is a single constant in the runtime (`vejas-runtime
   secret-pattern` prints it); the panel masks with it, CI lints every
   certified recipe with it (env-file recipes included), and the agent
-  generation contract embeds it. The pattern itself was chosen on a
-  55-key labeled benchmark, and a CI test pins the exact profile — changing
-  it reopens the decision with data, never silently.
+  generation contract embeds it. A key is read with camelCase as
+  snake_case, so `accessToken` is masked as `ACCESS_TOKEN` is. The pattern
+  was chosen on a labeled benchmark of 98 names, 43 of them camelCase, and a
+  CI test pins the exact profile: changing it reopens the decision with
+  data, never silently.
+- **Pairs.** In a trace record, a value whose sibling names a credential is
+  masked too: `{"name": "Authorization", "value": "…"}` in a header list,
+  `{"name": "DB_PASSWORD", "value": "…"}` in an environment list,
+  `{"Key": "clientSecret", "Value": "…"}` in tags.
 - **Standalone binaries** follow the deployment's own machinery (env from a
   secret store, CCDT/TLS keystores) — their recipes are linted the same:
   a credential-shaped env key must be a `${VAR:?}` reference, never a

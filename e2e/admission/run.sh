@@ -39,10 +39,13 @@ for NAME in "${RECIPES[@]}"; do
     LINT=$(python3 - "$DIR/$NAME.env.example" "$PAT" << 'PY'
 import re, sys
 pat = sys.argv[2]
+# a key as secrets::key_as_read reads it: camelCase as snake_case
+def credential(key):
+    return re.search(pat, re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', key), re.I)
 bad = []
 for line in open(sys.argv[1]):
     m = re.match(r'\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)$', line)
-    if not m or not re.search(pat, m.group(1), re.I):
+    if not m or not credential(m.group(1)):
         continue
     val = m.group(2).split('#')[0].strip().strip('"').strip("'")
     if val and not re.match(r'^\$\{[A-Z0-9_]+(:\?[^}]*)?\}$', val):
@@ -84,20 +87,23 @@ PY
   LINT=$(python3 - "$MANIFEST" "$PAT" << 'PY'
 import re, sys
 pat = sys.argv[2]
+# a key as secrets::key_as_read reads it: camelCase as snake_case
+def credential(key):
+    return re.search(pat, re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', key), re.I)
 bad = []
 for line in open(sys.argv[1]):
     m = re.match(r'\s*([A-Z][A-Z0-9_]*)\s*=\s*(.+)$', line)
     if not m:
         continue
     key, val = m.group(1), m.group(2)
-    if re.search(pat, key, re.I) and 'secret(' not in val:
+    if credential(key) and 'secret(' not in val:
         bad.append(key)
     # config-carrying doc literals: their SUB-keys must honor the rule too
     # (the panel masks them; the lint matches its scope). Test/sample bodies
     # are exempt — they carry fake data by definition.
     if val.lstrip().startswith('{') and 'BODY' not in key and 'PAYLOAD' not in key:
         for sk, sv in re.findall(r'["\']?([A-Za-z_][A-Za-z0-9_-]*)["\']?\s*:\s*([^,}]*)', val):
-            if re.search(pat, sk, re.I) and 'secret(' not in sv:
+            if credential(sk) and 'secret(' not in sv:
                 bad.append(f'{key}.{sk}')
 print(','.join(bad))
 PY
