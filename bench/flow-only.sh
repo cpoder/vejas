@@ -4,13 +4,17 @@
 # plain NATS subscription. This is the interpreter + JetStream number — what
 # the end-to-end pipeline can hope for once the I/O ceilings fall.
 #   bench/flow-only.sh [count]     (needs the `nats` CLI)
+# BIN=<path> runs another binary (a before/after comparison). With
+# BENCH_TRACEPARENT=<traceparent> the events carry that header, so the flow
+# continues a trace instead of starting one; OTEL_EXPORTER_OTLP_ENDPOINT, if
+# set, reaches the runtime and turns span export on (ADR-0034, point 6).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N="${1:-20000}"
 PUBS="${PUBS:-4}"           # parallel publishers — one sequential publisher caps ~2.8k/s
 N=$(( (N / PUBS) * PUBS ))  # keep the count exactly divisible
-BIN="core/target/release/vejas-runtime"
+BIN="${BIN:-core/target/release/vejas-runtime}"
 NATS_PORT=4224
 STORE=$(mktemp -d)
 ROOT=$(mktemp -d)
@@ -45,10 +49,13 @@ SUB_PID=$!
 sleep 0.5
 
 EVENT=$(tr -d '\n' < bench/root/flows/fixtures/bench_orders.json)
+HEADER=()
+[ -n "${BENCH_TRACEPARENT:-}" ] && HEADER=(-H "traceparent:$BENCH_TRACEPARENT")
 T0=$(date +%s%N)
 PUB_PIDS=()
 for _ in $(seq "$PUBS"); do
-  nats -s nats://127.0.0.1:$NATS_PORT pub vx.bench.orders --count=$((N / PUBS)) "$EVENT" > /dev/null 2>&1 &
+  nats -s nats://127.0.0.1:$NATS_PORT pub vx.bench.orders --count=$((N / PUBS)) \
+    ${HEADER[@]+"${HEADER[@]}"} "$EVENT" > /dev/null 2>&1 &
   PUB_PIDS+=($!)
 done
 wait "${PUB_PIDS[@]}"
@@ -57,10 +64,13 @@ PUB_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 wait $SUB_PID
 TOTAL_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 RSS_KB=$(ps -o rss= -p $RUNTIME_PID | tr -d ' ')
+# The runtime's own CPU time (user + system, Linux): what a change costs the
+# runtime, apart from the publishers and the server it shares the machine with.
+CPU_MS=$(awk -v hz="$(getconf CLK_TCK)" '{printf "%d", ($14 + $15) * 1000 / hz}' "/proc/$RUNTIME_PID/stat" 2>/dev/null || echo 0)
 
-python3 - "$N" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" << 'PY'
+python3 - "$N" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" "$CPU_MS" << 'PY'
 import json, sys
-n, pub_ms, total_ms, rss = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+n, pub_ms, total_ms, rss, cpu_ms = (int(a) for a in sys.argv[1:6])
 print(json.dumps({
   "scenario": "bus -> flow (lookup + conversions + projection loop) -> bus, no HTTP anywhere",
   "events": n,
@@ -68,5 +78,7 @@ print(json.dumps({
   "done_ms": total_ms,
   "flow_rate_per_s": round(n / (total_ms / 1000)),
   "runtime_rss_mb": round(rss / 1024, 1),
+  "runtime_cpu_ms": cpu_ms,
+  "runtime_cpu_us_per_event": round(cpu_ms * 1000 / n, 1),
 }, indent=2))
 PY

@@ -24,6 +24,9 @@ ureq = "2"
 # the hand-rolled MQTT client can wrap its stream in TLS. No new binary weight.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# Seeds the trace and span ids (ADR-0034). Already in the tree through ring, so
+# no new binary weight.
+getrandom = "0.2"
 # The Varpulis CEP engine, embedded as a library (ADR-0031): compile a VPL
 # program, feed it events, publish its emits. No async runtime in its tree —
 # its own CI (scripts/check-engine-deps.py) fails if one ever appears.

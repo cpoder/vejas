@@ -48,8 +48,16 @@ directory is a complete system.
 
 | Variable | Purpose |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP-JSON export (hand-rolled, no SDK tree). `/metrics` (Prometheus) is always on. |
-| `OTEL_SERVICE_NAME` | Service name for exported spans/metrics. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP-JSON span export to `<endpoint>/v1/traces` (hand-rolled, no SDK tree). `/metrics` (Prometheus) is always on. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | The full URL for spans, used as given; wins over the generic endpoint. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | `key=value,…` (percent-encoded) sent with each export, for a backend token. Never logged. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Milliseconds per export request (10000). |
+| `OTEL_SERVICE_NAME` | Service name for exported spans (`vejas`). |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, `key=value,…`. |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | Sampler (`parentbased_always_on`) and its ratio; failures are exported whatever it says. |
+| `OTEL_BSP_SCHEDULE_DELAY` / `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` / `OTEL_BSP_MAX_QUEUE_SIZE` | Export batching: 1000 ms, 512 spans per request, 4096 spans queued. |
+
+See [observability](../guides/observability.md) for what a trace holds.
 
 ## API flows
 

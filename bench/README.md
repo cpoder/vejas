@@ -151,6 +151,44 @@ harness and the same program: **18 643 evt/s** at 16 publishers (17 265 at
 about 20 µs per event under load and under 10 µs in isolation (its own
 `throughput_probe`). Same consumer path, same publish-before-ack barrier.
 
+## What tracing costs (ADR-0034, `bench/trace-cost.sh`)
+
+`bench/trace-cost.sh` runs the isolated flow hop above in each tracing
+configuration, interleaved, five times each (20 000 events, four
+publishers), and reads the runtime's own CPU time from `/proc`. With four
+publishers the rate is theirs; the CPU time is the runtime's. Spans go to a
+collector that only counts them (`bench/otlp-discard.py`). 2026-11-26, same
+machine; the runtime from before tracing is master at `491ba69`, passed as
+`BASE_BIN`:
+
+| Configuration | Flow-hop rate | Runtime CPU per event | RSS |
+|---|---|---|---|
+| Before tracing | 9 390/s | 72.5 µs | 9.7 MB |
+| Context propagated, no exporter | 9 403/s | 74.0 µs | 10.4 MB |
+| Every span exported | 9 166/s | 83.0 µs | 12.3 MB |
+| One trace in ten exported | 9 204/s | 76.5 µs | 12.0 MB |
+| Before tracing, events carrying `traceparent` | 8 718/s | 71.0 µs | 9.5 MB |
+| No exporter, events carrying `traceparent` | 8 632/s | 78.5 µs | 10.5 MB |
+| Every span exported, events carrying `traceparent` | 8 669/s | 88.0 µs | 12.6 MB |
+
+The 200 000 spans of the "every span" runs all reached the collector, and
+10 023 of the 100 000 events sampled at one in ten. Over four series the
+context alone measured between 1.5 and 4.5 µs; over three, export held at 10
+to 10.5 µs over the runtime from before tracing. Events that carry a header slow the
+publishers (the `nats` CLI sends it) as much before tracing as after.
+
+Two findings on the way, both fixed before the numbers above:
+
+- **#8 One HTTP request per handful of spans.** The first exporter posted
+  whatever its queue held and built a JSON tree per span: export cost 63 µs
+  of CPU per event over the same runtime without an exporter. Batching as
+  the OpenTelemetry SDKs do (512 spans or 1 s, `OTEL_BSP_*`) and writing the
+  JSON directly brought it to 28 µs.
+- **#9 Waking the exporter for every span.** An exporter that waits on its
+  queue has every producer wake it, a futex call and a context switch per
+  span. Reading the queue on a 25 ms tick while spans are pending brought
+  export to between 5.5 and 9 µs.
+
 ## The true hop ceiling and multi-flow scaling
 
 With parallel publishers, the single-flow hop tops out around **14–16 k/s**

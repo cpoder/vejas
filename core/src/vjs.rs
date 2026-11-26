@@ -1324,6 +1324,28 @@ pub struct Engine {
     exports: HashMap<String, Vec<String>>,
     secrets: Arc<dyn crate::secrets::SecretStore>,
     depth: usize,
+    /// While spans are exported: the hop a run belongs to and the `invoke`
+    /// spans it left (ADR-0034). None otherwise, so an untraced run pays one
+    /// test per invoke.
+    trace: Option<InvokeTrace>,
+}
+
+struct InvokeTrace {
+    /// The hop, then each invoke in progress: the last is the parent of the next.
+    stack: Vec<crate::trace::Hop>,
+    done: Vec<InvokeSpan>,
+}
+
+/// One `invoke`, timed, under the hop or the invoke that made it.
+pub struct InvokeSpan {
+    pub hop: crate::trace::Hop,
+    /// `package:service`.
+    pub service: String,
+    /// The service file, relative to the project root.
+    pub file: String,
+    pub start_nanos: u128,
+    pub end_nanos: u128,
+    pub error: Option<String>,
 }
 
 impl Engine {
@@ -1353,7 +1375,28 @@ impl Engine {
             exports: HashMap::new(),
             secrets,
             depth: 0,
+            trace: None,
         }
+    }
+    /// Record a span per `invoke` under `hop` in the runs that follow, or stop
+    /// recording (None). What was recorded and not taken is dropped.
+    pub fn trace_under(&mut self, hop: Option<&crate::trace::Hop>) {
+        match (hop, &mut self.trace) {
+            // Once per message: keep the allocations of the last one.
+            (Some(hop), Some(t)) => {
+                t.stack.clear();
+                t.stack.push(hop.clone());
+                t.done.clear();
+            }
+            (Some(hop), None) => {
+                self.trace = Some(InvokeTrace { stack: vec![hop.clone()], done: Vec::new() })
+            }
+            (None, _) => self.trace = None,
+        }
+    }
+    /// The `invoke` spans recorded since `trace_under`, oldest first.
+    pub fn take_spans(&mut self) -> Vec<InvokeSpan> {
+        self.trace.as_mut().map(|t| std::mem::take(&mut t.done)).unwrap_or_default()
     }
     pub fn invalidate(&mut self) {
         self.cache.clear();
@@ -1468,6 +1511,15 @@ fn run_service(
             return Err(e);
         }
     };
+    // A span for this invoke, under whatever is running it (ADR-0034).
+    let span = engine.trace.as_mut().map(|t| {
+        let hop = t.stack.last().expect("the hop is at the bottom").child();
+        t.stack.push(hop.clone());
+        (hop, crate::metrics::now_nanos())
+    });
+    let names = span.is_some().then(|| {
+        (format!("{pkg}:{svc}"), engine.pkg_dir(&pkg).join("services").join(format!("{svc}.vjs")))
+    });
     // The invoked service's own invokes resolve within ITS package.
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
     let mut ctx = Ctx { vars: args.clone(), emits: Vec::new(), response: None };
@@ -1475,6 +1527,19 @@ fn run_service(
     let result = exec_block(&stmts, &mut ctx, engine);
     engine.caller_pkg = saved_pkg;
     engine.depth -= 1;
+    if let (Some((hop, start_nanos)), Some((service, file))) = (span, names) {
+        let file = file.strip_prefix(&engine.project_root).unwrap_or(&file).display().to_string();
+        let t = engine.trace.as_mut().expect("a span was opened, so the engine traces");
+        t.stack.pop();
+        t.done.push(InvokeSpan {
+            hop,
+            service,
+            file,
+            start_nanos,
+            end_nanos: crate::metrics::now_nanos(),
+            error: result.as_ref().err().cloned(),
+        });
+    }
     result?;
     emits.append(&mut ctx.emits);
     ctx.vars.remove("event");

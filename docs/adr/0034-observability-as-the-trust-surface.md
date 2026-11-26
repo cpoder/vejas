@@ -1,8 +1,9 @@
 # 0034 — Observability as the trust surface
 
-- Status: Proposed (founder-directed, 2026-10-24; nothing built yet. The guide
-  correction in point 12 ships with this ADR)
-- Date: 2026-10-24; measured state re-read on v0.6.0 on 2026-11-26
+- Status: Accepted (partial): lot A is built and T6 gates it in CI (points 1
+  to 6, and 12 with them); lot B (points 7 to 11) is not
+- Date: 2026-10-24; measured state re-read on v0.6.0 on 2026-11-26; lot A
+  built 2026-11-26
 
 ## Context
 
@@ -191,6 +192,77 @@ MANIFESTO (the monitoring screen draws nothing) hold throughout.
 12. **Documentation discipline.** The guide sentence is corrected with this
     ADR: today every span is its own trace. The guide claims end-to-end traces
     only when T6 is green, and the ROADMAP points here from Phase 5.
+
+## What is built (2026-11-26): lot A
+
+Points 1 to 6 are built, point 12 with them, and T6 gates them in CI. Where
+the build departs from the text above, the reason is stated here.
+
+- **No span per emit.** An emit is a buffered publish, confirmed once per
+  batch (ADR-0002): its own span would last a few microseconds, measure
+  nothing, and double the volume of a one-emit flow. The emit carries the
+  context of the hop that made it, and the downstream span names its subject
+  and hangs under that hop. Fan-out stays readable: one child per subject.
+- **No CLIENT span inside a sink hop.** The sink hop's span is itself of kind
+  `CLIENT`, since the runtime is the client of the system it delivers to, and
+  its id is the one the HTTP call carries. A second span covering the same
+  call would repeat the first.
+- **Spans are named after their unit** (`flow:order_sync`), as before, rather
+  than `process <subject>`: the unit is what an operator knows, and a
+  backend's per-name rate and latency metrics then come per unit. The
+  semantic-convention attributes carry the subject.
+- **`code.line.number` is not set.** The AST has no line numbers yet. An
+  invoke span carries `code.function.name` and `code.file.path`.
+- **A success leaves the status unset**, as the semantic conventions ask of
+  instrumentation; a failure sets it to error with `error.type=_OTHER` and
+  `error.message`. int64 attributes travel as strings (OTLP JSON mapping).
+- **Retries follow the OTLP specification:** connection errors, 429, 502, 503
+  and 504, with `Retry-After` honoured up to 30 s. Any other 5xx is a
+  permanent failure there, so it is not retried.
+- **The exporter batches as the OpenTelemetry SDKs do**, with their variables
+  (`OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`,
+  `OTEL_BSP_MAX_QUEUE_SIZE`; the delay defaults to 1 s rather than 5 s), and
+  reads its queue on a 25 ms tick while spans are pending instead of waiting
+  on it. The first measurement showed why: export cost 63 µs of CPU per event.
+  A request per handful of spans and a JSON tree per span explained about 35
+  of it, and waking the export thread for every span about 20. A graceful
+  stop flushes the queue (3 s at most), and T6 checks that it does. The six
+  samplers of the specification are read, and a hop that is sampled out
+  builds no span.
+- **The context reaches more places than the text named:** the `http-in`
+  answer returns the trace id, a dead letter stores its `traceparent` and a
+  DLQ replay continues it, the `vx.dlq.events` announcement carries the trace
+  of its last letter, an `exec` sink gets `TRACEPARENT` and `TRACESTATE` in
+  its environment (the OpenTelemetry carrier for a child process), detect
+  units (ADR-0031) take part as flows do, and each entry of the event ring
+  records its trace and span ids.
+- **A trace never costs a message.** The headers count toward the server's
+  `max_payload`, so a message they would push past it is published without
+  them (its next hop starts a trace), and a death envelope that its
+  `traceparent` would push past it goes without that field. The
+  `vx.dlq.events` announcement keeps the trace ids but not the caller's
+  `tracestate`, which is text from outside.
+- **Propagation stays on without an exporter, and is not free.** Point 6
+  asked for zero cost with the exporter unset. The context has to travel even
+  then: a downstream system that traces needs it on the sink's call, another
+  instance or cell may export, and the event ring shows the trace id.
+  Measured, it costs about 3 µs of CPU per flow hop (1.5
+  to 4.5 over four series, against 72.5 µs for the hop). No switch turns it off; one can be added if a deployment needs it.
+- **Not built in lot A:** the Collector configuration and the Grafana
+  dashboard of point 5 (the guide gives a one-line Jaeger instead, checked
+  against Jaeger 2.23.0); `traceparent` on the GETs of `http-poll` and
+  `oauth-poll`; MQTT, which has no headers before version 5; `exec-rpc`
+  request/reply. Each is an addition, not a change of what is built.
+- **Cost (point 6):** `bench/trace-cost.sh` against the runtime from before
+  tracing (master at `491ba69`), isolated flow hop, 20 000 events, median of
+  five runs, the runtime's own CPU time per event: 72.5 µs before tracing,
+  74.0 with the context and no exporter (about 3 µs more over four series),
+  83.0 exporting every span, 76.5 exporting one trace in ten. Throughput stays within 2.5 %, since the four
+  publishers of the bench bound it. An event that arrives with a
+  `traceparent` costs about 5 µs more to continue. The hot path never waits
+  for the collector: the 200 000 spans of the exporting runs all arrived,
+  none dropped. The numbers are in `bench/README.md` and on the benchmarks
+  page.
 
 ## Consequences
 

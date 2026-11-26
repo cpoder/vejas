@@ -10,7 +10,9 @@ A flow error → redelivery (after `VEJAS_ACK_WAIT_SECS`) → up to 5 attempts
 no pointless retries. The dead letter lands on `vxdlq.<original subject>`
 wrapped in a **death envelope**: original payload, error, attempt count,
 timestamps, and the **flow version** that killed it (ADR-0021) — so a
-post-mortem knows *which* logic failed, even after a promote.
+post-mortem knows *which* logic failed, even after a promote. The envelope
+also keeps the `traceparent` of the event, and a replay continues that
+trace (see [observability](observability.md)).
 
 ## Seeing and replaying
 
@@ -31,12 +33,13 @@ happens next is a flow or a sink like any other:
 ```json
 {"transition": "dead-lettered", "ts": 1793980000, "unit": "flow:orders",
  "subject": "vx.orders.in", "attempts": 5, "version": "d5768a2de6e8cbb0",
- "count": 1}
+ "count": 1, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}
 ```
 
 - **Metadata only.** The payload and the error text stay in the DLQ: a dead
   letter is untrusted content, and this event is what wakes a person or an
-  agent. Read the letter with `vejas_dlq`.
+  agent. Read the letter with `vejas_dlq`. `trace_id` is the trace of the
+  last letter the event stands for, and the event travels in that trace.
 - **One event per unit per window** (`VEJAS_DLQ_EVENT_SECS`, 60 s). The first
   letter is news at once; `count` says how many letters the next event stands
   for, so a burst wakes a reader once and loses nothing. Each instance of a

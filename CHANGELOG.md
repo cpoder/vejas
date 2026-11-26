@@ -7,13 +7,42 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **One trace per business event** (ADR-0034, lot A). The runtime carries a W3C
+  `traceparent` in a NATS header on every message it publishes, so the spans of
+  one event, from the source or webhook through each flow and `invoke` to the
+  sink, form one trace with parent links. `http-in` and `api` flows continue a
+  caller's trace, and `http-in` answers with the trace id. `http-out` and
+  `slack-out` send `traceparent` downstream, and an `exec` sink gets it as
+  `TRACEPARENT`. A dead letter keeps its trace and a replay continues it. The
+  event ring and the `dead-lettered` event show the trace id. Transport test T6
+  checks the chain in CI against a stub collector, a graceful stop included.
+- **The OTLP exporter reads the standard variables:** the traces endpoint,
+  headers (never logged) and timeout, `OTEL_RESOURCE_ATTRIBUTES`, the six
+  samplers of `OTEL_TRACES_SAMPLER`, and the batch variables `OTEL_BSP_*`. It
+  retries connection errors, 429, 502, 503 and 504 with backoff, flushes its
+  queue on a graceful stop, and counts on `/metrics` what it sends and what it
+  loses (`vejas_spans_exported_total`, `vejas_spans_dropped_total{reason}`).
+
+### Changed
+- Spans have a new shape. The name is still the unit and the old attributes
+  stay, but the kind now says what the hop was (`SERVER`, `PRODUCER`,
+  `CONSUMER`, `CLIENT`, `INTERNAL` instead of `CONSUMER` everywhere), new
+  attributes follow the OpenTelemetry semantic conventions (`messaging.*`,
+  `error.type`) and carry the flow version, and a success leaves the status
+  unset instead of `OK`. A query or dashboard that filters on kind or status
+  may need updating.
+- The trace context travels even without an exporter, so a downstream system
+  and the event ring get it. It costs about 3 µs of CPU per flow hop; exporting
+  every span about 10 µs (see the benchmarks page).
+
 ### Corrected
 - The observability guide said an end-to-end request shows up as a trace across the
   pipeline. It does not: every span carries a fresh trace id and no parent, so a
   request that crosses three flows is three unrelated traces in the collector. The
   guide now says so, and says the cost of the OTLP exporter and of the event ring has
-  not been measured separately. ADR-0034 (Proposed) decides how one trace per event
-  gets built; the guide will claim it once its CI test passes.
+  not been measured separately. ADR-0034 decided how one trace per event gets
+  built, and it is built in this release: see Added.
 
 ### Security
 - **url 2.5.8 → 2.5.9** in the runtime and in the `mq` and `amqp` connectors, for

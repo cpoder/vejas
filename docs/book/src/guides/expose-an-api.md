@@ -22,7 +22,9 @@ PORT = 8787
 `POST /ingest/shop.orders` publishes the JSON body on `vx.shop.orders` and
 answers `202` only after JetStream confirmed the write — the caller's
 success means *persisted*, not *processed*. Flows consume from there with
-the full delivery contract (redelivery, DLQ).
+the full delivery contract (redelivery, DLQ). The answer carries the event's
+`trace_id`; send a `traceparent` header and the event continues your trace,
+on this webhook as on an API flow (see [observability](observability.md)).
 
 **Lock the port to its subjects.** The `/ingest` port is unauthenticated by
 design — it only publishes. Without a limit, any caller can publish to any
