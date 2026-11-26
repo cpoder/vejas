@@ -1058,6 +1058,14 @@ impl Scrub {
             .into_iter()
             .find_map(|(name, form)| caps.name(name).map(|m| (form, m)))
             .expect("one alternative matched");
+            // a shadow run's placeholder reads as a `secret:` pair: it names a
+            // reference and holds no value. An element is still read as one.
+            if form == Form::Colon {
+                if let Some(end) = key.start().checked_sub(1).and_then(|o| placeholder_end(bytes, o)) {
+                    at = end;
+                    continue;
+                }
+            }
             let value = whole.end();
             let found = match form {
                 Form::Url => userinfo(bytes, value).map(|(start, end)| Cut { start, end, with: With::Masked }),
@@ -1563,6 +1571,15 @@ fn eq_end(bytes: &[u8], at: usize) -> usize {
         }
         end = word;
     }
+}
+
+/// Where the placeholder starting at `at` ends: `<secret:path/key>`, what a
+/// shadow run makes of `secret("path/key")` (secrets.rs, `RedactedStore`). A
+/// reference with other characters, or one cut short, is read as any text.
+fn placeholder_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?.strip_prefix(b"<secret:")?;
+    let n = rest.iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-')).count();
+    (n > 0 && rest.get(n) == Some(&b'>')).then_some(at + b"<secret:".len() + n + 1)
 }
 
 /// Where the value after `Key:` starts and ends: the line, a quoted string, or
@@ -2950,6 +2967,26 @@ mod tests {
     fn a_cut_xml_credential_with_a_child_is_masked() {
         let shown = shown_text(&scrub(&[]), r#"{"id":5,"xml":"<apiKey><value>k-8831"#, true);
         assert!(!shown.contains("8831") && shown.contains(r#""id":5"#), "{shown}");
+    }
+
+    #[test]
+    fn a_shadow_runs_placeholder_is_shown_as_it_is() {
+        let shown = shown();
+        for text in ["<secret:demo/key>", "Bearer <secret:demo/key> sent", "a <secret:a/api_key> b <secret:x/y.z>"] {
+            assert_eq!(shown.text(text, false), text);
+            assert_eq!(shown.json(&json!({"note": text})), json!({"note": text}));
+        }
+        // a credential's name masks it as any value; a text that only looks
+        // like one is read as before
+        assert_eq!(shown.json(&json!({"password": "<secret:db/pw>"})), json!({"password": MASKED}));
+        assert_eq!(shown.text("password: <secret:db/pw>", false), format!("password: {MASKED}"));
+        for text in ["secret: hunter2", "<secret:>", "<secret:pw-77", "<secret:pw-77 sent"] {
+            assert!(shown.text(text, false).contains(MASKED), "{text}");
+        }
+        assert!(shown.text("x <secret:dem", true).contains(MASKED));
+        // an element whose prefix is `secret` is no placeholder
+        let xml = shown.text("<secret:password>hunter2</secret:password>", false);
+        assert!(xml.contains(MASKED) && !xml.contains("hunter2"), "{xml}");
     }
 
     #[test]

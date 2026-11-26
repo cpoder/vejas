@@ -5,7 +5,9 @@
 # the placeholder <secret:path/key>, while a real run still gets the value. A
 # time-travel candidate is arbitrary code, so this cannot be a filter on the
 # output (v0.3.6 returned the value in the diff, and over GET /preview with no
-# token at all).
+# token at all). The answers also mask a credential-named field (ADR-0034), so
+# the flow echoes the secret under a plain name as well, where the placeholder
+# stays readable.
 #   e2e/governed-agent.sh                    (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -31,7 +33,7 @@ source "vx.sdemo.in"
 tool "secret demo"
 CUTOFF = 1
 api_key = secret("demo/key")
-emit "vx.sdemo.out", {id: id, auth: f"Bearer {api_key}"}
+emit "vx.sdemo.out", {id: id, auth: f"Bearer {api_key}", echo: api_key}
 VJS
 echo '{"id": 1}' > "$R/flows/fixtures/sdemo.json"
 mkdir -p "$R/connectors"
