@@ -170,6 +170,8 @@ pub fn record_trace_full(
         // was: a retry shares the message, another message of the trace does not
         "stream_seq": delivery.as_ref().map(|d| d.stream_seq),
         "attempt": delivery.as_ref().map(|d| d.delivered),
+        // a dead letter's replay: the message that died, the same event
+        "replay_of": delivery.as_ref().and_then(|d| d.replay_of),
         // the full event, kept for shadow-replay; stripped from /events output
         "event": event,
     }));
@@ -1066,11 +1068,14 @@ fn preview_of(v: &Value) -> String {
     struct Upto(Vec<u8>);
     impl std::io::Write for Upto {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.0.len() >= ENOUGH {
+            // a long string comes in one write: take only what is missing
+            let room = ENOUGH.saturating_sub(self.0.len());
+            if room == 0 {
                 return Err(std::io::Error::other("enough for a preview"));
             }
-            self.0.extend_from_slice(buf);
-            Ok(buf.len())
+            let n = buf.len().min(room);
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -1364,7 +1369,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
                             metrics::observe(&handle.spec.name, false, 0, 0.0);
-                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried));
+                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()));
                             match &dead {
                                 Ok(()) => {
                                     metrics::inc_dead_letter(&handle.spec.name);
@@ -1450,7 +1455,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 msg.delivery().map(|i| i.delivered).unwrap_or(1);
                             let mut dead_lettered = false;
                             if delivered >= MAX_DELIVERIES {
-                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried)) {
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message())) {
                                     Ok(()) => {
                                         dead_lettered = true;
                                         metrics::inc_dead_letter(&handle.spec.name);
@@ -1563,6 +1568,9 @@ fn hop_span(
         span = span
             .attr("messaging.message.id", d.stream_seq.to_string())
             .attr("vejas.delivery.attempt", d.delivered);
+        if let Some(died) = d.replay_of {
+            span = span.attr("vejas.replay_of", died.to_string());
+        }
     }
     span
 }
@@ -1908,7 +1916,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                 let delivered =
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 metrics::observe(&handle.spec.name, false, 0, 0.0);
-                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried));
+                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()));
                                 match &dead {
                                     Ok(()) => {
                                         metrics::inc_dead_letter(&handle.spec.name);
@@ -1973,7 +1981,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 let mut dead_lettered = false;
                                 if delivered >= MAX_DELIVERIES {
-                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried)) {
+                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message())) {
                                         Ok(()) => {
                                             dead_lettered = true;
                                             metrics::inc_dead_letter(&handle.spec.name);
@@ -3579,14 +3587,17 @@ fn dlq_audit(
 /// all (both None).
 fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
-    let mut targets: Vec<(u64, String, Vec<u8>, Option<trace::Context>)> = Vec::new();
-    let take = |env: &Value| -> (u64, String, Vec<u8>, Option<trace::Context>) {
+    type Target = (u64, String, Vec<u8>, Option<trace::Context>, Option<u64>);
+    let mut targets: Vec<Target> = Vec::new();
+    let take = |env: &Value| -> Target {
         (
             env["seq"].as_u64().unwrap_or(0),
             env["original_subject"].as_str().unwrap_or("").to_string(),
             env["payload"].as_str().unwrap_or("").as_bytes().to_vec(),
             // The trace the letter died in (ADR-0034): the replay continues it.
             env["traceparent"].as_str().and_then(|tp| trace::Context::parse(tp, None)),
+            // The message that died: the replay names it, the same event.
+            env["original_seq"].as_u64(),
         )
     };
     if let Some(s) = seq {
@@ -3604,13 +3615,13 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
         }
     }
     let (mut n, mut errs) = (0u64, Vec::new());
-    for (s, subj, payload, died_in) in targets {
+    for (s, subj, payload, died_in, original) in targets {
         if subj.is_empty() || s == 0 {
             continue;
         }
         let hop = trace::Hop::begin(died_in);
         let start_nanos = metrics::now_nanos();
-        let published = js.publish_traced(&subj, &payload, &hop.context());
+        let published = js.publish_replay(&subj, &payload, &hop.context(), original);
         if metrics::wants(hop.sampled, published.is_err()) {
             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, "dlq:replay", start_nanos)
                 .messaging("send", &subj)
@@ -5700,7 +5711,7 @@ mod tests {
     #[test]
     fn a_retry_and_another_message_of_one_trace_read_apart() {
         let hop = trace::Hop::begin(None);
-        let delivery = |delivered, stream_seq| Some(bus::Delivery { delivered, stream_seq });
+        let delivery = |delivered, stream_seq| Some(bus::Delivery { delivered, stream_seq, replay_of: None });
         record_trace("flow:retry_probe", "vx.rt.in", false, Some("refused".into()), vec![], "{}".into(), None, Some(&hop), delivery(1, 41));
         record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(2, 41));
         record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(1, 42));
@@ -5712,6 +5723,12 @@ mod tests {
             .map(|e| (e["stream_seq"].as_u64().unwrap(), e["attempt"].as_i64().unwrap()))
             .collect();
         assert_eq!(read, [(42, 1), (41, 2), (41, 1)], "the retry shares its message; the other message has its own");
+        // the replay of a dead letter is a new message that names the one that died
+        let replay = Some(bus::Delivery { delivered: 1, stream_seq: 97, replay_of: Some(41) });
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), replay);
+        let out: Value = serde_json::from_str(&events_json(Some("flow:retry_probe"))).unwrap();
+        assert_eq!((out["events"][0]["stream_seq"].as_u64(), out["events"][0]["replay_of"].as_u64()), (Some(97), Some(41)));
+        assert_eq!(out["events"][1]["replay_of"], Value::Null);
         let source = "connector:retry_probe_source";
         record_trace(source, "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), None);
         let out: Value = serde_json::from_str(&events_json(Some(source))).unwrap();

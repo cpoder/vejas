@@ -273,6 +273,7 @@
   .path .stage .and { margin-right: 7px; color: var(--ink3); }
   .path .u svg.i { width: 15px; height: 15px; color: var(--ink3); }
   .path .tries { font-size: 12.5px; font-weight: 600; color: var(--err); }
+  .path .tries.through { color: var(--ink2); }
   .carried { font: 13px var(--mono); color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row .err-t { grid-column: 3 / -1; color: var(--err); font-size: 13.5px; }
   .tools { display: flex; gap: 12px 20px; align-items: end; flex-wrap: wrap; margin-bottom: 16px; }
@@ -1644,16 +1645,14 @@ function rankOf(u) {
   const c = (S.graph.connectors || []).find(c => 'connector:' + c.name === u);
   return c && /^(sink|rpc)/.test(c.kind || '') ? 2 : 0;
 }
-// One message a unit handled: its retries share its stream sequence; a hop that
-// consumed none (what a source let in) is a message alone. A flow's loop sends
-// several messages in one trace: one that failed is not undone by the others.
-const messageOf = h => h.flow + '|' + (h.stream_seq != null ? 's' + h.stream_seq : 'h' + h.seq);
-// A dead letter replayed comes back as a new message: the same payload, to the
-// same unit, in the trace it died in. The letter and its replay are one event.
-const replayOf = (n, m) => n.first.seq > m.last.seq && n.first.flow === m.first.flow && n.first.subject === m.first.subject
-  && !!m.first.trace_id && n.first.trace_id === m.first.trace_id && (n.first.preview || '') === (m.first.preview || '');
+// One message a unit handled: its retries share its stream sequence, and a dead
+// letter's replay names the message that died (replay_of): the same event. A
+// hop that consumed none (what a source let in) is a message alone. A flow's
+// loop sends several messages in one trace: one that failed is not undone by
+// the others.
+const messageOf = h => h.flow + '|' + (h.replay_of != null ? 's' + h.replay_of : h.stream_seq != null ? 's' + h.stream_seq : 'h' + h.seq);
 // The messages of some hops, in the order they came: each with its last attempt,
-// which decides, and the attempts it took, replays included.
+// which decides, and the attempts it took, a replay's included.
 function messagesOf(hops) {
   const by = new Map();
   for (const h of [...hops].sort((a, b) => a.seq - b.seq)) {
@@ -1661,18 +1660,7 @@ function messagesOf(hops) {
     if (!m) by.set(k, {first: h, last: h, attempts: Math.max(1, h.attempt || 0)});
     else { m.last = h; m.attempts = Math.max(m.attempts + 1, h.attempt || 0); }
   }
-  const all = [...by.values()], out = [];
-  for (const m of all) {
-    if (m.replayed) continue;
-    const one = {...m};
-    for (let at = m, next; !at.last.ok && /dead-lettered/.test(at.last.error || '')
-         && (next = all.find(n => !n.replayed && n !== at && replayOf(n, at))); at = next) {
-      next.replayed = true;
-      one.last = next.last; one.attempts += next.attempts;
-    }
-    out.push(one);
-  }
-  return out;
+  return [...by.values()];
 }
 function traceGroups(events, flow) {
   const by = new Map();
@@ -1691,7 +1679,8 @@ function traceGroups(events, flow) {
   }
   return groups.sort((a, b) => b.ts - a.ts || b.hops[0].seq - a.hops[0].seq);
 }
-const unitHtml = (u, tries = 1) => `<span class="u">${icon(String(u).startsWith('connector:') ? 'plug' : 'flow')}${esc(shortName(unitName(u)))}${tries > 1 ? ` <span class="tries">${tries} attempts</span>` : ''}</span>`;
+// a unit retried: red while its message still fails, plain once it went through
+const unitHtml = (u, tries = 1, through = false) => `<span class="u">${icon(String(u).startsWith('connector:') ? 'plug' : 'flow')}${esc(shortName(unitName(u)))}${tries > 1 ? ` <span class="tries${through ? ' through' : ''}">${tries} attempts</span>` : ''}</span>`;
 // The flows of one event by how far down its path they are: a flow that read
 // what another sent comes after it; two that read the same subject sit side by side.
 function flowLevels(hops) {
@@ -1717,8 +1706,11 @@ function rowHtml(g) {
   const sep = icon('chev', 'sep');
   // What let it in, the flows that handled it in the order they did, where it
   // went. A unit retried reads once, with the attempts its message took.
-  const tries = new Map();
-  for (const m of messagesOf(g.hops)) tries.set(m.first.flow, Math.max(tries.get(m.first.flow) || 0, m.attempts));
+  const tries = new Map(), stuck = new Set();
+  for (const m of messagesOf(g.hops)) {
+    tries.set(m.first.flow, Math.max(tries.get(m.first.flow) || 0, m.attempts));
+    if (!m.last.ok) stuck.add(m.first.flow);
+  }
   const units = rank => uniq(g.hops.filter(h => rankOf(h.flow) === rank).map(h => h.flow));
   // what was sent that no unit here took: it left the runtime on the bus
   const taken = new Set(g.hops.filter(h => rankOf(h.flow) !== 0).map(h => h.subject));
@@ -1726,7 +1718,7 @@ function rowHtml(g) {
   // in each stage, in the order of their names: the same flows read the same way row after row
   const byName = (a, b) => shortName(unitName(a)).localeCompare(shortName(unitName(b)));
   const stage = items => items.length ? `<span class="stage">${items.join('<span class="and">,</span>')}</span>` : '';
-  const named = us => us.sort(byName).map(u => unitHtml(u, tries.get(u)));
+  const named = us => us.sort(byName).map(u => unitHtml(u, tries.get(u), !stuck.has(u)));
   const parts = [
     stage(named(units(0))),
     ...flowLevels(g.hops).map(us => stage(named(us))),
@@ -1908,8 +1900,17 @@ async function pageReview(view, r, hooks) {
 const ago = ts => { const s = Math.max(0, Math.floor(Date.now() / 1000) - (ts || 0));
   return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min` : `${Math.floor(s / 3600)} h`; };
 // A proposal that changes a credential: its value, and what it changes, stay hidden.
-const changesSecret = p => (p.kind === 'set_literal' || p.kind === 'version')
-  && (isSecretKey((p.payload || {}).name || '') || secretPath((p.payload || {}).key || ''));
+// A proposal that sets a credential: by the literal's name, by the path of its
+// key, or as the value of a pair the literal holds ({name: 'Authorization',
+// value: …}, its `value`).
+function changesSecret(p) {
+  if (p.kind !== 'set_literal' && p.kind !== 'version') return false;
+  const pl = p.payload || {};
+  if (isSecretKey(pl.name || '') || secretPath(pl.key || '')) return true;
+  if (!pl.key || pl.key === '-') return false;
+  return S.surface.some(e => e.name === pl.name && baseName(e.file || '') === baseName(pl.file || '')
+    && hiddenAt(e.value, pl.key));
+}
 // What a proposal would change, in one line, keyed on its kind.
 function proposalChange(p) {
   const pl = p.payload || {};

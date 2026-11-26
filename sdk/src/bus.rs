@@ -512,13 +512,30 @@ pub struct Message {
     link: Arc<Link>,
 }
 
-/// What JetStream says about a delivery, read from its reply subject.
+/// What the bus says about a delivery: JetStream's count and sequence, read
+/// from its reply subject, and the dead letter it replays, from its header.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Delivery {
     /// How many times this message has been delivered, this time included.
     pub delivered: i64,
     pub stream_seq: u64,
+    /// A dead letter's replay names the message that died (its stream
+    /// sequence, [`REPLAY_OF`]): a new message, the same event.
+    pub replay_of: Option<u64>,
 }
+
+impl Delivery {
+    /// The message this delivery is of: the one it replays, when it is a
+    /// replay. A letter that dies again keeps the first message's name.
+    pub fn message(&self) -> u64 {
+        self.replay_of.unwrap_or(self.stream_seq)
+    }
+}
+
+/// The header a dead letter's replay carries: the stream sequence of the
+/// message that died (ADR-0015). The events ring reads the letter and its
+/// replay as one message by it.
+pub const REPLAY_OF: &str = "Vejas-Replay-Of";
 
 impl Message {
     fn new(message: async_nats::Message, link: Arc<Link>) -> Message {
@@ -539,7 +556,9 @@ impl Message {
 
     /// The JetStream delivery behind this message, if it is one.
     pub fn delivery(&self) -> Option<Delivery> {
-        parse_ack_subject(self.reply.as_deref()?)
+        let mut delivery = parse_ack_subject(self.reply.as_deref()?)?;
+        delivery.replay_of = self.header(REPLAY_OF).and_then(|v| v.trim().parse().ok());
+        Some(delivery)
     }
 
     pub fn ack(&self) -> Result<(), String> {
@@ -630,6 +649,7 @@ fn parse_ack_subject(reply: &str) -> Option<Delivery> {
     Some(Delivery {
         delivered: tokens[at].parse().ok()?,
         stream_seq: tokens[at + 1].parse().ok()?,
+        replay_of: None,
     })
 }
 
@@ -890,6 +910,31 @@ impl JetStream {
     ) -> Result<u64, String> {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
         let headers = trace_headers_within(trace, bytes.len(), self.max_payload());
+        self.store(subject, headers, bytes)
+    }
+
+    /// A dead letter's second chance (ADR-0015): traced, and naming the message
+    /// that died ([`REPLAY_OF`]). Neither header is ever the reason it fails:
+    /// past the server's limit, the replay goes without them, the name first.
+    pub fn publish_replay(
+        &self,
+        subject: &str,
+        payload: impl AsRef<[u8]>,
+        trace: &impl TraceContext,
+        replay_of: Option<u64>,
+    ) -> Result<u64, String> {
+        let bytes = Bytes::copy_from_slice(payload.as_ref());
+        let limit = self.max_payload();
+        let mut headers = trace_headers_within(trace, bytes.len(), limit);
+        if let Some(seq) = replay_of {
+            let mut named = headers.take().unwrap_or_default();
+            named.insert(REPLAY_OF, seq.to_string().as_str());
+            headers = if bytes.len() + headers_len(&named) <= limit {
+                Some(named)
+            } else {
+                trace_headers_within(trace, bytes.len(), limit)
+            };
+        }
         self.store(subject, headers, bytes)
     }
 
@@ -1330,7 +1375,8 @@ mod tests {
             parse_ack_subject(short),
             Some(Delivery {
                 delivered: 3,
-                stream_seq: 17
+                stream_seq: 17,
+                replay_of: None
             })
         );
         let long = "$JS.ACK.dom.ACC.VEJAS.flow_x.2.41.9.1793984542000000000.5.token";
@@ -1338,7 +1384,8 @@ mod tests {
             parse_ack_subject(long),
             Some(Delivery {
                 delivered: 2,
-                stream_seq: 41
+                stream_seq: 41,
+                replay_of: None
             })
         );
         assert_eq!(parse_ack_subject("_INBOX.abc"), None);
@@ -1641,6 +1688,37 @@ mod live {
 
     #[test]
     #[ignore]
+    fn a_replay_names_the_message_that_died() {
+        let server = Server::start();
+        let js = connect(&server.url()).unwrap().jetstream();
+        js.add_stream(&StreamConfig {
+            name: "T".into(),
+            subjects: vec!["t.>".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        js.create_pull_consumer("T", "r", &["t.in".to_string()], Duration::ZERO, None)
+            .unwrap();
+        let puller = js.pull_durable("T", "r", Some("t.in")).unwrap();
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let died = js.publish_traced("t.in", "event", &Carried(tp, None)).unwrap();
+        let replay = js
+            .publish_replay("t.in", "event", &Carried(tp, None), Some(died))
+            .unwrap();
+        let mut got: Vec<Message> = Vec::new();
+        let start = Instant::now();
+        while got.len() < 2 && start.elapsed() < Duration::from_secs(5) {
+            got.extend(puller.round().unwrap());
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].delivery().unwrap().replay_of, None);
+        let d = got[1].delivery().unwrap();
+        assert_eq!((d.stream_seq, d.replay_of, d.message()), (replay, Some(died), died));
+        assert_eq!(got[1].header("traceparent"), Some(tp), "still in the trace it died in");
+    }
+
+    #[test]
+    #[ignore]
     fn a_durable_survives_a_restart_and_keeps_its_place() {
         let mut server = Server::start();
         let js = connect(&server.url()).unwrap().jetstream();
@@ -1665,7 +1743,8 @@ mod live {
             first[0].delivery().unwrap(),
             Delivery {
                 delivered: 1,
-                stream_seq: 1
+                stream_seq: 1,
+                replay_of: None
             }
         );
         first[0].ack().unwrap();

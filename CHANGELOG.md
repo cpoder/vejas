@@ -39,6 +39,10 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   retry shares its message; the other messages a flow's loop sends in the same
   trace do not, so one of them that failed is no longer hidden by the others
   that went through.
+- A dead letter's replay names the message that died (ADR-0015 Amendment B):
+  `original_seq` in the envelope, a `Vejas-Replay-Of` header on the replay,
+  `replay_of` in the ring and `vejas.replay_of` on its span. An event whose
+  replay went through no longer shows as failed.
 
 ### Changed
 - **The panel is redesigned around two people.** A menu on the left; a page

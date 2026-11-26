@@ -54,6 +54,9 @@ impl Ctx {
                 span = span
                     .attr("messaging.message.id", d.stream_seq.to_string())
                     .attr("vejas.delivery.attempt", d.delivered);
+                if let Some(died) = d.replay_of {
+                    span = span.attr("vejas.replay_of", died.to_string());
+                }
             }
             span
         };
@@ -96,11 +99,12 @@ impl Ctx {
                     Err(e) => {
                         let latency = t0.elapsed();
                         // poison guard: give up after MAX_DELIVERIES attempts
-                        let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                        let delivery = msg.delivery();
+                        let delivered = delivery.as_ref().map(|i| i.delivered).unwrap_or(1);
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
                         let parked = (delivered >= MAX_DELIVERIES)
-                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried)));
+                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried), delivery.as_ref().map(bus::Delivery::message)));
                         let (ring_error, dead_lettered) = match &parked {
                             Some(Ok(())) => {
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);
@@ -130,7 +134,7 @@ impl Ctx {
                             input: Some(&msg.data),
                             latency: Some(latency),
                             dead_lettered,
-                            delivery: msg.delivery(),
+                            delivery,
                             ..HopEvent::default()
                         });
                         if dead_lettered {
