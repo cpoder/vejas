@@ -100,6 +100,22 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   subject (the envelope now keeps the unit's `consumer`). The panel shows that
   reason instead of "Replayed.".
 
+### Security
+- **The runtime masks what it shows of the bus, as the trace record does**
+  (ADR-0034). The events ring (`/events`, `vejas_events`: a hop's preview, a
+  sink's answer, an error), dead letters (`/dlq`, `vejas_dlq`: the payload and
+  the last error), each unit's last error in `/topology`, the events a shadow
+  replay, a time travel or a canary replays, the evidence of proposals and the
+  detail of a connector test were given as they came. The panel masked what
+  it shows; an agent reading the MCP tools saw it all. Credential-named keys
+  and pairs are now masked, and the values the secret stores handed out taken
+  out, before the answer leaves. Units, sequences, times and trace ids stay
+  as they are.
+- A cut JSON text is read as JSON as far as it goes, so a pair
+  (`{"name": "Authorization", "value": "Bearer …"}`) is masked in an event's
+  preview, and in the record's preview of a payload past 16 KB, as it is in
+  whole JSON.
+
 ## [0.7.0] — 2026-11-26
 
 ### Added

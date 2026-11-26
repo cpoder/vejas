@@ -206,6 +206,12 @@ pub fn handed_out() -> Vec<String> {
     values
 }
 
+/// A value as if a store had handed it out, for the tests of what reads them.
+#[cfg(test)]
+pub(crate) fn hand_out(value: &str) {
+    remember(value);
+}
+
 /// Changes when a value joins `handed_out()`: the trace record rebuilds its
 /// index of them only then.
 pub fn handed_out_generation() -> u64 {

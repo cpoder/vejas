@@ -197,6 +197,40 @@ fn events_with_paths_json(unit: &str) -> String {
 /// The other hops `/events?paths=1` gives with a unit's events, the newest.
 const PATH_HOPS_MAX: usize = 200;
 
+/// What a page or an agent is shown of the bus (ADR-0017), masked as the
+/// trace record masks it: credential-named keys and pairs, and the values the
+/// secret stores handed out. Only the fields that carry what went through the
+/// bus, by their names in the runtime's answers; units, sequences, times and
+/// trace ids stay as they are, since pages find events and letters by them.
+fn as_shown(mut v: Value) -> Value {
+    fn walk(v: &mut Value, scrub: &record::Shown) {
+        match v {
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    match (k.as_str(), &mut *x) {
+                        // the start of a longer text: a hop's payload, a sink's answer
+                        ("preview" | "response", Value::String(s)) => *s = scrub.text(s, true),
+                        // what failed, which may quote the start of an answer
+                        ("error" | "last_error" | "detail", Value::String(s)) => *s = scrub.error(s),
+                        // where it went: a subject can carry a value of the event
+                        ("subject" | "original_subject", Value::String(s)) => *s = scrub.text(s, false),
+                        // what went through, whole
+                        ("payload" | "event" | "emits" | "evidence", x) => {
+                            let shown = scrub.json(x);
+                            *x = shown;
+                        }
+                        (_, x) => walk(x, scrub),
+                    }
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, scrub)),
+            _ => {}
+        }
+    }
+    walk(&mut v, &record::shown());
+    v
+}
+
 fn events_out(flow: Option<&str>, paths: bool) -> String {
     let newest_first = |hops: &mut Vec<&Value>| {
         hops.sort_unstable_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)))
@@ -250,7 +284,7 @@ fn events_out(flow: Option<&str>, paths: bool) -> String {
             })
             .collect()
     };
-    json!({ "events": events }).to_string()
+    as_shown(json!({ "events": events })).to_string()
 }
 
 /// A unit's file as traces and the panel name it: relative to the project
@@ -4224,7 +4258,7 @@ fn mcp_tools(root: &Path) -> Value {
 fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Result<Value, String> {
     let text = |v: String| Ok(json!({"content": [{"type": "text", "text": v}]}));
     match name {
-        "vejas_topology" => text(topology_json(registry).to_string()),
+        "vejas_topology" => text(as_shown(topology_json(registry)).to_string()),
         "vejas_graph" => text(graph_json(root).to_string()),
         "vejas_surface" => text(surface_json(root).to_string()),
         "vejas_read" => {
@@ -4296,26 +4330,26 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let lname = args["name"].as_str().ok_or("name required")?;
             let key = args["key"].as_str().unwrap_or("-");
             let n = args["n"].as_u64().unwrap_or(20) as usize;
-            text(replay_literal(root, file, lname, key, &args["value"], n)?.to_string())
+            text(as_shown(replay_literal(root, file, lname, key, &args["value"], n)?).to_string())
         }
         "vejas_time_travel" => {
             let file = args["file"].as_str().ok_or("file required")?;
             let candidate = args["candidate"].as_str().ok_or("candidate required")?;
             let n = args["n"].as_u64().unwrap_or(20) as usize;
-            text(time_travel(root, file, candidate, n)?.to_string())
+            text(as_shown(time_travel(root, file, candidate, n)?).to_string())
         }
         "vejas_canary_start" => {
             let file = args["file"].as_str().ok_or("file required")?;
             let candidate = args["candidate"].as_str().ok_or("candidate required")?;
-            text(canary_start(root, file, candidate)?.to_string())
+            text(as_shown(canary_start(root, file, candidate)?).to_string())
         }
         "vejas_canary_status" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(canary_read(root, file)?.to_string())
+            text(as_shown(canary_read(root, file)?).to_string())
         }
         "vejas_canary_stop" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(canary_stop(root, file)?.to_string())
+            text(as_shown(canary_stop(root, file)?).to_string())
         }
         "vejas_propose" => {
             let kind = args["kind"].as_str().ok_or("kind required")?;
@@ -4323,7 +4357,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let evidence = args.get("evidence").cloned().unwrap_or(Value::Null);
             text(submit_proposal(root, kind, payload, "mcp", evidence)?.to_string())
         }
-        "vejas_proposals" => text(json!({"proposals": reconcile_and_list(root)?}).to_string()),
+        "vejas_proposals" => text(as_shown(json!({"proposals": reconcile_and_list(root)?})).to_string()),
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
             text(preview_json(root, file)?)
@@ -4380,7 +4414,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_test_connector" => {
             let file = args["file"].as_str().ok_or("file required")?;
-            text(probe_connector(root, file).to_string())
+            text(as_shown(probe_connector(root, file)).to_string())
         }
         "vejas_provision" => {
             approval_gate()?;
@@ -4421,7 +4455,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_dlq" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            text(json!({"dead_letters": dlq_list(limit)?}).to_string())
+            text(as_shown(json!({"dead_letters": dlq_list(limit)?})).to_string())
         }
         "vejas_trace" => {
             let found = match (args["trace_id"].as_str(), args["search"].as_str()) {
@@ -4645,7 +4679,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
 
     match (method, path_only.as_str()) {
         (tiny_http::Method::Get, "/proposals") => match reconcile_and_list(&root) {
-            Ok(list) => respond(request, 200, json!({"proposals": list}).to_string(), "application/json"),
+            Ok(list) => respond(request, 200, as_shown(json!({"proposals": list})).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
@@ -4689,7 +4723,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/topology") => respond(
             request,
             200,
-            topology_json(&registry).to_string(),
+            as_shown(topology_json(&registry)).to_string(),
             "application/json",
         ),
         (tiny_http::Method::Get, "/graph") => respond(
@@ -4731,7 +4765,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             }
         }
         (tiny_http::Method::Get, "/dlq") => match dlq_list(200) {
-            Ok(l) => respond(request, 200, json!({"dead_letters": l}).to_string(), "application/json"),
+            Ok(l) => respond(request, 200, as_shown(json!({"dead_letters": l})).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Post, "/dlq/replay") => {
@@ -4803,7 +4837,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let Some(file) = body["file"].as_str() else {
                 return respond(request, 400, "need file".into(), "text/plain");
             };
-            respond(request, 200, probe_connector(&root, file).to_string(), "application/json")
+            respond(request, 200, as_shown(probe_connector(&root, file)).to_string(), "application/json")
         }
         (tiny_http::Method::Post, "/provision") => {
             if let Err(e) = approval_gate() {
@@ -4949,7 +4983,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let key = body["key"].as_str().unwrap_or("-").to_string();
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match replay_literal(&root, &file, &name, &key, &body["value"], n) {
-                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Ok(diff) => respond(request, 200, as_shown(diff).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4961,7 +4995,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let candidate = body["candidate"].as_str().unwrap_or("").to_string();
             let n = body["n"].as_u64().unwrap_or(20) as usize;
             match time_travel(&root, &file, &candidate, n) {
-                Ok(diff) => respond(request, 200, diff.to_string(), "application/json"),
+                Ok(diff) => respond(request, 200, as_shown(diff).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4970,7 +5004,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let file = body["file"].as_str().unwrap_or("").to_string();
             let candidate = body["candidate"].as_str().unwrap_or("").to_string();
             match canary_start(&root, &file, &candidate) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 // a double-start is refused, not silently replaced
                 Err(e) if e.contains("already running") => respond(request, 409, e, "text/plain"),
                 Err(e) => respond(request, 422, e, "text/plain"),
@@ -4981,7 +5015,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "missing file".into(), "text/plain");
             };
             match canary_read(&root, &file) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -4989,7 +5023,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             let body = read_body(&mut request);
             let file = body["file"].as_str().unwrap_or("").to_string();
             match canary_stop(&root, &file) {
-                Ok(out) => respond(request, 200, out.to_string(), "application/json"),
+                Ok(out) => respond(request, 200, as_shown(out).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
@@ -5690,6 +5724,62 @@ mod tests {
         }
         assert!(entries.iter().any(|e| e["name"] == "SUBJECT"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn what_pages_and_agents_are_shown_of_the_bus_is_masked() {
+        crate::secrets::hand_out("hooks-s3cr3t-T0K3N-7f1");
+        record_trace_full(
+            "connector:mask_probe",
+            "vx.mask.out",
+            false,
+            Some("POST https://hooks.example/hooks-s3cr3t-T0K3N-7f1 failed: 500".into()),
+            vec![],
+            r#"{"id":7,"password":"hunter2","header":{"name":"Authorization","value":"Bearer abc"}}"#.into(),
+            Some(json!({"id": 7, "password": "hunter2"})),
+            Some(r#"{"echo":"hooks-s3cr3t-T0K3N-7f1"}"#.into()),
+            None,
+            Some(bus::Delivery { delivered: 2, stream_seq: 41, replay_of: None }),
+        );
+        let out = events_json(Some("connector:mask_probe"));
+        for leak in ["hunter2", "Bearer abc", "hooks-s3cr3t-T0K3N-7f1"] {
+            assert!(!out.contains(leak), "{leak} in {out}");
+        }
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let hop = &v["events"][0];
+        assert!(hop["preview"].as_str().unwrap().contains(r#""id":7"#), "{hop}");
+        assert!(hop["error"].as_str().unwrap().starts_with("POST https://hooks.example/"), "{hop}");
+        // what a page finds an event by stays as it was
+        assert_eq!(hop["flow"], "connector:mask_probe");
+        assert_eq!(hop["subject"], "vx.mask.out");
+        assert_eq!((hop["stream_seq"].as_u64(), hop["attempt"].as_u64()), (Some(41), Some(2)));
+
+        // a dead letter: its payload and its error; its sequence and unit stay
+        let letters = as_shown(json!({"dead_letters": [{
+            "seq": 12, "unit": "flow:orders", "original_seq": 40, "attempts": 5,
+            "original_subject": "vx.orders",
+            "payload": r#"{"order":1,"api_key":"k-123456","note":"hooks-s3cr3t-T0K3N-7f1"}"#,
+            "last_error": "refused: hooks-s3cr3t-T0K3N-7f1",
+        }]}));
+        let shown = letters.to_string();
+        for leak in ["k-123456", "hooks-s3cr3t-T0K3N-7f1"] {
+            assert!(!shown.contains(leak), "{leak} in {shown}");
+        }
+        let letter = &letters["dead_letters"][0];
+        assert_eq!((letter["seq"].as_u64(), letter["original_seq"].as_u64()), (Some(12), Some(40)));
+        assert_eq!(letter["unit"], "flow:orders");
+        assert!(letter["payload"].as_str().unwrap().contains(r#""order":1"#), "{letter}");
+
+        // a shadow replay's results, and a proposal that changes a credential
+        let replay = as_shown(json!({"results": [{"seq": 3, "preview": "{\"token\":\"t-998877\"}",
+            "before": {"emits": [{"subject": "vx.a", "payload": {"secret": "s-1"}}], "error": null}}]}));
+        let shown = replay.to_string();
+        assert!(!shown.contains("t-998877") && !shown.contains("s-1"), "{shown}");
+        assert_eq!(replay["results"][0]["before"]["emits"][0]["subject"], "vx.a");
+        let proposal = as_shown(json!({"proposals": [{"id": "p1", "kind": "set_literal",
+            "payload": {"file": "flows/a.vjs", "name": "ERP_HEADERS", "key": "Authorization", "value": "Bearer xyz"}}]}));
+        assert!(!proposal.to_string().contains("Bearer xyz"), "{proposal}");
+        assert_eq!(proposal["proposals"][0]["id"], "p1");
     }
 
     #[test]

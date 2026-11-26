@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 pub const STREAM: &str = "VEJAS_TRACES";
@@ -1163,11 +1163,28 @@ impl Scrub {
             return;
         }
         let first = text.trim_start().as_bytes().first();
-        if !cut && nest < NEST_MAX && matches!(first, Some(b'{' | b'[' | b'"')) && !self.spans_json(text.as_bytes()) {
+        if nest < NEST_MAX && matches!(first, Some(b'{' | b'[' | b'"')) && !self.spans_json(text.as_bytes()) {
             let mut json = String::with_capacity(text.len() + 16);
-            if scrubbed_json(text.as_bytes(), &mut json, self, nest + 1) {
+            if !cut && scrubbed_json(text.as_bytes(), &mut json, self, nest + 1) {
                 json_string(out, &clip(&json, max));
                 return;
+            }
+            // JSON that stops before its end, cut here or before: read as JSON
+            // as far as it goes, so that a pair is masked in it as in the whole
+            let text = if cut { &text[..self.vault_start_at_end(text)] } else { text };
+            if let Some((keep, closers)) = made_whole(text) {
+                let whole = [&text[..keep], closers.as_str()].concat();
+                if !self.spans_json(whole.as_bytes()) && scrubbed_json(whole.as_bytes(), &mut json, self, nest + 1) {
+                    // what closed it is not shown, unless a mask took it in; a
+                    // string masked where it stopped keeps its quotes
+                    if let Some(body) = json.strip_suffix(closers.as_str()) {
+                        let quoted = closers.starts_with('"')
+                            && [MASKED, TAKEN_OUT].iter().any(|m| body.strip_suffix(m).is_some_and(|b| b.ends_with('"')));
+                        json.truncate(body.len() + usize::from(quoted));
+                    }
+                    json_string(out, &clip(&json, max));
+                    return;
+                }
             }
         }
         json_string(out, &clip(&self.scrubbed(text, cut), max));
@@ -1263,6 +1280,105 @@ fn backslashes_before(bytes: &[u8], i: usize) -> usize {
 /// an even number from the text inside.
 fn quote_level(bytes: &[u8], i: usize) -> u32 {
     (backslashes_before(bytes, i) as u64).trailing_ones()
+}
+
+/// A JSON text that may stop anywhere, made whole to be read as JSON: how
+/// much of it is kept, and what closes it. It closes after a value, after the
+/// `[` or `{` that opens one, and inside a string that is a value; a key, a
+/// number or a literal it stops in goes, with what led to it since the last
+/// value. None when it is not an array or an object as far as it goes, or
+/// holds more than one.
+fn made_whole(text: &str) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    let mut at = bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    if !matches!(bytes.get(at), Some(b'{' | b'[')) {
+        return None;
+    }
+    // the closer of each array and object open, the outermost first
+    let mut open: Vec<u8> = Vec::new();
+    let mut key_next = false;
+    // where the text can stop and be closed, and how many are open there
+    let mut safe = (at, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'{' | b'[' => {
+                key_next = bytes[at] == b'{';
+                open.push(if key_next { b'}' } else { b']' });
+                at += 1;
+                safe = (at, open.len());
+            }
+            close @ (b'}' | b']') => {
+                if open.pop() != Some(close) {
+                    return None;
+                }
+                at += 1;
+                if open.is_empty() {
+                    return bytes[at..].iter().all(u8::is_ascii_whitespace).then(|| (bytes.len(), String::new()));
+                }
+                safe = (at, open.len());
+            }
+            b',' => {
+                key_next = open.last() == Some(&b'}');
+                at += 1;
+            }
+            b':' => {
+                key_next = false;
+                at += 1;
+            }
+            b'"' => match string_at(bytes, at) {
+                Ok(end) => {
+                    at = end;
+                    if !key_next {
+                        safe = (at, open.len());
+                    }
+                }
+                Err(keep) if !key_next => {
+                    let closers = std::iter::once(b'"').chain(open.iter().rev().copied()).map(char::from).collect();
+                    return Some((keep, closers));
+                }
+                Err(_) => break,
+            },
+            b if b.is_ascii_whitespace() => at += 1,
+            _ => {
+                // a number or a literal, which may be cut short however it reads
+                let len = bytes[at..]
+                    .iter()
+                    .take_while(|b| !matches!(b, b',' | b'}' | b']' | b':' | b'"') && !b.is_ascii_whitespace())
+                    .count();
+                if at + len == bytes.len() {
+                    break;
+                }
+                at += len;
+                safe = (at, open.len());
+            }
+        }
+    }
+    let (keep, depth) = safe;
+    Some((keep, open[..depth].iter().rev().copied().map(char::from).collect()))
+}
+
+/// The JSON string that opens at `at`: Ok(where it ends, past its quote), or,
+/// when the text stops in it, Err(where it can be closed): before an escape
+/// left unfinished, or the first half of a character a pair of escapes gives.
+fn string_at(bytes: &[u8], at: usize) -> Result<usize, usize> {
+    let mut i = at + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Ok(i + 1),
+            b'\\' => {
+                let len = if bytes.get(i + 1) == Some(&b'u') { 6 } else { 2 };
+                let high = len == 6
+                    && matches!(bytes.get(i + 2), Some(b'd' | b'D'))
+                    && matches!(bytes.get(i + 3), Some(b'8' | b'9' | b'a' | b'b' | b'A' | b'B'));
+                if i + len > bytes.len() || (high && i + 2 * len > bytes.len()) {
+                    return Err(i);
+                }
+                i += len;
+            }
+            _ => i += 1,
+        }
+    }
+    Err(bytes.len())
 }
 
 /// Where the JSON value at `at` ends, in JSON escaped `level` times, in a text
@@ -1862,6 +1978,75 @@ fn answer(out: &mut String, answer: &Kept, scrub: &Scrub) {
     scrub.write_text(out, &String::from_utf8_lossy(&answer.bytes), !answer.whole(), TEXT_MAX);
 }
 
+// ───────────────────────── what other surfaces show ─────────────────────────
+
+/// The record's masks, for what pages and agents are shown of the bus outside
+/// it (ADR-0017): the events ring, the dead letters, a unit's last error,
+/// shadow replays, the evidence of proposals. An instance of its own,
+/// refreshed as the stores hand values out.
+static SHOWN: OnceLock<Mutex<Scrub>> = OnceLock::new();
+
+/// The masks, ready for one answer: one lock however many texts it holds.
+pub struct Shown(MutexGuard<'static, Scrub>);
+
+/// The masks as they stand: the values the stores handed out so far included.
+pub fn shown() -> Shown {
+    let mut scrub = SHOWN.get_or_init(|| Mutex::new(Scrub::new())).lock().unwrap_or_else(PoisonError::into_inner);
+    scrub.refresh();
+    Shown(scrub)
+}
+
+impl Shown {
+    /// A text: JSON scrubbed as JSON, anything else as text. A `cut` one is
+    /// the start of a longer text (a preview, the summary of an answer): it
+    /// loses the start of a value handed out that it ends in.
+    pub fn text(&self, text: &str, cut: bool) -> String {
+        shown_text(&self.0, text, cut)
+    }
+
+    /// An error, as the record keeps one: it may quote the start of an answer.
+    pub fn error(&self, error: &str) -> String {
+        shown_error(&self.0, error)
+    }
+
+    /// A JSON value, scrubbed as the record scrubs a payload.
+    pub fn json(&self, v: &Value) -> Value {
+        shown_json(&self.0, v)
+    }
+}
+
+fn shown_text(scrub: &Scrub, text: &str, cut: bool) -> String {
+    // a preview marks where it was cut: the text ends before the mark
+    let (text, mark) = match text.strip_suffix('…') {
+        Some(before) if cut => (before, "…"),
+        _ => (text, ""),
+    };
+    let mut out = String::with_capacity(text.len() + 16);
+    scrub.write_text(&mut out, text, cut, usize::MAX);
+    let mut shown: String = serde_json::from_str(&out).unwrap_or_else(|_| TAKEN_OUT.to_string());
+    shown.push_str(mark);
+    shown
+}
+
+fn shown_error(scrub: &Scrub, error: &str) -> String {
+    let mut out = String::with_capacity(error.len().min(TEXT_MAX) + 16);
+    scrub.write_error(&mut out, error);
+    serde_json::from_str(&out).unwrap_or_else(|_| TAKEN_OUT.to_string())
+}
+
+/// Whole, or nothing of it: when a value handed out is a JSON document that
+/// spans it, or it nests too deep to read, `v` is not shown at all.
+fn shown_json(scrub: &Scrub, v: &Value) -> Value {
+    let bytes = serde_json::to_vec(v).unwrap_or_default();
+    let mut out = String::with_capacity(bytes.len() + 64);
+    if !scrub.spans_json(&bytes) && scrubbed_json(&bytes, &mut out, scrub, 0) {
+        if let Ok(shown) = serde_json::from_str(&out) {
+            return shown;
+        }
+    }
+    Value::String(TAKEN_OUT.to_string())
+}
+
 /// One record, written straight to JSON text: the span's ids, unit, kind,
 /// timing and attributes, then what the hop adds.
 fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
@@ -2264,6 +2449,46 @@ mod tests {
     }
 
     #[test]
+    fn what_other_surfaces_show_is_masked_as_the_record_is() {
+        let s = scrub(&["s3cr3t-handed-out"]);
+        let letter = json!({"dead_letters": [{
+            "unit": "flow:orders", "original_subject": "vx.orders", "attempts": 5,
+            "payload": r#"{"id":7,"password":"hunter2","header":{"name":"Authorization","value":"Bearer abc"},"note":"s3cr3t-handed-out"}"#,
+            "last_error": "POST failed: token s3cr3t-handed-out refused",
+        }]});
+        let shown = shown_json(&s, &letter).to_string();
+        for leak in ["hunter2", "Bearer abc", "s3cr3t-handed-out"] {
+            assert!(!shown.contains(leak), "{leak} in {shown}");
+        }
+        assert!(shown.contains(r#"\"id\":7"#) && shown.contains("vx.orders"), "the rest stays: {shown}");
+        // the shape of the answer is kept: what the panel reads is still there
+        let back = shown_json(&s, &letter);
+        assert_eq!(back["dead_letters"][0]["attempts"], 5);
+        assert_eq!(back["dead_letters"][0]["unit"], "flow:orders");
+        // a preview cut in a value handed out loses its start
+        let cut = shown_text(&s, r#"{"id":7,"note":"s3cr3t-han"#, true);
+        assert!(!cut.contains("s3cr3t-han"), "{cut}");
+        assert!(cut.contains(r#""id":7"#), "{cut}");
+        // an error that ends in the start of one, too
+        let error = shown_error(&s, "downstream said: s3cr3t-hand");
+        assert!(!error.contains("s3cr3t-hand"), "{error}");
+        // a credential named in a cut preview
+        let cut = shown_text(&s, r#"{"user":"bob","password":"hunt"#, true);
+        assert!(!cut.contains("hunt") && cut.contains("bob"), "{cut}");
+        // a preview marks its cut with an ellipsis: the text ends before it
+        let cut = shown_text(&s, r#"{"id":7,"note":"s3cr3t-han…"#, true);
+        assert!(!cut.contains("s3cr3t-han") && cut.ends_with('…'), "{cut}");
+        // a pair, in a preview whole and in one cut
+        for preview in [
+            r#"{"header":{"name":"Authorization","value":"Bearer abc"}}"#,
+            r#"{"headers":[{"name":"Authorization","value":"Bearer abc"},{"name":"X-Trace","value":"t1"}],"body":"lo…"#,
+        ] {
+            let shown = shown_text(&s, preview, true);
+            assert!(!shown.contains("Bearer abc"), "{shown}");
+        }
+    }
+
+    #[test]
     fn a_record_is_the_span_and_what_the_hop_adds() {
         let extras = Extras {
             emits: vec!["vx.orders.validated".into()],
@@ -2583,6 +2808,41 @@ mod tests {
         assert!(preview.len() <= PREVIEW_MAX + "…".len());
         assert!(!preview.contains("hunter2"));
         assert!(preview.contains(MASKED));
+    }
+
+    #[test]
+    fn a_big_payload_masks_a_pair_in_its_preview() {
+        let big = format!(
+            r#"{{"headers":[{{"name":"X-Id","value":"7"}},{{"value":"Bearer abc","name":"Authorization"}}],"blob":"{}"}}"#,
+            "x".repeat(40_000)
+        );
+        let i = &rendered(&span(), with_input(big.as_bytes()), &[])["input"];
+        let preview = i["preview"].as_str().unwrap();
+        assert!(!preview.contains("Bearer abc") && preview.contains(r#""value":"7""#), "{preview}");
+    }
+
+    #[test]
+    fn a_cut_json_text_is_made_whole_to_be_read_as_json() {
+        let whole = |t: &str| made_whole(t).map(|(keep, closers)| format!("{}{closers}", &t[..keep]));
+        for (cut, made) in [
+            (r#"{"a":1,"b":"x"#, r#"{"a":1,"b":"x"}"#),
+            (r#"{"a":[1,2,"#, r#"{"a":[1,2]}"#),
+            (r#"{"a":1,"pass"#, r#"{"a":1}"#),
+            (r#"{"a":1,"b":"#, r#"{"a":1}"#),
+            (r#"{"a":1,"b":""#, r#"{"a":1,"b":""}"#),
+            (r#"{"a":{"b":tru"#, r#"{"a":{}}"#),
+            (r#"{"a":12"#, "{}"),
+            (r#" [{"x":"a\"#, r#" [{"x":"a"}]"#),
+            (r#"{"x":"a\u00"#, r#"{"x":"a"}"#),
+            (r#"{"x":"\ud83d\ude"#, r#"{"x":""}"#),
+            (r#"{"x":"\ud83d\ude00"#, r#"{"x":"\ud83d\ude00"}"#),
+            (r#"{"a":1}"#, r#"{"a":1}"#),
+        ] {
+            assert_eq!(whole(cut).as_deref(), Some(made), "{cut}");
+        }
+        for not_one in [r#"{"a":1} {"b":2}"#, r#"{"a":1]"#, "a=1", r#""text"#, ""] {
+            assert_eq!(whole(not_one), None, "{not_one}");
+        }
     }
 
     #[test]

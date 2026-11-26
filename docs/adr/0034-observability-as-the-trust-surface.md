@@ -432,6 +432,41 @@ that fails and of an `api` call that invokes a service.
   flows into, through assignments and invoked services, and write
   `<secret>` in their place.
 
+## What is built (2026-11-26): the runtime's answers, masked as the record
+
+- **The record was masked; the other answers were not.** The events ring
+  (`/events`, `vejas_events`) kept each hop's preview, a sink's answer and
+  an error as they came. A dead letter (`/dlq`, `vejas_dlq`) kept its payload
+  and its last error, `/topology` each unit's last error. Shadow replays,
+  time travel and canary results showed the events they replayed, and a
+  proposal kept the evidence an agent attached. The panel masked what it
+  shows, case by case, and each review of the panel found a case it missed.
+  An agent reading the MCP tools saw it all.
+- **One function at each answer.** `as_shown` scrubs the fields that carry
+  what went through the bus, by their names in the runtime's answers: a
+  preview and a sink's answer as the start of a longer text, an error and a
+  last error as the record scrubs an error, a subject as a text, and a
+  payload, an event, the emits and the evidence whole. The rest stays as it
+  is: units, sequences, times, trace ids. Pages find events and letters by
+  them, and a value handed out that is a number would otherwise turn a
+  sequence into `<secret>`. A new field that carries bus data has to be
+  named there.
+- **A cut JSON text is read as JSON as far as it goes.** A preview is the
+  first 160 characters of the event, so the pair rule of the JSON path
+  (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
+  the record's preview of a payload past 16 KB. The
+  text is now closed where it stops (the string it stops in, then the arrays
+  and objects open), scrubbed as JSON, and shown without what closed it. A
+  key, a number or a literal the cut fell in is dropped. Text that is not
+  JSON keeps the text rules.
+- **An instance of its own.** The answers use a scrub of their own behind a
+  lock, refreshed from the stores on each answer, so the record's thread is
+  never slowed by a page.
+- **What it does not cover.** A flow's preview on its sample and
+  `vejas_run_flow` run in the shadow engine, which never holds a secret's
+  value, on a sample from the repository; `/surface`, `/file` and `/fixture`
+  give the repository's files. The panel's own mask stays, as a second line.
+
 ## Consequences
 
 - The guide is honest today. The "future extension" of ADR-0016 has a design

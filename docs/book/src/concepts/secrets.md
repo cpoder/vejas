@@ -20,8 +20,15 @@ What keeps the rule real, rather than aspirational:
   was chosen on a labeled benchmark of 98 names, 43 of them camelCase, and a
   CI test pins the exact profile: changing it reopens the decision with
   data, never silently.
-- **Pairs.** In a trace record, a value whose sibling names a credential is
-  masked too: `{"name": "Authorization", "value": "…"}` in a header list,
+- **What the runtime shows is masked as the trace record is.** The events
+  in Activity and `/events` (a hop's preview, a sink's answer, an error),
+  dead letters, a unit's last error, the events a shadow replay, a time
+  travel or a canary replays, a proposal's evidence and a connector test's
+  detail leave the runtime with credential-named keys and pairs masked and
+  every value a secret store handed out taken out, for the panel and for
+  agents alike. The panel masks what it shows on top of that.
+- **Pairs.** In a trace record and in what the runtime shows, a value whose
+  sibling names a credential is masked too: `{"name": "Authorization", "value": "…"}` in a header list,
   `{"name": "DB_PASSWORD", "value": "…"}` in an environment list,
   `{"Key": "clientSecret", "Value": "…"}` in tags.
 - **Standalone binaries** follow the deployment's own machinery (env from a
