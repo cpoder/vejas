@@ -1,7 +1,8 @@
 # 0037 — How the connector catalog grows: vendors as certified recipes on protocol drivers
 
-- Status: Accepted, not built (the founder answered the three open questions
-  on 2026-11-26; the answers close this record)
+- Status: Accepted (partial). Driver 1, signed webhooks on `http-in`, is
+  built; the rest is not. The founder answered the three open questions on
+  2026-11-26, and the answers close this record.
 - Date: 2026-11-26
 
 ## Context
@@ -65,6 +66,9 @@ review", which is the adoption argument a smaller catalog can make.
       tolerance, with presets for the common schemes (Stripe, Slack, GitHub,
       Shopify). A request that fails the check gets 401 before anything is
       published. Small, and a security baseline for any public ingest.
+      **Built** on 2026-11-26: `SIGNATURE` takes `github`, `stripe`, `slack`,
+      `shopify`, `standard-webhooks` and `gitlab`, and `hmac-sha256` or
+      `token` for any other sender; the guide *Expose an API* says how.
    2. **SQL, Postgres first** (`sql-poll`, `sql-sink`, `rpc:sql`). Statements
       are declared in the manifest, named and parameterized; a flow passes
       parameters, never SQL text, so a flow an agent wrote cannot become an

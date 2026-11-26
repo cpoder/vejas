@@ -79,16 +79,26 @@ neither the answer nor the log shows it.
 Every HMAC is SHA-256. Where a timestamp is signed, a request more than
 `SIGNATURE_TOLERANCE_SECS` (300) away from the runtime's clock is refused,
 which bounds how long a captured request can be played again. GitHub and
-Shopify sign no timestamp, so a flow that must not act twice keys on the
-sender's delivery id. The path is not signed either: keep `ALLOW`, so that a
-signed request reaches only the subjects it is for. Slack's Events API posts
-JSON; its slash commands post a form, which `http-in` does not take.
+Shopify sign no timestamp: a flow that must not act twice keys on what names
+the event in its body, an order's `id` and `updated_at` for instance, since the
+delivery id these senders put in a header does not reach a flow. The path is
+not signed either: keep `ALLOW`, so that a signed request reaches only the
+subjects it is for.
+
+GitHub posts a form unless the webhook's content type is `application/json`:
+choose it, since `http-in` takes JSON only. Slack checks a Request URL before
+it sends events to it; once the signature passes and `ALLOW` takes the
+subject, `http-in` answers that check with its challenge and publishes
+nothing. Slack's Events API then posts JSON, and its slash commands post a
+form, which `http-in` does not take.
 
 Refusals are counted on `/metrics` as
 `vejas_signature_failures_total{unit,reason}`, the reason being `missing`,
 `malformed`, `stale` or `mismatch`, and the log counts them too. A manifest
-that sets `SIGNATURE` without a secret the runtime can read does not start:
-the port stays closed rather than open without its check.
+that names a key of the check (`SIGNATURE`, `SIGNING_SECRET`, `SIGNATURE_…`)
+and does not give the runtime a check it can run does not start: no scheme it
+knows, no secret it can read, a `whsec_` key under 16 bytes. The port stays
+closed rather than open without its check.
 
 ## Sync: a flow that is an API
 

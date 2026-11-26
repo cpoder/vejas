@@ -367,6 +367,7 @@ fn handle_http_in(
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         let mut header_end = None;
+        let mut framing = Framing::Unframed;
         let mut eof = false;
         let deadline = Instant::now() + REQUEST_READ_LIMIT;
         loop {
@@ -382,15 +383,20 @@ fn handle_http_in(
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
                     if header_end.is_none() {
-                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            header_end = Some(pos + 4);
+                        // Only the bytes just read, and the three before them, can
+                        // complete the blank line that ends the head.
+                        let from = buf.len().saturating_sub(n + 3);
+                        if let Some(pos) = buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
+                            let he = from + pos + 4;
+                            header_end = Some(he);
+                            framing = Framing::of(&String::from_utf8_lossy(&buf[..he]));
                         }
                     }
                     if let Some(he) = header_end {
-                        let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
-                        // Saturating: a forged Content-Length must not wrap. A
-                        // request declared past the bound is not read any further.
-                        let end = he.saturating_add(clen);
+                        // A request declared past the bound is not read any further,
+                        // and one whose length is not known is taken as it came.
+                        let Framing::Length(len) = framing else { break };
+                        let end = he.saturating_add(len);
                         if buf.len() >= end || end > MAX_REQUEST_BYTES {
                             break;
                         }
@@ -405,15 +411,22 @@ fn handle_http_in(
                 }
             }
         }
-        if header_end.is_none() {
+        let Some(he) = header_end else {
             break; // no complete request (client closed or idled out)
-        }
+        };
         // The head is decoded on its own: an index into the lossy text of the
         // whole buffer could fall inside a character.
-        let he = header_end.unwrap_or(0).min(buf.len());
         let head = String::from_utf8_lossy(&buf[..he]);
-        let end = he.saturating_add(content_length(&head));
+        // Saturating: a forged Content-Length must not wrap. Without one, the body
+        // is what came with the head, as http-in always took it.
+        let end = match framing {
+            Framing::Length(len) => he.saturating_add(len),
+            Framing::Unframed | Framing::Chunked | Framing::BadLength => buf.len(),
+        };
         let too_big = end > MAX_REQUEST_BYTES;
+        // Where this request ends on the wire is not known, or not all of it was
+        // read: what follows is not a next request, and the connection closes.
+        let close = too_big || matches!(framing, Framing::Chunked | Framing::BadLength);
         let (code, json): (&str, String) = {
             let mut parts = head.split("\r\n").next().unwrap_or("").split(' ');
             let method = parts.next().unwrap_or("");
@@ -425,6 +438,13 @@ fn handle_http_in(
                 ("200 OK", "{\"ok\":true}".to_string())
             } else if method != "POST" || !path.starts_with("/ingest/") {
                 ("404 Not Found", "{\"error\":\"POST /ingest/<subject-suffix>\"}".to_string())
+            } else if framing == Framing::Chunked {
+                (
+                    "411 Length Required",
+                    "{\"error\":\"send the body with a Content-Length: a chunked body is not read here\"}".to_string(),
+                )
+            } else if framing == Framing::BadLength {
+                ("400 Bad Request", "{\"error\":\"Content-Length is not one number\"}".to_string())
             } else if too_big {
                 (
                     "413 Payload Too Large",
@@ -454,25 +474,39 @@ fn handle_http_in(
                     ("400 Bad Request", "{\"error\":\"missing subject suffix\"}".to_string())
                 } else if !crate::vjs::valid_subject(suffix) {
                     ("400 Bad Request", "{\"error\":\"invalid subject suffix\"}".to_string())
-                } else if serde_json::from_slice::<Value>(body).is_err() {
-                    ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string())
-                } else if !allow.is_empty() && !suffix_allowed(suffix, allow) {
-                    // ALLOW set: this unauthenticated surface may only publish to the
-                    // declared subjects (defence in depth — without ALLOW a caller can
-                    // inject any vx.* event, a SINK subject included; ADR-0029 R7 F2).
-                    ("403 Forbidden", format!("{{\"error\":\"subject {suffix:?} not permitted by ALLOW\"}}"))
                 } else {
-                    let subject = format!("{subj_root}.{suffix}");
-                    // A caller that traces sends its context; the event's trace
-                    // then starts in the caller's (ADR-0034).
-                    let incoming = header_value(&head, trace::TRACEPARENT)
-                        .and_then(|tp| trace::Context::parse(tp, header_value(&head, trace::TRACESTATE)));
-                    match source_publish(name, js, &subject, body, incoming, Kind::Server) {
-                        (hop, Ok(_)) => (
-                            "202 Accepted",
-                            format!("{{\"published\":\"{subject}\",\"trace_id\":\"{}\"}}", hop.trace_hex()),
+                    match serde_json::from_slice::<Value>(body) {
+                        Err(_) => ("400 Bad Request", "{\"error\":\"body must be JSON\"}".to_string()),
+                        // ALLOW set: this unauthenticated surface may only publish to the
+                        // declared subjects (defence in depth — without ALLOW a caller can
+                        // inject any vx.* event, a SINK subject included; ADR-0029 R7 F2).
+                        Ok(_) if !allow.is_empty() && !suffix_allowed(suffix, allow) => (
+                            "403 Forbidden",
+                            format!("{{\"error\":\"subject {suffix:?} not permitted by ALLOW\"}}"),
                         ),
-                        (_, Err(e)) => ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}")),
+                        Ok(event) => match signature.and_then(|v| v.handshake(&event)) {
+                            // A sender checking this URL before it sends events to it:
+                            // its challenge goes back, and nothing is published.
+                            Some(answer) => ("200 OK", answer),
+                            None => {
+                                let subject = format!("{subj_root}.{suffix}");
+                                // A caller that traces sends its context; the event's trace
+                                // then starts in the caller's (ADR-0034).
+                                let incoming = header_value(&head, trace::TRACEPARENT).and_then(|tp| {
+                                    trace::Context::parse(tp, header_value(&head, trace::TRACESTATE))
+                                });
+                                match source_publish(name, js, &subject, body, incoming, Kind::Server) {
+                                    (hop, Ok(_)) => (
+                                        "202 Accepted",
+                                        format!(
+                                            "{{\"published\":\"{subject}\",\"trace_id\":\"{}\"}}",
+                                            hop.trace_hex()
+                                        ),
+                                    ),
+                                    (_, Err(e)) => ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}")),
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -480,13 +514,14 @@ fn handle_http_in(
         // One buffer, one write: with TCP_NODELAY `write!` puts each piece of the
         // format string in a segment of its own.
         let response = format!(
-            "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{json}",
-            json.len()
+            "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{json}",
+            json.len(),
+            if close { "close" } else { "keep-alive" }
         );
         let _ = sock.write_all(response.as_bytes());
-        if too_big {
-            // The rest of an oversized request is still on the wire, and it is
-            // not a next request.
+        if close {
+            // The rest of the request may still be on its way, and it is not a
+            // next request.
             linger_close(sock);
             break;
         }
@@ -521,13 +556,48 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn content_length(head: &str) -> usize {
-    for line in head.lines() {
-        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            return v.trim().parse().unwrap_or(0);
+/// Where a request's body ends, as its head says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// `Content-Length`: the body is that many bytes. Digits past what a `usize`
+    /// holds count as the largest length, which is too large, not malformed.
+    Length(usize),
+    /// Neither `Content-Length` nor `Transfer-Encoding`: the body is what came
+    /// with the head, as `http-in` always took it (a small device's HTTP stack
+    /// may send no length).
+    Unframed,
+    /// A `Transfer-Encoding`: a chunked body is not read here.
+    Chunked,
+    /// A `Content-Length` that is not one number, or two that differ.
+    BadLength,
+}
+
+impl Framing {
+    fn of(head: &str) -> Framing {
+        let mut length = None;
+        for line in head.split("\r\n").skip(1) {
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Framing::Chunked;
+            }
+            if !name.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            // Sent twice, or as a list, it must still say one number (RFC 9110, 8.6).
+            for item in value.split(',').map(str::trim) {
+                if item.is_empty() || !item.bytes().all(|b| b.is_ascii_digit()) {
+                    return Framing::BadLength;
+                }
+                let len = item.parse::<usize>().unwrap_or(usize::MAX);
+                if length.is_some_and(|known| known != len) {
+                    return Framing::BadLength;
+                }
+                length = Some(len);
+            }
         }
+        length.map_or(Framing::Unframed, Framing::Length)
     }
-    0
 }
 
 // ───────────────────────── source: interval (timer) ─────────────────────────
@@ -2746,6 +2816,34 @@ mod tests {
             lat
         );
         let _ = js.delete_stream(&stream);
+    }
+
+    #[test]
+    fn a_body_ends_where_its_head_says() {
+        let head = |lines: &str| format!("POST /ingest/a HTTP/1.1\r\nHost: h\r\n{lines}\r\n");
+        assert_eq!(Framing::of(&head("Content-Length: 7\r\n")), Framing::Length(7));
+        assert_eq!(Framing::of(&head("content-length:007\r\n")), Framing::Length(7));
+        // Sent twice, or as a list, the same number is one length.
+        assert_eq!(Framing::of(&head("Content-Length: 5\r\nContent-Length: 5\r\n")), Framing::Length(5));
+        assert_eq!(Framing::of(&head("Content-Length: 5, 5\r\n")), Framing::Length(5));
+        assert_eq!(Framing::of(&head("Content-Length: 5, 6\r\n")), Framing::BadLength);
+        assert_eq!(Framing::of(&head("Content-Length: 5\r\nContent-Length: 6\r\n")), Framing::BadLength);
+        for bad in ["abc", "", "+5", "-1", "5 5", "0x10", "1e3"] {
+            assert_eq!(Framing::of(&head(&format!("Content-Length: {bad}\r\n"))), Framing::BadLength, "{bad:?}");
+        }
+        // Digits a usize cannot hold: too large, which the bound refuses.
+        assert_eq!(
+            Framing::of(&head("Content-Length: 18446744073709551616\r\n")),
+            Framing::Length(usize::MAX)
+        );
+        assert_eq!(Framing::of(&head("Transfer-Encoding: chunked\r\n")), Framing::Chunked);
+        assert_eq!(
+            Framing::of(&head("Content-Length: 5\r\nTransfer-Encoding: chunked\r\n")),
+            Framing::Chunked
+        );
+        assert_eq!(Framing::of(&head("")), Framing::Unframed);
+        // The request line is not a header, whatever it holds.
+        assert_eq!(Framing::of("POST /content-length:5 HTTP/1.1\r\n\r\n"), Framing::Unframed);
     }
 }
 
