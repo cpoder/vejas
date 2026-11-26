@@ -13,12 +13,12 @@ Shadow-replay reruns the flow's last real events through the *proposed*
 change and shows you the before/after diff — nothing is published, nothing
 is committed.
 
-- Panel: edit a literal → **Apply** → the shadow strip shows what would
-  change → **Promote** or **Discard**.
+- Panel: click the yellow value, change it → **Check on recent events**
+  shows which events would change and how → **Make it live** or **Undo**.
 - API: `POST /surface/replay`; agent: `vejas_replay_literal`.
 
-If there is no recent traffic to replay against, Apply promotes directly —
-there is nothing to preview.
+If there is no recent traffic to replay against, the panel says so and offers
+**Make it live anyway** — there is nothing to preview.
 
 ## Promote and roll back
 

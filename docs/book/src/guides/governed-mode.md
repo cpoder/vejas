@@ -41,11 +41,11 @@ the `X-Approval-Token` header. The panel asks for the token when it needs it.
 1. **Agent proposes** — `vejas_propose` with the change and its *evidence*
    (a shadow-replay diff, a canary result). It cannot approve. `vejas_proposals`
    lists the queue.
-2. **Human decides** — in the panel's **Approval queue** card, or
+2. **Human decides** — in the panel's **To review** page, or
    `POST /proposals/{id}/approve|reject` with the `X-Approval-Token`
-   header, which is enough on its own even when `VEJAS_TOKEN` is set. The card
-   shows the evidence; a proposal with none is flagged
-   **"⚠ No evidence"** loud — approving blind is a deliberate act.
+   header, which is enough on its own even when `VEJAS_TOKEN` is set. The page
+   shows the evidence; a proposal with none is flagged loudly
+   ("No evidence attached") — approving blind is a deliberate act.
 3. **On approve** — the change executes exactly as a normal promote would
    (hot-reload, or a [cluster-wide version](change-safely.md) in 20 ms) and
    is recorded.

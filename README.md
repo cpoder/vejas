@@ -40,14 +40,15 @@ sustained with **every event hop persisted** in JetStream, **2 070/s** through a
 real MQTT broker and back (QoS 1 both ways, PUBACK-gated). Same order of
 magnitude as engines that persist nothing, in ~20× less memory.
 
-![Prompt-to-flow and the pipeline, derived from the code itself](docs/screenshots/panel-top.png)
+![The map: connectors, subjects, flows and services, drawn from the code itself](docs/screenshots/panel-top.png)
 
-Below: a flow an agent wrote from one sentence, in VejasScript. Its transcoding
-table is seeded, samples come from the fixture, the emitted payload sits on top,
-and the whole script is editable in the panel. A domain expert corrects any of
-it without touching code:
+Below: a flow an agent wrote in VejasScript, as the panel reads it, top to
+bottom: what it receives, what it computes with the sample event, what it checks,
+what it sends. The yellow values are the business rules. A domain expert changes
+one in place, sees on the last real events what would change, and makes it live
+without touching code:
 
-![An agent-written VejasScript flow — sample run, transcoding table, constants, editable script](docs/screenshots/panel-vjs-editor.png)
+![A flow read top to bottom; a threshold being changed and checked on recent events](docs/screenshots/panel-vjs-editor.png)
 
 ## How it works
 

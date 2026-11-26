@@ -16,7 +16,7 @@ trace (see [observability](observability.md)).
 
 ## Seeing and replaying
 
-- Panel: the DLQ card; API: `GET /dlq`; agent: `vejas_dlq`.
+- Panel: the **To review** page; API: `GET /dlq`; agent: `vejas_dlq`.
 - Replay is **explicit** — `POST /dlq/replay` (`vejas_dlq_replay`), never
   automatic: if the logic was wrong, replaying before fixing just kills the
   message again. Purge (`/dlq/purge`) is equally explicit. Both are recorded

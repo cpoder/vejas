@@ -3,7 +3,8 @@
 Fixtures written by hand go stale; real traffic is the truth. Golden
 curation turns **one real event into a permanent test** in one click:
 
-- In the panel's event ring, star ★ an event (or `POST /events/golden`).
+- In the panel's Activity page, open an event and choose **Save as a test**
+  on a flow's hop (or `POST /events/golden`).
 - The runtime re-runs the flow on that event **now** and captures the
   actual emits as the expectation.
 - What lands is a file: `tests/vjs/curated_<flow>_<n>.vjs` — input event +

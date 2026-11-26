@@ -51,7 +51,7 @@ const LATE_ORDER = { order_id: 'SO-1004', country: 'FR', total_cents: 26000, lin
 
 const CAPTIONS = {
   intro: "Un agent a construit cette intégration. Voici l'écran de l'expert métier.",
-  pipeline: 'Le pipeline et les derniers événements traités — dérivés du code réel.',
+  pipeline: 'La carte et les derniers événements traités, dérivés du code réel.',
   rules: 'Les règles métier, extraites du code : tables de transcodage, seuils.',
   fix1: "L'entrepôt par défaut est faux. L'expert le corrige — sans une ligne de code.",
   replay1: 'Avant d’appliquer : la correction est rejouée sur les dernières commandes réelles.',
@@ -155,26 +155,30 @@ async function click(page, locator) {
   await page.waitForTimeout(350);
 }
 
-async function correctConstant(page, card, label, newValue, capFix, capReplay, capPromote) {
-  const box = card.locator('.const', { hasText: label });
-  const input = box.locator('input.rule');
+// Sur la page du flow, une valeur métier est une pastille jaune : un clic ouvre
+// son éditeur, « Check on recent events » rejoue la correction sur les derniers
+// événements réels, « Make it live » l'écrit.
+async function correctValue(page, name, newValue, capFix, capReplay, capPromote) {
+  const chip = page.locator(`.val[data-lit="${name}"]`).first();
   await caption(page, capFix, 2600);
-  await glide(page, input);
-  await input.click();
+  await click(page, chip);
+  const editor = page.locator('.editor');
+  const input = editor.locator('input').first();
+  await input.waitFor({ state: 'visible', timeout: 5000 });
   await input.fill('');
   await input.pressSequentially(String(newValue), { delay: 90 });
   await page.waitForTimeout(500);
-  await click(page, box.locator('button.apply'));
+  await click(page, editor.locator('button', { hasText: 'Check on recent events' }));
 
-  const strip = card.locator('.replay');
-  await strip.waitFor({ state: 'visible', timeout: 15000 });
-  const stripText = await strip.textContent();
-  assert.ok(/would change/.test(stripText), `replay strip shows a diff for ${label}`);
-  assert.ok(!/(^|[^0-9])0(<\/b>)? would change/.test(stripText), `at least one event changes for ${label}`);
+  const result = editor.locator('.result');
+  await result.waitFor({ state: 'visible', timeout: 15000 });
+  const text = await result.textContent();
+  assert.ok(/would change/.test(text), `the check shows a diff for ${name}`);
+  assert.ok(!/None of/.test(text), `at least one event changes for ${name}`);
   await caption(page, capReplay, 3600);
   await captionOff(page);
   await caption(page, capPromote, 2400);
-  await click(page, strip.locator('button', { hasText: 'Promote' }));
+  await click(page, editor.locator('button', { hasText: 'Make it live' }));
   await page.waitForSelector('#toast.show', { timeout: 10000 });
   await page.waitForTimeout(1200);
   await captionOff(page);
@@ -194,45 +198,46 @@ async function main() {
   });
   const page = await context.newPage();
 
-  console.log('· scène 1 : panel + pipeline + événements');
+  console.log('· scène 1 : la carte, puis les événements');
   await page.goto(BASE, { waitUntil: 'networkidle' });
   await stage(page);
   await caption(page, CAPTIONS.intro, 4200);
   await captionOff(page);
   await caption(page, CAPTIONS.pipeline, 1200);
-  const events = page.locator('#events table');
-  await events.waitFor({ state: 'visible', timeout: 10000 });
-  await glide(page, events);
+  const map = page.locator('#map');
+  await map.waitFor({ state: 'visible', timeout: 10000 });
+  await glide(page, map.locator('.node.flow', { hasText: 'order_dispatch' }));
+  await page.waitForTimeout(1200);
+  await click(page, page.locator('.rail .item', { hasText: 'Activity' }));
+  const events = page.locator('#events .it');
+  await events.first().waitFor({ state: 'visible', timeout: 10000 });
+  await glide(page, events.first());
   await page.waitForTimeout(2200);
   await captionOff(page);
 
-  console.log('· scène 2 : la carte du flow, règles métier');
-  const flowCard = () => page.locator('.card', { has: page.locator('h2', { hasText: 'order_dispatch' }) });
-  const card = flowCard();
-  await card.scrollIntoViewIfNeeded();
+  console.log('· scène 2 : la page du flow, valeurs métier');
+  await click(page, page.locator('.rail .item', { hasText: 'order_dispatch' }));
+  await page.locator('.route').waitFor({ state: 'visible', timeout: 10000 });
   await caption(page, CAPTIONS.rules, 3000);
-  await glide(page, card.locator('.sect', { hasText: 'transcoding table' }));
+  await glide(page, page.locator('.val[data-lit="WAREHOUSE_CODES"]').first());
   await page.waitForTimeout(1200);
   await captionOff(page);
 
-  console.log('· scène 3 : correction n°1 — entrepôt par défaut, shadow-replay, promote');
-  await correctConstant(page, card, 'DEFAULT_WAREHOUSE', 'WH-EXP',
+  console.log('· scène 3 : correction n°1, entrepôt par défaut, vérifiée puis mise en service');
+  await correctValue(page, 'DEFAULT_WAREHOUSE', 'WH-EXP',
     CAPTIONS.fix1, CAPTIONS.replay1, CAPTIONS.promote1);
 
-  console.log('· scène 4 : correction n°2 — seuil d’alerte, shadow-replay, promote');
-  const card2 = flowCard();
-  await card2.scrollIntoViewIfNeeded();
-  await correctConstant(page, card2, 'ALERT_THRESHOLD_EUR', 200,
+  console.log('· scène 4 : correction n°2, seuil d’alerte, vérifiée puis mise en service');
+  await correctValue(page, 'ALERT_THRESHOLD_EUR', 200,
     CAPTIONS.fix2, CAPTIONS.replay1, CAPTIONS.promote2);
 
   console.log('· scène 5 : une nouvelle commande vit la nouvelle règle');
-  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
-  await page.waitForTimeout(900);
+  await click(page, page.locator('.rail .item', { hasText: 'Activity' }));
   await caption(page, CAPTIONS.live, 1500);
   await ingest(LATE_ORDER);
-  await page.locator('#events td[title*="SO-1004"]').first()
-    .waitFor({ state: 'visible', timeout: 15000 });
-  await glide(page, page.locator('#events td[title*="SO-1004"]').first());
+  const lateRow = page.locator('#events .row[title*="SO-1004"]').first();
+  await lateRow.waitFor({ state: 'visible', timeout: 15000 });
+  await glide(page, lateRow);
   await page.waitForTimeout(2600);
   await captionOff(page);
 

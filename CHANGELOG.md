@@ -23,7 +23,24 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `SIGNATURE`) does not start. No new crate in the build: `ring` and `base64`
   were in it already. e2e `http-in-signed.sh` checks it in CI.
 
+- **`GET /shape?file=<path>`**: a flow's or a service's shape for the panel's
+  flow page. The event fields it reads, each value it computes with the
+  business literals it uses, the services it calls and what they give back,
+  its checks (the rules projection), what it sends and where, and the comment
+  written above each literal. `/surface` entries carry that comment as `doc`.
+
 ### Changed
+- **The panel is redesigned around two people.** A menu on the left; a page
+  per flow for the domain expert, read top to bottom (receives, computes,
+  calls, checks, sends), with the business values in yellow where the flow
+  uses them, each checked on recent real events before it goes live; Activity
+  (one row per event, end to end) and To review (dead letters, proposals) for
+  the operator; a map of what runs. Still one HTML file with no dependency.
+  Every function of the previous panel is kept. e2e `demo.mjs` and
+  `bridge-film.mjs` follow the new screens.
+- **`/graph` gives a connector's subjects as NATS patterns.** A webhook
+  without `SUBJECT` publishes on `vx.>` (it was `vx.*`, which missed any
+  subject of three tokens), and within its `ALLOW` list when it has one.
 - **Connectors are written against one crate, `vejas-connector`** (`sdk/`,
   ADR-0038): the bus, the trace context, `Config`, `Ctx`, the `Driver` trait,
   and the services every driver shares (a source's publish as the first hop of
