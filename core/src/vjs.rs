@@ -657,9 +657,22 @@ fn collect_reads(e: &Expr, own: &[String], out: &mut Vec<String>) {
         Expr::Doc(fields) => fields.iter().for_each(|(_, v)| collect_reads(v, own, out)),
         Expr::Array(items) => items.iter().for_each(|i| collect_reads(i, own, out)),
         Expr::Projection(b) | Expr::Unary(_, b) => collect_reads(b, own, out),
-        Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => {
+        Expr::Index(a, b) | Expr::Bin(_, a, b) => {
             collect_reads(a, own, out);
             collect_reads(b, own, out);
+        }
+        Expr::Filter(items, cond) => {
+            collect_reads(items, own, out);
+            // `line_items[qty > 10]`: the condition reads each item's keys,
+            // which only the run knows. Of its names, only the business
+            // literals are the flow's.
+            let mut names = Vec::new();
+            collect_reads(cond, own, &mut names);
+            for n in names {
+                if is_upper_name(n.split('.').next().unwrap_or(&n)) && !out.contains(&n) {
+                    out.push(n);
+                }
+            }
         }
         Expr::Call(_, args) => args.iter().for_each(|a| collect_reads(a, own, out)),
         Expr::Invoke(_, args) => args.iter().for_each(|(_, v)| collect_reads(v, own, out)),
@@ -691,6 +704,68 @@ fn collect_own(stmts: &[Stmt], out: &mut Vec<String>) {
                 }
             }
             Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+        }
+    }
+}
+
+/// A name in capitals (`MIN_TOTAL_EUR`): how a business literal is named.
+fn is_upper_name(name: &str) -> bool {
+    name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        && name.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// What a flow reads from its event, in the order it runs: a name read before
+/// the flow gives it a value (`email = lower(email)` reads the event's email).
+/// A branch or a loop body starts from what was set before it, and what it
+/// sets counts after it. An invoke gives back its arguments and what the
+/// service sets (`makes`, keyed by the name the invoke uses).
+fn reads_in_order(stmts: &[Stmt], set: &mut Vec<String>, makes: &[(String, Vec<String>)], out: &mut Vec<String>) {
+    fn add(set: &mut Vec<String>, name: &str) {
+        if !set.iter().any(|n| n == name) {
+            set.push(name.to_string());
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign(path, e) => {
+                collect_reads(e, set, out);
+                if let Some(root) = path.first() {
+                    add(set, root);
+                }
+            }
+            Stmt::For(var, iter, body) => {
+                collect_reads(iter, set, out);
+                let mut inner = set.clone();
+                add(&mut inner, var);
+                reads_in_order(body, &mut inner, makes, out);
+                inner.iter().for_each(|n| add(set, n));
+            }
+            Stmt::If(arms, otherwise) => {
+                let before = set.clone();
+                let mut walk = |body: &[Stmt], out: &mut Vec<String>| {
+                    let mut inner = before.clone();
+                    reads_in_order(body, &mut inner, makes, out);
+                    inner.iter().for_each(|n| add(set, n));
+                };
+                for (cond, _, body) in arms {
+                    collect_reads(cond, &before, out);
+                    walk(body, out);
+                }
+                if let Some(body) = otherwise {
+                    walk(body, out);
+                }
+            }
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+                collect_reads(a, set, out);
+                collect_reads(b, set, out);
+            }
+            Stmt::InvokeMerge(service, args) => {
+                args.iter().for_each(|(_, v)| collect_reads(v, set, out));
+                args.iter().for_each(|(name, _)| add(set, name));
+                for (_, names) in makes.iter().filter(|(s, _)| s == service) {
+                    names.iter().for_each(|n| add(set, n));
+                }
+            }
         }
     }
 }
@@ -794,7 +869,7 @@ pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)])
         }
     }
     let mut reads = Vec::new();
-    reads_of_stmts(&prog.stmts, &own, &mut reads);
+    reads_in_order(&prog.stmts, &mut surface.clone(), services, &mut reads);
 
     // A value a loop builds (`positions = []`, then `positions = positions + …`
     // in the loop) is one step, the loop's: its empty start is no step.
@@ -1034,11 +1109,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Tok::Ident(name) = self.peek().clone() {
-                let uppercase = name
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-                    && name.chars().any(|c| c.is_ascii_uppercase());
-                if uppercase && self.peek2() == Some(&Tok::Eq) {
+                if is_upper_name(&name) && self.peek2() == Some(&Tok::Eq) {
                     let save = self.i;
                     self.i += 2;
                     let start = self.pos();
@@ -2780,6 +2851,41 @@ end\n";
         assert_eq!(shape["steps"][0]["kind"], "invoke");
         assert_eq!(shape["steps"][0]["literals"], json!(["GREETING"]), "a literal an invoke passes is editable where it is passed");
         assert_eq!(shape["steps"][0]["uses"], json!(["origin"]));
+    }
+
+    #[test]
+    fn a_field_the_flow_rewrites_is_still_read_from_the_event() {
+        let src = "source \"vx.in\"\nemail = lower(email)\ncountry = country ?? \"FR\"\nemit \"vx.out\", {email: email, country: country}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["email", "country"]));
+    }
+
+    #[test]
+    fn what_a_branch_sets_counts_after_it_not_in_the_next_branch() {
+        let src = "source \"vx.in\"\nif big:\n  label = \"big\"\nelif small:\n  label = label\nelse:\n  label = \"mid\"\nend\nemit \"vx.out\", {label: label}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["big", "small", "label"]),
+                   "the elif reads the event's label: the first branch did not run");
+    }
+
+    #[test]
+    fn a_filter_reads_its_items_keys_not_the_event() {
+        let src = "source \"vx.in\"\nMIN_QTY = 10\nbig = line_items[qty > MIN_QTY]\nemit \"vx.out\", {big: big}\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[]);
+        assert_eq!(shape["reads"], json!(["line_items"]));
+        assert_eq!(shape["steps"][0]["literals"], json!(["MIN_QTY"]));
+    }
+
+    #[test]
+    fn what_an_invoke_passes_comes_back_to_the_flow() {
+        let src = "source \"vx.in\"\ninvoke fmt(text: f\"{id}\")\nemit \"vx.out\", {text: text}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["id"]));
+        let src = "source \"vx.in\"\nemit \"vx.early\", {t: alert_text}\ninvoke fmt(sev: severity)\nemit \"vx.out\", {t: alert_text}\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[("fmt".into(), vec!["alert_text".into()])]);
+        assert_eq!(shape["reads"], json!(["alert_text", "severity"]), "read before the invoke, it is the event's");
     }
 
     #[test]

@@ -28,6 +28,10 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   business literals it uses, the services it calls and what they give back,
   its checks (the rules projection), what it sends and where, and the comment
   written above each literal. `/surface` entries carry that comment as `doc`.
+- **`GET /events?flow=<unit>&paths=1`**: one unit's events, each with the other
+  hops of its path (same trace id). The panel's flow and connector pages read
+  it, so a unit that sends often (a timer) no longer pushes a quiet flow's
+  events out of its own page, as it did out of the newest hundred of all units.
 
 ### Changed
 - **The panel is redesigned around two people.** A menu on the left; a page
@@ -40,7 +44,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `bridge-film.mjs` follow the new screens.
 - **`/graph` gives a connector's subjects as NATS patterns.** A webhook
   without `SUBJECT` publishes on `vx.>` (it was `vx.*`, which missed any
-  subject of three tokens), and within its `ALLOW` list when it has one.
+  subject of three tokens), and within its `ALLOW` list when it has one,
+  under `VEJAS_SUBJECT_ROOT` when it is set, as the webhook itself does.
+- `POST /flows/new` and `/connectors/new` answer with the name the file got.
+  When the name the agent chose was taken, the file is `<name>_2.vjs` and the
+  answer said `<name>`, the existing unit.
 - **Connectors are written against one crate, `vejas-connector`** (`sdk/`,
   ADR-0038): the bus, the trace context, `Config`, `Ctx`, the `Driver` trait,
   and the services every driver shares (a source's publish as the first hop of

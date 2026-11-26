@@ -269,6 +269,8 @@
   .row .time { font: 13px var(--mono); color: var(--ink3); }
   .path { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; font-weight: 600; font-size: 14.5px; }
   .path .u { display: inline-flex; align-items: center; gap: 5px; }
+  .path .stage { display: inline-flex; align-items: center; flex-wrap: wrap; }
+  .path .stage .and { margin-right: 7px; color: var(--ink3); }
   .path .u svg.i { width: 15px; height: 15px; color: var(--ink3); }
   .path .tries { font-size: 12.5px; font-weight: 600; color: var(--err); }
   .carried { font: 13px var(--mono); color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -521,6 +523,37 @@ const setLiteral = (file, name, key, value) => post('/surface/set', {file, name,
 const SECRET_KEY_PATTERN = "{{SECRET_PATTERN}}";
 const keyAsRead = k => String(k).replace(/([a-z0-9])(?=[A-Z])/g, '$1_');
 const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(keyAsRead(k));
+// A value as the panel may show it: every credential-named key masked, at any depth.
+const maskDeep = v => Array.isArray(v) ? v.map(maskDeep)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, isSecretKey(k) ? 'hidden' : maskDeep(x)]))
+  : v;
+const parsed = s => { if (typeof s !== 'string') return s; try { return JSON.parse(s); } catch { return s; } };
+const masked = v => maskDeep(parsed(v));
+
+// A live region rewritten under the reader keeps their place: the control they
+// had focused gets the focus back, the <details> they had opened stay open.
+const placeOf = el => [el.tagName, el.dataset.act, el.dataset.seq, el.dataset.id, el.dataset.do, el.dataset.key,
+  el.getAttribute('href'), el.closest('[data-key]')?.dataset.key, el.closest('[data-id]')?.dataset.id].join('|');
+function holdPlace(region) {
+  const a = document.activeElement;
+  const focused = a && a !== document.body && region.contains(a) ? placeOf(a) : null;
+  const open = new Set($$('details[open]', region).map(placeOf));
+  return () => {
+    for (const d of $$('details', region)) if (open.has(placeOf(d))) d.open = true;
+    if (!focused) return;
+    const f = $$('a[href], button, input, select, textarea, summary, [tabindex]', region).find(x => placeOf(x) === focused);
+    if (f) f.focus({preventScroll: true});
+  };
+}
+// A region the polls refresh is written only when what it shows changed.
+const written = new WeakMap();
+function rewrite(region, html) {
+  if (!region || written.get(region) === html) return;
+  const restore = holdPlace(region);
+  region.innerHTML = html;
+  written.set(region, html);
+  restore();
+}
 
 /* ---------- what the runtime holds ---------- */
 const S = { surface: [], topo: {flows: [], connectors: []}, graph: {flows: [], services: [], connectors: []},
@@ -545,7 +578,8 @@ function stateOf(file) {
   const st = unitStatus(file);
   if (!st) return {cls: 'off', label: 'Not running'};
   const s = String(st.status || '');
-  if (s.startsWith('running')) return {cls: 'ok', label: 'Running'};
+  // a running unit keeps the last error it met since it started (a message it failed on)
+  if (s.startsWith('running')) return {cls: 'ok', label: 'Running', since: st.last_error};
   return {cls: st.last_error ? 'bad' : 'off', label: s ? s[0].toUpperCase() + s.slice(1) : 'Not running', error: st.last_error};
 }
 const stateHtml = st => `<span class="state ${st.cls}"><span class="dot"></span>${esc(st.label)}</span>`;
@@ -560,6 +594,28 @@ function matches(pattern, subject) {
   }
   return p.length === s.length;
 }
+// Two patterns overlap when some subject matches both (`vx.a.*` and `vx.*.b`).
+function overlaps(a, b) {
+  const x = String(a).split('.'), y = String(b).split('.');
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] === '>') return y.length > i;
+    if (y[i] === '>') return x.length > i;
+    if (i >= x.length || i >= y.length) return false;
+    if (x[i] !== '*' && y[i] !== '*' && x[i] !== y[i]) return false;
+  }
+  return true;
+}
+// Whether every subject `inner` matches also matches `outer`: then an event
+// sent on `inner` always reaches what listens on `outer`.
+function covers(outer, inner) {
+  const o = String(outer).split('.'), n = String(inner).split('.');
+  for (let i = 0; i < o.length; i++) {
+    if (o[i] === '>') return n.length > i;
+    if (i >= n.length || n[i] === '>') return false;
+    if (o[i] !== '*' && o[i] !== n[i]) return false;
+  }
+  return o.length === n.length;
+}
 const isPattern = p => String(p).split('.').some(t => t === '*' || t === '>');
 const DRIVER_WORDS = {'http-in': 'webhook', 'http-out': 'HTTP call', 'http-poll': 'HTTP poll', 'oauth-poll': 'API poll',
                       'timer': 'timer', 'slack-out': 'Slack', 'mqtt': 'MQTT', 'exec': 'process'};
@@ -570,15 +626,15 @@ function svcFor(f, inv) {
   return svcs.find(s => s.name === (pkg === 'default' ? short : pkg + ':' + short)) || svcs.find(s => shortName(s.name) === short);
 }
 // Who can put an event on `subject` (itself a pattern when a flow listens to one).
-// A connector that publishes on a wildcard only may: `may` says so.
+// A connector whose subjects `subject` does not cover only may: `may` says so.
 function producersOf(subject) {
   const out = [];
   for (const c of S.graph.connectors || []) {
-    const p = (c.subjects_out || []).find(p => matches(p, subject) || matches(subject, p));
-    if (p) out.push({kind: 'connector', name: c.name, c, may: isPattern(p)});
+    const ps = (c.subjects_out || []).filter(p => overlaps(p, subject));
+    if (ps.length) out.push({kind: 'connector', name: c.name, c, may: !ps.some(p => covers(subject, p))});
   }
-  for (const f of S.graph.flows || []) if ((f.emits || []).some(e => matches(subject, e))) out.push({kind: 'flow', name: f.name});
-  for (const s of S.graph.services || []) if ((s.emits || []).some(e => matches(subject, e))) out.push({kind: 'service', name: s.name});
+  for (const f of S.graph.flows || []) if ((f.emits || []).some(e => overlaps(subject, e))) out.push({kind: 'flow', name: f.name});
+  for (const s of S.graph.services || []) if ((s.emits || []).some(e => overlaps(subject, e))) out.push({kind: 'service', name: s.name});
   return out;
 }
 // NATS patterns in words: `vx.>` is any subject under vx, `a` with `a.>` is a and below it.
@@ -625,12 +681,12 @@ function renderRail() {
   const pkgOf = f => (f.pkg && f.pkg !== 'default' ? f.pkg : '');
   const flows = [...(S.graph.flows || [])].sort((a, b) => pkgOf(a).localeCompare(pkgOf(b)) || a.name.localeCompare(b.name));
   let pkg = '';
-  $('#rail-flows').innerHTML = flows.map(f => {
+  rewrite($('#rail-flows'), flows.map(f => {
     const st = stateOf(f.file);
     // flows of a package sit under its name, so each name reads in full
     const head = pkgOf(f) !== pkg ? `<p class="pkg">package ${esc(pkg = pkgOf(f))}</p>` : '';
     return `${head}<a class="item" href="${hrefFlow(f.name)}" data-key="flow/${esc(f.name)}" title="${esc(f.name)}: ${esc(st.label)}"><span class="dot ${st.cls === 'ok' ? '' : st.cls}"></span><span class="t">${esc(shortName(f.name))}</span></a>`;
-  }).join('') || '<p class="none">No flow yet.</p>';
+  }).join('') || '<p class="none">No flow yet.</p>');
   $('#n-connectors').textContent = (S.graph.connectors || []).length || '';
   $('#n-services').textContent = (S.graph.services || []).length || '';
   const missing = ((S.secrets && S.secrets.secrets) || []).filter(s => s.status !== 'ok').length;
@@ -659,12 +715,14 @@ function renderReviewCount() {
 // #/ the map · #/flow/<name> · #/service/<name> · #/services · #/connector/<name>
 // #/connectors · #/activity?flow= · #/review · #/secrets · #/new?type=connector
 // #focus=<keys> is the map with a path followed (links made by earlier panels).
+const decoded = p => { try { return decodeURIComponent(p); } catch { return p; } };
 function parseRoute() {
   const h = location.hash || '';
-  if (h.startsWith('#focus=')) return {page: 'map', arg: '', q: new URLSearchParams(), focus: decodeURIComponent(h.slice(7))};
+  // each key is encoded on its own: a subject may hold a comma or a %
+  if (h.startsWith('#focus=')) return {page: 'map', arg: '', q: new URLSearchParams(), focus: h.slice(7).split(',').map(decoded)};
   const [path, query] = h.replace(/^#\/?/, '').split('?');
-  const parts = path.split('/').filter(Boolean).map(p => { try { return decodeURIComponent(p); } catch { return p; } });
-  return {page: parts[0] || 'map', arg: parts[1] || '', q: new URLSearchParams(query || ''), focus: ''};
+  const parts = path.split('/').filter(Boolean).map(decoded);
+  return {page: parts[0] || 'map', arg: parts[1] || '', q: new URLSearchParams(query || ''), focus: []};
 }
 let R = parseRoute();
 let pageToken = 0;
@@ -674,10 +732,14 @@ async function render(opts = {}) {
   markRail();
   const y = window.scrollY;
   const view = document.createElement('div'); view.className = 'page';
-  const hooks = {after: null};
-  try { await (PAGES[R.page] || pageMissing)(view, R, hooks); }
-  catch (e) { view.innerHTML = `<div class="head"><h1>This page did not load</h1></div><p class="lede">${esc(e.message)}</p>`; }
+  // a page hands back the literals it shows in hooks.ctx: they become PAGE only
+  // once it is on screen, never while an older page still is
+  const hooks = {after: null, ctx: null};
+  // the page name comes from the address bar: only our own pages, never a prototype's member
+  try { await (Object.hasOwn(PAGES, R.page) ? PAGES[R.page] : pageMissing)(view, R, hooks); }
+  catch (e) { hooks.ctx = null; view.innerHTML = `<div class="head"><h1>This page did not load</h1></div><p class="lede">${esc(e.message)}</p>`; }
   if (token !== pageToken) return;  // a newer route took over meanwhile
+  PAGE = hooks.ctx;
   view.id = 'page';
   $('#page').replaceWith(view);
   window.scrollTo(0, opts.keepScroll ? y : 0);
@@ -687,7 +749,6 @@ window.addEventListener('hashchange', () => render());
 history.scrollRestoration = 'manual';
 
 function pageMissing(view, r, hooks, what = 'page') {
-  PAGE = null;
   document.title = 'Not found · Vejas';
   view.innerHTML = `<div class="head"><h1>Not found</h1></div><p class="lede">No ${esc(what)}${r.arg ? ` named <code>${esc(r.arg)}</code>` : ''} in this runtime. <a href="#/">Back to the map</a></p>`;
 }
@@ -695,7 +756,6 @@ function pageMissing(view, r, hooks, what = 'page') {
 /* ---------- the map: what runs here, from the code ---------- */
 let MAP = null;
 async function pageMap(view, r, hooks) {
-  PAGE = null;
   document.title = 'Map · Vejas';
   const flows = S.graph.flows || [], cons = S.graph.connectors || [];
   if (!flows.length && !cons.length) {
@@ -740,7 +800,7 @@ function drawMap(svg, bar, focus) {
   const rowH = 54, top = 44, W = 1080, H = top + rows * rowH + 8;
   const C = {ins: [4, 184], src: [214, 184], mid: [428, 240], sink: [700, 184], outs: [916, 160]};
   const y = (i, n) => top + (i + .5) * rowH + (rows - n) * rowH / 2;
-  const pos = {};
+  const pos = Object.create(null);  // keys come from names and the address bar
   let nodes = '';
   const colh = (c, t) => `<text class="colh" x="${C[c][0]}" y="20">${t}</text>`;
   const con = (c, k, col, yy) => {
@@ -770,9 +830,10 @@ function drawMap(svg, bar, focus) {
 
   const E = [];
   const edge = (a, b, cls = '') => { if (pos[a] && pos[b]) E.push({a, b, cls}); };
+  // a connector always goes to a subject that covers what it publishes, else it may
   for (const c of ins) for (const s of srcs) {
-    const p = (c.subjects_out || []).find(p => matches(p, s));
-    if (p) edge('c:' + c.name, 's:' + s, isPattern(p) ? 'may' : '');
+    const ps = (c.subjects_out || []).filter(p => overlaps(p, s));
+    if (ps.length) edge('c:' + c.name, 's:' + s, ps.some(p => covers(s, p)) ? '' : 'may');
   }
   for (const f of flows) {
     for (const s of f.sources || []) edge('s:' + s, 'f:' + f.name);
@@ -781,8 +842,8 @@ function drawMap(svg, bar, focus) {
   }
   for (const s of services) for (const e of s.emits || []) edge('v:' + s.name, 'k:' + e);
   for (const c of outs) for (const k of sinks) {
-    const p = (c.subjects_in || []).find(p => matches(p, k));
-    if (p) edge('k:' + k, 'o:' + c.name, isPattern(p) ? 'may' : '');
+    const ps = (c.subjects_in || []).filter(p => overlaps(p, k));
+    if (ps.length) edge('k:' + k, 'o:' + c.name, ps.some(p => covers(p, k)) ? '' : 'may');
   }
   const pathOf = ({a, b, cls}) => {
     const A = pos[a], B = pos[b];
@@ -799,11 +860,10 @@ function drawMap(svg, bar, focus) {
 
   // A path through a node: everything upstream of it and everything downstream,
   // never turning back. A subject sent by one flow and read by another goes on.
-  const fwd = {}, rev = {};
+  const fwd = Object.create(null), rev = Object.create(null);
   const link = (a, b) => { (fwd[a] = fwd[a] || []).push(b); (rev[b] = rev[b] || []).push(a); };
   E.forEach(e => link(e.a, e.b));
-  sinks.forEach(s => { if (pos['s:' + s]) link('k:' + s, 's:' + s); });
-  srcs.forEach(s => { if (pos['k:' + s]) link('k:' + s, 's:' + s); });
+  for (const k of sinks) for (const s of srcs) if (overlaps(k, s)) link('k:' + k, 's:' + s);
   const reach = keys => {
     const out = new Set(keys);
     for (const adj of [fwd, rev]) {
@@ -815,7 +875,7 @@ function drawMap(svg, bar, focus) {
   // keys from earlier panels: c: covered both sides of a connector, v: a short service name
   const legacy = k => k.startsWith('c:') ? ['c:' + k.slice(2), 'o:' + k.slice(2)]
     : k.startsWith('v:') && !pos[k] ? services.filter(s => shortName(s.name) === k.slice(2)).map(s => 'v:' + s.name) : [k];
-  const sel = new Set(String(focus || '').split(',').filter(Boolean).flatMap(legacy).filter(k => pos[k]));
+  const sel = new Set((focus || []).filter(Boolean).flatMap(legacy).filter(k => pos[k]));
   const paint = keys => {
     const on = keys.size ? reach([...keys]) : null;
     svg.classList.toggle('focus', !!on);
@@ -833,7 +893,7 @@ function drawMap(svg, bar, focus) {
   };
   const commit = () => {
     paint(sel);
-    history.replaceState(null, '', sel.size ? '#focus=' + [...sel].join(',') : '#/');
+    history.replaceState(null, '', sel.size ? '#focus=' + [...sel].map(enc).join(',') : '#/');
     bar.innerHTML = sel.size
       ? `<span>Following ${[...sel].map(k => `<b>${esc(k.slice(2))}</b>`).join(', ')}</span><button class="btn small" type="button" data-act="map-clear">Clear</button>`
       : '';
@@ -954,7 +1014,7 @@ function summarize(v) {
 function sampleHtml(v, name) {
   if (v === undefined) return '<span class="none">not in the sample</span>';
   if (name && isSecretKey(String(name).split('.').pop())) return '<span class="sv">hidden</span>';
-  return `<span class="sv" title="${esc(trunc(v, 600))}">${esc(summarize(v))}</span>`;
+  return `<span class="sv" title="${esc(trunc(maskDeep(v), 600))}">${esc(summarize(v))}</span>`;
 }
 const stop = (cls, mark, title, rest, body) =>
   `<section class="stop ${cls}"><div class="mark">${icon(mark)}</div><div class="box"><h2>${title}${rest ? ` <span class="what">${rest}</span>` : ''}</h2>${body}</div></section>`;
@@ -974,24 +1034,27 @@ function flowLede(f) {
   return `Latest event at <b class="num">${clock(last)}</b>. ${tally} <a href="#/activity?flow=${enc(f.name)}">See its events</a>`;
 }
 
-async function pageFlow(view, r) {
+async function pageFlow(view, r, hooks) {
   const f = (S.graph.flows || []).find(x => x.name === r.arg);
   if (!f) return pageMissing(view, r, null, 'flow');
   document.title = `${shortName(f.name)} · Vejas`;
   const [shape, preview] = await Promise.all([
     getJSON('/shape?file=' + enc(f.file)).catch(e => ({error: e.message})),
     getJSON('/preview?file=' + enc(f.file)).catch(() => null),
+    loadEvents(r),
   ]);
   const ctx = makeCtx(f.file, 'flow', {pipeline: (preview && preview.pipeline) || {}, input: preview && preview.fixture ? preview.input : undefined});
-  PAGE = ctx;
+  hooks.ctx = ctx;
   const st = stateOf(f.file);
   let html = `<div class="head"><h1>${esc(shortName(f.name))}</h1>${stateHtml(st)}${f.pkg && f.pkg !== 'default' ? `<span class="tag">package ${esc(f.pkg)}</span>` : ''}
     <div class="actions"><button class="btn" type="button" data-act="open-code">${icon('code')}Open the code</button></div></div>
     <p class="lede" id="flow-lede">${flowLede(f)}</p>`;
   if (st.error) html += callout(`It stopped on an error: ${st.error}`);
   if (preview && preview.error) html += callout(`With the sample event, it fails: ${preview.error}`);
-  if (shape.error || f.lang !== 'vjs') {
+  if (f.lang !== 'vjs') {
     html += `<p class="lede">This flow is not written in VejasScript: the panel shows its values, not its path.</p>`;
+  } else if (shape.error) {
+    html += callout(`The panel could not read its path: ${shape.error}`);
   } else {
     html += routeHtml(f, shape, ctx, preview);
   }
@@ -1112,9 +1175,9 @@ function stopSends(f, shape, ctx, preview) {
     const set = s.constant ? ` <span class="muted">The subject comes from ${where}.</span>` : '';
     const sample = ((preview && preview.emits) || []).filter(e => e.subject === s.subject);
     const det = sample.length
-      ? `<details class="more"><summary>What the sample sends</summary><pre class="json">${esc(sample.map(e => pretty(e.payload)).join('\n'))}</pre></details>`
+      ? `<details class="more"><summary>What the sample sends</summary><pre class="json">${esc(sample.map(e => pretty(masked(e.payload))).join('\n'))}</pre></details>`
       : (ctx.input !== undefined && s.subject ? `<p class="note">With the sample event, it sends nothing here.</p>` : '');
-    return `<div class="send">${one ? '' : `<p>To ${subj}.</p>`}${what ? `<p>With ${what}.${set}</p>` : (set ? `<p>${set}</p>` : '')}${readersLine(s.subject)}${det}</div>`;
+    return `<div class="send" data-slot>${one ? '' : `<p>To ${subj}.</p>`}${what ? `<p>With ${what}.${set}</p>` : (set ? `<p>${set}</p>` : '')}${readersLine(s.subject)}${det}</div>`;
   });
   for (const svc of viaSvc) for (const subj of svc.emits) {
     blocks.push(`<div class="send"><p>Through its service <a href="${hrefSvc(svc.name)}">${esc(shortName(svc.name))}</a>, to <span class="subject out">${esc(subj)}</span>.</p>${readersLine(subj)}</div>`);
@@ -1152,13 +1215,14 @@ const vrow = (ctx, e) => `<div class="vrow" data-slot><span class="k">${esc(e.na
 // connector has no event stream to replay: its settings save and it restarts.
 const ruleToText = r => Array.isArray(r) ? r.join(' | ') : String(r);
 const textToRule = t => { const p = t.split('|').map(s => s.trim()).filter(Boolean); return p.length > 1 ? p : p[0] ?? ''; };
+const DECIMAL = /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 const parseConst = t => { const s = t.trim();
   if (s === 'true') return true; if (s === 'false') return false;
-  if (s !== '' && !isNaN(Number(s))) return Number(s); return s; };
+  if (DECIMAL.test(s) && Number.isFinite(Number(s))) return Number(s); return s; };
 function parseLike(original, text) {
   if (typeof original === 'number') {
-    const n = Number(text.trim());
-    if (text.trim() === '' || isNaN(n)) throw new Error('This value is a number: enter a number.');
+    const s = text.trim(), n = Number(s);
+    if (!DECIMAL.test(s) || !Number.isFinite(n)) throw new Error('This value is a number: enter a number, like 12 or 12.5.');
     return n;
   }
   if (typeof original === 'boolean') {
@@ -1198,12 +1262,12 @@ function buildEditor(ctx, e) {
   box.innerHTML = `<p class="why">${e.doc ? esc(e.doc) + ' ' : ''}<span class="name">${esc(e.name)}</span></p>`;
   const fields = [];
   const grid = document.createElement('div');
-  const v = e.value;
+  const v = e.value, secret = isSecretKey(e.name);
   const addField = (label, key, original, mode) => {
     const text = mode === 'list' ? original.map(show).join(', ') : mode === 'rule' ? ruleToText(original) : show(original);
     if (label != null) grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(label)}</span><span class="arrow">${icon('chev')}</span>`);
     const input = document.createElement('input');
-    input.type = isSecretKey(label != null ? label : e.name) ? 'password' : 'text';
+    input.type = secret || (label != null && String(label).split('.').some(isSecretKey)) ? 'password' : 'text';
     input.autocomplete = 'off'; input.spellcheck = false; input.value = text;
     input.setAttribute('aria-label', label != null ? `${e.name}, ${label}` : e.name);
     grid.appendChild(input);
@@ -1212,7 +1276,7 @@ function buildEditor(ctx, e) {
     input.addEventListener('input', () => changed(field));
     input.addEventListener('keydown', ev => {
       if (ev.key === 'Enter') { const b = $('.bar .primary', box); if (b && !b.disabled) b.click(); }
-      if (ev.key === 'Escape') undo();
+      if (ev.key === 'Escape' && !input.readOnly) undo();
     });
   };
   if (v && typeof v === 'object' && !Array.isArray(v)) {
@@ -1224,7 +1288,8 @@ function buildEditor(ctx, e) {
       } else if (e.kind === 'mapping') {
         addField(k, k, val, 'rule');
       } else if (val !== null && typeof val === 'object') {
-        grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(k)}</span><span class="arrow">${icon('chev')}</span><code class="ro" title="A nested value: change it in the code">${esc(trunc(val, 60))}</code>`);
+        const ro = secret || isSecretKey(k) ? 'hidden' : trunc(maskDeep(val), 60);
+        grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(k)}</span><span class="arrow">${icon('chev')}</span><code class="ro" title="A nested value: change it in the code">${esc(ro)}</code>`);
       } else {
         addField(k, k, val, 'value');
       }
@@ -1237,13 +1302,13 @@ function buildEditor(ctx, e) {
   const result = document.createElement('div'); result.className = 'result'; result.hidden = true;
   const bar = document.createElement('div'); bar.className = 'bar'; bar.hidden = true;
   box.append(result, bar);
-  let active = null;
+  let active = null, checked = null;
 
   function changed(field) {
     const dirty = field.input.value !== field.text;
     field.input.classList.toggle('changed', dirty);
     result.hidden = true; result.innerHTML = '';
-    active = dirty ? field : null;
+    active = dirty ? field : null; checked = null;
     for (const x of fields) if (x !== field) x.input.disabled = dirty;
     if (dirty) offerCheck(); else bar.hidden = true;
   }
@@ -1275,25 +1340,34 @@ function buildEditor(ctx, e) {
     else setBar([['Check on recent events', 'primary', check, 'replay'], ['Undo', 'quiet', undo]]);
   }
   async function check(ev) {
+    const field = active;
+    if (!field) return;
     let val;
-    try { val = value(active); } catch (err) { return fail(err); }
+    try { val = value(field); } catch (err) { return fail(err); }
+    const asked = field.input.value;
     const btn = ev.currentTarget; btn.disabled = true; btn.textContent = 'Checking…';
-    try {
-      const res = await (await post('/surface/replay', {file: ctx.file, name: e.name, key: active.key, value: val, n: 20})).json();
-      result.innerHTML = replayHtml(res); result.hidden = false;
-      setBar([[res.events ? 'Make it live' : 'Make it live anyway', 'primary', makeLive], ['Undo', 'quiet', undo]]);
-    } catch (err) {
-      result.innerHTML = `<p><b>It could not be checked on recent events.</b> ${esc(String(err.message).slice(0, 300))}</p>`;
-      result.hidden = false;
-      setBar([['Make it live anyway', 'primary', makeLive], ['Undo', 'quiet', undo]]);
-    }
+    field.input.readOnly = true;  // the value checked is the value that goes live
+    let res = null, error = null;
+    try { res = await (await post('/surface/replay', {file: ctx.file, name: e.name, key: field.key, value: val, n: 20})).json(); }
+    catch (err) { error = err; }
+    field.input.readOnly = false;
+    if (active !== field || field.input.value !== asked) return;  // undone meanwhile
+    checked = asked;
+    const hide = secret || isSecretKey(String(field.key).split('/').pop());
+    result.innerHTML = res ? replayHtml(res, hide)
+      : `<p><b>It could not be checked on recent events.</b> ${esc(String(error.message).slice(0, 300))}</p>`;
+    result.hidden = false;
+    setBar([[res && res.events ? 'Make it live' : 'Make it live anyway', 'primary', makeLive], ['Undo', 'quiet', undo]]);
   }
   async function makeLive(ev) {
+    const field = active;
+    if (!field) return;
+    if (!ctx.direct && field.input.value !== checked) return offerCheck();
     let val;
-    try { val = value(active); } catch (err) { return fail(err); }
+    try { val = value(field); } catch (err) { return fail(err); }
     const btn = ev.currentTarget; btn.disabled = true;
     try {
-      await setLiteral(ctx.file, e.name, active.key, val);
+      await setLiteral(ctx.file, e.name, field.key, val);
       toast(ctx.direct ? `${e.name} saved. The connector restarted.` : `${e.name} is live. The ${ctx.kind} reloaded.`);
       await loadCore();
       await render({keepScroll: true});
@@ -1303,9 +1377,9 @@ function buildEditor(ctx, e) {
 }
 
 // What the flow makes of one event, with the current value or with the new one.
-function emitSummary(side, after) {
+function emitSummary(side, after, hide) {
   if (!side) return '';
-  if (side.error) return `<span class="bad">${after ? 'would fail' : 'fails'}: ${esc(trunc(side.error, 80))}</span>`;
+  if (side.error) return `<span class="bad">${after ? 'would fail' : 'fails'}${hide ? '' : ': ' + esc(trunc(side.error, 80))}</span>`;
   const es = side.emits || [];
   if (!es.length) return `<span class="muted">${after ? 'would send nothing' : 'sends nothing'}</span>`;
   return `${after ? 'would send to' : 'sends to'} ${es.map(e => `<span class="subject out">${esc(e.subject)}</span>`).join(' ')}`;
@@ -1330,25 +1404,27 @@ function diffValues(x, y, path, out) {
   out.push([path || 'the payload', x, y]);
 }
 // One changed event in one line: the fields whose value changes, else the outputs.
-function diffLine(r) {
+// `hide`: the value changed is a credential, so no value or error is shown.
+function diffLine(r, hide) {
   const b = r.before || {}, a = r.after || {};
   const be = b.emits || [], ae = a.emits || [];
   const sep = icon('chev', 'sep');
   if (b.error || a.error || be.length !== ae.length || be.some((e, i) => e.subject !== ae[i].subject)) {
-    return `${emitSummary(b, false)} ${sep} ${emitSummary(a, true)}`;
+    return `${emitSummary(b, false, hide)} ${sep} ${emitSummary(a, true, hide)}`;
   }
   const parts = [];
   be.forEach((e, i) => diffValues(e.payload, ae[i].payload, '', parts));
   if (!parts.length) return '<span class="muted">the same output</span>';
-  const val = v => v === undefined ? '<span class="muted">nothing</span>' : esc(trunc(v, 34));
-  return parts.slice(0, 3).map(([k, x, y]) => `<code>${esc(k)}</code> ${val(x)} ${sep} <b>${val(y)}</b>`).join('; ');
+  const val = (k, v) => v === undefined ? '<span class="muted">nothing</span>'
+    : hide || isSecretKey(String(k).split('.').pop()) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
+  return parts.slice(0, 3).map(([k, x, y]) => `<code>${esc(k)}</code> ${val(k, x)} ${sep} <b>${val(k, y)}</b>`).join('; ');
 }
-function replayHtml(res) {
+function replayHtml(res, hide) {
   if (!res.events) return '<p><b>No recent event to check it on.</b></p>';
   const lastN = res.events === 1 ? 'the last event' : `the last ${res.events} events`;
   const changed = (res.results || []).filter(r => r.changed);
   const head = res.changed ? `<b>${res.changed} of ${lastN} would change.</b>` : `<b>None of ${lastN} would change.</b>`;
-  const list = changed.slice(0, 5).map(r => `<li><span class="time num">${esc(eventLabel(r))}</span><span>${diffLine(r)}</span></li>`).join('');
+  const list = changed.slice(0, 5).map(r => `<li><span class="time num">${esc(eventLabel(r))}</span><span>${diffLine(r, hide)}</span></li>`).join('');
   return `<p>${head}</p>${list ? `<ul>${list}</ul>` : ''}${changed.length > 5 ? `<p class="muted">And ${changed.length - 5} more.</p>` : ''}`;
 }
 
@@ -1398,7 +1474,6 @@ function toggleSample() {
 /* ---------- services ---------- */
 const callersOf = s => (S.graph.flows || []).filter(f => (f.invokes || []).some(v => { const x = svcFor(f, v); return x && x.name === s.name; }));
 async function pageServices(view) {
-  PAGE = null;
   document.title = 'Services · Vejas';
   const svcs = S.graph.services || [];
   view.innerHTML = `<div class="head"><h1>Services</h1></div>
@@ -1408,13 +1483,13 @@ async function pageServices(view) {
       return `<a class="it link" href="${hrefSvc(s.name)}">${icon('svc')}<b>${esc(shortName(s.name))}</b>${s.pkg && s.pkg !== 'default' ? `<span class="tag">package ${esc(s.pkg)}</span>` : ''}<span class="muted">${callers.length ? 'called by ' + callers.map(f => esc(shortName(f.name))).join(', ') : 'no flow calls it'}</span>${icon('chev', 'sep')}</a>`;
     }).join('')}</div>` : `<div class="empty"><p>No service in this runtime.</p></div>`}`;
 }
-async function pageService(view, r) {
+async function pageService(view, r, hooks) {
   const s = (S.graph.services || []).find(x => x.name === r.arg);
   if (!s) return pageMissing(view, r, null, 'service');
   document.title = `${shortName(s.name)} · Vejas`;
   const shape = await getJSON('/shape?file=' + enc(s.file)).catch(e => ({error: e.message}));
   const ctx = makeCtx(s.file, 'service');
-  PAGE = ctx;
+  hooks.ctx = ctx;
   const callers = callersOf(s);
   let html = `<div class="head"><h1>${esc(shortName(s.name))}</h1><span class="tag">service</span>${s.pkg && s.pkg !== 'default' ? `<span class="tag">package ${esc(s.pkg)}</span>` : ''}
     <div class="actions"><button class="btn" type="button" data-act="open-code">${icon('code')}Open the code</button></div></div>
@@ -1450,7 +1525,6 @@ async function loadDrivers(el) {
   } catch (e) { el.textContent = e.message; }
 }
 async function pageConnectors(view) {
-  PAGE = null;
   document.title = 'Connectors · Vejas';
   // what brings events in first, then what takes them out, as a flow reads
   const out = c => ((c.subjects_out || []).length ? 0 : 1);
@@ -1464,13 +1538,14 @@ async function pageConnectors(view) {
     <details class="section"><summary><h2>Drivers in this runtime</h2></summary><p>A connector uses one driver, the protocol it speaks.</p><div id="drivers" class="muted">Loading…</div></details>`;
   loadDrivers($('#drivers', view));
 }
-async function pageConnector(view, r) {
+async function pageConnector(view, r, hooks) {
   const c = (S.graph.connectors || []).find(x => x.name === r.arg);
   if (!c) return pageMissing(view, r, null, 'connector');
   document.title = `${c.name} · Vejas`;
   const file = conFile(c.name);
+  await loadEvents(r);
   const ctx = makeCtx(file, 'connector');
-  PAGE = ctx;
+  hooks.ctx = ctx;
   const st = file ? stateOf(file) : {cls: 'off', label: 'Not running'};
   const evs = S.events.filter(e => e.flow === 'connector:' + c.name);
   const dir = connectorDir(c);
@@ -1478,18 +1553,20 @@ async function pageConnector(view, r) {
   const outs = c.subjects_out || [], ins = c.subjects_in || [];
   let ties = '';
   if (outs.length) {
-    const fl = (S.graph.flows || []).filter(f => (f.sources || []).some(s => outs.some(p => matches(p, s) || matches(s, p))));
-    if (fl.length) ties = ` ${outs.some(isPattern) ? 'Its events can reach' : 'Read by'} ${orList(fl.map(f => whoHtml({kind: 'flow', name: f.name})), 'and')}.`;
+    const fl = (S.graph.flows || []).filter(f => (f.sources || []).some(s => outs.some(p => overlaps(p, s))));
+    const sure = fl.every(f => (f.sources || []).some(s => outs.some(p => covers(s, p))));
+    if (fl.length) ties = ` ${sure ? 'Read by' : 'Its events can reach'} ${orList(fl.map(f => whoHtml({kind: 'flow', name: f.name})), 'and')}.`;
   } else if (ins.length) {
     const units = [...(S.graph.flows || []).map(f => ({kind: 'flow', name: f.name, emits: f.emits})),
                    ...(S.graph.services || []).map(s => ({kind: 'service', name: s.name, emits: s.emits}))];
-    const fed = units.filter(u => (u.emits || []).some(e => ins.some(p => matches(p, e))));
+    const fed = units.filter(u => (u.emits || []).some(e => ins.some(p => overlaps(p, e))));
     if (fed.length) ties = ` Fed by ${orList(fed.map(whoHtml), 'and')}.`;
   }
   let html = `<div class="head"><h1>${esc(c.name)}</h1>${stateHtml(st)}<span class="tag">${esc(driverWord(c))}</span>
     <div class="actions"><button class="btn" type="button" data-act="open-code">${icon('code')}Open the code</button></div></div>
     <p class="lede">It uses the driver <code>${esc(c.driver)}</code>${dir ? ` and ${dir}` : ''}.${ties}${evs.length ? ` Latest event at <b class="num">${clock(Math.max(...evs.map(e => e.ts || 0)))}</b>.` : ''}</p>`;
   if (st.error) html += callout(`It stopped on an error: ${st.error}`);
+  else if (st.since) html += `<p class="note">The last error it met since it started: ${esc(trunc(st.since, 300))}</p>`;
   html += valuesSections(ctx, {});
   if (!Object.keys(ctx.entries).length) html += `<section class="section"><h2>Settings</h2><p>It has no setting.</p></section>`;
   const refs = c.secret_refs || [];
@@ -1517,15 +1594,17 @@ async function testConnector(btn) {
 }
 
 /* ---------- activity: each event, end to end ---------- */
-const A = {flow: '', open: new Set(), sig: '', seen: new Set()};
+const A = {flow: '', sig: '', seen: new Set()};
 // The events ring holds each unit's last events; the hops of one event share
 // its trace id (ADR-0034), so an event is one row whatever it went through.
+// Where a unit sits on an event's path: 0 a source that let it in, 1 a flow,
+// 2 a connector that took it out.
+function rankOf(u) {
+  if (u.startsWith('flow:')) return 1;
+  const c = (S.graph.connectors || []).find(c => 'connector:' + c.name === u);
+  return c && (c.subjects_in || []).length ? 2 : 0;
+}
 function traceGroups(events, flow) {
-  const rankOf = u => {
-    if (u.startsWith('flow:')) return 1;
-    const c = (S.graph.connectors || []).find(c => 'connector:' + c.name === u);
-    return c && (c.subjects_in || []).length ? 2 : 0;
-  };
   const by = new Map();
   for (const e of events) {
     const id = /^[0-9a-f]{32}$/.test(e.trace_id || '') ? e.trace_id : `seq-${e.flow}-${e.seq}`;
@@ -1536,33 +1615,50 @@ function traceGroups(events, flow) {
   for (const [id, hops] of by) {
     hops.sort((a, b) => (a.ts - b.ts) || (rankOf(a.flow) - rankOf(b.flow)) || (a.seq - b.seq));
     if (flow && !hops.some(h => h.flow === 'flow:' + flow)) continue;
-    groups.push({id, traced: !id.startsWith('seq-'), hops, ts: Math.min(...hops.map(h => h.ts || 0)), ok: hops.every(h => h.ok)});
+    // a unit retried until it went through went through: its last attempt decides
+    const last = new Map();
+    for (const h of hops) { const p = last.get(h.flow); if (!p || h.seq > p.seq) last.set(h.flow, h); }
+    const failed = [...last.values()].find(h => !h.ok) || null;
+    groups.push({id, traced: !id.startsWith('seq-'), hops, ts: Math.min(...hops.map(h => h.ts || 0)), ok: !failed, failed});
   }
   return groups.sort((a, b) => b.ts - a.ts || b.hops[0].seq - a.hops[0].seq);
 }
 const unitHtml = (u, tries = 1) => `<span class="u">${icon(String(u).startsWith('connector:') ? 'plug' : 'flow')}${esc(shortName(unitName(u)))}${tries > 1 ? ` <span class="tries">${tries} attempts</span>` : ''}</span>`;
 function rowHtml(g) {
-  const first = g.hops[0], last = g.hops[g.hops.length - 1], failed = g.hops.find(h => !h.ok);
+  const first = g.hops[0], failed = g.failed;
   const sep = icon('chev', 'sep');
-  // retries of one unit read as one step with its number of attempts
-  const steps = [];
+  // What let it in, the flows that handled it, where it went: two flows that
+  // read the same subject handled it side by side, they never fed each other.
+  // A unit retried reads once, with its number of attempts.
+  const stages = [[], [], []], tries = new Map();
   for (const h of g.hops) {
-    const prev = steps[steps.length - 1];
-    if (prev && prev.unit === h.flow) prev.tries++; else steps.push({unit: h.flow, tries: 1});
+    tries.set(h.flow, (tries.get(h.flow) || 0) + 1);
+    const st = stages[rankOf(h.flow)];
+    if (!st.includes(h.flow)) st.push(h.flow);
   }
-  const tail = !failed && (last.emits || []).length ? sep + last.emits.map(s => `<span class="subject out">${esc(s)}</span>`).join(' ') : '';
+  // what the flows sent that no unit here took: it left the runtime on the bus
+  const taken = new Set(g.hops.map(h => h.subject));
+  const left = failed ? [] : uniq(g.hops.filter(h => h.ok && rankOf(h.flow) === 1).flatMap(h => h.emits || [])).filter(s => !taken.has(s));
+  // in each stage, in the order of their names: the same flows read the same way row after row
+  const byName = (a, b) => shortName(unitName(a)).localeCompare(shortName(unitName(b)));
+  const stage = items => items.length ? `<span class="stage">${items.join('<span class="and">,</span>')}</span>` : '';
+  const parts = [
+    stage(stages[0].sort(byName).map(u => unitHtml(u, tries.get(u)))),
+    stage(stages[1].sort(byName).map(u => unitHtml(u, tries.get(u)))),
+    stage([...stages[2].sort(byName).map(u => unitHtml(u, tries.get(u))), ...left.sort().map(s => `<span class="subject out">${esc(s)}</span>`)]),
+  ].filter(Boolean);
   return `<div class="it" data-id="${esc(g.id)}">
     <button class="row" type="button" data-act="trace" aria-expanded="false" title="${esc(first.preview || '')}">
       <span class="time num">${clock(g.ts)}</span>${g.ok ? icon('check', 'ok-i') : icon('x', 'err-i')}
-      <span class="path">${steps.map(s => unitHtml(s.unit, s.tries)).join(sep)}${tail}</span>
+      <span class="path">${parts.join(sep)}</span>
       <span class="carried">${esc(first.preview || '')}</span>
       ${failed ? `<span class="err-t">${esc(unitName(failed.flow))}: ${esc(trunc(failed.error || 'failed', 180))}</span>` : ''}
     </button><div class="trace" hidden></div></div>`;
 }
 async function pageActivity(view, r, hooks) {
-  PAGE = null;
   document.title = 'Activity · Vejas';
-  A.flow = r.q.get('flow') || ''; A.open = new Set(); A.sig = ''; A.seen = new Set();
+  A.flow = r.q.get('flow') || ''; A.sig = ''; A.seen = new Set();
+  await loadEvents(r);
   const flows = S.graph.flows || [];
   view.innerHTML = `<div class="head"><h1>Activity</h1></div>
     <p class="lede">Each event the runtime handled, newest first. Open one to follow it from where it came in to where it went.</p>
@@ -1585,7 +1681,9 @@ function activityRefresh(force) {
   const groups = traceGroups(S.events, A.flow);
   const sig = groups.map(g => g.id + g.hops.length + (g.ok ? '' : 'x')).join('|');
   if (!force && sig === A.sig) return;
-  if (!force && A.open.size) {
+  // the rows open in the list, read from the page itself so they never drift from it
+  const open = $$('.it', list).filter(it => $('.row', it)?.getAttribute('aria-expanded') === 'true');
+  if (!force && open.length) {
     const fresh = groups.filter(g => !A.seen.has(g.id)).length;
     const n = $('#newer');
     if (fresh) { n.hidden = false; n.innerHTML = `<span>${plural(fresh, 'new event')} came in.</span><button class="btn small" type="button" data-act="show-newer">Show</button>`; }
@@ -1597,18 +1695,17 @@ function activityRefresh(force) {
     list.innerHTML = `<div class="it none"><p>${A.flow ? 'No event for this flow yet.' : 'No event yet.'} Events show here as soon as a connector or a flow handles one.</p></div>`;
     return;
   }
-  const keep = new Map();
-  for (const id of A.open) { const el = $$('.it', list).find(x => x.dataset.id === id); if (el) keep.set(id, el); }
+  const restore = holdPlace(list);
   list.innerHTML = groups.slice(0, 40).map(rowHtml).join('');
-  for (const [id, el] of keep) { const fresh = $$('.it', list).find(x => x.dataset.id === id); if (fresh) fresh.replaceWith(el); }
+  for (const el of open) { const fresh = $$('.it', list).find(x => x.dataset.id === el.dataset.id); if (fresh) fresh.replaceWith(el); }
+  restore();
 }
 async function toggleTrace(btn) {
   const it = btn.closest('.it'), box = $('.trace', it), id = it.dataset.id;
   const open = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!open));
   box.hidden = open;
-  if (open) { A.open.delete(id); if (!A.open.size) activityRefresh(); return; }
-  A.open.add(id);
+  if (open) { if (it.closest('#events')) activityRefresh(); return; }
   if (box.dataset.loaded) return;
   const ring = S.events.filter(e => e.trace_id === id || `seq-${e.flow}-${e.seq}` === id);
   if (!/^[0-9a-f]{32}$/.test(id)) { box.innerHTML = ringHtml(ring); box.dataset.loaded = '1'; return; }
@@ -1716,7 +1813,6 @@ async function saveGolden(btn) {
 let approvalToken = '';
 let reviewSig = '';
 async function pageReview(view, r, hooks) {
-  PAGE = null;
   document.title = 'To review · Vejas';
   reviewSig = '';
   view.innerHTML = `<div class="head"><h1>To review</h1></div>
@@ -1731,9 +1827,10 @@ function proposalChange(p) {
   const pl = p.payload || {};
   if (p.kind === 'set_literal' || p.kind === 'version') {
     const target = `${esc(baseName(pl.file || '?'))}: ${esc(pl.name || '?')}` + (pl.key && pl.key !== '-' ? '.' + esc(pl.key) : '');
-    return `<code>${target}</code> ${icon('chev', 'sep')} <code>${esc(trunc(pl.value, 60))}</code>`;
+    const secret = isSecretKey(pl.name || '') || String(pl.key || '').split('/').some(isSecretKey);
+    return `<code>${target}</code> ${icon('chev', 'sep')} <code>${esc(secret ? 'hidden' : trunc(maskDeep(pl.value), 60))}</code>`;
   }
-  return `<code>${esc(p.kind)}</code> ${esc(trunc(JSON.stringify(pl), 80))}`;
+  return `<code>${esc(p.kind)}</code> ${esc(trunc(JSON.stringify(maskDeep(pl)), 80))}`;
 }
 // Evidence is the whole point of the queue: show it, and if there is none say so
 // plainly (approving blind is a decision the operator should make on purpose).
@@ -1741,8 +1838,9 @@ function evidenceBlock(p) {
   const e = p.evidence;
   const empty = e == null || e === '' || (Array.isArray(e) && !e.length) || (typeof e === 'object' && !Array.isArray(e) && !Object.keys(e).length);
   if (empty) return `<p class="noev">${icon('alert')}No evidence attached: approving it is a blind change.</p>`;
-  const oneLine = typeof e === 'object' ? Object.entries(e).map(([k, v]) => `${k}: ${trunc(v, 40)}`).join(', ') : String(e);
-  return `<details class="more"><summary>Evidence: ${esc(trunc(oneLine, 90))}</summary><pre class="json">${esc(pretty(e))}</pre></details>`;
+  const m = masked(e);
+  const oneLine = m && typeof m === 'object' ? Object.entries(m).map(([k, v]) => `${k}: ${trunc(v, 40)}`).join(', ') : String(m);
+  return `<details class="more" data-key="ev-${esc(p.id)}"><summary>Evidence: ${esc(trunc(oneLine, 90))}</summary><pre class="json">${esc(pretty(m))}</pre></details>`;
 }
 function reviewRefresh(force) {
   const body = $('#review-body');
@@ -1760,10 +1858,10 @@ function reviewRefresh(force) {
   const decided = S.proposals.filter(p => p.status !== 'pending').slice(0, 8);
   let html = `<section class="section" style="margin-top:0"><h2>Dead letters <span class="count">${S.dlq.length}</span></h2>
     <p>Events a connector or a flow could not handle, kept instead of lost. Fix the cause first, then replay them. Discarding deletes them for good.</p>`;
-  html += S.dlq.length ? `<div class="list">${S.dlq.map(e => `<div class="it dl"><div>
+  html += S.dlq.length ? `<div class="list">${S.dlq.map(e => `<div class="it dl" data-key="dl-${Number(e.seq)}"><div>
         <div>${unitLink(e.unit)} could not handle an event on <span class="subject">${esc(e.original_subject || '')}</span></div>
         <div class="dl-err bad">${esc(e.last_error || '')}</div>
-        <details class="more"><summary>The event</summary><pre class="json">${esc(pretty(e.payload || ''))}</pre></details></div>
+        <details class="more"><summary>The event</summary><pre class="json">${esc(pretty(masked(e.payload || '')))}</pre></details></div>
       <div class="acts"><button class="btn small" type="button" data-act="dlq" data-path="/dlq/replay" data-seq="${Number(e.seq)}">${icon('replay')}Replay</button><button class="btn small quiet" type="button" data-act="dlq" data-path="/dlq/purge" data-seq="${Number(e.seq)}">${icon('trash')}Discard</button></div></div>`).join('')}</div>
       <div class="bar"><button class="btn" type="button" data-act="dlq" data-path="/dlq/replay">${icon('replay')}Replay all</button><button class="btn quiet" type="button" data-act="dlq" data-path="/dlq/purge">${icon('trash')}Discard all</button></div>`
     : '<p class="muted">None.</p>';
@@ -1772,15 +1870,17 @@ function reviewRefresh(force) {
     html += `<section class="section"><h2>Changes proposed by agents <span class="count">${pending.length}</span></h2>
       <p>An agent proposes, a person decides. Approving applies the change at once. It takes the approval token, which is not the agent's: the agent that proposed cannot approve itself.</p>
       <div class="token"><label for="approval-token">Approval token</label><input type="password" id="approval-token" autocomplete="off" value="${esc(approvalToken)}"><span class="muted">Kept in this tab only, never stored.</span></div>
-      ${pending.length ? `<div class="list">${pending.map(p => `<div class="it prop"><div>
+      ${pending.length ? `<div class="list">${pending.map(p => `<div class="it prop" data-key="p-${esc(p.id)}"><div>
           <div>${proposalChange(p)}</div>
           <div class="muted">Proposed by <code>${esc(p.author || '?')}</code>, ${ago(p.created_at)} ago</div>${evidenceBlock(p)}</div>
         <div class="acts"><button class="btn small primary" type="button" data-act="decide" data-id="${esc(p.id)}" data-do="approve">Approve</button><button class="btn small quiet" type="button" data-act="decide" data-id="${esc(p.id)}" data-do="reject">Reject</button></div></div>`).join('')}</div>`
         : '<p class="muted">No change is waiting for a decision.</p>'}
-      ${decided.length ? `<details class="more"><summary>Decided recently</summary><ul class="history">${decided.map(p => `<li>${proposalChange(p)}: <b class="${p.status === 'approved' ? '' : p.status === 'expired' ? 'bad' : 'muted'}">${esc(p.status)}</b>${p.decided_by ? ` by <code>${esc(p.decided_by)}</code>` : ''}</li>`).join('')}</ul></details>` : ''}
+      ${decided.length ? `<details class="more" data-key="decided"><summary>Decided recently</summary><ul class="history">${decided.map(p => `<li>${proposalChange(p)}: <b class="${p.status === 'approved' ? '' : p.status === 'expired' ? 'bad' : 'muted'}">${esc(p.status)}</b>${p.decided_by ? ` by <code>${esc(p.decided_by)}</code>` : ''}</li>`).join('')}</ul></details>` : ''}
     </section>`;
   }
+  const restore = holdPlace(body);
   body.innerHTML = html;
+  restore();
   const tok = $('#approval-token');
   if (tok) tok.addEventListener('input', ev => { approvalToken = ev.target.value.trim(); });
 }
@@ -1817,7 +1917,6 @@ async function decideProposal(id, action) {
 
 /* ---------- secrets: references and status, values write-only ---------- */
 async function pageSecrets(view) {
-  PAGE = null;
   document.title = 'Secrets · Vejas';
   let d;
   try { d = await getJSON('/secrets'); S.secrets = d; } catch (e) { d = {secrets: [], error: e.message}; }
@@ -1850,7 +1949,6 @@ async function setSecretRow(btn) {
 
 /* ---------- a new flow or connector, written by the agent ---------- */
 async function pageNew(view, r) {
-  PAGE = null;
   const type = r.q.get('type') === 'connector' ? 'connector' : 'flow';
   document.title = `New ${type} · Vejas`;
   view.innerHTML = `<div class="head"><h1>New ${type}</h1></div>
@@ -1908,12 +2006,31 @@ document.addEventListener('click', ev => {
 });
 
 /* ---------- live data ---------- */
+// What the page on screen reads from the events ring. Activity reads the newest
+// of all; a flow's or a connector's page, and Activity for one flow, read that
+// unit's events with the other hops of each: a timer that sends every second
+// never pushes a quiet flow's events out of its own page.
+function eventsUrl(r = R) {
+  const one = r.page === 'activity' ? r.q.get('flow') : '';
+  const unit = r.page === 'flow' ? 'flow:' + r.arg : r.page === 'connector' ? 'connector:' + r.arg : one ? 'flow:' + one : '';
+  if (unit) return '/events?paths=1&flow=' + enc(unit);
+  return r.page === 'activity' ? '/events' : null;
+}
+async function loadEvents(r = R) {
+  const url = eventsUrl(r);
+  if (!url) return false;
+  let events;
+  try { events = (await getJSON(url)).events || []; } catch { return false; }
+  if (url !== eventsUrl()) return false;  // the page changed meanwhile
+  S.events = events;
+  return true;
+}
 async function pollEvents() {
-  try { S.events = (await getJSON('/events')).events || []; } catch { return; }
+  if (!await loadEvents()) return;
   if (R.page === 'activity') activityRefresh();
   if (R.page === 'flow') {
     const el = $('#flow-lede'), f = (S.graph.flows || []).find(x => x.name === R.arg);
-    if (el && f) el.innerHTML = flowLede(f);
+    if (el && f) rewrite(el, flowLede(f));
   }
 }
 async function pollReview() {
@@ -1940,7 +2057,7 @@ async function pollTopo() {
 }
 
 (async function start() {
-  try { await Promise.all([loadCore(), pollEvents(), pollReview()]); }
+  try { await Promise.all([loadCore(), pollReview()]); }
   catch (e) {
     $('#page').innerHTML = `<div class="head"><h1>The runtime does not answer</h1></div><p class="lede">${esc(e.message)}</p>`;
     return;

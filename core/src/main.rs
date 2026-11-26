@@ -175,28 +175,51 @@ pub fn record_trace_full(
 /// Newest-first flat list of trace entries, optionally for one flow, capped.
 /// The stored full event stays internal (replay fuel), only the preview goes out.
 fn events_json(flow: Option<&str>) -> String {
+    events_out(flow, false)
+}
+
+/// One unit's events, each with the other hops of its path (the entries that
+/// share its trace id), for a page that follows events end to end. A unit that
+/// sends often (a timer) never pushes a quiet flow's events out of it, as it
+/// does out of the newest hundred of all units.
+fn events_with_paths_json(unit: &str) -> String {
+    events_out(Some(unit), true)
+}
+
+fn events_out(flow: Option<&str>, paths: bool) -> String {
     let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let traces: std::collections::HashSet<&str> = match (flow, paths) {
+        (Some(f), true) => map
+            .get(f)
+            .map(|ring| ring.iter().filter_map(|e| e["trace_id"].as_str()).collect())
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
+    let traces = &traces;
     let mut all: Vec<Value> = map
         .iter()
-        .filter(|(name, _)| flow.map(|f| f == name.as_str()).unwrap_or(true))
-        .flat_map(|(_, ring)| {
-            ring.iter().map(|e| {
-                let mut e = e.clone();
-                if let Some(o) = e.as_object_mut() {
-                    // Hot loops store the event and no preview (one JSON walk
-                    // less per message); derive it here, on read.
-                    if o.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
-                        let pv = o.get("event").map(preview_of).unwrap_or_default();
-                        o.insert("preview".into(), Value::String(pv));
+        .flat_map(|(name, ring)| {
+            let mine = flow.is_none_or(|f| f == name.as_str());
+            ring.iter()
+                .filter(move |e| mine || e["trace_id"].as_str().is_some_and(|t| traces.contains(t)))
+                .map(|e| {
+                    let mut e = e.clone();
+                    if let Some(o) = e.as_object_mut() {
+                        // Hot loops store the event and no preview (one JSON walk
+                        // less per message); derive it here, on read.
+                        if o.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
+                            let pv = o.get("event").map(preview_of).unwrap_or_default();
+                            o.insert("preview".into(), Value::String(pv));
+                        }
+                        o.remove("event");
                     }
-                    o.remove("event");
-                }
-                e
-            })
+                    e
+                })
         })
         .collect();
     all.sort_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)));
-    all.truncate(100);
+    // a unit's ring holds 50; with the other hops of those events, 200 holds them
+    all.truncate(if paths { 200 } else { 100 });
     json!({ "events": all }).to_string()
 }
 
@@ -2428,6 +2451,7 @@ fn topology_json(registry: &Registry) -> Value {
 /// Connector instances (manifests), for the graph: name, driver, kind, in/out.
 fn connector_graph(root: &Path) -> Vec<Value> {
     let mut out = Vec::new();
+    let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
     let scan = |dir: PathBuf, list: &mut Vec<Value>| {
         let Ok(entries) = fs::read_dir(&dir) else { return };
         for e in entries.flatten() {
@@ -2445,8 +2469,8 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             let mut entry = json!({"name": name, "driver": driver, "kind": kind});
             if kind.starts_with("source") {
                 // NATS patterns: `*` is one token, `>` the rest. A webhook
-                // publishes on vx.<what the caller asked for>, within its ALLOW
-                // list when it has one (an entry allows itself and below).
+                // publishes on <root>.<what the caller asked for>, within its
+                // ALLOW list when it has one (an entry allows itself and below).
                 let allow: Vec<&str> = cfg
                     .get("ALLOW")
                     .and_then(|v| v.as_array())
@@ -2455,9 +2479,9 @@ fn connector_graph(root: &Path) -> Vec<Value> {
                 let subjects: Vec<String> = match cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                     Some(s) => vec![s.to_string()],
                     None if driver == "http-in" && !allow.is_empty() => {
-                        allow.iter().flat_map(|a| [format!("vx.{a}"), format!("vx.{a}.>")]).collect()
+                        allow.iter().flat_map(|a| [format!("{subj_root}.{a}"), format!("{subj_root}.{a}.>")]).collect()
                     }
-                    None => vec!["vx.>".to_string()],
+                    None => vec![format!("{subj_root}.>")],
                 };
                 entry["subjects_out"] = json!(subjects);
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
@@ -2870,6 +2894,10 @@ fn ask_agent(prompt: String) -> Result<String, String> {
     Ok(code)
 }
 
+fn stem_of(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
 fn unique_target(dir: &Path, name: &str) -> PathBuf {
     let mut target = dir.join(format!("{name}.vjs"));
     let mut n = 2;
@@ -2906,6 +2934,8 @@ fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
     let name = first_line_name(&code, "# flow:", "flow");
     let target = unique_target(&root.join("flows"), &name);
     fs::write(&target, &code).map_err(|e| e.to_string())?;
+    // the name it runs under: the file's, which a taken name made order_sync_2
+    let name = stem_of(&target).unwrap_or(name);
     Ok(json!({"ok": true, "file": target.display().to_string(), "flow": name, "lang": "vjs"})
         .to_string())
 }
@@ -2961,6 +2991,7 @@ fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
     let _ = fs::create_dir_all(&dir);
     let target = unique_target(&dir, &name);
     fs::write(&target, &code).map_err(|e| e.to_string())?;
+    let name = stem_of(&target).unwrap_or(name);
     Ok(json!({"ok": true, "file": target.display().to_string(), "connector": name, "driver": driver})
         .to_string())
 }
@@ -4557,8 +4588,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             "application/json",
         ),
         (tiny_http::Method::Get, "/events") => {
-            let flow = qparam(&url, "flow");
-            respond(request, 200, events_json(flow.as_deref()), "application/json")
+            // `flow%3Aorder_sync`, as a browser encodes it, is `flow:order_sync`
+            let flow = qparam(&url, "flow").map(|f| metrics::percent_decode(&f));
+            let body = match flow.as_deref() {
+                Some(unit) if qparam(&url, "paths").as_deref() == Some("1") => events_with_paths_json(unit),
+                unit => events_json(unit),
+            };
+            respond(request, 200, body, "application/json")
         }
         (tiny_http::Method::Post, "/events/golden") => {
             // Curate a golden test from a real event (candidate 4.4). Writes a
@@ -5547,6 +5583,23 @@ mod tests {
         assert_eq!(entry["flow"], "flow:strip_probe");
         assert!(entry.get("event").is_none(), "full event must not leave the runtime via /events");
         assert_eq!(entry["preview"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_units_events_come_with_the_other_hops_of_their_path() {
+        let hook = trace::Hop::begin(None);
+        let flow = hook.child();
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&hook));
+        record_trace("flow:paths_probe", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&flow));
+        let elsewhere = trace::Hop::begin(None);
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&elsewhere));
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, None);
+        let out: Value = serde_json::from_str(&events_with_paths_json("flow:paths_probe")).unwrap();
+        let units: Vec<&str> = out["events"].as_array().unwrap().iter().filter_map(|e| e["flow"].as_str()).collect();
+        assert_eq!(units, ["flow:paths_probe", "connector:paths_hook"],
+                   "the flow's event and the webhook's hop of it, not the webhook's other events");
+        let alone: Value = serde_json::from_str(&events_json(Some("flow:paths_probe"))).unwrap();
+        assert_eq!(alone["events"].as_array().unwrap().len(), 1);
     }
 
     #[test]
