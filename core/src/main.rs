@@ -132,8 +132,9 @@ pub fn record_trace(
     preview: String,
     event: Option<Value>,
     trace: Option<&trace::Hop>,
+    delivery: Option<bus::Delivery>,
 ) {
-    record_trace_full(flow, subject, ok, error, emits, preview, event, None, trace)
+    record_trace_full(flow, subject, ok, error, emits, preview, event, None, trace, delivery)
 }
 
 /// Full form: `response` carries a sink's response-body summary (what the
@@ -150,6 +151,7 @@ pub fn record_trace_full(
     event: Option<Value>,
     response: Option<String>,
     trace: Option<&trace::Hop>,
+    delivery: Option<bus::Delivery>,
 ) {
     // The trace this hop belongs to (ADR-0034): what an operator copies into
     // the tracing backend to see the whole path of this event.
@@ -164,6 +166,12 @@ pub fn record_trace_full(
         "seq": seq, "ts": now_secs(), "flow": unit, "subject": subject,
         "ok": ok, "error": error, "emits": emits, "preview": preview,
         "response": response, "trace_id": trace_id, "span_id": span_id,
+        // the JetStream message the hop consumed and which delivery of it this
+        // was: a retry shares the message, another message of the trace does not
+        "stream_seq": delivery.as_ref().map(|d| d.stream_seq),
+        "attempt": delivery.as_ref().map(|d| d.delivered),
+        // a dead letter's replay: the message that died, the same event
+        "replay_of": delivery.as_ref().and_then(|d| d.replay_of),
         // the full event, kept for shadow-replay; stripped from /events output
         "event": event,
     }));
@@ -175,29 +183,74 @@ pub fn record_trace_full(
 /// Newest-first flat list of trace entries, optionally for one flow, capped.
 /// The stored full event stays internal (replay fuel), only the preview goes out.
 fn events_json(flow: Option<&str>) -> String {
-    let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    let mut all: Vec<Value> = map
-        .iter()
-        .filter(|(name, _)| flow.map(|f| f == name.as_str()).unwrap_or(true))
-        .flat_map(|(_, ring)| {
-            ring.iter().map(|e| {
-                let mut e = e.clone();
-                if let Some(o) = e.as_object_mut() {
+    events_out(flow, false)
+}
+
+/// One unit's events, each with the other hops of its path (the entries that
+/// share its trace id), for a page that follows events end to end. A unit that
+/// sends often (a timer) never pushes a quiet flow's events out of it, as it
+/// does out of the newest hundred of all units.
+fn events_with_paths_json(unit: &str) -> String {
+    events_out(Some(unit), true)
+}
+
+/// The other hops `/events?paths=1` gives with a unit's events, the newest.
+const PATH_HOPS_MAX: usize = 200;
+
+fn events_out(flow: Option<&str>, paths: bool) -> String {
+    let newest_first = |hops: &mut Vec<&Value>| {
+        hops.sort_unstable_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)))
+    };
+    // Every message's hop waits on this lock: under it, only the choice, a copy
+    // of what goes out and its preview (bounded); the serialising after.
+    let events: Vec<Value> = {
+        let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let mut picked: Vec<&Value> = match flow {
+            Some(f) => {
+                // the unit's own ring (50) whole; the other hops capped, so a
+                // busy path never pushes the unit's oldest events out
+                let mut own: Vec<&Value> = map.get(f).map(|ring| ring.iter().collect()).unwrap_or_default();
+                if paths {
+                    let traces: HashSet<&str> = own.iter().filter_map(|e| e["trace_id"].as_str()).collect();
+                    let mut others: Vec<&Value> = map
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != f)
+                        .flat_map(|(_, ring)| ring.iter())
+                        .filter(|e| e["trace_id"].as_str().is_some_and(|t| traces.contains(t)))
+                        .collect();
+                    newest_first(&mut others);
+                    others.truncate(PATH_HOPS_MAX);
+                    own.extend(others);
+                }
+                own
+            }
+            None => map.values().flat_map(|ring| ring.iter()).collect(),
+        };
+        newest_first(&mut picked);
+        if flow.is_none() {
+            picked.truncate(100);
+        }
+        picked
+            .into_iter()
+            .map(|e| {
+                let mut out = serde_json::Map::new();
+                if let Some(o) = e.as_object() {
+                    // the stored event stays in (replay fuel); a copy of the rest
+                    for (k, v) in o.iter().filter(|(k, _)| k.as_str() != "event") {
+                        out.insert(k.clone(), v.clone());
+                    }
                     // Hot loops store the event and no preview (one JSON walk
                     // less per message); derive it here, on read.
-                    if o.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
+                    if out.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
                         let pv = o.get("event").map(preview_of).unwrap_or_default();
-                        o.insert("preview".into(), Value::String(pv));
+                        out.insert("preview".into(), Value::String(pv));
                     }
-                    o.remove("event");
                 }
-                e
+                Value::Object(out)
             })
-        })
-        .collect();
-    all.sort_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)));
-    all.truncate(100);
-    json!({ "events": all }).to_string()
+            .collect()
+    };
+    json!({ "events": events }).to_string()
 }
 
 /// A unit's file as traces and the panel name it: relative to the project
@@ -1005,13 +1058,41 @@ fn trace_preview(entry: &Value) -> String {
     }
 }
 
+/// The beginning of an event as the ring shows it: 160 characters at most,
+/// written only as far as that takes, however large the event (`/events`
+/// derives it under the ring's lock).
 fn preview_of(v: &Value) -> String {
-    let s = v.to_string();
-    if s.chars().count() > 160 {
-        let cut: String = s.chars().take(159).collect();
+    const CHARS: usize = 160;
+    // four bytes at most a character: past this, more than CHARS are written
+    const ENOUGH: usize = 4 * (CHARS + 1);
+    struct Upto(Vec<u8>);
+    impl std::io::Write for Upto {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // a long string comes in one write: take only what is missing
+            let room = ENOUGH.saturating_sub(self.0.len());
+            if room == 0 {
+                return Err(std::io::Error::other("enough for a preview"));
+            }
+            let n = buf.len().min(room);
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Upto(Vec::new());
+    // stopped on purpose past ENOUGH: what was written is all the preview needs
+    let _ = serde_json::to_writer(&mut out, v);
+    let s = match std::str::from_utf8(&out.0) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&out.0[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    if s.chars().count() > CHARS {
+        let cut: String = s.chars().take(CHARS - 1).collect();
         format!("{cut}…")
     } else {
-        s
+        s.to_string()
     }
 }
 
@@ -1288,17 +1369,17 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let prev: String =
                                 String::from_utf8_lossy(&msg.data).chars().take(160).collect();
                             metrics::observe(&handle.spec.name, false, 0, 0.0);
-                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried));
+                            let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()));
                             match &dead {
                                 Ok(()) => {
                                     metrics::inc_dead_letter(&handle.spec.name);
                                     record_trace(&handle.spec.name, &msg.subject, false,
-                                        Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop));
+                                        Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.ack();
                                 }
                                 Err(de) => {
                                     record_trace(&handle.spec.name, &msg.subject, false,
-                                        Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None, Some(&hop));
+                                        Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.nak();
                                 }
                             }
@@ -1360,6 +1441,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 String::new(),
                                 Some(event),
                                 Some(&hop),
+                                msg.delivery(),
                             );
                             to_ack.push(msg); // acked after the batch flush
                         }
@@ -1373,25 +1455,25 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 msg.delivery().map(|i| i.delivered).unwrap_or(1);
                             let mut dead_lettered = false;
                             if delivered >= MAX_DELIVERIES {
-                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried)) {
+                                match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message())) {
                                     Ok(()) => {
                                         dead_lettered = true;
                                         metrics::inc_dead_letter(&handle.spec.name);
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
-                                            vec![], String::new(), Some(event.clone()), Some(&hop));
+                                            vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.ack();
                                     }
                                     Err(de) => {
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — DLQ publish failed: {de}")),
-                                            vec![], String::new(), Some(event.clone()), Some(&hop));
+                                            vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.nak();
                                     }
                                 }
                             } else {
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], String::new(), Some(event.clone()), Some(&hop));
+                                    vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                 // no ack -> redelivery after ack_wait
                             }
                             if observing {
@@ -1486,6 +1568,9 @@ fn hop_span(
         span = span
             .attr("messaging.message.id", d.stream_seq.to_string())
             .attr("vejas.delivery.attempt", d.delivered);
+        if let Some(died) = d.replay_of {
+            span = span.attr("vejas.replay_of", died.to_string());
+        }
     }
     span
 }
@@ -1831,7 +1916,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                 let delivered =
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 metrics::observe(&handle.spec.name, false, 0, 0.0);
-                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried));
+                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()));
                                 match &dead {
                                     Ok(()) => {
                                         metrics::inc_dead_letter(&handle.spec.name);
@@ -1882,6 +1967,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     connectors::trace_preview(&msg.data),
                                     None,
                                     Some(&hop),
+                                    msg.delivery(),
                                 );
                                 if ok {
                                     to_ack.push((msg, seq));
@@ -1895,7 +1981,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     msg.delivery().map(|i| i.delivered).unwrap_or(1);
                                 let mut dead_lettered = false;
                                 if delivered >= MAX_DELIVERIES {
-                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried)) {
+                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message())) {
                                         Ok(()) => {
                                             dead_lettered = true;
                                             metrics::inc_dead_letter(&handle.spec.name);
@@ -1916,7 +2002,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
                                 }
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop));
+                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
                                 set_state(&handle, |st| st.last_error = Some(e));
                             }
                         }
@@ -2428,6 +2514,7 @@ fn topology_json(registry: &Registry) -> Value {
 /// Connector instances (manifests), for the graph: name, driver, kind, in/out.
 fn connector_graph(root: &Path) -> Vec<Value> {
     let mut out = Vec::new();
+    let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
     let scan = |dir: PathBuf, list: &mut Vec<Value>| {
         let Ok(entries) = fs::read_dir(&dir) else { return };
         for e in entries.flatten() {
@@ -2444,8 +2531,22 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let mut entry = json!({"name": name, "driver": driver, "kind": kind});
             if kind.starts_with("source") {
-                let subj = cfg.get("SUBJECT").and_then(|v| v.as_str()).unwrap_or("vx.*");
-                entry["subjects_out"] = json!([subj]);
+                // NATS patterns: `*` is one token, `>` the rest. A webhook
+                // publishes on <root>.<what the caller asked for>, within its
+                // ALLOW list when it has one (an entry allows itself and below).
+                let allow: Vec<&str> = cfg
+                    .get("ALLOW")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let subjects: Vec<String> = match cfg.get("SUBJECT").and_then(|v| v.as_str()) {
+                    Some(s) => vec![s.to_string()],
+                    None if driver == "http-in" && !allow.is_empty() => {
+                        allow.iter().flat_map(|a| [format!("{subj_root}.{a}"), format!("{subj_root}.{a}.>")]).collect()
+                    }
+                    None => vec![format!("{subj_root}.>")],
+                };
+                entry["subjects_out"] = json!(subjects);
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                 entry["subjects_in"] = json!([s]);
             }
@@ -2542,6 +2643,7 @@ fn surface_json(root: &Path) -> Value {
         for e in prog.surface {
             entries.push(json!({
                 "file": path.display().to_string(),
+                "doc": vjs::literal_doc(&src, e.value_span.0),
                 "name": e.name,
                 "kind": vjs_kind_of(&e.name, &e.value),
                 "value": e.value,
@@ -2590,6 +2692,7 @@ fn surface_json(root: &Path) -> Value {
             let mut v = base.clone();
             let o = v.as_object_mut().unwrap();
             o.insert("name".into(), json!(e.name));
+            o.insert("doc".into(), json!(vjs::literal_doc(&src, e.value_span.0)));
             o.insert("kind".into(), json!(vjs_kind_of(&e.name, &e.value)));
             o.insert("value".into(), e.value.clone());
             o.insert("list".into(), json!(e.value.is_array()));
@@ -2651,6 +2754,28 @@ fn rules_json(root: &Path, file: &str) -> Result<String, String> {
     let prog = vjs::parse(&src)?;
     let rules = vjs::flow_rules(&prog, &src, &prog.surface);
     Ok(json!({"file": file, "rules": rules}).to_string())
+}
+
+/// A flow as its page shows it: what it reads from its event, each value it
+/// computes and from what, what it checks (the rules-view), where it sends,
+/// and the comment each business literal carries. Derived from the code,
+/// read-only: the panel changes literals through the surface.
+fn shape_json(root: &Path, file: &str) -> Result<String, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let prog = vjs::parse(&src)?;
+    // what each invoked service makes, resolved as a run would resolve it
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
+    let services: Vec<(String, Vec<String>)> = prog
+        .invokes
+        .iter()
+        .filter_map(|name| engine.service_makes(name).ok().map(|made| (name.clone(), made)))
+        .collect();
+    let mut shape = vjs::flow_shape(&prog, &src, &services);
+    shape["file"] = json!(file);
+    shape["source"] = json!(prog.source);
+    shape["rules"] = Value::Array(vjs::flow_rules(&prog, &src, &prog.surface));
+    Ok(shape.to_string())
 }
 
 fn preview_json(root: &Path, file: &str) -> Result<String, String> {
@@ -2832,6 +2957,10 @@ fn ask_agent(prompt: String) -> Result<String, String> {
     Ok(code)
 }
 
+fn stem_of(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
 fn unique_target(dir: &Path, name: &str) -> PathBuf {
     let mut target = dir.join(format!("{name}.vjs"));
     let mut n = 2;
@@ -2868,6 +2997,8 @@ fn generate_flow(root: &Path, prompt: &str) -> Result<String, String> {
     let name = first_line_name(&code, "# flow:", "flow");
     let target = unique_target(&root.join("flows"), &name);
     fs::write(&target, &code).map_err(|e| e.to_string())?;
+    // the name it runs under: the file's, which a taken name made order_sync_2
+    let name = stem_of(&target).unwrap_or(name);
     Ok(json!({"ok": true, "file": target.display().to_string(), "flow": name, "lang": "vjs"})
         .to_string())
 }
@@ -2923,6 +3054,7 @@ fn generate_connector(root: &Path, prompt: &str) -> Result<String, String> {
     let _ = fs::create_dir_all(&dir);
     let target = unique_target(&dir, &name);
     fs::write(&target, &code).map_err(|e| e.to_string())?;
+    let name = stem_of(&target).unwrap_or(name);
     Ok(json!({"ok": true, "file": target.display().to_string(), "connector": name, "driver": driver})
         .to_string())
 }
@@ -3455,14 +3587,17 @@ fn dlq_audit(
 /// all (both None).
 fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
     let js = dlq_js()?;
-    let mut targets: Vec<(u64, String, Vec<u8>, Option<trace::Context>)> = Vec::new();
-    let take = |env: &Value| -> (u64, String, Vec<u8>, Option<trace::Context>) {
+    type Target = (u64, String, Vec<u8>, Option<trace::Context>, Option<u64>);
+    let mut targets: Vec<Target> = Vec::new();
+    let take = |env: &Value| -> Target {
         (
             env["seq"].as_u64().unwrap_or(0),
             env["original_subject"].as_str().unwrap_or("").to_string(),
             env["payload"].as_str().unwrap_or("").as_bytes().to_vec(),
             // The trace the letter died in (ADR-0034): the replay continues it.
             env["traceparent"].as_str().and_then(|tp| trace::Context::parse(tp, None)),
+            // The message that died: the replay names it, the same event.
+            env["original_seq"].as_u64(),
         )
     };
     if let Some(s) = seq {
@@ -3480,13 +3615,13 @@ fn dlq_replay(seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value
         }
     }
     let (mut n, mut errs) = (0u64, Vec::new());
-    for (s, subj, payload, died_in) in targets {
+    for (s, subj, payload, died_in, original) in targets {
         if subj.is_empty() || s == 0 {
             continue;
         }
         let hop = trace::Hop::begin(died_in);
         let start_nanos = metrics::now_nanos();
-        let published = js.publish_traced(&subj, &payload, &hop.context());
+        let published = js.publish_replay(&subj, &payload, &hop.context(), original);
         if metrics::wants(hop.sampled, published.is_err()) {
             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, "dlq:replay", start_nanos)
                 .messaging("send", &subj)
@@ -4519,8 +4654,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             "application/json",
         ),
         (tiny_http::Method::Get, "/events") => {
-            let flow = qparam(&url, "flow");
-            respond(request, 200, events_json(flow.as_deref()), "application/json")
+            // `flow%3Aorder_sync`, as a browser encodes it, is `flow:order_sync`
+            let flow = qparam(&url, "flow").map(|f| metrics::percent_decode(&f));
+            let body = match flow.as_deref() {
+                Some(unit) if qparam(&url, "paths").as_deref() == Some("1") => events_with_paths_json(unit),
+                unit => events_json(unit),
+            };
+            respond(request, 200, body, "application/json")
         }
         (tiny_http::Method::Post, "/events/golden") => {
             // Curate a golden test from a real event (candidate 4.4). Writes a
@@ -4648,6 +4788,15 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "missing file".into(), "text/plain");
             };
             match rules_json(&root, &file) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, "/shape") => {
+            let Some(file) = qparam(&url, "file") else {
+                return respond(request, 400, "missing file".into(), "text/plain");
+            };
+            match shape_json(&root, &file) {
                 Ok(json) => respond(request, 200, json, "application/json"),
                 Err(err) => respond(request, 500, err, "text/plain"),
             }
@@ -5280,6 +5429,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn a_source_lists_the_subjects_it_can_publish_as_nats_patterns() {
+        let root = std::env::temp_dir().join(format!("vejas-cgraph-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("connectors")).unwrap();
+        let write = |name: &str, src: &str| fs::write(root.join("connectors").join(name), src).unwrap();
+        write("open_hook.vjs", "driver \"http-in\"\nPORT = 8787\n");
+        write("shop_hook.vjs", "driver \"http-in\"\nPORT = 8788\nALLOW = [\"shop\"]\n");
+        write("tick.vjs", "driver \"timer\"\nSUBJECT = \"vx.ops.ping\"\nINTERVAL_SECS = 30\n");
+        let graph = connector_graph(&root);
+        let out = |name: &str| graph.iter().find(|c| c["name"] == name).unwrap()["subjects_out"].clone();
+        assert_eq!(out("open_hook"), json!(["vx.>"]), "without ALLOW a webhook reaches any vx subject");
+        assert_eq!(out("shop_hook"), json!(["vx.shop", "vx.shop.>"]), "an ALLOW entry allows itself and below");
+        assert_eq!(out("tick"), json!(["vx.ops.ping"]));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // NOTE: TRACES is process-global and tests run in parallel — every test
     // must use its own unique flow name.
 
@@ -5292,8 +5458,8 @@ mod tests {
             "source \"vx.rp.test\"\nTH = 500\nif amount > TH:\n  emit \"vx.out\", {a: amount}\nend\n",
         )
         .unwrap();
-        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec!["vx.out".into()], "{}".into(), Some(json!({"amount": 700})), None);
-        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec![], "{}".into(), Some(json!({"amount": 300})), None);
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec!["vx.out".into()], "{}".into(), Some(json!({"amount": 700})), None, None);
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec![], "{}".into(), Some(json!({"amount": 300})), None, None);
         let diff = replay_literal(&root, "flows/replay_probe.vjs", "TH", "-", &json!(200), 20).unwrap();
         assert_eq!(diff["events"], 2);
         // 700 emitted before and after; 300 emits only after the change
@@ -5477,12 +5643,96 @@ mod tests {
 
     #[test]
     fn events_json_strips_the_full_event() {
-        record_trace("flow:strip_probe", "vx.sp.test", true, None, vec![], "{\"a\":1}".into(), Some(json!({"a": 1})), None);
+        record_trace("flow:strip_probe", "vx.sp.test", true, None, vec![], "{\"a\":1}".into(), Some(json!({"a": 1})), None, None);
         let out: Value = serde_json::from_str(&events_json(Some("flow:strip_probe"))).unwrap();
         let entry = &out["events"][0];
         assert_eq!(entry["flow"], "flow:strip_probe");
         assert!(entry.get("event").is_none(), "full event must not leave the runtime via /events");
         assert_eq!(entry["preview"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_units_events_come_with_the_other_hops_of_their_path() {
+        let hook = trace::Hop::begin(None);
+        let flow = hook.child();
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&hook), None);
+        record_trace("flow:paths_probe", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&flow), None);
+        let elsewhere = trace::Hop::begin(None);
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&elsewhere), None);
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, None, None);
+        let out: Value = serde_json::from_str(&events_with_paths_json("flow:paths_probe")).unwrap();
+        let units: Vec<&str> = out["events"].as_array().unwrap().iter().filter_map(|e| e["flow"].as_str()).collect();
+        assert_eq!(units, ["flow:paths_probe", "connector:paths_hook"],
+                   "the flow's event and the webhook's hop of it, not the webhook's other events");
+        let alone: Value = serde_json::from_str(&events_json(Some("flow:paths_probe"))).unwrap();
+        assert_eq!(alone["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_preview_is_the_same_cut_however_large_the_event() {
+        let whole = |v: &Value| {
+            let s = v.to_string();
+            if s.chars().count() > 160 {
+                format!("{}…", s.chars().take(159).collect::<String>())
+            } else {
+                s
+            }
+        };
+        let values = [
+            json!({}),
+            json!({"a": "x".repeat(152)}),
+            json!({"a": "x".repeat(153)}),
+            json!({"t": "é€😀a".repeat(5000)}),
+            json!("ü".repeat(161)),
+            json!({"n": (0..10_000).collect::<Vec<u32>>()}),
+        ];
+        for v in &values {
+            assert_eq!(preview_of(v), whole(v));
+        }
+        assert_eq!(preview_of(&values[1]).chars().count(), 160, "exactly 160: whole");
+    }
+
+    #[test]
+    fn a_busy_path_never_pushes_the_units_own_events_out() {
+        let hook = trace::Hop::begin(None);
+        let flow = hook.child();
+        record_trace("flow:cap_probe", "vx.cap.in", true, None, vec![], "{}".into(), None, Some(&flow), None);
+        // newer hops of the same trace, more than the cap, over five rings of 50
+        for i in 0..PATH_HOPS_MAX + 10 {
+            let unit = format!("connector:cap_hook_{}", i % 5);
+            record_trace(&unit, "vx.cap.in", true, None, vec![], "{}".into(), None, Some(&hook), None);
+        }
+        let out: Value = serde_json::from_str(&events_with_paths_json("flow:cap_probe")).unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), PATH_HOPS_MAX + 1);
+        assert_eq!(events.last().unwrap()["flow"], "flow:cap_probe", "the oldest, and still there");
+    }
+
+    #[test]
+    fn a_retry_and_another_message_of_one_trace_read_apart() {
+        let hop = trace::Hop::begin(None);
+        let delivery = |delivered, stream_seq| Some(bus::Delivery { delivered, stream_seq, replay_of: None });
+        record_trace("flow:retry_probe", "vx.rt.in", false, Some("refused".into()), vec![], "{}".into(), None, Some(&hop), delivery(1, 41));
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(2, 41));
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(1, 42));
+        let out: Value = serde_json::from_str(&events_json(Some("flow:retry_probe"))).unwrap();
+        let read: Vec<(u64, i64)> = out["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["stream_seq"].as_u64().unwrap(), e["attempt"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(read, [(42, 1), (41, 2), (41, 1)], "the retry shares its message; the other message has its own");
+        // the replay of a dead letter is a new message that names the one that died
+        let replay = Some(bus::Delivery { delivered: 1, stream_seq: 97, replay_of: Some(41) });
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), replay);
+        let out: Value = serde_json::from_str(&events_json(Some("flow:retry_probe"))).unwrap();
+        assert_eq!((out["events"][0]["stream_seq"].as_u64(), out["events"][0]["replay_of"].as_u64()), (Some(97), Some(41)));
+        assert_eq!(out["events"][1]["replay_of"], Value::Null);
+        let source = "connector:retry_probe_source";
+        record_trace(source, "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), None);
+        let out: Value = serde_json::from_str(&events_json(Some(source))).unwrap();
+        assert_eq!(out["events"][0]["stream_seq"], Value::Null, "a hop that consumed nothing names no message");
     }
 
     #[test]

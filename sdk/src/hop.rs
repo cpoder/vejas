@@ -54,6 +54,9 @@ pub struct HopEvent<'a> {
     pub latency: Option<Duration>,
     /// The delivery was parked in the dead-letter queue.
     pub dead_lettered: bool,
+    /// The JetStream delivery a sink consumed: which message, which attempt.
+    /// The ring tells a retry from another message of the same trace by it.
+    pub delivery: Option<bus::Delivery>,
 }
 
 /// The beginning of a payload, as the events ring shows it.

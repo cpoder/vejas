@@ -80,7 +80,7 @@ fn supervise(registry: Registry, root: PathBuf, tenant: String) {
                         crate::record_trace_full(
                             "control", &cmd_subj, ok,
                             (!ok).then(|| reply["error"].as_str().unwrap_or("error").to_string()),
-                            vec![], format!("{cmd} {summary}"), None, None, None,
+                            vec![], format!("{cmd} {summary}"), None, None, None, None,
                         );
                         let _ = nc.publish(
                             &audit_subj,

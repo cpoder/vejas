@@ -17,8 +17,9 @@ mappings — is the **business surface**. It self-describes at `GET /surface`
   "value": { "critique": "P1", "haute": "P2", "normale": "P3", "basse": "P4" } }
 ```
 
-The panel renders each entry as an editable card; the agent reads the same
-surface to know what it may safely change.
+The panel shows each entry in yellow on the flow's page, where the flow uses
+it, and a click opens it for editing; the agent reads the same surface to know
+what it may safely change.
 
 ## Rules as sentences
 
@@ -42,12 +43,13 @@ sentence.
 
 Editing one entry is a promote:
 
-- Panel: change the card → **Apply**.
+- Panel: click the yellow value, change it → **Check on recent events** →
+  **Make it live**.
 - API: `POST /surface/set`; agent: `vejas_set_literal`.
 
 It hot-reloads that flow — the one unit picks up the new value, no process
 restart and no deploy. And you don't do it blind:
-Apply previews the change against real traffic first (shadow-replay), so you
+the check previews the change against real traffic first (shadow-replay), so you
 see *what would have differed* before you commit. That whole safety story —
 preview, promote, roll back, canary — is [change safely](change-safely.md).
 

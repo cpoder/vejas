@@ -21,13 +21,14 @@ answer with a didactic refusal pointing at the proposal queue.
 | `GET /metrics` | Prometheus text format — hand-rolled, always on. |
 | `GET /` · `GET /panel` | The panel (single embedded HTML). |
 | `GET /topology` | Units and their wiring. |
-| `GET /graph` | The flow graph (drives the panel's clickable diagram). |
-| `GET /events` | Recent traced events (ring). |
+| `GET /graph` | The flow graph (drives the panel's map). A connector lists the subjects it reads or publishes as NATS patterns. |
+| `GET /events` | Recent traced events (ring): the newest 100 of all units, or one unit's with `?flow=<unit>` (`flow:order_sync`, `connector:http_in`). With `&paths=1`, that unit's events come with the other hops of each one (the entries that share its trace id, the newest 200), so a page reads each path whole. Each entry names the unit, the subject, `ok` and the error, what it sent (`emits`), the beginning of its payload, its `trace_id`, and for a hop that consumed a JetStream message, that message (`stream_seq`) and which delivery of it this was (`attempt`): a retry shares its message, and a dead letter's replay names the message that died (`replay_of`). |
 | `GET /traces/{trace id}` | One event end to end from the trace record (ADR-0034): every hop kept, in the order they started, each flow hop with the statements it ran and their code, while the file (or, for a flow promoted in a cluster, the version store) still holds the version that ran. 404 when none is. |
 | `GET /traces?search=<text>&limit=20` | The latest traces with a hop that mentions the text (payload, subject, unit, emits, error, answer), newest first, among the last 50 000 hops; `searched_hops` says how many it read. |
 | `GET /drivers` | Live driver catalog with config contracts. |
 | `GET /rules` | The rules view (ADR-0019): N1 parameters, N2 read-only projection. |
-| `GET /surface` | The business surface: editable literals, tables, spans. |
+| `GET /surface` | The business surface: editable literals, tables, spans, and the comment written above each literal (`doc`). |
+| `GET /shape?file=<path>` | A flow's or a service's shape, for the panel's flow page: the event fields it reads, each value it computes with the business literals it uses, its calls, its checks (the rules projection), what it sends, and the comment above each literal. |
 | `GET /evictions` | Version-overlay evictions (git-wins, loud — ADR-0021). |
 
 ## Files & surface

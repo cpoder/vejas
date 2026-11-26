@@ -22,7 +22,7 @@ const FLOW_FILE = 'flows/sap_idoc_to_sf.vjs';
 
 const CAPTIONS = {
   intro: 'SAP on one side. Salesforce on the other. Two flows an agent wrote — one Rust binary, no JVM, no builder.',
-  pipeline: 'The pipeline — derived from the code itself.',
+  pipeline: 'The map, drawn from the code itself.',
   idoc: 'A real IDoc leaves SAP: ten accounts, streamed onto the bus…',
   arrived: '…bulk-inserted into Salesforce. Every step traced.',
   rules: "The business rules, extracted from the code. This is the expert's screen.",
@@ -135,57 +135,60 @@ async function main() {
   await stage(page);
   await caption(page, CAPTIONS.intro, 4600);
   await captionOff(page);
-  const graph = page.locator('#graph, svg').first();
-  await graph.scrollIntoViewIfNeeded().catch(() => {});
+  const map = page.locator('#map');
+  await map.scrollIntoViewIfNeeded().catch(() => {});
   await caption(page, CAPTIONS.pipeline, 2800);
   await captionOff(page);
 
   console.log('· scene 2: a real IDoc arrives on camera');
   const before = (await events()).length;
-  await page.locator('#events table').scrollIntoViewIfNeeded().catch(() => {});
+  await click(page, page.locator('.rail .item', { hasText: 'Activity' }));
   await caption(page, CAPTIONS.idoc, 1400);
   triggerIdoc();
   await waitForEvents(before + 1);
-  const row = page.locator('#events tbody tr, #events tr').nth(1);
+  const row = page.locator('#events .it').first();
   await glide(page, row);
   await caption(page, CAPTIONS.arrived, 3400);
   await captionOff(page);
 
-  console.log('· scene 3: the expert corrects the meaning — replay — promote');
-  const card = page.locator('.card', { has: page.locator('h2', { hasText: 'sap_idoc_to_sf' }) });
-  await card.scrollIntoViewIfNeeded().catch(() => {});
+  console.log('· scene 3: the expert corrects the meaning, checks it, makes it live');
+  await click(page, page.locator('.rail .item', { hasText: 'sap_idoc_to_sf' }));
+  await page.locator('.route').waitFor({ state: 'visible', timeout: 10000 });
   await caption(page, CAPTIONS.rules, 3200);
   await captionOff(page);
-  const box = card.locator('.const', { hasText: 'DEFAULT_INDUSTRY' });
-  const input = box.locator('input.rule');
   await caption(page, CAPTIONS.fix, 2600);
-  await glide(page, input);
-  await input.click();
+  await click(page, page.locator('.val[data-lit="DEFAULT_INDUSTRY"]').first());
+  const editor = page.locator('.editor');
+  const input = editor.locator('input').first();
+  await input.waitFor({ state: 'visible', timeout: 5000 });
   await input.fill('');
   await input.pressSequentially('SAP-sourced', { delay: 90 });
   await page.waitForTimeout(500);
-  await click(page, box.locator('button.apply'));
-  const strip = card.locator('.replay');
-  await strip.waitFor({ state: 'visible', timeout: 15000 });
-  assert.ok(/would change/.test(await strip.textContent()), 'replay strip shows a diff');
+  await click(page, editor.locator('button', { hasText: 'Check on recent events' }));
+  const result = editor.locator('.result');
+  await result.waitFor({ state: 'visible', timeout: 15000 });
+  assert.ok(/would change/.test(await result.textContent()), 'the check shows a diff');
   await caption(page, CAPTIONS.replay, 3600);
   await captionOff(page);
   await caption(page, CAPTIONS.promote, 2200);
-  await click(page, strip.locator('button', { hasText: 'Promote' }));
+  await click(page, editor.locator('button', { hasText: 'Make it live' }));
   await page.waitForSelector('#toast.show', { timeout: 10000 });
   await page.waitForTimeout(1000);
   await captionOff(page);
 
   console.log('· scene 4: the next IDoc lives the corrected rule');
-  await page.locator('#events table').scrollIntoViewIfNeeded().catch(() => {});
+  await click(page, page.locator('.rail .item', { hasText: 'Activity' }));
   await caption(page, CAPTIONS.live, 1400);
   const n2 = (await events()).length;
   triggerIdoc();
   await waitForEvents(n2 + 1);
-  const fresh = page.locator('#events tbody tr, #events tr').nth(1);
+  const fresh = page.locator('#events .it').first();
   await glide(page, fresh);
-  // open its payload: the corrected label, on camera
-  try { await fresh.locator('td.payload summary').click({ timeout: 3000 }); } catch {}
+  // open it end to end, then what the sink received: the corrected label, on camera
+  try {
+    await fresh.locator('.row').click({ timeout: 3000 });
+    await fresh.locator('.trace .hop').last().locator('summary').first().click({ timeout: 5000 });
+  } catch {}
   await page.waitForTimeout(3200);
   await captionOff(page);
 

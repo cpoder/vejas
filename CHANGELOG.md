@@ -23,7 +23,43 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `SIGNATURE`) does not start. No new crate in the build: `ring` and `base64`
   were in it already. e2e `http-in-signed.sh` checks it in CI.
 
+- **`GET /shape?file=<path>`**: a flow's or a service's shape for the panel's
+  flow page. The event fields it reads, each value it computes with the
+  business literals it uses, the services it calls and what they give back,
+  its checks (the rules projection), what it sends and where, and the comment
+  written above each literal. `/surface` entries carry that comment as `doc`.
+- **`GET /events?flow=<unit>&paths=1`**: one unit's events, each with the other
+  hops of its path (same trace id). Activity for one flow reads it, and the
+  flow and connector pages read `?flow=<unit>`, so a unit that sends often (a
+  timer) no longer pushes a quiet flow's events out of its page, as it did out
+  of the newest hundred of all units. The unit's own events are all there; the
+  other hops are capped at the newest 200.
+- An event in the ring names the JetStream message its hop consumed and which
+  delivery it was (`stream_seq`, `attempt`; null for a source's publish). A
+  retry shares its message; the other messages a flow's loop sends in the same
+  trace do not, so one of them that failed is no longer hidden by the others
+  that went through.
+- A dead letter's replay names the message that died (ADR-0015 Amendment B):
+  `original_seq` in the envelope, a `Vejas-Replay-Of` header on the replay,
+  `replay_of` in the ring and `vejas.replay_of` on its span. An event whose
+  replay went through no longer shows as failed.
+
 ### Changed
+- **The panel is redesigned around two people.** A menu on the left; a page
+  per flow for the domain expert, read top to bottom (receives, computes,
+  calls, checks, sends), with the business values in yellow where the flow
+  uses them, each checked on recent real events before it goes live; Activity
+  (one row per event, end to end) and To review (dead letters, proposals) for
+  the operator; a map of what runs. Still one HTML file with no dependency.
+  Every function of the previous panel is kept. e2e `demo.mjs` and
+  `bridge-film.mjs` follow the new screens.
+- **`/graph` gives a connector's subjects as NATS patterns.** A webhook
+  without `SUBJECT` publishes on `vx.>` (it was `vx.*`, which missed any
+  subject of three tokens), and within its `ALLOW` list when it has one,
+  under `VEJAS_SUBJECT_ROOT` when it is set, as the webhook itself does.
+- `POST /flows/new` and `/connectors/new` answer with the name the file got.
+  When the name the agent chose was taken, the file is `<name>_2.vjs` and the
+  answer said `<name>`, the existing unit.
 - **Connectors are written against one crate, `vejas-connector`** (`sdk/`,
   ADR-0038): the bus, the trace context, `Config`, `Ctx`, the `Driver` trait,
   and the services every driver shares (a source's publish as the first hop of

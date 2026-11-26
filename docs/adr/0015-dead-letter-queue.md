@@ -96,6 +96,17 @@ the event subject is not announced, so a failing reader cannot feed itself. An
 agent started from an `exec-*` connector would run as the runtime's user, on the
 same bus, so the documented route out is `http-out`.
 
+**Amendment B (2026-11-26, normative):** a replay names the message that died.
+A replay is a new JetStream message, so a trace showed the letter as failed
+after its replay went through. The envelope now keeps the stream sequence of the
+message that died (`original_seq`), and the replay carries it in a
+`Vejas-Replay-Of` header. The events ring records it as `replay_of`, spans as
+`vejas.replay_of`, and the panel reads the letter and its replays as one
+message. A letter that dies again keeps the first message's sequence. The header
+is left out when it would push the message past the server's limit, as the
+trace headers are, and a letter written before this amendment replays without
+it.
+
 ## Alternatives considered
 
 - **Keep dropping after the cap** — rejected: the failed work is lost and
