@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 pub const STREAM: &str = "VEJAS_TRACES";
@@ -1162,32 +1162,62 @@ impl Scrub {
             json_string(out, TAKEN_OUT);
             return;
         }
-        let first = text.trim_start().as_bytes().first();
+        let first = text.trim_start().as_bytes().first().copied();
         if nest < NEST_MAX && matches!(first, Some(b'{' | b'[' | b'"')) && !self.spans_json(text.as_bytes()) {
-            let mut json = String::with_capacity(text.len() + 16);
-            if !cut && scrubbed_json(text.as_bytes(), &mut json, self, nest + 1) {
-                json_string(out, &clip(&json, max));
-                return;
-            }
-            // JSON that stops before its end, cut here or before: read as JSON
-            // as far as it goes, so that a pair is masked in it as in the whole
             let text = if cut { &text[..self.vault_start_at_end(text)] } else { text };
-            if let Some((keep, closers)) = made_whole(text) {
-                let whole = [&text[..keep], closers.as_str()].concat();
-                if !self.spans_json(whole.as_bytes()) && scrubbed_json(whole.as_bytes(), &mut json, self, nest + 1) {
-                    // what closed it is not shown, unless a mask took it in; a
-                    // string masked where it stopped keeps its quotes
-                    if let Some(body) = json.strip_suffix(closers.as_str()) {
-                        let quoted = closers.starts_with('"')
-                            && [MASKED, TAKEN_OUT].iter().any(|m| body.strip_suffix(m).is_some_and(|b| b.ends_with('"')));
-                        json.truncate(body.len() + usize::from(quoted));
-                    }
+            let whole = made_whole(text);
+            let complete = match &whole {
+                Some(w) => w.closers.is_empty() && w.string.is_none() && w.keep == text.len(),
+                None => !cut && first == Some(b'"'),
+            };
+            if complete {
+                let mut json = String::with_capacity(text.len() + 16);
+                if scrubbed_json(text.as_bytes(), &mut json, self, nest + 1) {
                     json_string(out, &clip(&json, max));
+                    return;
+                }
+            } else if let Some(w) = whole.filter(|w| cut || w.keep == text.len()) {
+                // JSON that stops before its end: read as JSON as far as it
+                // goes, so that a pair is masked in it as in the whole. One
+                // that was not cut here is read so only if none of it is lost.
+                if self.write_cut_json(out, text, &w, max, nest) {
                     return;
                 }
             }
         }
         json_string(out, &clip(&self.scrubbed(text, cut), max));
+    }
+
+    /// `text`, JSON that stops before its end, as `made_whole` closes it:
+    /// scrubbed as JSON, the string it stops in read apart as a text cut
+    /// short, and written without what closed it. False, and `out` as it
+    /// was, when it does not read as JSON.
+    fn write_cut_json(&self, out: &mut String, text: &str, w: &Whole, max: usize, nest: u8) -> bool {
+        // the string it stops in is left empty, and read apart below
+        let head = &text[..w.string.unwrap_or(w.keep)];
+        let whole = [head, if w.string.is_some() { "\"" } else { "" }, &w.closers].concat();
+        let mut json = String::with_capacity(whole.len() + 16);
+        if self.spans_json(whole.as_bytes()) || !scrubbed_json(whole.as_bytes(), &mut json, self, nest + 1) {
+            return false;
+        }
+        // what closed it is not shown, unless a mask took it in
+        if let Some(body) = json.strip_suffix(w.closers.as_str()) {
+            json.truncate(body.len());
+            // the string still empty: no mask took it in, so it is read apart;
+            // one a mask took in shows as the mask, in its quotes
+            if let Some(start) = w.string.filter(|_| json.ends_with("\"\"")) {
+                let Ok(content) = serde_json::from_str::<String>(&format!("\"{}\"", &text[start..w.keep])) else {
+                    return false;
+                };
+                let mut read = String::with_capacity(content.len() + 16);
+                self.write_text_in(&mut read, &content, true, usize::MAX, nest + 1);
+                // its opening quote is there already, and it stays open
+                json.pop();
+                json.push_str(&read[1..read.len() - 1]);
+            }
+        }
+        json_string(out, &clip(&json, max));
+        true
     }
 
     /// An error, as text. One past `INPUT_MAX` is cut there. One that ends in
@@ -1282,13 +1312,24 @@ fn quote_level(bytes: &[u8], i: usize) -> u32 {
     (backslashes_before(bytes, i) as u64).trailing_ones()
 }
 
-/// A JSON text that may stop anywhere, made whole to be read as JSON: how
-/// much of it is kept, and what closes it. It closes after a value, after the
-/// `[` or `{` that opens one, and inside a string that is a value; a key, a
-/// number or a literal it stops in goes, with what led to it since the last
-/// value. None when it is not an array or an object as far as it goes, or
-/// holds more than one.
-fn made_whole(text: &str) -> Option<(usize, String)> {
+/// A JSON text that may stop anywhere, made whole to be read as JSON.
+struct Whole {
+    /// How much of the text is kept.
+    keep: usize,
+    /// What closes the arrays and objects it leaves open, the innermost first.
+    closers: String,
+    /// Where the string it stops in starts, past its quote, when it stops in
+    /// one that is a value: that string is read apart, as a text cut short.
+    string: Option<usize>,
+}
+
+/// `text`, JSON that may stop anywhere, made whole. It closes after a value,
+/// after the `[` or `{` that opens one, and inside a string that is a value;
+/// a key, a number or a literal it stops in goes, with what led to it since
+/// the last value. None when it is not an array or an object as far as it
+/// goes, or holds more than one.
+fn made_whole(text: &str) -> Option<Whole> {
+    let close = |open: &[u8]| open.iter().rev().copied().map(char::from).collect::<String>();
     let bytes = text.as_bytes();
     let mut at = bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
     if !matches!(bytes.get(at), Some(b'{' | b'[')) {
@@ -1313,7 +1354,8 @@ fn made_whole(text: &str) -> Option<(usize, String)> {
                 }
                 at += 1;
                 if open.is_empty() {
-                    return bytes[at..].iter().all(u8::is_ascii_whitespace).then(|| (bytes.len(), String::new()));
+                    let rest_blank = bytes[at..].iter().all(u8::is_ascii_whitespace);
+                    return rest_blank.then(|| Whole { keep: bytes.len(), closers: String::new(), string: None });
                 }
                 safe = (at, open.len());
             }
@@ -1332,10 +1374,7 @@ fn made_whole(text: &str) -> Option<(usize, String)> {
                         safe = (at, open.len());
                     }
                 }
-                Err(keep) if !key_next => {
-                    let closers = std::iter::once(b'"').chain(open.iter().rev().copied()).map(char::from).collect();
-                    return Some((keep, closers));
-                }
+                Err(keep) if !key_next => return Some(Whole { keep, closers: close(&open), string: Some(at + 1) }),
                 Err(_) => break,
             },
             b if b.is_ascii_whitespace() => at += 1,
@@ -1354,7 +1393,7 @@ fn made_whole(text: &str) -> Option<(usize, String)> {
         }
     }
     let (keep, depth) = safe;
-    Some((keep, open[..depth].iter().rev().copied().map(char::from).collect()))
+    Some(Whole { keep, closers: close(&open[..depth]), string: None })
 }
 
 /// The JSON string that opens at `at`: Ok(where it ends, past its quote), or,
@@ -1984,16 +2023,22 @@ fn answer(out: &mut String, answer: &Kept, scrub: &Scrub) {
 /// it (ADR-0017): the events ring, the dead letters, a unit's last error,
 /// shadow replays, the evidence of proposals. An instance of its own,
 /// refreshed as the stores hand values out.
-static SHOWN: OnceLock<Mutex<Scrub>> = OnceLock::new();
+static SHOWN: OnceLock<Mutex<Arc<Scrub>>> = OnceLock::new();
 
-/// The masks, ready for one answer: one lock however many texts it holds.
-pub struct Shown(MutexGuard<'static, Scrub>);
+/// The masks, ready for one answer.
+pub struct Shown(Arc<Scrub>);
 
-/// The masks as they stand: the values the stores handed out so far included.
+/// The masks as they stand: the values the stores handed out so far
+/// included. The lock is held to learn of new values, never while an answer
+/// is scrubbed, so one long answer does not hold up the others.
 pub fn shown() -> Shown {
-    let mut scrub = SHOWN.get_or_init(|| Mutex::new(Scrub::new())).lock().unwrap_or_else(PoisonError::into_inner);
-    scrub.refresh();
-    Shown(scrub)
+    let mut scrub = SHOWN.get_or_init(|| Mutex::new(Arc::new(Scrub::new()))).lock().unwrap_or_else(PoisonError::into_inner);
+    if scrub.generation != Some(crate::secrets::handed_out_generation()) {
+        let mut fresh = Scrub::new();
+        fresh.refresh();
+        *scrub = Arc::new(fresh);
+    }
+    Shown(Arc::clone(&scrub))
 }
 
 impl Shown {
@@ -2012,6 +2057,17 @@ impl Shown {
     /// A JSON value, scrubbed as the record scrubs a payload.
     pub fn json(&self, v: &Value) -> Value {
         shown_json(&self.0, v)
+    }
+
+    /// A text the bus carried whole, a dead letter's payload: past
+    /// `INPUT_MAX`, only its start, as the record keeps a payload.
+    pub fn payload(&self, text: &str) -> String {
+        if text.len() <= INPUT_MAX {
+            return shown_text(&self.0, text, false);
+        }
+        let mut shown = shown_text(&self.0, &text[..floor_boundary(text, INPUT_MAX)], true);
+        shown.push('…');
+        shown
     }
 }
 
@@ -2823,7 +2879,9 @@ mod tests {
 
     #[test]
     fn a_cut_json_text_is_made_whole_to_be_read_as_json() {
-        let whole = |t: &str| made_whole(t).map(|(keep, closers)| format!("{}{closers}", &t[..keep]));
+        let whole = |t: &str| {
+            made_whole(t).map(|w| format!("{}{}{}", &t[..w.keep], if w.string.is_some() { "\"" } else { "" }, w.closers))
+        };
         for (cut, made) in [
             (r#"{"a":1,"b":"x"#, r#"{"a":1,"b":"x"}"#),
             (r#"{"a":[1,2,"#, r#"{"a":[1,2]}"#),
@@ -2843,6 +2901,64 @@ mod tests {
         for not_one in [r#"{"a":1} {"b":2}"#, r#"{"a":1]"#, "a=1", r#""text"#, ""] {
             assert_eq!(whole(not_one), None, "{not_one}");
         }
+    }
+
+    /// Every cut point of documents with a credential planted in each shape
+    /// the scrub reads: no three characters of it are shown (four of a value
+    /// handed out, a shorter start of which is no value yet).
+    #[test]
+    fn no_credential_is_shown_wherever_its_text_is_cut() {
+        const VAULT: &str = "VAULTQZXJ-3386-handed";
+        let s = scrub(&[VAULT]);
+        let docs = [
+            (r#"{"id":7,"password":"PWQZXJ7731","user":"bob"}"#, "PWQZXJ7731"),
+            (r#"{"id":7,"api_key":"AKQZXJ8842","n":1}"#, "AKQZXJ8842"),
+            (r#"{"accessToken":"ATQZXJ9953","x":[1,2]}"#, "ATQZXJ9953"),
+            (r#"{"pin":1,"password":99887766,"z":1}"#, "99887766"),
+            (r#"{"headers":[{"name":"X-Id","value":"7"},{"name":"Authorization","value":"Bearer HVQZXJ1164"}],"b":1}"#, "HVQZXJ1164"),
+            (r#"{"note":"VAULTQZXJ-3386-handed","id":9}"#, VAULT),
+            (r#"{"body":"{\"password\":\"NJQZXJ4497\",\"a\":1}","id":2}"#, "NJQZXJ4497"),
+            (r#"{"body":"{\"headers\":[{\"name\":\"Authorization\",\"value\":\"Bearer NHQZXJ5590\"}]}","id":2}"#, "NHQZXJ5590"),
+            (r#"{"log":"connect token=TKQZXJ5508 ok","id":3}"#, "TKQZXJ5508"),
+            (r#"{"log":"Authorization: Bearer HDQZXJ6619\nnext","id":3}"#, "HDQZXJ6619"),
+            (r#"{"dsn":"postgres://app:URQZXJ7720@db:5432/x","id":4}"#, "URQZXJ7720"),
+            (r#"{"xml":"<apiKey><value>XKQZXJ8831</value></apiKey>","id":5}"#, "XKQZXJ8831"),
+            (r#"{"xml":"<password>XPQZXJ9942</password>","id":5}"#, "XPQZXJ9942"),
+            (r#"{"xml":"<secret>\n  <v>XSQZXJ1357</v>\n</secret>","id":5}"#, "XSQZXJ1357"),
+            (r#"{"q":"a=1&client_secret=CSQZXJ2468&b=2","id":6}"#, "CSQZXJ2468"),
+            (r#"{"env":[{"name":"DB_PASSWORD","value":"EVQZXJ3579"}]}"#, "EVQZXJ3579"),
+            (r#"{"tags":[{"Key":"api_key","Value":"TGQZXJ4680"}]}"#, "TGQZXJ4680"),
+            // a pair whose value comes first is masked once its name is read
+            // whole; cut before, the value cannot be told from any other
+            (r#"{"headers":[{"value":"Bearer HWQZXJ2275","name":"Authorization"}],"b":1}"#, "HWQZXJ2275"),
+        ];
+        let mut leaks = Vec::new();
+        for (doc, token) in docs {
+            let n = if token == VAULT { PREFIX_MIN } else { 3 };
+            let from = if token == "HWQZXJ2275" { doc.find("Authorization\"").unwrap() + 14 } else { 1 };
+            for k in (from..=doc.len()).filter(|&k| doc.is_char_boundary(k)) {
+                let shown = shown_text(&s, &doc[..k], true);
+                if token.as_bytes().windows(n).any(|w| shown.contains(std::str::from_utf8(w).unwrap())) {
+                    leaks.push(format!("{}  =>  {shown}", &doc[..k]));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{} leaks:\n{}", leaks.len(), leaks.join("\n"));
+    }
+
+    #[test]
+    fn a_cut_xml_credential_with_a_child_is_masked() {
+        let shown = shown_text(&scrub(&[]), r#"{"id":5,"xml":"<apiKey><value>k-8831"#, true);
+        assert!(!shown.contains("8831") && shown.contains(r#""id":5"#), "{shown}");
+    }
+
+    #[test]
+    fn a_whole_text_keeps_its_end() {
+        for t in ["[1,2,3", "[WARN", r#"{"a":1,"b":22"#, r#"{"a":"x\"#] {
+            assert_eq!(text(t, &[], false), t);
+        }
+        // one that only lacks its end is read as JSON: nothing of it is lost
+        assert_eq!(text(r#"{"a":1,"password":"x"#, &[], false), r#"{"a":1,"password":"<masked>""#);
     }
 
     #[test]

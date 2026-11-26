@@ -111,7 +111,7 @@ What happened to one business event, end to end, from the trace record (ADR-0034
 
 ## `vejas_dlq`
 
-List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.
+List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.
 
 ## `vejas_dlq_replay`
 

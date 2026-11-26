@@ -9,7 +9,8 @@ What the API gives of the bus (`/events`, `/dlq`, the last errors in
 `/topology`, shadow replays, time travel and canary results, the evidence of
 proposals, `/connectors/test`) is masked as the trace record is:
 credential-named keys and pairs, and every value the secret stores handed
-out ([Secrets](../concepts/secrets.md)).
+out ([Secrets](../concepts/secrets.md)). A dead letter's payload past 16 KB
+is given as its start.
 
 ## Request headers
 

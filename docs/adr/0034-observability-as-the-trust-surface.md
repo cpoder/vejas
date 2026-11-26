@@ -445,28 +445,48 @@ that fails and of an `api` call that invokes a service.
 - **One function at each answer.** `as_shown` scrubs the fields that carry
   what went through the bus, by their names in the runtime's answers: a
   preview and a sink's answer as the start of a longer text, an error and a
-  last error as the record scrubs an error, a subject as a text, and a
-  payload, an event and the emits whole. The rest stays as it is: units,
-  sequences, times, trace ids. Pages find events and letters by them, and a
-  value handed out that is a number would otherwise turn a sequence into
-  `<secret>`. A new field that carries bus data has to be named there. A
+  last error as the record scrubs an error, a subject as a text, a dead
+  letter's payload as the record keeps a payload (past 16 KB, its start), an
+  emitted event's payload whole, and the emits one by one, so that one event
+  too deep to read stays an event among the others. The rest stays as it
+  is: units, sequences, times, trace ids. Pages find events and letters by
+  them, and a value handed out that is a number would otherwise turn a
+  sequence into `<secret>`. A new field that carries bus data has to be
+  named there. The control channel's status and probe go through it too. A
   proposal's evidence is masked whole; the change it proposes is not, since
   it goes into the repository as it is and an agent may revise it.
+- **A shadow run never reads a credential.** Time travel and the canary run
+  an agent's candidate on real events, the shadow replay runs the flow with
+  a value changed, and a golden case records a run into the repository. A
+  candidate that copies `event.password` under another name carried the
+  value past any mask on names. The events these runs read are now masked
+  first, as `secret()` already was in shadow: the value never enters the
+  run, and a branch that reads a masked field reads `<masked>`.
 - **A cut JSON text is read as JSON as far as it goes.** A preview is the
   first 160 characters of the event, so the pair rule of the JSON path
   (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
-  the record's preview of a payload past 16 KB. The
-  text is now closed where it stops (the string it stops in, then the arrays
-  and objects open), scrubbed as JSON, and shown without what closed it. A
-  key, a number or a literal the cut fell in is dropped. Text that is not
-  JSON keeps the text rules.
-- **An instance of its own.** The answers use a scrub of their own behind a
-  lock, refreshed from the stores on each answer, so the record's thread is
-  never slowed by a page.
+  the record's preview of a payload past 16 KB. The text is now closed where
+  it stops (the arrays and objects open), scrubbed as JSON, and shown
+  without what closed it. The string it stops in is read apart, as a text
+  cut short, so an XML element or a query in it is masked to its end. A key,
+  a number or a literal the cut fell in is dropped. A text that was not cut
+  is read so only when none of it would be lost: `[WARN` stays `[WARN`. Text
+  that is not JSON keeps the text rules. A test cuts documents with a
+  credential in each shape at every point, and none shows three characters
+  of it.
+- **One gap is left.** A pair whose value comes before its name is masked
+  once the name is read whole. Cut before that, the value cannot be told
+  from any other `value` field, and sensor events carry one at their top.
+  A flow's preview lists an event's keys in alphabetical order, so the name
+  comes first; a connector's preview keeps the order it received.
+- **An instance of its own.** The answers use a scrub of their own, so the
+  record's thread is never slowed by a page. Its lock is held to learn of
+  new values handed out, never while an answer is scrubbed. `vejas_dlq`
+  gives 200 letters at most, as the panel reads them.
 - **What it does not cover.** A flow's preview on its sample and
-  `vejas_run_flow` run in the shadow engine, which never holds a secret's
-  value, on a sample from the repository; `/surface`, `/file` and `/fixture`
-  give the repository's files. The panel's own mask stays, as a second line.
+  `vejas_run_flow` run in the shadow engine on a sample from the repository;
+  `/surface`, `/file` and `/fixture` give the repository's files. The
+  panel's own mask stays, as a second line.
 
 ## Consequences
 

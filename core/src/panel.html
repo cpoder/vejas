@@ -1455,7 +1455,8 @@ function diffLine(r, hide) {
   }
   const parts = [];
   be.forEach((e, i) => diffValues(e.payload, ae[i].payload, '', parts));
-  if (!parts.length) return '<span class="muted">the same output</span>';
+  // a changed event whose fields all read the same: what changes is masked
+  if (!parts.length) return '<span class="muted">a hidden value changes</span>';
   const val = (k, v, veiled) => v === undefined ? '<span class="muted">nothing</span>'
     : hide || veiled || secretPath(k) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
   return parts.slice(0, 3).map(([k, x, y, veiled]) => `<code>${esc(k)}</code> ${val(k, x, veiled)} ${sep} <b>${val(k, y, veiled)}</b>`).join('; ');

@@ -40,7 +40,10 @@ What keeps the rule real, rather than aspirational:
   it (preview, `vejas_run_flow`, flow-as-tool, shadow-replay, time-travel,
   canary, golden capture) resolves `secret()` to the placeholder
   `<secret:path/key>`. It stays fail-closed: a missing secret still aborts.
-  A candidate is arbitrary code, so it cannot be left to a filter on the
-  output, and the value never enters the run. One consequence to know when
+  The real events a shadow replay, time travel, the canary or a golden
+  capture reads are masked first: a credential-named field or a pair reads
+  `<masked>`, a value a store handed out `<secret>`. A candidate is
+  arbitrary code, so it cannot be left to a filter on the output, and the
+  value never enters the run. One consequence to know when
   reading a diff: a branch that compares with a secret takes the not-equal
   path in shadow.

@@ -214,10 +214,22 @@ fn as_shown(mut v: Value) -> Value {
                         ("error" | "last_error" | "detail", Value::String(s)) => *s = scrub.error(s),
                         // where it went: a subject can carry a value of the event
                         ("subject" | "original_subject", Value::String(s)) => *s = scrub.text(s, false),
-                        // what went through, whole
-                        ("payload" | "event" | "emits", x) => {
+                        // what went through: a dead letter's payload, as the
+                        // record keeps a payload; an emitted event's, whole
+                        ("payload", Value::String(s)) => *s = scrub.payload(s),
+                        ("payload" | "event", x) => {
                             let shown = scrub.json(x);
                             *x = shown;
+                        }
+                        // what a hop or a run emitted, one by one: one event
+                        // too deep to read stays an event among the others
+                        ("emits", Value::Array(emits)) => {
+                            for e in emits {
+                                match e {
+                                    Value::String(subject) => *subject = scrub.text(subject, false),
+                                    e => walk(e, scrub),
+                                }
+                            }
                         }
                         (_, x) => walk(x, scrub),
                     }
@@ -234,13 +246,31 @@ fn as_shown(mut v: Value) -> Value {
 /// Proposals as pages and agents are shown them: the change as it was
 /// proposed, since it goes into the repository as it is and an agent may
 /// revise it; the evidence, events of the bus, masked (ADR-0034).
-fn proposals_shown(mut list: Vec<Value>) -> Vec<Value> {
+fn proposals_shown(list: Vec<Value>) -> Vec<Value> {
     let scrub = record::shown();
-    for evidence in list.iter_mut().filter_map(|p| p.get_mut("evidence")) {
+    list.into_iter().map(|p| proposal_shown(p, &scrub)).collect()
+}
+
+/// One proposal, or a decision's answer that holds it under `proposal`.
+fn proposal_shown(mut p: Value, scrub: &record::Shown) -> Value {
+    if let Some(inner) = p.get_mut("proposal") {
+        let shown = proposal_shown(inner.take(), scrub);
+        *inner = shown;
+    }
+    if let Some(evidence) = p.get_mut("evidence") {
         let shown = scrub.json(evidence);
         *evidence = shown;
     }
-    list
+    p
+}
+
+/// A real event as a shadow run is given it (ADR-0034), masked as the trace
+/// record masks it. A candidate is any code, so what it emits cannot be left
+/// to a mask on names: `{pw: event.password}` would carry the value out
+/// under a name no mask reads. As with `secret()`, the value never enters
+/// the run, and a branch that reads a masked field reads `<masked>`.
+fn shadow_input(event: &Value, scrub: &record::Shown) -> Value {
+    scrub.json(event)
 }
 
 fn events_out(flow: Option<&str>, paths: bool) -> String {
@@ -389,11 +419,12 @@ fn replay_literal(
     };
     let mut results = Vec::new();
     let mut changed_count = 0;
+    let scrub = record::shown();
     for entry in &events {
-        let ev = entry.get("event").cloned().unwrap_or(Value::Null);
-        if ev.is_null() {
+        let Some(ev) = entry.get("event").filter(|ev| !ev.is_null()) else {
             continue; // unparseable event of a bad-json trace: nothing to replay
-        }
+        };
+        let ev = shadow_input(ev, &scrub);
         let b = run_one(&before, &ev);
         let a = run_one(&after, &ev);
         let changed = b != a;
@@ -449,7 +480,9 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
     };
     let mut results = Vec::new();
     let mut changed = 0;
+    let scrub = record::shown();
     for (seq, subject, event) in &rows {
+        let event = &shadow_input(event, &scrub);
         let b = run_one(&current, event);
         let a = run_one(&candidate, event);
         let ch = b != a;
@@ -580,10 +613,12 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 }
             }
             let batch = connectors::fetch_round(&sub).unwrap_or_default();
+            let scrub = record::shown();
             for m in &batch {
                 let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
                     continue;
                 };
+                let event = shadow_input(&event, &scrub);
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 let b = shadow_emits(&current, &event, &root, &pkg);
                 let a = shadow_emits(&candidate, &event, &root, &pkg);
@@ -3796,6 +3831,9 @@ fn golden_from_event(root: &Path, flow_unit: &str, seq: u64) -> Result<Value, St
             .filter(|v| !v.is_null())
             .ok_or("no stored event for that flow/seq (ring rotated, or a non-JSON event)")?
     };
+    // the case goes into the repository: a credential of the event does not,
+    // and the run it records reads the mask, as every shadow run does
+    let event = shadow_input(&event, &record::shown());
     // map the unit back to its flow file (repo-relative)
     let file = vjs_files(root)
         .into_iter()
@@ -4246,7 +4284,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
+        json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
@@ -4466,7 +4504,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             text(sap_rpc_request(root, &op)?.to_string())
         }
         "vejas_dlq" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(200) as usize;
             text(as_shown(json!({"dead_letters": dlq_list(limit)?})).to_string())
         }
         "vejas_trace" => {
@@ -4683,7 +4721,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Some(_) => {}
             }
             return match decide_proposal(&registry, &root, id, approve, &actor) {
-                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Ok(v) => respond(request, 200, proposal_shown(v, &record::shown()).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             };
         }
@@ -5796,6 +5834,66 @@ mod tests {
         assert!(!proposals[0]["evidence"].to_string().contains("pw-4455"), "{}", proposals[0]);
         assert_eq!(proposals[0]["payload"]["candidate"], candidate);
         assert_eq!(proposals[0]["id"], "p1");
+
+        // a letter past 16 KB is shown as its start, as the record keeps one
+        let big = format!(r#"{{"api_key":"k-998877","blob":"{}"}}"#, "x".repeat(40_000));
+        let letters = as_shown(json!({"dead_letters": [{"seq": 13, "payload": big}]}));
+        let payload = letters["dead_letters"][0]["payload"].as_str().unwrap();
+        assert!(payload.len() < 17_000 && payload.ends_with('…'), "{}", payload.len());
+        assert!(!payload.contains("k-998877") && payload.contains("<masked>"), "{}", &payload[..60]);
+    }
+
+    #[test]
+    fn a_shadow_run_never_reads_a_credential_of_a_real_event() {
+        let root = std::env::temp_dir().join(format!("vejas-shadow-mask-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("rename_probe.vjs"),
+            "source \"vx.rn.test\"\nTH = 1\nif n > TH:\n  emit \"vx.out\", {pw: password, h: headers}\nend\n",
+        )
+        .unwrap();
+        let event = json!({"n": 5, "password": "pw-rename-7731", "headers": [{"name": "Authorization", "value": "Bearer rn-55"}]});
+        record_trace("flow:rename_probe", "vx.rn.test", true, None, vec![], "{}".into(), Some(event), None, None);
+        let diff = as_shown(replay_literal(&root, "flows/rename_probe.vjs", "TH", "-", &json!(2), 20).unwrap());
+        let shown = diff.to_string();
+        // a name no mask reads would carry it out: it never enters the run
+        assert!(!shown.contains("pw-rename-7731") && !shown.contains("rn-55"), "{shown}");
+        assert_eq!(diff["results"][0]["after"]["emits"][0]["payload"]["pw"], "<masked>", "{shown}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_golden_case_keeps_no_credential_of_its_event() {
+        let root = std::env::temp_dir().join(format!("vejas-golden-mask-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(
+            root.join("flows").join("golden_probe.vjs"),
+            "source \"vx.gp.test\"\nemit \"vx.out\", {id: id, pw: password}\n",
+        )
+        .unwrap();
+        let event = json!({"id": 3, "password": "pw-golden-4417"});
+        record_trace("flow:golden_probe", "vx.gp.test", true, None, vec![], "{}".into(), Some(event), None, None);
+        let events: Value = serde_json::from_str(&events_json(Some("flow:golden_probe"))).unwrap();
+        let seq = events["events"][0]["seq"].as_u64().unwrap();
+        let out = golden_from_event(&root, "flow:golden_probe", seq).unwrap();
+        let case = std::fs::read_to_string(root.join("tests").join("vjs").join(out["case"].as_str().unwrap())).unwrap();
+        assert!(!case.contains("pw-golden-4417") && case.contains("<masked>"), "{case}");
+        assert_eq!(out["expect_emits"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_event_too_deep_to_read_leaves_the_others_their_shape() {
+        let mut deep = json!("leaf");
+        for _ in 0..120 {
+            deep = json!({ "d": deep });
+        }
+        let shown = as_shown(json!({"results": [{"after": {"error": null, "emits": [
+            {"subject": "vx.a", "payload": deep}, {"subject": "vx.b", "payload": {"id": 1}}]}}]}));
+        let emits = &shown["results"][0]["after"]["emits"];
+        assert!(emits.is_array(), "{emits}");
+        assert_eq!((emits[0]["subject"].as_str(), emits[0]["payload"].as_str()), (Some("vx.a"), Some("<secret>")));
+        assert_eq!(emits[1]["payload"], json!({"id": 1}));
     }
 
     #[test]

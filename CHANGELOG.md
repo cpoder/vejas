@@ -110,7 +110,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   it shows; an agent reading the MCP tools saw it all. Credential-named keys
   and pairs are now masked, and the values the secret stores handed out taken
   out, before the answer leaves. Units, sequences, times and trace ids stay
-  as they are.
+  as they are. The control channel's status and probe are masked the same
+  way. A dead letter's payload past 16 KB is shown as its start, and
+  `vejas_dlq` gives 200 letters at most.
+- **A shadow run never reads a credential of the events it replays.** Time
+  travel and the canary run an agent's candidate on real events: one that
+  copied `event.password` under another name got the value back past any
+  mask on names. The shadow replay, time travel, the canary and golden
+  capture now read the events masked, as they already read `secret()`. A
+  golden case no longer writes an event's credentials into the repository.
 - A cut JSON text is read as JSON as far as it goes, so a pair
   (`{"name": "Authorization", "value": "Bearer …"}`) is masked in an event's
   preview, and in the record's preview of a payload past 16 KB, as it is in
