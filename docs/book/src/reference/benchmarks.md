@@ -18,6 +18,7 @@ yours.
 | Isolated flow hop | 13 652/s (13 746/s aggregate over 10 flows) | `bench/flow-only.sh`, `bench/multi-flow.sh` |
 | Tracing, runtime CPU per flow hop | 72.5 µs before tracing; +1.5 µs with no exporter (1.5 to 4.5 over four series), +10.5 µs exporting every span, +4 µs one trace in ten | `bench/trace-cost.sh` |
 | Trace record, runtime CPU per flow hop | 74 to 75.5 µs with the record off; +17.5 to +20 µs recording every hop, +12 to +13.5 µs without payloads, +3.5 to +4 µs one trace in ten (two series) | `bench/trace-cost.sh` |
+| Trace record's steps, runtime CPU per flow hop | +3.5 to +5.5 µs over the record without them, about 2 of it on the record's thread, on a flow of eleven statements (two series of eight alternating pairs) | `bench/pairs.sh` |
 | Trace record, NATS memory per trace kept | 200 to 450 bytes (the subject index) | `bench/trace-subjects.py` |
 | MQTT loopback, QoS 1 both ways, real mosquitto | 2 070 rt/s, 5 000/5 000 | `bench/broker-mqtt.sh 5000` |
 | Cluster: instance kill -9 under load | 20 000/20 000, zero loss | `bench/cluster.sh` |

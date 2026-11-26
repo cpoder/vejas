@@ -112,8 +112,9 @@ attributes (`messaging.system=nats`, `messaging.destination.name`,
 `messaging.message.id`, the JetStream sequence) and the Vejas ones:
 `vejas.unit`, `vejas.flow.version` (the content hash of the version that ran,
 see [change safely](change-safely.md)), `vejas.flow.baseline` when a
-promoted version overrides git, `vejas.delivery.attempt`, `vejas.emits`, and
-`vejas.dlq=true` on a dead-lettered run. An `invoke` span is named
+promoted version overrides git, `vejas.delivery.attempt`, `vejas.emits`,
+`vejas.dlq=true` on a dead-lettered run, and `code.file.path`, the unit's file
+under the project root. An `invoke` span is named
 `invoke package:service`. A failure sets the span status to error, with
 `error.message`.
 
@@ -172,9 +173,19 @@ no room for:
   "error": null,
   "subject": "vx.orders.in",
   "emits": ["vx.orders.validated"],
-  "input": {"order": "4711", "card_token": "<masked>"},
+  "input": {"order": "4711", "amount": "812.50", "customer_id": "C-17", "card_token": "<masked>"},
   "answer": null,
-  "attributes": {"vejas.flow.version": "d5768a2de6e8cbb0", "vejas.delivery.attempt": 1}
+  "attributes": {"vejas.flow.version": "d5768a2de6e8cbb0", "vejas.delivery.attempt": 1,
+                 "code.file.path": "flows/order_sync.vjs"},
+  "steps": [
+    {"line": 4, "code": "total = num(amount)"},
+    {"line": 5, "code": "if total > LIMIT:"},
+    {"line": 6, "code": "customer = invoke crm:lookup(id: customer_id)"},
+    {"service": "crm:lookup", "version": "9c1d02b7e4a5f3c8"},
+    {"service": "crm:lookup", "line": 2, "code": "tier = \"gold\""},
+    {"line": 8, "emit": "vx.orders.validated", "code": "emit \"vx.orders.validated\", {order: order, tier: customer.tier}"}
+  ],
+  "services": {"crm:lookup": "9c1d02b7e4a5f3c8"}
 }
 ```
 
@@ -187,9 +198,37 @@ no room for:
   scrubbed whole, then cut to 2 KB, so a JSON answer keeps its shape.
 - Each failed delivery is a hop of its own, with `vejas.delivery.attempt` in
   its attributes, and the one that went to the DLQ has `vejas.dlq: true`.
+- `steps` are the statements a flow ran, in order: a line of the flow, a line
+  of an invoked service with its `service`, the subject an `emit` sent to, the
+  status a `respond` set, and where an invoked service started, the version of
+  its source. `services` gives each service the run invoked, with that
+  version. A business-surface constant (`LIMIT = 500`) is left out, since
+  every run assigns it the same way. A run keeps its first 192 steps and its
+  last 64, and `{"skipped": n}` stands for the ones between.
+- A run that fails ends on the statement it failed on, which says
+  `"failed": true` and shows in red in the panel. When that statement had
+  invoked a service before it failed, it comes again after the service's
+  steps.
+- A `respond` in a service answers no one and shows as a plain line. The
+  status the caller got is the hop's `http.response.status_code`: that of the
+  last `respond` when the run succeeded, 500 when it failed.
+- Steps carry no payload, only line numbers, names, subjects (scrubbed, like
+  `emits`) and status codes: they stay when payloads are off. Every hop
+  records them while the record is on, so a run that fails has them whatever
+  the sampler said.
+- When a trace is read, each step gets the `code` of its line, from the file
+  that ran it, if that file still has the version that ran. A flow promoted
+  over its file in a cluster gets its code from the version store, while the
+  store still holds that version. A step whose code is in neither keeps its
+  line number, and the panel says so. The record itself holds no code, and a
+  read drops any a record carries. One read takes at most 64 files, 257 steps
+  a hop and 1 MB of code.
 
 **What a record does not carry.** Every field is scrubbed before it is
-written, on the record's own thread:
+written, on the record's own thread, except what the runtime computes itself
+and no event reaches: the attributes `code.file.path`, `vejas.flow.version`
+and `vejas.flow.baseline`, and a step's service name and version. A subject
+is cut to 256 bytes once scrubbed.
 
 - The values of credential-named keys, with the panel's own pattern, become
   `<masked>`: in JSON at any depth, JSON held in a string included, and in
@@ -227,7 +266,10 @@ credential-named fields.
 
 **What is kept.** The exporter's sampler decides: by default every trace the
 runtime starts is kept, and a caller that sends `traceparent` with the
-sampled flag off is followed. Failures are kept whatever the sampler says.
+sampled flag off is followed. A run that fails is kept whatever the sampler
+says. One gap: a hop the sampler left out, whose run succeeded but whose batch
+then failed to flush before the ack, is not recorded; its message is
+delivered again.
 The stream keeps the last 100 000 hops, 256 MB and seven days at most,
 whichever limit comes first, oldest out first.
 
@@ -251,12 +293,14 @@ to 15 MB when traces have three hops. Raising `VEJAS_TRACES_MAX_HOPS` raises
 it in proportion.
 
 **What it costs the runtime.** On the isolated flow hop of the benchmarks
-page, recording every hop takes 17.5 to 20 µs of CPU per event over two
+page, recording every hop took 17.5 to 20 µs of CPU per event over two
 series, against 74 to 75.5 for the hop with the record off; 12 to 13.5 µs
 with payloads kept out, about 4 µs when the sampler keeps one trace in ten.
 About 13 µs of it runs on the record's own thread, which the flow does not
-wait for. The NATS server spends a few µs more per event storing the hops.
-`bench/trace-cost.sh` measures it.
+wait for. The steps came after those series: they add 3.5 to 5.5 µs on that
+flow, which runs eleven statements per event, about 2 of them on the
+record's thread. The NATS server spends a few µs more per event storing the
+hops. `bench/trace-cost.sh` and `bench/pairs.sh` measure it.
 
 **Who can read it.** The record holds payloads, masked but otherwise as they
 came. `GET /traces` is a read, open like `GET /events` and `GET /dlq`: keep
@@ -279,10 +323,10 @@ vejas_trace_records_dropped_total{reason="queue_full"} 0
 vejas_trace_records_dropped_total{reason="publish_failed"} 0
 ```
 
-Not built yet (ADR-0034, lot B): the statements a flow executed with its
-variables at each `invoke`, `emit` and `respond`, and the provenance of each
-flow version (who wrote it, who approved it, the replay diff before it was
-promoted).
+Not built yet (ADR-0034, lot B): a flow's variables at each `invoke`, `emit`
+and `respond`, the code of a version that is neither on disk nor in the
+version store, and the provenance of each flow version (who wrote it, who
+approved it, the replay diff before it was promoted).
 
 ## The event ring — what just happened
 

@@ -48,6 +48,24 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   Recording every hop costs 17.5 to 20 µs of CPU per flow hop over two
   benchmark series, about 13 of them on the record's own thread, and about
   4 µs at one trace in ten (see the benchmarks page). e2e `trace-record.sh` checks it in CI.
+- **A flow hop's record says which statements it ran** (ADR-0034, point 8,
+  first part): each line in order, the service a line is in, the subject an
+  `emit` sent to, the status a flow's `respond` set, and the version of an
+  invoked service where it starts; the record also lists the services the
+  run invoked with their versions. A run keeps its first 192 steps and its
+  last 64, with the count of those between. A failed run ends on the
+  statement that failed, marked `"failed": true` and said again after the
+  steps of a service it invoked before failing. Steps carry no payload, so
+  they stay with payloads off.
+  Reading a trace (`GET /traces/{id}`, `vejas_trace`, the panel's Trace card)
+  gives each step its line of code when the file, or the version store for a
+  flow promoted in a cluster, still has the version that ran. A read drops
+  any code a record carries and stops at 64 files, 257 steps a hop and 1 MB
+  of code. Spans carry `code.file.path`. On the benchmark's flow, eleven
+  statements per event, the steps add 3.5 to 5.5 µs of CPU per hop, about 2
+  of them on the record's own thread (two series of eight alternating pairs,
+  `bench/pairs.sh`, new); with the record off, the interpreter does no more
+  work than before.
 
 ### Changed
 - Spans have a new shape. The name is still the unit and the old attributes
@@ -62,6 +80,16 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   every span about 10 µs (see the benchmarks page).
 
 ### Fixed
+- **The file guard took a folder's name as a prefix.** `flows_old/a.vjs` or a
+  `services.json` at the project root passed the check that confines
+  `GET /file` and the file writes to `flows/`, `services/`, `connectors/` and
+  `packages/`. A folder must now be the path's whole first component.
+- **A character of several bytes outside a string crashed the parser.** An
+  em dash or a byte-order mark in a flow's code panicked the lexer, and the
+  unit restarted in a loop. A byte-order mark at the start of a file is now
+  skipped, and any other such character is a parse error that names it.
+- The MCP tools reference showed twelve dashes as broken characters and left
+  out `vejas_vpl_check` and the four SAP tools.
 - **A read-only cursor stopped after 1 000 messages.** The ephemeral consumers
   behind the shadow replay's history, the canary and the trace search asked for
   acks and never gave any, so the server stopped delivering at its default of

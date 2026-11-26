@@ -1,7 +1,9 @@
 #!/bin/bash
 # The trace record (ADR-0034, lot B): every hop of an event is kept in the
 # VEJAS_TRACES stream and read back as one trace, by its id or by a search,
-# over HTTP and MCP. Credential-named keys are masked, in a sink's long answer
+# over HTTP and MCP, each flow hop with the lines it ran and their code, an
+# api call's into the service it invoked.
+# Credential-named keys are masked, in a sink's long answer
 # too, and a vault value never reaches the stream's files; a search reaches
 # past a thousand records; the record writes on a connection of its own and
 # brings back a stream removed by hand; a trace the caller sampled out leaves
@@ -39,6 +41,19 @@ cat > "$R/flows/rec_bad.vjs" <<'VJS'
 source "vx.rec.bad"
 x = secret("missing/x")
 emit "vx.rec.never", { x: x }
+VJS
+# An api call that invokes a service: its steps go into the service and back.
+# The service's own `respond` answers no one.
+mkdir -p "$R/services"
+cat > "$R/services/rec_greet.vjs" <<'VJS'
+# the service a traced api call invokes
+greeting = f"hello {name}"
+respond 418, { not: "for the caller" }
+VJS
+cat > "$R/flows/rec_api.vjs" <<'VJS'
+api "GET /rec/greet"
+g = invoke rec_greet(name: "ada")
+respond 201, { text: g.greeting }
 VJS
 # A sink whose downstream answers more than the events ring shows, a key in it.
 cat > "$R/connectors/rec_out.vjs" <<VJS
@@ -108,11 +123,52 @@ need(h[1]["attributes"].get("vejas.flow.version"), "no flow version")
 need(h[1]["input"]["order"] == "4711", "the payload is not kept")
 need(h[0]["input"]["password"] == "<masked>" and h[1]["input"]["password"] == "<masked>", "a password in the clear")
 need(h[2]["input"]["key"] == "<secret>", f"the vault value is not taken out: {h[2]['input']}")
+need(h[1]["attributes"].get("code.file.path") == "flows/rec_check.vjs", f"no file: {h[1]['attributes']}")
+need(h[1].get("steps") == [{"line": 2, "emit": "vx.rec.checked",
+                            "code": 'emit "vx.rec.checked", { order: event.order, key: secret("demo/key") }'}],
+     f"steps: {h[1].get('steps')}")
+need(h[2].get("steps") == [{"line": 2, "emit": "vx.rec.stored", "code": 'emit "vx.rec.stored", { order: event.order }'}],
+     f"steps: {h[2].get('steps')}")
+need("steps" not in h[0], "a connector has steps")
 print("ok")
 PY
 )
-[ "$VERDICT" = ok ] && ok "source, flow, flow: in order, parent under parent, input masked, vault value taken out" \
+[ "$VERDICT" = ok ] && ok "source, flow, flow: in order, parent under parent, input masked, vault value taken out, each flow's line and its code" \
   || ko "the trace is wrong: $VERDICT"
+
+echo "── an api call: its lines, the service it invoked, the status it set"
+TG=5c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f; PG=1a2b3c4d5e6f7a8b
+C=$(curl -s -o "$S/g.out" -w '%{http_code}' -H "traceparent: 00-$TG-$PG-01" "$H/api/rec/greet")
+for _ in $(seq 1 100); do
+  curl -s "$H/traces/$TG" > "$S/g.json"
+  [ "$(hops "$S/g.json")" -ge 1 ] && break; sleep 0.1
+done
+VERDICT=$(python3 - "$S/g.json" "$C" "$S/g.out" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))["hops"]
+def need(cond, why):
+    if not cond:
+        print(why); sys.exit(1)
+need(sys.argv[2] == "201", f"status {sys.argv[2]}: {open(sys.argv[3]).read()[:200]}")
+need([x["unit"] for x in h] == ["flow:rec_api"], f"hops: {[x['unit'] for x in h]}")
+a = h[0]
+need(a["attributes"].get("code.file.path") == "flows/rec_api.vjs", f"file: {a['attributes']}")
+need(a["attributes"].get("http.response.status_code") == 201, f"status: {a['attributes']}")
+steps = a.get("steps") or []
+v = (a.get("services") or {}).get("default:rec_greet", "")
+need(len(v) == 16, f"services: {a.get('services')}")
+need(steps == [
+    {"line": 2, "code": 'g = invoke rec_greet(name: "ada")'},
+    {"service": "default:rec_greet", "version": v},
+    {"service": "default:rec_greet", "line": 2, "code": 'greeting = f"hello {name}"'},
+    {"service": "default:rec_greet", "line": 3, "code": 'respond 418, { not: "for the caller" }'},
+    {"line": 3, "respond": 201, "code": "respond 201, { text: g.greeting }"},
+], f"steps: {steps}")
+print("ok")
+PY
+)
+[ "$VERDICT" = ok ] && ok "an api call: its lines, the service's lines and version, the status the flow set, each with its code" \
+  || ko "the api call's trace is wrong: $VERDICT"
 
 echo "── a sink's long answer is masked, then cut"
 TS=5bf92f3577b34da6a3ce929d0e0e4739; PS=30f067aa0ba902ba
@@ -146,7 +202,21 @@ echo "── found by what it carries, over HTTP and MCP"
 curl -s "$H/traces?search=4711" | grep -q "\"trace_id\":\"$TA\"" && ok "GET /traces?search finds it" \
   || ko "search: $(curl -s "$H/traces?search=4711" | cut -c1-200)"
 mcp '{"search":"4711"}' | grep -q "$TA" && ok "vejas_trace finds it by search" || ko "vejas_trace search: $(mcp '{"search":"4711"}' | cut -c1-200)"
-mcp "{\"trace_id\":\"$TA\"}" | grep -q 'flow:rec_store' && ok "vejas_trace reads it by id" || ko "vejas_trace by id"
+mcp "{\"trace_id\":\"$TA\"}" > "$S/m.json"
+VERDICT=$(python3 - "$S/m.json" <<'PY'
+import json, sys
+try:
+    h = json.loads(json.load(open(sys.argv[1]))["result"]["content"][0]["text"])["hops"]
+except Exception as e:
+    print(f"not a trace: {e}"); sys.exit(1)
+store = [x for x in h if x["unit"] == "flow:rec_store"]
+if not store: print("no flow:rec_store hop"); sys.exit(1)
+if store[0].get("steps", [{}])[0].get("code") != 'emit "vx.rec.stored", { order: event.order }':
+    print(f"steps: {store[0].get('steps')}"); sys.exit(1)
+print("ok")
+PY
+)
+[ "$VERDICT" = ok ] && ok "vejas_trace reads it by id, the code of each step with it" || ko "vejas_trace by id: $VERDICT"
 case "$(curl -s -o /dev/null -w '%{http_code}' "$H/traces/not-a-trace")" in
   400) ok "a malformed id is refused";; *) ko "a malformed id was not refused";; esac
 
@@ -206,10 +276,11 @@ if not h or any(x["ok"] for x in h): print("a failure is missing or a hop succee
 if attempts != list(range(1, len(h) + 1)) or len(h) < 2: print(f"attempts: {attempts}"); sys.exit(1)
 if not h[-1]["attributes"].get("vejas.dlq"): print("the last attempt is not dead-lettered"); sys.exit(1)
 if "missing/x" not in (h[0]["error"] or ""): print(f"error: {h[0]['error']}"); sys.exit(1)
+if h[0].get("steps") != [{"line": 2, "code": 'x = secret("missing/x")', "failed": True}]: print(f"steps: {h[0].get('steps')}"); sys.exit(1)
 print("ok")
 PY
 )
-[ "$VERDICT" = ok ] && ok "each failed attempt is kept, the last one dead-lettered" || ko "failures: $VERDICT"
+[ "$VERDICT" = ok ] && ok "each failed attempt is kept, the last one dead-lettered, the line that failed marked" || ko "failures: $VERDICT"
 
 echo "── counted"
 curl -s "$H/metrics" | grep -qE '^vejas_trace_records_total [1-9]' && ok "/metrics counts the records" \

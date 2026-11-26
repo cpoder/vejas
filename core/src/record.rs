@@ -32,6 +32,7 @@
 
 use crate::bus;
 use crate::metrics::{self, json_string, Attr, Span};
+use crate::vjs::{Step, Steps, What};
 use aho_corasick::AhoCorasick;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Value};
@@ -64,6 +65,41 @@ const INPUT_MAX: usize = 16 * 1024;
 const PREVIEW_MAX: usize = 2048;
 /// Errors and answers longer than this are cut, once scrubbed.
 const TEXT_MAX: usize = 2048;
+/// A subject as a record writes it, at most, once scrubbed: one built from an
+/// event can be long, and a run's steps can name 256 of them.
+const SUBJECT_MAX: usize = 256;
+
+
+/// The subjects a record names, each scrubbed once and copied from where it
+/// was first written: a hop names its own subject twice, and a loop emits to
+/// the same one over and over. The first 16 distinct subjects are kept.
+/// `out` only grows while they are written, so a place in it stays good.
+#[derive(Default)]
+struct Subjects<'a> {
+    written: Vec<(&'a str, std::ops::Range<usize>)>,
+}
+
+impl<'a> Subjects<'a> {
+    fn write(&mut self, out: &mut String, subject: &'a str, scrub: &Scrub) {
+        if let Some((_, at)) = self.written.iter().find(|(s, _)| *s == subject) {
+            out.extend_from_within(at.clone());
+            return;
+        }
+        let start = out.len();
+        scrub.write_text(out, subject, false, SUBJECT_MAX);
+        if self.written.len() < 16 {
+            self.written.push((subject, start..out.len()));
+        }
+    }
+
+    /// A subject held in an attribute.
+    fn write_attr(&mut self, out: &mut String, value: &'a Attr, scrub: &Scrub) {
+        match value {
+            Attr::Str(s) => self.write(out, s, scrub),
+            other => scrub.write_attr(out, other),
+        }
+    }
+}
 /// The distinct subjects a record lists, at most; `vejas.emits` keeps the count.
 /// A fan-out of thousands would otherwise make a record too big to publish.
 const EMITS_MAX: usize = 100;
@@ -93,6 +129,7 @@ pub struct Extras {
     emits: Vec<String>,
     input: Option<Kept>,
     answer: Option<Kept>,
+    steps: Option<Steps>,
 }
 
 /// A payload or an answer as the hot path hands it over: its first
@@ -162,10 +199,24 @@ impl Extras {
         self
     }
 
+    /// The statements the hop's run went through (ADR-0034, point 8). They
+    /// say which lines ran, never the data, so they stay when payloads are off.
+    pub fn steps(mut self, steps: Option<Steps>) -> Extras {
+        self.steps = steps.filter(|s| !s.is_empty());
+        self
+    }
+
     /// What it weighs in the queue, near enough.
     fn weight(&self) -> usize {
         let kept = |k: &Option<Kept>| k.as_ref().map_or(0, |k| k.bytes.len());
-        256 + self.emits.iter().map(|s| s.len() + 24).sum::<usize>() + kept(&self.input) + kept(&self.answer)
+        let steps = self.steps.as_ref().map_or(0, |s| {
+            let emitted = |step: &Step| match &step.what {
+                What::Emit(_, subject) => subject.len(),
+                _ => 0,
+            };
+            (s.len() + s.services().len()) * 64 + s.head().iter().chain(s.tail()).map(emitted).sum::<usize>()
+        });
+        256 + self.emits.iter().map(|s| s.len() + 24).sum::<usize>() + kept(&self.input) + kept(&self.answer) + steps
     }
 }
 
@@ -1158,6 +1209,8 @@ impl Scrub {
         match value {
             Attr::Str(s) => self.write_text(out, s, false, usize::MAX),
             Attr::Static(s) => json_string(out, s),
+            // the runtime's own: a file under the root, a content hash
+            Attr::Computed(s) => json_string(out, s),
             Attr::Int(i) => {
                 let _ = write!(out, "{i}");
             }
@@ -1730,6 +1783,7 @@ fn answer(out: &mut String, answer: &Kept, scrub: &Scrub) {
 /// timing and attributes, then what the hop adds.
 fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
     let mut out = String::with_capacity(512 + extras.weight());
+    let mut subjects = Subjects::default();
     let _ = write!(
         out,
         r#"{{"trace_id":"{:032x}","span_id":"{:016x}","parent_id":"#,
@@ -1759,7 +1813,7 @@ fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
     }
     out.push_str(r#","subject":"#);
     match span.attrs.iter().find(|(key, _)| *key == "messaging.destination.name") {
-        Some((_, value)) => scrub.write_attr(&mut out, value),
+        Some((_, value)) => subjects.write_attr(&mut out, value, scrub),
         None => out.push_str("null"),
     }
     out.push_str(r#","emits":["#);
@@ -1767,7 +1821,7 @@ fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
         if i > 0 {
             out.push(',');
         }
-        scrub.write_text(&mut out, subject, false, usize::MAX);
+        subjects.write(&mut out, subject, scrub);
     }
     out.push_str(r#"],"answer":"#);
     match &extras.answer {
@@ -1781,15 +1835,118 @@ fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
         }
         json_string(&mut out, key);
         out.push(':');
-        scrub.write_attr(&mut out, value);
+        match value {
+            _ if *key == "messaging.destination.name" => subjects.write_attr(&mut out, value, scrub),
+            _ => scrub.write_attr(&mut out, value),
+        }
     }
     out.push('}');
+    if let Some(steps) = &extras.steps {
+        write_steps(&mut out, steps, scrub, &mut subjects);
+        write_services(&mut out, steps.services());
+    }
     if let Some(input) = &extras.input {
         out.push_str(r#","input":"#);
         payload(&mut out, input, scrub);
     }
     out.push('}');
     out
+}
+
+/// The statements a run went through, in order: `{"line":n}` for each, with
+/// the service it is in when it is not the flow's own, the subject an `emit`
+/// sent to, the status a flow's `respond` set, and an invoked service's version
+/// where it starts. `{"skipped":n}` stands for the statements that ran
+/// between the first ones kept and the last. The statement a failed run
+/// ended on, the last step, says `"failed":true`.
+fn write_steps<'a>(out: &mut String, steps: &'a Steps, scrub: &Scrub, subjects: &mut Subjects<'a>) {
+    let failed_at = if steps.failed() { steps.len().checked_sub(1) } else { None };
+    let mut one = |out: &mut String, step: &'a Step, at: usize| {
+        out.push('{');
+        // checked identifiers, `package:service`: no event data reaches them
+        if let Some(service) = &step.service {
+            out.push_str(r#""service":"#);
+            json_string(out, service);
+            out.push(',');
+        }
+        match &step.what {
+            What::Line(line) => {
+                out.push_str(r#""line":"#);
+                push_u64(out, u64::from(*line));
+            }
+            What::Emit(line, subject) => {
+                out.push_str(r#""line":"#);
+                push_u64(out, u64::from(*line));
+                out.push_str(r#","emit":"#);
+                subjects.write(out, subject, scrub);
+            }
+            What::Respond(line, status) => {
+                out.push_str(r#""line":"#);
+                push_u64(out, u64::from(*line));
+                out.push_str(r#","respond":"#);
+                scrub.write_number(out, format_args!("{status}"));
+            }
+            What::Enter(version) => {
+                // a hash of the service's source, computed here
+                out.push_str(r#""version":"#);
+                json_string(out, version);
+            }
+        }
+        if failed_at == Some(at) && !matches!(step.what, What::Enter(_)) {
+            out.push_str(r#","failed":true"#);
+        }
+        out.push('}');
+    };
+    out.push_str(r#","steps":["#);
+    let head = steps.head().len();
+    for (i, step) in steps.head().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        one(out, step, i);
+    }
+    if steps.skipped() > 0 {
+        let _ = write!(out, r#",{{"skipped":{}}}"#, steps.skipped());
+    }
+    for (i, step) in steps.tail().enumerate() {
+        out.push(',');
+        one(out, step, head + i);
+    }
+    out.push(']');
+}
+
+/// The services a run invoked, each with the version of its source: names
+/// the runtime checked and hashes it computed, written as they are.
+fn write_services(out: &mut String, services: &[(std::sync::Arc<str>, std::sync::Arc<str>)]) {
+    if services.is_empty() {
+        return;
+    }
+    out.push_str(r#","services":{"#);
+    for (i, (name, version)) in services.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_string(out, name);
+        out.push(':');
+        json_string(out, version);
+    }
+    out.push('}');
+}
+
+/// A number, with none of the formatting machinery: a record writes one for
+/// each step.
+fn push_u64(out: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&digits[at..]).unwrap_or("0"));
 }
 
 /// The subjects in the order first emitted, each once, `EMITS_MAX` at most.
@@ -2029,6 +2186,7 @@ mod tests {
             emits: vec!["vx.orders.validated".into()],
             input: Some(Kept::copy(br#"{"order":4711}"#)),
             answer: Some(Kept::copy(b"202 accepted")),
+            steps: None,
         };
         let r = rendered(&span(), extras, &[]);
         assert_eq!(r["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
@@ -2108,12 +2266,21 @@ mod tests {
         let mut s = span();
         s.error = Some("401 for s3cr3t-value-long".into());
         s.attrs.push(("http.url", Attr::Str("https://h/?k=s3cr3t".into())));
+        s.attrs[1].1 = Attr::Str("vx.in.s3cr3t".into());
+        s.attrs.push(("code.file.path", Attr::Str("flows/orders.vjs".into())));
         let extras = Extras {
             emits: vec!["vx.out.s3cr3t".into()],
             input: Some(Kept::copy(
                 br#"{"note":"forwarding s3cr3t-value-long","n":["s3cr3t"],"pin":98765432,"s3cr3t":1}"#,
             )),
             answer: Some(Kept::copy(br#"{"echo":"s3cr3t","api_key":"abc"}"#)),
+            steps: Some(steps_of(vec![
+                (None, What::Line(1)),
+                (None, What::Emit(2, "vx.out.s3cr3t".into())),
+                (None, What::Emit(2, "vx.out.s3cr3t".into())),
+                (Some("default:auth"), What::Enter("0123456789abcdef".into())),
+                (Some("default:auth"), What::Respond(3, 401)),
+            ])),
         };
         let out = render(&s, &extras, &scrub(&secrets));
         assert!(!out.contains("s3cr3t") && !out.contains("98765432"), "{out}");
@@ -2126,9 +2293,88 @@ mod tests {
         assert_eq!(r["error"], "401 for <secret>");
         assert_eq!(r["attributes"]["http.url"], "https://h/?k=<secret>");
         assert_eq!(r["emits"][0], "vx.out.<secret>");
+        // the hop's own subject, scrubbed once, written twice
+        assert_eq!(r["subject"], "vx.in.<secret>");
+        assert_eq!(r["attributes"]["messaging.destination.name"], "vx.in.<secret>");
+        assert_eq!(r["attributes"]["code.file.path"], "flows/orders.vjs");
         // a JSON answer is scrubbed like a payload
         let answer: Value = serde_json::from_str(r["answer"].as_str().unwrap()).unwrap();
         assert_eq!(answer, json!({"echo": "<secret>", "api_key": MASKED}));
+        // and so do the subjects and statuses the steps name
+        assert_eq!(
+            r["steps"],
+            json!([
+                {"line": 1},
+                {"line": 2, "emit": "vx.out.<secret>"},
+                {"line": 2, "emit": "vx.out.<secret>"},
+                {"service": "default:auth", "version": "0123456789abcdef"},
+                {"service": "default:auth", "line": 3, "respond": 401},
+            ])
+        );
+    }
+
+    fn steps_of(steps: Vec<(Option<&str>, What)>) -> Steps {
+        let mut out = Steps::new();
+        for (service, what) in steps {
+            out.push(Step { service: service.map(Into::into), what });
+        }
+        out
+    }
+
+    #[test]
+    fn a_record_says_which_lines_a_hop_ran() {
+        let n = crate::vjs::STEPS_HEAD + crate::vjs::STEPS_TAIL + 10;
+        let mut steps: Vec<(Option<&str>, What)> = (1..=n).map(|l| (None, What::Line(l as u32))).collect();
+        steps.push((None, What::Emit(n as u32 + 1, format!("vx.{}", "k".repeat(1000)))));
+        steps.push((None, What::Respond(n as u32 + 2, 201)));
+        let r = rendered(&span(), Extras::new().steps(Some(steps_of(steps))), &[]);
+        let kept = r["steps"].as_array().unwrap();
+        assert_eq!(kept.len(), crate::vjs::STEPS_HEAD + 1 + crate::vjs::STEPS_TAIL);
+        assert_eq!(kept[0], json!({"line": 1}));
+        assert_eq!(kept[crate::vjs::STEPS_HEAD], json!({"skipped": 12}));
+        assert_eq!(kept.last().unwrap(), &json!({"line": n + 2, "respond": 201}));
+        // a long subject is cut once scrubbed
+        let long = kept[kept.len() - 2]["emit"].as_str().unwrap();
+        assert!(long.starts_with("vx.kkk") && long.ends_with('…'), "{long}");
+        assert_eq!(long.len(), SUBJECT_MAX + '…'.len_utf8());
+        // the services a run invoked, by name, with their versions
+        let mut steps = steps_of(vec![
+            (None, What::Line(u32::MAX)),
+            (Some("default:auth"), What::Enter("0123456789abcdef".into())),
+        ]);
+        steps.entered(&"default:auth".into(), &"0123456789abcdef".into());
+        steps.entered(&"billing:fmt".into(), &"fedcba9876543210".into());
+        let r = rendered(&span(), Extras::new().steps(Some(steps)), &[]);
+        assert_eq!(r["steps"][0], json!({"line": u32::MAX}));
+        assert_eq!(r["services"], json!({"default:auth": "0123456789abcdef", "billing:fmt": "fedcba9876543210"}));
+        for n in [0, 9, 10, 99, 100, u64::from(u32::MAX), u64::MAX] {
+            let mut out = String::new();
+            push_u64(&mut out, n);
+            assert_eq!(out, n.to_string());
+        }
+        // the statement a failed run ended on, its last step, says so: in the
+        // head of a short run or the tail of a long one, never on a start
+        let mut steps = steps_of(vec![(None, What::Line(4)), (Some("default:crm"), What::Line(2)), (None, What::Line(6))]);
+        steps.set_failed();
+        let r = rendered(&span(), Extras::new().steps(Some(steps)), &[]);
+        assert_eq!(
+            r["steps"],
+            json!([{"line": 4}, {"service": "default:crm", "line": 2}, {"line": 6, "failed": true}])
+        );
+        let n = crate::vjs::STEPS_HEAD + crate::vjs::STEPS_TAIL + 3;
+        let mut steps = steps_of((1..=n).map(|l| (None, What::Line(l as u32))).collect());
+        steps.set_failed();
+        let r = rendered(&span(), Extras::new().steps(Some(steps)), &[]);
+        let kept = r["steps"].as_array().unwrap();
+        assert_eq!(kept.last().unwrap(), &json!({"line": n, "failed": true}));
+        assert_eq!(kept.iter().filter(|st| st.get("failed").is_some()).count(), 1);
+        let mut steps = steps_of(vec![(Some("default:crm"), What::Enter("0123456789abcdef".into()))]);
+        steps.set_failed();
+        let r = rendered(&span(), Extras::new().steps(Some(steps)), &[]);
+        assert_eq!(r["steps"], json!([{"service": "default:crm", "version": "0123456789abcdef"}]));
+        // no step, no field; steps carry no payload, so payloads off keeps them
+        assert!(rendered(&span(), Extras::new().steps(Some(Steps::new())), &[]).get("steps").is_none());
+        assert!(rendered(&span(), Extras::new(), &[]).get("steps").is_none());
     }
 
     #[test]
@@ -2792,10 +3038,16 @@ mod tests {
             }
             let mut s = span();
             s.error = Some(String::from_utf8_lossy(&bytes).into_owned());
+            let lossy = String::from_utf8_lossy(&bytes).into_owned();
             let extras = Extras {
                 emits: vec![String::from_utf8_lossy(&bytes[..bytes.len().min(40)]).into_owned()],
                 input: Some(Kept::copy(&bytes)),
                 answer: Some(Kept::copy(&bytes)),
+                steps: Some(steps_of(vec![
+                    (None, What::Emit(1, lossy.clone())),
+                    (Some("default:x"), What::Emit(2, lossy)),
+                    (None, What::Respond(3, 500)),
+                ])),
             };
             let out = render(&s, &extras, &sc);
             serde_json::from_str::<Value>(&out).unwrap_or_else(|e| panic!("round {round}, not JSON ({e}): {out}"));

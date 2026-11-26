@@ -375,6 +375,10 @@ pub enum Attr {
     Str(String),
     /// A constant: no allocation on the hot path.
     Static(&'static str),
+    /// A value the runtime computed from its own state, never from an event:
+    /// a file under the project root, a content hash. Shared, so a hop does
+    /// not copy it, and the trace record writes it with no scrub.
+    Computed(std::sync::Arc<str>),
     Int(i64),
     Bool(bool),
 }
@@ -875,6 +879,10 @@ fn attribute(out: &mut String, key: &str, value: &Attr) {
             json_string(out, s);
         }
         Attr::Static(s) => {
+            out.push_str(r#""stringValue":"#);
+            json_string(out, s);
+        }
+        Attr::Computed(s) => {
             out.push_str(r#""stringValue":"#);
             json_string(out, s);
         }

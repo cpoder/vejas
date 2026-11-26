@@ -105,7 +105,8 @@ fn err_at(pos: usize, src: &str, msg: &str) -> String {
 pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
     let b = src.as_bytes();
     let mut out = Vec::new();
-    let mut i = 0;
+    // a byte-order mark, which some editors write, is not code
+    let mut i = if b.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
     while i < b.len() {
         let c = b[i] as char;
         match c {
@@ -170,7 +171,8 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                 out.push(Spanned { tok, pos: start });
             }
             _ => {
-                let two = if i + 1 < b.len() { &src[i..i + 2] } else { "" };
+                // `get`: a character of several bytes has no boundary at `i + 2`
+                let two = src.get(i..i + 2).unwrap_or("");
                 let (tok, len) = match two {
                     "?." => (Tok::QDot, 2),
                     "??" => (Tok::QQ, 2),
@@ -195,7 +197,10 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
                         '-' => (Tok::Minus, 1),
                         '*' => (Tok::Star, 1),
                         '/' => (Tok::Slash, 1),
-                        _ => return Err(err_at(i, src, &format!("unexpected character {c:?}"))),
+                        _ => {
+                            let found = src.get(i..).and_then(|rest| rest.chars().next()).unwrap_or(c);
+                            return Err(err_at(i, src, &format!("unexpected character {found:?}")));
+                        }
                     },
                 };
                 out.push(Spanned { tok, pos: i });
@@ -348,14 +353,48 @@ pub enum Stmt {
     /// Each arm is (condition, condition source span, body). The span lets the
     /// rules-view (ADR-0019) show a non-projectable guard's exact source rather
     /// than a paraphrase; the interpreter ignores it.
-    If(Vec<(Expr, (usize, usize), Vec<Stmt>)>, Option<Vec<Stmt>>),
-    For(String, Expr, Vec<Stmt>),
+    If(Vec<(Expr, (usize, usize), Block)>, Option<Block>),
+    For(String, Expr, Block),
     Emit(Expr, Expr),
     /// `respond <status>, <body>` — set the synchronous HTTP response of an
     /// `api` flow (status code + JSON body). Side-effect `emit`s still go to the
     /// bus; `respond` is what the caller gets back.
     Respond(Expr, Expr),
     InvokeMerge(String, Vec<(String, Expr)>),
+}
+
+/// Statements in order, with the source line each one starts on: the trace
+/// record says which statements an event went through (ADR-0034, point 8).
+/// It reads as a slice of statements everywhere else.
+#[derive(Clone, Debug, Default)]
+pub struct Block {
+    stmts: Vec<Stmt>,
+    /// 0 for a statement the record leaves out: a business-surface constant,
+    /// which every run assigns the same way. As long as `stmts`: only `push`
+    /// adds to either.
+    lines: Vec<u32>,
+}
+
+impl Block {
+    fn push(&mut self, line: u32, stmt: Stmt) {
+        self.stmts.push(stmt);
+        self.lines.push(line);
+    }
+}
+
+impl std::ops::Deref for Block {
+    type Target = [Stmt];
+    fn deref(&self) -> &[Stmt] {
+        &self.stmts
+    }
+}
+
+impl<'a> IntoIterator for &'a Block {
+    type Item = &'a Stmt;
+    type IntoIter = std::slice::Iter<'a, Stmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter()
+    }
 }
 
 pub struct SurfaceEntry {
@@ -378,7 +417,7 @@ pub struct Program {
     /// When set, this file is a connector instance manifest: `driver "http-in"`
     /// plus UPPERCASE literal config. It is run by a native driver, not as a flow.
     pub driver: Option<String>,
-    pub stmts: Vec<Stmt>,
+    pub stmts: Block,
     pub surface: Vec<SurfaceEntry>,
     pub emit_subjects: Vec<String>,
     pub invokes: Vec<String>,
@@ -546,6 +585,8 @@ struct Parser<'a> {
     toks: &'a [Spanned],
     i: usize,
     src: &'a str,
+    /// Where each line ends in `src`, to give a statement its line.
+    newlines: &'a [usize],
 }
 
 impl<'a> Parser<'a> {
@@ -572,6 +613,11 @@ impl<'a> Parser<'a> {
     }
     fn err(&self, msg: &str) -> String {
         err_at(self.pos(), self.src, msg)
+    }
+    /// The line the next token is on, from 1.
+    fn line(&self) -> u32 {
+        let pos = self.pos();
+        (self.newlines.partition_point(|&nl| nl < pos) + 1) as u32
     }
     fn eat(&mut self, t: Tok, what: &str) -> Result<(), String> {
         if *self.peek() == t {
@@ -631,7 +677,7 @@ impl<'a> Parser<'a> {
         let mut tool = None;
         let mut driver = None;
         let mut api = None;
-        let mut stmts = Vec::new();
+        let mut stmts = Block::default();
         let mut surface = Vec::new();
         loop {
             self.skip_newlines();
@@ -680,7 +726,7 @@ impl<'a> Parser<'a> {
                     self.i += 2;
                     let start = self.pos();
                     if let Some((value, entry_spans, end)) = self.try_literal()? {
-                        stmts.push(Stmt::Assign(vec![name.clone()], Expr::Lit(value.clone())));
+                        stmts.push(0, Stmt::Assign(vec![name.clone()], Expr::Lit(value.clone())));
                         surface.push(SurfaceEntry {
                             name,
                             value,
@@ -692,7 +738,9 @@ impl<'a> Parser<'a> {
                     self.i = save;
                 }
             }
-            stmts.push(self.stmt()?);
+            let line = self.line();
+            let stmt = self.stmt()?;
+            stmts.push(line, stmt);
         }
         let mut prog = Program {
             source,
@@ -883,8 +931,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn block(&mut self) -> Result<Vec<Stmt>, String> {
-        let mut stmts = Vec::new();
+    fn block(&mut self) -> Result<Block, String> {
+        let mut block = Block::default();
         loop {
             self.skip_newlines();
             match self.peek() {
@@ -894,9 +942,11 @@ impl<'a> Parser<'a> {
             if self.at_end() {
                 return Err(self.err("missing `end`"));
             }
-            stmts.push(self.stmt()?);
+            let line = self.line();
+            let stmt = self.stmt()?;
+            block.push(line, stmt);
         }
-        Ok(stmts)
+        Ok(block)
     }
 
     fn invoke_args(&mut self) -> Result<(String, Vec<(String, Expr)>), String> {
@@ -1027,7 +1077,7 @@ impl<'a> Parser<'a> {
                     match p {
                         FPart::Lit(s) => out.push(FStringPart::Lit(s)),
                         FPart::Expr(toks) => {
-                            let mut sub = Parser { toks: &toks, i: 0, src: self.src };
+                            let mut sub = Parser { toks: &toks, i: 0, src: self.src, newlines: self.newlines };
                             out.push(FStringPart::Expr(sub.expr(0)?));
                         }
                     }
@@ -1274,7 +1324,8 @@ fn expr_writes_bus(e: &Expr) -> bool {
 
 pub fn parse(src: &str) -> Result<Program, String> {
     let toks = lex(src)?;
-    let mut p = Parser { toks: &toks, i: 0, src };
+    let newlines: Vec<usize> = src.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i).collect();
+    let mut p = Parser { toks: &toks, i: 0, src, newlines: &newlines };
     p.program()
 }
 
@@ -1320,7 +1371,7 @@ fn to_display(v: &Value) -> String {
 pub struct Engine {
     pub project_root: PathBuf,
     pub caller_pkg: String,
-    cache: HashMap<String, Program>,
+    cache: HashMap<String, Arc<Service>>,
     exports: HashMap<String, Vec<String>>,
     secrets: Arc<dyn crate::secrets::SecretStore>,
     depth: usize,
@@ -1328,6 +1379,180 @@ pub struct Engine {
     /// spans it left (ADR-0034). None otherwise, so an untraced run pays one
     /// test per invoke.
     trace: Option<InvokeTrace>,
+    /// While the trace record is on: the statements the run goes through
+    /// (ADR-0034, point 8). None otherwise, so a run pays one test per
+    /// statement.
+    steps: Option<Steps>,
+    /// The service whose statements are running, for `steps`; None in the
+    /// flow itself.
+    in_service: Option<Arc<str>>,
+}
+
+/// A service as the engine runs it: its statements, and the version of the
+/// source they came from, which the trace record joins the code with.
+struct Service {
+    stmts: Block,
+    /// `package:service`, as its steps name it.
+    name: Arc<str>,
+    /// Its source, hashed into its version the first time a run that records
+    /// steps invokes it: a run that records none never pays for the hash.
+    src: Box<str>,
+    version: std::sync::OnceLock<Arc<str>>,
+}
+
+impl Service {
+    fn version(&self) -> Arc<str> {
+        self.version.get_or_init(|| crate::versions::hash_content(&self.src).into()).clone()
+    }
+}
+
+/// How many statements of one run the record keeps: the first `STEPS_HEAD`
+/// and the last `STEPS_TAIL`. A loop over a long array costs a bounded record,
+/// and the statement a run failed on is always the last one kept.
+pub const STEPS_HEAD: usize = 192;
+pub const STEPS_TAIL: usize = 64;
+
+/// The statements one run went through, in order (ADR-0034, point 8).
+pub struct Steps {
+    head: Vec<Step>,
+    tail: std::collections::VecDeque<Step>,
+    count: u64,
+    /// Each service the run invoked, once, with the version of its source:
+    /// its lines find their code by it even when the step where it started
+    /// is among those left out.
+    services: Vec<(Arc<str>, Arc<str>)>,
+    /// A statement has said the run failed on it.
+    failed: bool,
+}
+
+/// The services a run's steps name with their versions, at most.
+pub const SERVICES_MAX: usize = 32;
+
+/// Step buffers handed back, emptied, when their steps are dropped. A run's
+/// steps are filled on its flow's thread and written on the record's: freed
+/// there, a buffer costs a lock in glibc's malloc that the flow's thread
+/// takes too, and that measured more than recording the steps.
+static SPARE: std::sync::Mutex<Vec<Vec<Step>>> = std::sync::Mutex::new(Vec::new());
+const SPARE_MAX: usize = 64;
+
+impl Drop for Steps {
+    fn drop(&mut self) {
+        let mut head = std::mem::take(&mut self.head);
+        if head.capacity() == 0 {
+            return;
+        }
+        head.clear();
+        if let Ok(mut spare) = SPARE.try_lock() {
+            if spare.len() < SPARE_MAX {
+                spare.push(head);
+            }
+        }
+    }
+}
+
+/// A statement that ran, or an invoked service that started.
+pub struct Step {
+    /// The service the statement is in, `package:service`; None in the flow.
+    pub service: Option<Arc<str>>,
+    pub what: What,
+}
+
+pub enum What {
+    /// A statement started on this line.
+    Line(u32),
+    /// The `emit` on this line sent to this subject.
+    Emit(u32, String),
+    /// The flow's `respond` on this line set this HTTP status: the caller
+    /// gets the last one set, if the run succeeds.
+    Respond(u32, u16),
+    /// An invoked service started, at this version of its source.
+    Enter(Arc<str>),
+}
+
+impl Steps {
+    pub(crate) fn new() -> Steps {
+        let head = SPARE.try_lock().ok().and_then(|mut spare| spare.pop());
+        Steps {
+            head: head.unwrap_or_else(|| Vec::with_capacity(16)),
+            tail: std::collections::VecDeque::new(),
+            count: 0,
+            services: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// A service the run invoked, at this version of its source.
+    pub(crate) fn entered(&mut self, name: &Arc<str>, version: &Arc<str>) {
+        if self.services.len() < SERVICES_MAX && !self.services.iter().any(|(n, _)| n == name) {
+            self.services.push((name.clone(), version.clone()));
+        }
+    }
+
+    /// Each service the run invoked, with the version of its source.
+    pub fn services(&self) -> &[(Arc<str>, Arc<str>)] {
+        &self.services
+    }
+
+    pub(crate) fn push(&mut self, step: Step) -> u64 {
+        let k = self.count;
+        self.count += 1;
+        if self.head.len() < STEPS_HEAD {
+            self.head.push(step);
+        } else {
+            if self.tail.len() == STEPS_TAIL {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(step);
+        }
+        k
+    }
+
+    /// The `k`th step pushed, if it is still kept.
+    fn get_mut(&mut self, k: u64) -> Option<&mut Step> {
+        if (k as usize) < self.head.len() {
+            return self.head.get_mut(k as usize);
+        }
+        let first_in_tail = self.count - self.tail.len() as u64;
+        if k >= first_in_tail {
+            self.tail.get_mut((k - first_in_tail) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// The first steps kept, in order.
+    pub fn head(&self) -> &[Step] {
+        &self.head
+    }
+
+    /// The last steps kept, in order, after `skipped()` left out.
+    pub fn tail(&self) -> impl Iterator<Item = &Step> {
+        self.tail.iter()
+    }
+
+    /// How many steps ran between the head and the tail, not kept.
+    pub fn skipped(&self) -> u64 {
+        self.count - (self.head.len() + self.tail.len()) as u64
+    }
+
+    /// How many are kept.
+    pub fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// A statement failed, and the run ended on it: its step is the last.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failed(&mut self) {
+        self.failed = true;
+    }
 }
 
 struct InvokeTrace {
@@ -1376,6 +1601,8 @@ impl Engine {
             secrets,
             depth: 0,
             trace: None,
+            steps: None,
+            in_service: None,
         }
     }
     /// Record a span per `invoke` under `hop` in the runs that follow, or stop
@@ -1397,6 +1624,40 @@ impl Engine {
     /// The `invoke` spans recorded since `trace_under`, oldest first.
     pub fn take_spans(&mut self) -> Vec<InvokeSpan> {
         self.trace.as_mut().map(|t| std::mem::take(&mut t.done)).unwrap_or_default()
+    }
+    /// Record the statements of the run that follows (ADR-0034, point 8), or
+    /// stop recording. What was recorded and not taken is dropped.
+    pub fn record_steps(&mut self, on: bool) {
+        self.steps = on.then(Steps::new);
+    }
+    /// The statements recorded since `record_steps(true)`, in order.
+    pub fn take_steps(&mut self) -> Option<Steps> {
+        self.steps.take()
+    }
+    fn step(&mut self, what: What) -> Option<u64> {
+        let steps = self.steps.as_mut()?;
+        Some(steps.push(Step { service: self.in_service.clone(), what }))
+    }
+    /// The run failed on the statement of step `k`, on `line`. Unless a
+    /// statement inside it failed first and said so, the steps end on it: an
+    /// `invoke` in the statement may have added steps of its own after it.
+    fn failed_on(&mut self, k: Option<u64>, line: u32) {
+        let Some(steps) = self.steps.as_mut() else { return };
+        if std::mem::replace(&mut steps.failed, true) {
+            return;
+        }
+        if k.is_some_and(|k| steps.count != k + 1) {
+            steps.push(Step { service: self.in_service.clone(), what: What::Line(line) });
+        }
+    }
+    /// Say what the statement of step `k` did, once it has done it.
+    fn mark(&mut self, k: Option<u64>, what: impl FnOnce(u32) -> What) {
+        let step = k.and_then(|k| self.steps.as_mut().and_then(|s| s.get_mut(k)));
+        if let Some(step) = step {
+            if let What::Line(line) = step.what {
+                step.what = what(line);
+            }
+        }
     }
     pub fn invalidate(&mut self) {
         self.cache.clear();
@@ -1460,16 +1721,23 @@ impl Engine {
         }
         Ok((pkg, svc))
     }
-    fn service_stmts(&mut self, pkg: &str, svc: &str) -> Result<Vec<Stmt>, String> {
+    fn service(&mut self, pkg: &str, svc: &str) -> Result<Arc<Service>, String> {
         let key = format!("{pkg}:{svc}");
-        if !self.cache.contains_key(&key) {
-            let path = self.pkg_dir(pkg).join("services").join(format!("{svc}.vjs"));
-            let src = std::fs::read_to_string(&path)
-                .map_err(|_| format!("unknown service {key:?} (no {})", path.display()))?;
-            let prog = parse(&src).map_err(|e| format!("service {key}: {e}"))?;
-            self.cache.insert(key.clone(), prog);
+        if let Some(service) = self.cache.get(&key) {
+            return Ok(service.clone());
         }
-        Ok(self.cache.get(&key).unwrap().stmts.clone())
+        let path = self.pkg_dir(pkg).join("services").join(format!("{svc}.vjs"));
+        let src = std::fs::read_to_string(&path)
+            .map_err(|_| format!("unknown service {key:?} (no {})", path.display()))?;
+        let prog = parse(&src).map_err(|e| format!("service {key}: {e}"))?;
+        let service = Arc::new(Service {
+            stmts: prog.stmts,
+            name: Arc::from(key.as_str()),
+            src: src.into_boxed_str(),
+            version: std::sync::OnceLock::new(),
+        });
+        self.cache.insert(key, service.clone());
+        Ok(service)
     }
 }
 
@@ -1504,13 +1772,20 @@ fn run_service(
     }
     let (pkg, svc) = engine.resolve(name)?;
     engine.depth += 1;
-    let stmts = match engine.service_stmts(&pkg, &svc) {
+    let service = match engine.service(&pkg, &svc) {
         Ok(s) => s,
         Err(e) => {
             engine.depth -= 1;
             return Err(e);
         }
     };
+    // The steps that follow are this service's, until it returns.
+    let saved_service = engine.steps.as_mut().map(|steps| {
+        let version = service.version();
+        steps.entered(&service.name, &version);
+        steps.push(Step { service: Some(service.name.clone()), what: What::Enter(version) });
+        engine.in_service.replace(service.name.clone())
+    });
     // A span for this invoke, under whatever is running it (ADR-0034).
     let span = engine.trace.as_mut().map(|t| {
         let hop = t.stack.last().expect("the hop is at the bottom").child();
@@ -1524,8 +1799,11 @@ fn run_service(
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
     let mut ctx = Ctx { vars: args.clone(), emits: Vec::new(), response: None };
     ctx.vars.insert("event".into(), Value::Object(args));
-    let result = exec_block(&stmts, &mut ctx, engine);
+    let result = exec_block(&service.stmts, &mut ctx, engine);
     engine.caller_pkg = saved_pkg;
+    if let Some(saved) = saved_service {
+        engine.in_service = saved;
+    }
     engine.depth -= 1;
     if let (Some((hop, start_nanos)), Some((service, file))) = (span, names) {
         let file = file.strip_prefix(&engine.project_root).unwrap_or(&file).display().to_string();
@@ -1546,78 +1824,100 @@ fn run_service(
     Ok(Value::Object(ctx.vars))
 }
 
-fn exec_block(stmts: &[Stmt], ctx: &mut Ctx, engine: &mut Engine) -> Result<(), String> {
-    for s in stmts {
-        match s {
-            Stmt::Assign(path, e) => {
-                let v = eval(e, ctx, engine)?;
-                if path.len() == 1 {
-                    ctx.vars.insert(path[0].clone(), v);
-                } else {
-                    let root = ctx
-                        .vars
-                        .entry(path[0].clone())
-                        .or_insert_with(|| Value::Object(Map::new()));
-                    set_path(root, &path[1..], v);
-                }
-            }
-            Stmt::InvokeMerge(name, args) => {
-                let mut arg_map = Map::new();
-                for (k, e) in args {
-                    arg_map.insert(k.clone(), eval(e, ctx, engine)?);
-                }
-                let mut emits = Vec::new();
-                let out = run_service(name, arg_map, engine, &mut emits)?;
-                ctx.emits.append(&mut emits);
-                if let Value::Object(o) = out {
-                    for (k, v) in o {
-                        ctx.vars.insert(k, v);
-                    }
-                }
-            }
-            Stmt::If(arms, otherwise) => {
-                let mut done = false;
-                for (cond, _span, body) in arms {
-                    if truthy(&eval(cond, ctx, engine)?) {
-                        exec_block(body, ctx, engine)?;
-                        done = true;
-                        break;
-                    }
-                }
-                if !done {
-                    if let Some(body) = otherwise {
-                        exec_block(body, ctx, engine)?;
-                    }
-                }
-            }
-            Stmt::For(var, iter, body) => {
-                let items = eval(iter, ctx, engine)?;
-                if let Value::Array(items) = items {
-                    for item in items {
-                        ctx.vars.insert(var.clone(), item);
-                        exec_block(body, ctx, engine)?;
-                    }
-                }
-            }
-            Stmt::Emit(subj, payload) => {
-                let s = match eval(subj, ctx, engine)? {
-                    Value::String(s) => s,
-                    other => return Err(format!("emit subject must be a string, got {other}")),
-                };
-                if !valid_subject(&s) {
-                    return Err(format!("emit subject {s:?} is not a valid subject"));
-                }
-                let p = eval(payload, ctx, engine)?;
-                ctx.emits.push((s, p));
-            }
-            Stmt::Respond(status, body) => {
-                let st = eval(status, ctx, engine)?;
-                let b = eval(body, ctx, engine)?;
-                ctx.response = Some((st, b));
-            }
+fn exec_block(block: &Block, ctx: &mut Ctx, engine: &mut Engine) -> Result<(), String> {
+    for (stmt, &line) in block.stmts.iter().zip(&block.lines) {
+        let step = if line > 0 { engine.step(What::Line(line)) } else { None };
+        if let Err(e) = exec_stmt(stmt, step, ctx, engine) {
+            engine.failed_on(step, line);
+            return Err(e);
         }
     }
     Ok(())
+}
+
+/// One statement; `step` is its own, if the run records steps.
+fn exec_stmt(stmt: &Stmt, step: Option<u64>, ctx: &mut Ctx, engine: &mut Engine) -> Result<(), String> {
+    match stmt {
+        Stmt::Assign(path, e) => {
+            let v = eval(e, ctx, engine)?;
+            if path.len() == 1 {
+                ctx.vars.insert(path[0].clone(), v);
+            } else {
+                let root = ctx
+                    .vars
+                    .entry(path[0].clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                set_path(root, &path[1..], v);
+            }
+        }
+        Stmt::InvokeMerge(name, args) => {
+            let mut arg_map = Map::new();
+            for (k, e) in args {
+                arg_map.insert(k.clone(), eval(e, ctx, engine)?);
+            }
+            let mut emits = Vec::new();
+            let out = run_service(name, arg_map, engine, &mut emits)?;
+            ctx.emits.append(&mut emits);
+            if let Value::Object(o) = out {
+                for (k, v) in o {
+                    ctx.vars.insert(k, v);
+                }
+            }
+        }
+        Stmt::If(arms, otherwise) => {
+            let mut done = false;
+            for (cond, _span, body) in arms {
+                if truthy(&eval(cond, ctx, engine)?) {
+                    exec_block(body, ctx, engine)?;
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                if let Some(body) = otherwise {
+                    exec_block(body, ctx, engine)?;
+                }
+            }
+        }
+        Stmt::For(var, iter, body) => {
+            let items = eval(iter, ctx, engine)?;
+            if let Value::Array(items) = items {
+                for item in items {
+                    ctx.vars.insert(var.clone(), item);
+                    exec_block(body, ctx, engine)?;
+                }
+            }
+        }
+        Stmt::Emit(subj, payload) => {
+            let s = match eval(subj, ctx, engine)? {
+                Value::String(s) => s,
+                other => return Err(format!("emit subject must be a string, got {other}")),
+            };
+            if !valid_subject(&s) {
+                return Err(format!("emit subject {s:?} is not a valid subject"));
+            }
+            let p = eval(payload, ctx, engine)?;
+            engine.mark(step, |line| What::Emit(line, s.clone()));
+            ctx.emits.push((s, p));
+        }
+        Stmt::Respond(status, body) => {
+            let st = eval(status, ctx, engine)?;
+            let b = eval(body, ctx, engine)?;
+            // a service's `respond` answers no one: run_service drops it
+            if engine.in_service.is_none() {
+                let code = http_status(&st);
+                engine.mark(step, |line| What::Respond(line, code));
+            }
+            ctx.response = Some((st, b));
+        }
+    }
+    Ok(())
+}
+
+/// The HTTP status a `respond` sets: a number, or a string that
+/// holds one, and 200 otherwise.
+pub fn http_status(status: &Value) -> u16 {
+    status.as_u64().or_else(|| status.as_str().and_then(|s| s.parse().ok())).unwrap_or(200) as u16
 }
 
 /// Can this string go on the wire as a subject? The NATS protocol is line-based
@@ -2367,5 +2667,242 @@ mod tests {
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();
         assert_eq!(ctx.emits, vec![("vx.deep".to_string(), json!({"r": 10}))]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A run's steps, written short: `3` a line, `3>vx.s` an emit, `3<201` a
+    /// respond, `enter p:s` a service starting, `p:s:2` a line in it, `...n`
+    /// the steps left out.
+    fn steps_of(engine: &mut Engine) -> Vec<String> {
+        let steps = engine.take_steps().expect("the engine records steps");
+        let one = |st: &Step| {
+            let at = st.service.as_deref().map(|s| format!("{s}:")).unwrap_or_default();
+            match &st.what {
+                What::Line(l) => format!("{at}{l}"),
+                What::Emit(l, subject) => format!("{at}{l}>{subject}"),
+                What::Respond(l, status) => format!("{at}{l}<{status}"),
+                What::Enter(_) => format!("enter {}", st.service.as_deref().unwrap_or("?")),
+            }
+        };
+        let mut out: Vec<String> = steps.head().iter().map(one).collect();
+        if steps.skipped() > 0 {
+            out.push(format!("...{}", steps.skipped()));
+        }
+        out.extend(steps.tail().map(one));
+        // `!`: the run failed on this statement
+        if let (true, Some(last)) = (steps.failed(), out.last_mut()) {
+            last.push('!');
+        }
+        out
+    }
+
+    #[test]
+    fn steps_are_the_lines_a_run_went_through() {
+        let src = [
+            "LIMIT = 100",
+            "# a comment",
+            "total = amount * 2",
+            "if total > LIMIT:",
+            "  emit \"vx.big\", {t: total}",
+            "elif total > 10:",
+            "  emit \"vx.mid\", {t: total}",
+            "else:",
+            "  x = 1",
+            "end",
+            "for i in items:",
+            "  n = i",
+            "end",
+            "doc = {",
+            "  a: 1,",
+            "  b: 2",
+            "}",
+            "",
+            "respond 201, doc",
+        ]
+        .join("\n");
+        let prog = parse(&src).unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        run(&prog, &json!({"amount": 30, "items": [1, 2]}), &mut engine).unwrap();
+        // the surface constant on line 1 runs the same way every time: left out
+        assert_eq!(steps_of(&mut engine), ["3", "4", "7>vx.mid", "11", "12", "12", "14", "19<201"]);
+        // nothing is recorded unless asked
+        engine.record_steps(false);
+        run(&prog, &json!({"amount": 30, "items": []}), &mut engine).unwrap();
+        assert!(engine.take_steps().is_none());
+    }
+
+    #[test]
+    fn steps_name_the_service_a_line_is_in_and_its_version() {
+        let root = std::env::temp_dir().join(format!("vejas-steps-{}", std::process::id()));
+        let pkg = root.join("packages").join("billing");
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::create_dir_all(pkg.join("services")).unwrap();
+        let double = "twice = n * 2\nhalf = n / 2\n";
+        std::fs::write(root.join("services").join("double.vjs"), double).unwrap();
+        std::fs::write(pkg.join("services").join("fmt.vjs"), "invoke inner(v: x)\nlabel = f\"<{r}>\"\n").unwrap();
+        std::fs::write(pkg.join("services").join("inner.vjs"), "r = v\n").unwrap();
+        std::fs::write(pkg.join("package.vjs"), "EXPORTS = [\"fmt\"]\n").unwrap();
+        let prog = parse("invoke double(n: 4)\nd = invoke billing:fmt(x: twice)\nemit \"vx.t\", {l: d.label}\n").unwrap();
+        let mut engine = Engine::live(root.clone(), "default".into());
+        engine.record_steps(true);
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1["l"], "<8>");
+        engine.record_steps(true);
+        run(&prog, &json!({}), &mut engine).unwrap();
+        let steps = engine.take_steps().unwrap();
+        let version = steps.head().iter().find_map(|st| match &st.what {
+            What::Enter(v) if st.service.as_deref() == Some("default:double") => Some(v.to_string()),
+            _ => None,
+        });
+        assert_eq!(version, Some(crate::versions::hash_content(double)));
+        // each service once, with its version: a reader finds a service's
+        // code by it even when the step where it started was left out
+        let services: Vec<(String, String)> =
+            steps.services().iter().map(|(name, version)| (name.to_string(), version.to_string())).collect();
+        assert_eq!(services.len(), 3, "{services:?}");
+        assert_eq!(services[0], ("default:double".to_string(), crate::versions::hash_content(double)));
+        assert_eq!(services[1].0, "billing:fmt");
+        assert_eq!(services[2].0, "billing:inner");
+        // a run that records no steps never hashes a service
+        let mut quiet = Engine::live(root.clone(), "default".into());
+        run(&prog, &json!({}), &mut quiet).unwrap();
+        assert!(quiet.cache.values().all(|service| service.version.get().is_none()));
+        engine.record_steps(true);
+        run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(
+            steps_of(&mut engine),
+            [
+                "1",
+                "enter default:double",
+                "default:double:1",
+                "default:double:2",
+                "2",
+                "enter billing:fmt",
+                "billing:fmt:1",
+                "enter billing:inner",
+                "billing:inner:1",
+                "billing:fmt:2",
+                "3>vx.t",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_run_keeps_its_first_and_last_steps() {
+        let prog = parse("for i in items:\n  n = i\nend\nemit \"vx.done\", {n: n}\n").unwrap();
+        let items: Vec<i32> = (0..1000).collect();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        run(&prog, &json!({"items": items}), &mut engine).unwrap();
+        let steps = steps_of(&mut engine);
+        // the `for`, a thousand times its body, the emit
+        assert_eq!(steps.len(), STEPS_HEAD + 1 + STEPS_TAIL);
+        assert_eq!(steps[..3], ["1", "2", "2"]);
+        assert_eq!(steps[STEPS_HEAD], format!("...{}", 1002 - STEPS_HEAD - STEPS_TAIL));
+        assert_eq!(steps.last().unwrap(), "4>vx.done");
+    }
+
+    #[test]
+    fn a_failed_run_ends_on_the_statement_that_failed() {
+        let prog = parse("a = 1\nfor i in items:\n  emit f\"vx.{i}\", {i: i}\nend\nb = 2\n").unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        let Err(err) = run(&prog, &json!({"items": ["ok", "not ok"]}), &mut engine) else {
+            panic!("a subject with a space must fail the run");
+        };
+        assert!(err.contains("not a valid subject"), "{err}");
+        assert_eq!(steps_of(&mut engine), ["1", "2", "3>vx.ok", "3!"]);
+
+        let root = std::env::temp_dir().join(format!("vejas-failed-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::write(root.join("services").join("route.vjs"), "o = 1\nsubject = \"vx.bad subject\"\n").unwrap();
+        std::fs::write(root.join("services").join("broken.vjs"), "emit \"vx.bad subject\", {}\n").unwrap();
+        let mut engine = Engine::live(root.clone(), "default".into());
+        let mut failed = |src: &str| {
+            engine.record_steps(true);
+            assert!(run(&parse(src).unwrap(), &json!({"a": true}), &mut engine).is_err(), "{src}");
+            steps_of(&mut engine)
+        };
+        // the statement fails once an invoke in it has returned: the service's
+        // steps came after its own, so it says it again
+        assert_eq!(
+            failed("a = 1\nemit (invoke route(o: 1)).subject, {a: a}\nb = 2\n"),
+            ["1", "2", "enter default:route", "default:route:1", "default:route:2", "2!"]
+        );
+        // the service's statement failed: the run ends there, and the
+        // statement that invoked it does not say it again
+        assert_eq!(failed("r = invoke broken()\n"), ["1", "enter default:broken", "default:broken:1!"]);
+        // nor does the block around a statement that failed
+        assert_eq!(failed("if a:\n  emit \"vx.bad subject\", {}\nend\n"), ["1", "2!"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_respond_in_a_service_answers_no_one() {
+        let root = std::env::temp_dir().join(format!("vejas-respond-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::write(root.join("services").join("auth.vjs"), "ok = false\nrespond 401, {error: \"no\"}\n").unwrap();
+        let prog = parse("invoke auth(token: t)\nrespond 201, {ok: ok}\n").unwrap();
+        let mut engine = Engine::live(root.clone(), "default".into());
+        engine.record_steps(true);
+        let ctx = run(&prog, &json!({"t": "x"}), &mut engine).unwrap();
+        assert_eq!(ctx.response.map(|(status, _)| status), Some(json!(201)));
+        // run_service drops the service's response: its line is a line, no more
+        assert_eq!(
+            steps_of(&mut engine),
+            ["1", "enter default:auth", "default:auth:1", "default:auth:2", "2<201"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_code_and_a_wide_character_is_an_error() {
+        let src = format!("{}x = 1\nemit \"vx.a\", {{x: x}}\n", '\u{feff}');
+        let prog = parse(&src).unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(ctx.emits, vec![("vx.a".to_string(), json!({"x": 1}))]);
+        assert_eq!(steps_of(&mut engine), ["1", "2>vx.a"]);
+        // a character of three bytes outside a string once panicked the lexer
+        for (src, found) in [("x = 1 \u{2014} 2\n", '\u{2014}'), ("y = 2\n\u{feff}z = 3\n", '\u{feff}')] {
+            let err = parse(src).err().expect("not code");
+            assert!(err.contains(&format!("unexpected character {found:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_buffer_handed_back_comes_back_empty() {
+        let mut steps = Steps::new();
+        for i in 0..40 {
+            steps.push(Step { service: None, what: What::Emit(i, format!("vx.{i}")) });
+        }
+        drop(steps);
+        let again = Steps::new();
+        assert!(again.is_empty() && again.head().is_empty() && again.services().is_empty());
+    }
+
+    #[test]
+    fn a_step_is_found_again_while_it_is_kept() {
+        let mut steps = Steps::new();
+        let n = STEPS_HEAD + 2 * STEPS_TAIL;
+        for i in 0..n {
+            steps.push(Step { service: None, what: What::Line(i as u32) });
+        }
+        let line = |steps: &mut Steps, k: usize| {
+            steps.get_mut(k as u64).map(|st| match st.what {
+                What::Line(l) => l as usize,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(line(&mut steps, 0), Some(0));
+        assert_eq!(line(&mut steps, STEPS_HEAD - 1), Some(STEPS_HEAD - 1));
+        assert_eq!(line(&mut steps, STEPS_HEAD), None);
+        assert_eq!(line(&mut steps, n - STEPS_TAIL - 1), None);
+        assert_eq!(line(&mut steps, n - STEPS_TAIL), Some(n - STEPS_TAIL));
+        assert_eq!(line(&mut steps, n - 1), Some(n - 1));
+        assert_eq!(line(&mut steps, n), None);
+        assert_eq!((steps.len(), steps.skipped()), (STEPS_HEAD + STEPS_TAIL, STEPS_TAIL as u64));
     }
 }

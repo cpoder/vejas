@@ -203,6 +203,12 @@ fn events_json(flow: Option<&str>) -> String {
     json!({ "events": all }).to_string()
 }
 
+/// A unit's file as traces and the panel name it: relative to the project
+/// root when it is under it.
+fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).display().to_string()
+}
+
 /// The supervised process name of a flow file (how the trace ring is keyed).
 fn flow_proc_name(path: &Path) -> String {
     let stem = path
@@ -1133,7 +1139,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // (baseline advanced / flow git-deleted) is evicted here — git wins.
             // The git baseline's hash when a promoted version overrides it: the
             // spans carry both (ADR-0034), the version being the provenance key.
-            let mut overlay_of: Option<String> = None;
+            let mut overlay_of: Option<Arc<str>> = None;
             let src = {
                 let vconn = bus::connect(&url).ok().map(|bus| bus.jetstream());
                 let vstore = vconn.as_ref().and_then(versions::open_store);
@@ -1145,7 +1151,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 );
                 match outcome {
                     versions::Outcome::Overlay => {
-                        overlay_of = Some(versions::hash_content(&baseline));
+                        overlay_of = Some(versions::hash_content(&baseline).into());
                         eprintln!("[vejas] {} on a promoted version (overlay)", handle.spec.name)
                     }
                     versions::Outcome::Evicted { parent, baseline: base_hash } => {
@@ -1167,7 +1173,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             let prog = vjs::parse(&src)?;
             // the version (content hash of the effective source) this flow runs —
             // tags any message it dead-letters (ADR-0021).
-            let flow_version = versions::hash_content(&src);
+            let flow_version: Arc<str> = versions::hash_content(&src).into();
             let Some(source) = prog.source.clone() else {
                 // An api-only / tool-only flow has no bus source: it is served
                 // synchronously by the HTTP/API and MCP routers, not consumed
@@ -1215,6 +1221,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 handle.spec.name
             );
             let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
+            // The flow's file as the record names it: a trace joins each
+            // statement it ran with this file's code (ADR-0034, point 8).
+            let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
             // One pull request is always in flight ahead of the round being
             // processed. Without it every round began with ~2 ms of waiting for
             // its first message — request, round-trip, server delivery — while
@@ -1293,7 +1302,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 }
                             }
                             if observing {
-                                let span = hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos);
+                                let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos);
                                 record::end(
                                     if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
                                     record::Extras::new().input(&msg.data),
@@ -1305,6 +1314,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let t0 = Instant::now();
                     // Each `invoke` leaves a span under the hop, while spans are exported.
                     engine.trace_under(traced.then_some(&hop));
+                    // The record says which statements the event went through.
+                    engine.record_steps(record::on());
                     // Holding an emit is local, so a refusal is final for this message:
                     // it can never leave, however often it redelivers. That makes it
                     // a failed run, capped by MAX_DELIVERIES and dead-lettered.
@@ -1323,6 +1334,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             metrics::span(invoke_span(&handle.spec.name, invoked));
                         }
                     }
+                    let steps = engine.take_steps();
                     match outcome {
                         Ok(ctx) => {
                             let emits = ctx.emits.len() as u64;
@@ -1330,9 +1342,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             let subjects: Vec<String> = ctx.emits.iter().map(|(s, _)| s.clone()).collect();
                             if observing && hop.sampled {
                                 done.push((
-                                    hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos)
+                                    hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos)
                                         .attr("vejas.emits", emits),
-                                    record::Extras::new().emits(subjects.clone()).input(&msg.data),
+                                    record::Extras::new().emits(subjects.clone()).input(&msg.data).steps(steps),
                                 ));
                             }
                             record_trace(
@@ -1382,9 +1394,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 // no ack -> redelivery after ack_wait
                             }
                             if observing {
-                                let span = hop_span(&hop, &handle.spec.name, &msg, &flow_version, overlay_of.as_deref(), start_nanos);
+                                let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos);
                                 let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                                record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
+                                record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data).steps(steps));
                             }
                             set_state(&handle, |st| st.last_error = Some(e));
                         }
@@ -1454,18 +1466,20 @@ fn end_confirmed(done: Vec<(metrics::Span, record::Extras)>, confirmed: &Result<
 fn hop_span(
     hop: &trace::Hop,
     unit: &str,
+    file: &Arc<str>,
     msg: &bus::Message,
-    version: &str,
-    baseline: Option<&str>,
+    version: &Arc<str>,
+    baseline: Option<&Arc<str>>,
     start_nanos: u128,
 ) -> metrics::Span {
     let mut span = metrics::Span::hop(hop, metrics::Kind::Consumer, unit, start_nanos)
-        .messaging("process", &msg.subject);
+        .messaging("process", &msg.subject)
+        .attr("code.file.path", metrics::Attr::Computed(file.clone()));
     if !version.is_empty() {
-        span = span.attr("vejas.flow.version", version);
+        span = span.attr("vejas.flow.version", metrics::Attr::Computed(version.clone()));
     }
     if let Some(baseline) = baseline {
-        span = span.attr("vejas.flow.baseline", baseline);
+        span = span.attr("vejas.flow.baseline", metrics::Attr::Computed(baseline.clone()));
     }
     if let Some(d) = msg.delivery() {
         span = span
@@ -1517,7 +1531,7 @@ fn emit_subject(emit: &varpulis_engine::Emit, subj_root: &str, stem: &str) -> St
 /// a `kill -9`, redelivered messages replay into an empty engine. A
 /// stateless detection (a threshold, a filter) loses nothing today; a
 /// sequence can miss the matches that straddle the crash.
-fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
+fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
     let subj_root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
@@ -1546,7 +1560,8 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let mut program =
                 varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
-            let version = versions::hash_content(&src);
+            let version: Arc<str> = versions::hash_content(&src).into();
+            let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
             let mut sources: Vec<(String, String)> = Vec::new();
             for b in program.sources() {
                 let Some(subject) = b.topic_override.clone() else {
@@ -1607,7 +1622,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
             let mut resume_seq: Option<u64> = None;
             if let Some(store) = &store {
                 match connectors::snapshot_get(store, &handle.spec.name)? {
-                    Some(snap) if snap.version == version => {
+                    Some(snap) if *snap.version == *version => {
                         program
                             .restore(&snap.state)
                             .map_err(|e| format!("restore snapshot: {e}"))?;
@@ -1745,7 +1760,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                         metrics::observe_tick_emits(&handle.spec.name, emits.len() as u64);
                                         if metrics::wants(hop.sampled, lost.is_some()) {
                                             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, &handle.spec.name, start_nanos)
-                                                .attr("vejas.flow.version", version.as_str())
+                                                .attr("vejas.flow.version", metrics::Attr::Computed(version.clone()))
                                                 .attr("vejas.emits", emits.len() as u64);
                                             record::end(
                                                 match lost {
@@ -1828,7 +1843,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                     }
                                 }
                                 if observing {
-                                    let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos);
+                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
                                     record::end(
                                         if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
                                         record::Extras::new().input(&msg.data),
@@ -1848,7 +1863,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                 }
                                 metrics::observe(&handle.spec.name, ok, emits.len() as u64, t0.elapsed().as_secs_f64());
                                 if observing && (hop.sampled || !ok) {
-                                    let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos)
+                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos)
                                         .attr("vejas.emits", emits.len() as u64);
                                     let extras = record::Extras::new().emits(subjects.clone()).input(&msg.data);
                                     if ok {
@@ -1895,7 +1910,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                                     retrying.insert(seq); // left un-acked: redelivers after ack_wait
                                 }
                                 if observing {
-                                    let span = hop_span(&hop, &handle.spec.name, &msg, &version, None, start_nanos);
+                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
                                     let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
                                     record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
                                 }
@@ -2688,9 +2703,12 @@ fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
     if let Ok(stripped) = Path::new(rel).strip_prefix(root) {
         rel = stripped.to_str()?;
     }
-    let ok_dir = ["flows", "services", "connectors", "packages"]
-        .iter()
-        .any(|d| rel.starts_with(d));
+    // the first component whole, and a file in it: `flows_old/a.vjs` or a
+    // `services.json` at the root is in none of these
+    let mut parts = Path::new(rel).components();
+    let ok_dir = matches!(parts.next(), Some(std::path::Component::Normal(d))
+        if ["flows", "services", "connectors", "packages"].iter().any(|ok| d == std::ffi::OsStr::new(ok)))
+        && parts.next().is_some();
     let ok_ext = rel.ends_with(".vjs") || rel.ends_with(".json");
     if !(ok_dir && ok_ext) {
         return None;
@@ -3196,7 +3214,7 @@ fn record_absent(e: &str) -> bool {
 
 /// One trace from the record (ADR-0034): every hop kept, in the order they
 /// started. A 404 says why a trace can be missing.
-fn trace_view(id: &str) -> Result<Value, (u16, String)> {
+fn trace_view(root: &Path, id: &str) -> Result<Value, (u16, String)> {
     let Some(key) = record::trace_key(id) else {
         return Err((400, "a trace id is 32 hexadecimal digits".into()));
     };
@@ -3206,12 +3224,165 @@ fn trace_view(id: &str) -> Result<Value, (u16, String)> {
             404,
             format!("no hop of trace {key} is in the record: sampled out, past the retention limits, or never seen by this cell"),
         )),
-        Ok(hops) => Ok(json!({"trace_id": key, "hops": hops})),
+        Ok(mut hops) => {
+            let mut sources = Sources::new(Some(js));
+            for hop in &mut hops {
+                join_code(root, hop, &mut sources);
+            }
+            Ok(json!({"trace_id": key, "hops": hops}))
+        }
         Err(e) if record_absent(&e) => Err((
             404,
             "the trace record holds nothing: VEJAS_TRACES is off, or no hop has ended yet".into(),
         )),
         Err(e) => Err((500, e)),
+    }
+}
+
+/// A file read for a trace view: the version it hashes to, and its lines.
+struct Source {
+    version: String,
+    lines: Arc<Vec<String>>,
+}
+
+impl Source {
+    fn of(src: &str) -> Source {
+        Source {
+            version: versions::hash_content(src),
+            lines: Arc::new(src.lines().map(|l| l.trim().chars().take(200).collect()).collect()),
+        }
+    }
+}
+
+/// One trace view's reads: each file once, whatever version a hop names, and
+/// the version store's overlays the same way.
+struct Sources {
+    js: Option<bus::JetStream>,
+    store: Option<Option<bus::Kv>>,
+    files: HashMap<String, Option<Source>>,
+    overlays: HashMap<String, Option<Source>>,
+    /// Bytes of code given so far.
+    given: usize,
+}
+
+/// What one trace view reads and gives out, at most. Anyone who can publish
+/// on the bus can write a record: these keep one from making a view slow or
+/// huge.
+const JOIN_FILES_MAX: usize = 64;
+const JOIN_FILE_BYTES_MAX: u64 = 1 << 20;
+const JOIN_CODE_MAX: usize = 1 << 20;
+const JOIN_STEPS_MAX: usize = vjs::STEPS_HEAD + vjs::STEPS_TAIL + 1;
+
+impl Sources {
+    fn new(js: Option<bus::JetStream>) -> Sources {
+        Sources { js, store: None, files: HashMap::new(), overlays: HashMap::new(), given: 0 }
+    }
+
+    /// The lines of `file` if it still hashes to `version`.
+    fn file(&mut self, root: &Path, file: &str, version: &str) -> Option<Arc<Vec<String>>> {
+        if !self.files.contains_key(file) {
+            if self.files.len() >= JOIN_FILES_MAX {
+                return None;
+            }
+            let read = || -> Option<Source> {
+                let path = guard_path(root, file)?;
+                if fs::metadata(&path).ok()?.len() > JOIN_FILE_BYTES_MAX {
+                    return None;
+                }
+                Some(Source::of(&fs::read_to_string(&path).ok()?))
+            };
+            self.files.insert(file.to_string(), read());
+        }
+        let source = self.files.get(file)?.as_ref()?;
+        (source.version == version).then(|| source.lines.clone())
+    }
+
+    /// The lines of the version promoted over a flow's file in a cluster
+    /// (ADR-0024), if the version store still holds it as `version`.
+    fn overlay(&mut self, flow: &str, version: &str) -> Option<Arc<Vec<String>>> {
+        if !self.overlays.contains_key(flow) {
+            if self.overlays.len() >= JOIN_FILES_MAX {
+                return None;
+            }
+            let js = &self.js;
+            let store = self.store.get_or_insert_with(|| js.as_ref().and_then(versions::open_store));
+            let source = store
+                .as_ref()
+                .and_then(|store| versions::get_version(store, flow))
+                .and_then(|overlay| overlay["source"].as_str().map(Source::of));
+            self.overlays.insert(flow.to_string(), source);
+        }
+        let source = self.overlays.get(flow)?.as_ref()?;
+        (source.version == version).then(|| source.lines.clone())
+    }
+}
+
+/// A service's file, from its name as steps give it.
+fn service_file(service: &str) -> Option<String> {
+    match service.split_once(':')? {
+        ("default", svc) => Some(format!("services/{svc}.vjs")),
+        (pkg, svc) => Some(format!("packages/{pkg}/services/{svc}.vjs")),
+    }
+}
+
+/// Give each step of a hop the line of code it ran (ADR-0034, point 8): the
+/// flow's from the file the record names, or from the version promoted over
+/// it, when one of them is the version that ran (`vejas.flow.version`); a
+/// service's from its file, when it is the version the record's `services`
+/// gives. A step whose code is in neither keeps its line number only. The
+/// record itself holds no code: any it carries is taken out first.
+fn join_code(root: &Path, hop: &mut Value, sources: &mut Sources) {
+    let Some(steps) = hop.get_mut("steps").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for step in steps.iter_mut() {
+        if let Some(step) = step.as_object_mut() {
+            step.remove("code");
+        }
+    }
+    let attrs = &hop["attributes"];
+    let flow = match (attrs["code.file.path"].as_str(), attrs["vejas.flow.version"].as_str()) {
+        (Some(file), Some(version)) => sources.file(root, file, version).or_else(|| {
+            // promoted in a cluster: the file is still the version it forked from
+            let promoted = attrs["vejas.flow.baseline"].is_string();
+            let name = hop["unit"].as_str().and_then(|unit| unit.strip_prefix("flow:"));
+            name.filter(|_| promoted).and_then(|name| sources.overlay(name, version))
+        }),
+        _ => None,
+    };
+    let services: HashMap<String, String> = hop["services"]
+        .as_object()
+        .map(|services| {
+            let named = services.iter().filter_map(|(name, version)| Some((name.clone(), version.as_str()?.to_string())));
+            named.take(vjs::SERVICES_MAX).collect()
+        })
+        .unwrap_or_default();
+    let mut of_service: HashMap<String, Option<Arc<Vec<String>>>> = HashMap::new();
+    let Some(steps) = hop.get_mut("steps").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for step in steps.iter_mut().take(JOIN_STEPS_MAX) {
+        let Some(step) = step.as_object_mut() else { continue };
+        let Some(line) = step.get("line").and_then(Value::as_u64) else { continue };
+        let lines = match step.get("service").and_then(Value::as_str) {
+            None => flow.clone(),
+            Some(service) => match of_service.get(service) {
+                Some(lines) => lines.clone(),
+                None => {
+                    let lines = services
+                        .get(service)
+                        .and_then(|version| sources.file(root, &service_file(service)?, version));
+                    of_service.insert(service.to_string(), lines.clone());
+                    lines
+                }
+            },
+        };
+        let Some(code) = lines.as_ref().and_then(|l| l.get((line as usize).checked_sub(1)?)) else { continue };
+        if sources.given + code.len() > JOIN_CODE_MAX {
+            return;
+        }
+        sources.given += code.len();
+        step.insert("code".into(), Value::String(code.clone()));
     }
 }
 
@@ -3628,9 +3799,9 @@ fn run_api_flow(
     // Instrument the synchronous /api path like the bus hot path (ADR-0016
     // follow-up): a run-time error is `ok:false`; a `respond 4xx/5xx` is a valid
     // business outcome, so the flow still counts as processed.
-    let unit = guard_path(root, file)
-        .map(|p| flow_proc_name(&p))
-        .unwrap_or_else(|| file.to_string());
+    // resolved once: each resolution canonicalizes twice
+    let path = guard_path(root, file);
+    let unit = path.as_deref().map(flow_proc_name).unwrap_or_else(|| file.to_string());
     // The request's trace, honoured when it carries one (ADR-0034): the flow's
     // span hangs under the caller's, and its emits carry the trace on.
     let hop = trace::Hop::begin(incoming);
@@ -3640,9 +3811,10 @@ fn run_api_flow(
     let mut version = String::new();
     let mut route = String::new();
     let mut invoked = Vec::new();
+    let mut steps = None;
     let result = (|| -> Result<vjs::Ctx, String> {
-        let path = guard_path(root, file).ok_or("path not allowed")?;
-        let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let path = path.as_deref().ok_or("path not allowed")?;
+        let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
         version = versions::hash_content(&src);
         let prog = vjs::parse(&src)?;
         route = prog
@@ -3651,10 +3823,12 @@ fn run_api_flow(
             .and_then(|spec| spec.split_whitespace().nth(1))
             .unwrap_or_default()
             .to_string();
-        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
+        let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(path));
         engine.trace_under(traced.then_some(&hop));
+        engine.record_steps(record::on());
         let run = vjs::run(&prog, input, &mut engine);
         invoked = engine.take_spans();
+        steps = engine.take_steps();
         run
     })();
     let ok = result.is_ok();
@@ -3664,13 +3838,7 @@ fn run_api_flow(
         Ok(ctx) => {
             publish_emits(&ctx.emits, &hop.context());
             match &ctx.response {
-                Some((status, body)) => {
-                    let code = status
-                        .as_u64()
-                        .or_else(|| status.as_str().and_then(|s| s.parse().ok()))
-                        .unwrap_or(200) as u16;
-                    (code, body.to_string())
-                }
+                Some((status, body)) => (vjs::http_status(status), body.to_string()),
                 None => (
                     200,
                     json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
@@ -3697,14 +3865,17 @@ fn run_api_flow(
             span = span.attr("http.route", route);
         }
         if !version.is_empty() {
-            span = span.attr("vejas.flow.version", version);
+            span = span.attr("vejas.flow.version", metrics::Attr::Computed(version.into()));
+        }
+        if let Some(path) = &path {
+            span = span.attr("code.file.path", metrics::Attr::Computed(relative_to(root, path).into()));
         }
         if let Err(e) = result {
             span = span.failed(e);
         }
         record::end(
             span,
-            record::Extras::new().emits(subjects).input_value(input).answer(Some(&body)),
+            record::Extras::new().emits(subjects).input_value(input).answer(Some(&body)).steps(steps),
         );
     }
     (code, body)
@@ -3839,7 +4010,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_describe", "description": "Describe a SAP function module's interface: every parameter's name, direction (import/export/changing/tables), type and length. Read this before sap_call.", "inputSchema": obj(json!({"func": {"type": "string"}}), vec!["func"])}),
         json!({"name": "sap_call", "description": "Call a SAP function module (BAPI/RFC) on the live system and return its outputs. `import` values may be scalars, structures (a JSON object) or tables (an array of row objects); every EXPORT/CHANGING scalar & structure and every TABLES parameter comes back auto-marshalled from metadata. `max_rows` caps table output. E.g. func=\"RFC_READ_TABLE\", import={\"QUERY_TABLE\":\"T000\"}.", "inputSchema": obj(json!({"func": {"type": "string"}, "import": {"type": "object"}, "max_rows": {"type": "integer"}}), vec!["func"])}),
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
-        json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
+        json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject so the (now corrected) flow reprocesses it, then remove it from the DLQ. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
@@ -4065,7 +4236,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
         }
         "vejas_trace" => {
             let found = match (args["trace_id"].as_str(), args["search"].as_str()) {
-                (Some(id), _) => trace_view(id),
+                (Some(id), _) => trace_view(root, id),
                 (None, Some(search)) => {
                     trace_search(search, args["limit"].as_u64().unwrap_or(20) as usize)
                 }
@@ -4243,7 +4414,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 None => Err((400, "GET /traces/{trace id}, or GET /traces?search=<text>".into())),
             })
         } else {
-            path_only.strip_prefix("/traces/").map(trace_view)
+            path_only.strip_prefix("/traces/").map(|id| trace_view(&root, id))
         };
         if let Some(found) = found {
             return match found {
@@ -5197,6 +5368,12 @@ mod tests {
         assert!(guard_path(&root, "flows/new.vjs").is_some());
         // string escapes still rejected
         assert!(guard_path(&root, "/etc/passwd").is_none());
+        // a folder's name is a whole component, not a prefix
+        for beside in ["flows_old/a.vjs", "services.json", "connectors-prod.json", "packagesx/p/package.vjs", "flows"] {
+            assert!(guard_path(&root, beside).is_none(), "{beside}");
+        }
+        std::fs::create_dir_all(root.join("packages/p/services")).unwrap();
+        assert!(guard_path(&root, "packages/p/services/s.vjs").is_some());
         assert!(guard_path(&root, "flows/../secrets.json").is_none());
 
         // F1: a symlink that ESCAPES root is rejected (arbitrary read/write hole)
@@ -5303,5 +5480,123 @@ mod tests {
         assert_eq!(entry["flow"], "flow:strip_probe");
         assert!(entry.get("event").is_none(), "full event must not leave the runtime via /events");
         assert_eq!(entry["preview"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_trace_shows_the_code_its_steps_ran_while_the_file_is_unchanged() {
+        let root = std::env::temp_dir().join(format!("vejas-join-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::create_dir_all(root.join("packages/crm/services")).unwrap();
+        let flow = "source \"vx.in\"\n  total = amount * 2\nemit \"vx.out\", {t: total}\n";
+        let service = "found = true\n";
+        std::fs::write(root.join("flows/join_probe.vjs"), flow).unwrap();
+        std::fs::write(root.join("packages/crm/services/lookup.vjs"), service).unwrap();
+        let hop = |flow_version: &str, service_version: &str| {
+            json!({
+                "unit": "flow:join_probe",
+                "attributes": {"code.file.path": "flows/join_probe.vjs", "vejas.flow.version": flow_version},
+                "steps": [
+                    {"line": 2},
+                    {"service": "crm:lookup", "version": service_version},
+                    {"service": "crm:lookup", "line": 1},
+                    {"line": 3, "emit": "vx.out"},
+                    {"line": 99},
+                    {"skipped": 4},
+                ],
+                "services": {"crm:lookup": service_version},
+            })
+        };
+        let mut sources = Sources::new(None);
+        let mut same = hop(&versions::hash_content(flow), &versions::hash_content(service));
+        join_code(&root, &mut same, &mut sources);
+        let code: Vec<Value> = same["steps"].as_array().unwrap().iter().map(|s| s["code"].clone()).collect();
+        assert_eq!(
+            code,
+            [json!("total = amount * 2"), Value::Null, json!("found = true"), json!("emit \"vx.out\", {t: total}"), Value::Null, Value::Null]
+        );
+        // a file changed since: its steps keep their numbers, without code
+        let mut changed = hop("0000000000000000", &versions::hash_content(service));
+        join_code(&root, &mut changed, &mut sources);
+        let code: Vec<Value> = changed["steps"].as_array().unwrap().iter().map(|s| s["code"].clone()).collect();
+        assert_eq!(code, [Value::Null, Value::Null, json!("found = true"), Value::Null, Value::Null, Value::Null]);
+        // a file the record names outside the project is not read
+        let mut outside = json!({
+            "attributes": {"code.file.path": "../../etc/passwd", "vejas.flow.version": "x"},
+            "steps": [{"line": 1}],
+        });
+        join_code(&root, &mut outside, &mut sources);
+        assert!(outside["steps"][0].get("code").is_none());
+
+        // a service's code comes from the record's `services`, even when the
+        // step where it started was left out
+        let mut skipped = hop(&versions::hash_content(flow), &versions::hash_content(service));
+        skipped["steps"].as_array_mut().unwrap().remove(1);
+        join_code(&root, &mut skipped, &mut sources);
+        assert_eq!(skipped["steps"][1]["code"], "found = true");
+
+        // a flow promoted over its file in a cluster: the overlay that ran
+        let promoted = "source \"vx.in\"\nshipped = true\n";
+        let mut overlaid = hop(&versions::hash_content(promoted), &versions::hash_content(service));
+        overlaid["attributes"]["vejas.flow.baseline"] = json!(versions::hash_content(flow));
+        sources.overlays.insert("join_probe".into(), Some(Source::of(promoted)));
+        join_code(&root, &mut overlaid, &mut sources);
+        assert_eq!(overlaid["steps"][0]["code"], "shipped = true");
+        // without the baseline, a hop ran no overlay: no code from one
+        let mut plain = hop(&versions::hash_content(promoted), &versions::hash_content(service));
+        join_code(&root, &mut plain, &mut sources);
+        assert!(plain["steps"][0].get("code").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_forged_record_cannot_make_a_trace_view_slow_or_huge() {
+        let root = std::env::temp_dir().join(format!("vejas-forged-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        let flow = format!("source \"vx.in\"\nx = \"{}\"\n", "y".repeat(150));
+        std::fs::write(root.join("flows/f.vjs"), &flow).unwrap();
+        let version = versions::hash_content(&flow);
+        let mut sources = Sources::new(None);
+        // code a record carries is never shown: the runtime writes none
+        let mut forged = json!({
+            "attributes": {"code.file.path": "flows/f.vjs", "vejas.flow.version": "0000000000000000"},
+            "steps": [{"line": 2, "code": "rm -rf /"}],
+        });
+        join_code(&root, &mut forged, &mut sources);
+        assert!(forged["steps"][0].get("code").is_none());
+        // a thousand versions of one file: read once
+        for i in 0..1000 {
+            let mut hop = json!({
+                "attributes": {"code.file.path": "flows/f.vjs", "vejas.flow.version": format!("{i:016x}")},
+                "steps": [{"line": 2}],
+                "services": {"default:s": format!("{i:016x}")},
+            });
+            join_code(&root, &mut hop, &mut sources);
+        }
+        assert_eq!(sources.files.len(), 1);
+        // a thousand files: JOIN_FILES_MAX read at most
+        for i in 0..1000 {
+            let mut hop = json!({
+                "attributes": {"code.file.path": format!("flows/f{i}.vjs"), "vejas.flow.version": "x"},
+                "steps": [{"line": 1}],
+            });
+            join_code(&root, &mut hop, &mut sources);
+        }
+        assert_eq!(sources.files.len(), JOIN_FILES_MAX);
+        // steps past what a run keeps get no code, nor bytes past JOIN_CODE_MAX
+        let mut sources = Sources::new(None);
+        let mut given = 0;
+        for _ in 0..100 {
+            let mut hop = json!({
+                "attributes": {"code.file.path": "flows/f.vjs", "vejas.flow.version": version},
+                "steps": vec![json!({"line": 2}); 5000],
+            });
+            join_code(&root, &mut hop, &mut sources);
+            let with_code = hop["steps"].as_array().unwrap().iter().filter(|s| s.get("code").is_some()).count();
+            assert!(with_code <= JOIN_STEPS_MAX, "{with_code}");
+            given += with_code;
+        }
+        assert!(sources.given <= JOIN_CODE_MAX && given < 100 * JOIN_STEPS_MAX, "{given} {}", sources.given);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
