@@ -1,12 +1,10 @@
 /core/target/
-/connectors/sap-rfc/target/
-/connectors/salesforce/target/
+# every connector crate, present and future (ADR-0037: no build output in the repo)
+/connectors/*/target/
 /e2e/node_modules/
 /e2e/out/
 .env
 *.log
 .DS_Store
 e2e/film-out/
-/connectors/mq/target/
-/connectors/amqp/target/
 docs/book/book/
