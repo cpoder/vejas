@@ -663,6 +663,8 @@ fn reads_of(e: &Expr, own: &[String], item_keys: bool, out: &mut Vec<String>) {
                     segments.insert(0, root.clone());
                     push(segments.join("."));
                 }
+                // a path the flow set, or an item's key: not the event's
+                Expr::Var(_) => {}
                 other => reads_of(other, own, item_keys, out),
             }
         }
@@ -2899,6 +2901,13 @@ end\n";
         let src = "source \"vx.in\"\ncustomer.email = lower(customer.email)\nname = customer.name\nemit \"vx.out\", {email: customer.email, name: name, all: customer}\n";
         let prog = parse(src).unwrap();
         assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["customer.email", "customer.name", "customer"]));
+        // what it set it does not read, and the rest of `customer` stays unread
+        let src = "source \"vx.in\"\ncustomer.email = \"x@y\"\nemit \"vx.out\", {email: customer.email}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!([]));
+        let src = "source \"vx.in\"\ncustomer.email = lower(customer.email)\nemit \"vx.out\", {email: customer.email}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["customer.email"]));
     }
 
     #[test]

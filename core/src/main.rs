@@ -199,8 +199,8 @@ fn events_out(flow: Option<&str>, paths: bool) -> String {
     let newest_first = |hops: &mut Vec<&Value>| {
         hops.sort_unstable_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)))
     };
-    // Every message's hop waits on this lock: under it, only the choice and a
-    // copy of what goes out; the serialising after.
+    // Every message's hop waits on this lock: under it, only the choice, a copy
+    // of what goes out and its preview (bounded); the serialising after.
     let events: Vec<Value> = {
         let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
         let mut picked: Vec<&Value> = match flow {
@@ -1056,13 +1056,38 @@ fn trace_preview(entry: &Value) -> String {
     }
 }
 
+/// The beginning of an event as the ring shows it: 160 characters at most,
+/// written only as far as that takes, however large the event (`/events`
+/// derives it under the ring's lock).
 fn preview_of(v: &Value) -> String {
-    let s = v.to_string();
-    if s.chars().count() > 160 {
-        let cut: String = s.chars().take(159).collect();
+    const CHARS: usize = 160;
+    // four bytes at most a character: past this, more than CHARS are written
+    const ENOUGH: usize = 4 * (CHARS + 1);
+    struct Upto(Vec<u8>);
+    impl std::io::Write for Upto {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.len() >= ENOUGH {
+                return Err(std::io::Error::other("enough for a preview"));
+            }
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Upto(Vec::new());
+    // stopped on purpose past ENOUGH: what was written is all the preview needs
+    let _ = serde_json::to_writer(&mut out, v);
+    let s = match std::str::from_utf8(&out.0) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&out.0[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    if s.chars().count() > CHARS {
+        let cut: String = s.chars().take(CHARS - 1).collect();
         format!("{cut}…")
     } else {
-        s
+        s.to_string()
     }
 }
 
@@ -5630,6 +5655,30 @@ mod tests {
                    "the flow's event and the webhook's hop of it, not the webhook's other events");
         let alone: Value = serde_json::from_str(&events_json(Some("flow:paths_probe"))).unwrap();
         assert_eq!(alone["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_preview_is_the_same_cut_however_large_the_event() {
+        let whole = |v: &Value| {
+            let s = v.to_string();
+            if s.chars().count() > 160 {
+                format!("{}…", s.chars().take(159).collect::<String>())
+            } else {
+                s
+            }
+        };
+        let values = [
+            json!({}),
+            json!({"a": "x".repeat(152)}),
+            json!({"a": "x".repeat(153)}),
+            json!({"t": "é€😀a".repeat(5000)}),
+            json!("ü".repeat(161)),
+            json!({"n": (0..10_000).collect::<Vec<u32>>()}),
+        ];
+        for v in &values {
+            assert_eq!(preview_of(v), whole(v));
+        }
+        assert_eq!(preview_of(&values[1]).chars().count(), 160, "exactly 160: whole");
     }
 
     #[test]

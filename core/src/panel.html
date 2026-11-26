@@ -532,14 +532,28 @@ const secretPath = p => String(p).split(/[./]/).some(isSecretKey);
 const PAIR_NAMES = ['name', 'key', 'header', 'field', 'parameterkey', 'parametername'];
 const PAIR_VALUES = ['value', 'parametervalue'];
 const namesCredential = x => typeof x === 'string' && x.length <= 128 && !/\s/.test(x) && isSecretKey(x);
+const pairNamed = o => !!o && typeof o === 'object' && !Array.isArray(o)
+  && Object.entries(o).some(([k, x]) => PAIR_NAMES.includes(k.toLowerCase()) && namesCredential(x));
+const pairValue = (o, k) => PAIR_VALUES.includes(String(k).toLowerCase()) && pairNamed(o);
 // A value as the panel may show it: every credential masked, at any depth.
 function maskDeep(v) {
   if (Array.isArray(v)) return v.map(maskDeep);
   if (!v || typeof v !== 'object') return v;
-  const entries = Object.entries(v);
-  const named = entries.some(([k, x]) => PAIR_NAMES.includes(k.toLowerCase()) && namesCredential(x));
-  return Object.fromEntries(entries.map(([k, x]) => [k,
+  const named = pairNamed(v);
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k,
     isSecretKey(k) || (named && x !== null && PAIR_VALUES.includes(k.toLowerCase())) ? 'hidden' : maskDeep(x)]));
+}
+// Would maskDeep hide what is at this path of a value: a credential-named key
+// on the way to it, or the value of a pair that names one.
+function hiddenAt(root, path) {
+  let o = root;
+  for (const k of String(path).split('.')) {
+    if (isSecretKey(k)) return true;
+    if (!o || typeof o !== 'object') return false;
+    if (pairValue(o, k)) return true;
+    o = o[k];
+  }
+  return false;
 }
 const parsed = s => { if (typeof s !== 'string') return s; try { return JSON.parse(s); } catch { return s; } };
 const masked = v => maskDeep(parsed(v));
@@ -1027,9 +1041,11 @@ function summarize(v) {
   if (v && typeof v === 'object') return '{ ' + Object.keys(v).join(', ') + ' }';
   return trunc(typeof v === 'string' ? JSON.stringify(v) : v, 44);
 }
-function sampleHtml(v, name) {
+// What a sample holds at a path, as the panel may show it.
+function sampleHtml(root, path) {
+  const v = getPath(root, path);
   if (v === undefined) return '<span class="none">not in the sample</span>';
-  if (name && secretPath(name)) return '<span class="sv">hidden</span>';
+  if (hiddenAt(root, path)) return '<span class="sv">hidden</span>';
   return `<span class="sv" title="${esc(trunc(maskDeep(v), 600))}">${esc(summarize(v))}</span>`;
 }
 const stop = (cls, mark, title, rest, body) =>
@@ -1039,8 +1055,8 @@ function flowLede(f) {
   const evs = S.events.filter(e => e.flow === 'flow:' + f.name);
   if (!evs.length) return 'No event has gone through it yet.';
   // one event retried five times is one event: it failed if its last attempt did
-  const byEvent = lastAttempts(evs);
-  const n = byEvent.size, failed = [...byEvent.values()].filter(e => !e.ok).length;
+  const byEvent = messagesOf(evs);
+  const n = byEvent.length, failed = byEvent.filter(m => !m.last.ok).length;
   const last = Math.max(...evs.map(e => e.ts || 0));
   const tally = failed ? `<b class="bad">${failed} of the last ${n} failed.</b>` : n === 1 ? 'It went through.' : `Of the last ${n}, none failed.`;
   return `Latest event at <b class="num">${clock(last)}</b>. ${tally} <a href="#/activity?flow=${enc(f.name)}">See its events</a>`;
@@ -1102,7 +1118,7 @@ function stopReceives(f, shape, ctx, preview) {
     const whole = (shape.sends || []).some(s => s.whole === 'event');
     body += `<p class="note">${whole ? 'It passes the event on as it came.' : 'It reads no field of the event.'}</p>`;
   } else if (ctx.input !== undefined) {
-    body += `<div class="fields">${reads.map(p => `<div class="k">${esc(p)}</div><div class="v">${sampleHtml(getPath(ctx.input, p), p)}</div>`).join('')}</div>`;
+    body += `<div class="fields">${reads.map(p => `<div class="k">${esc(p)}</div><div class="v">${sampleHtml(ctx.input, p)}</div>`).join('')}</div>`;
   } else {
     body += `<div class="names">${reads.map(p => `<span>${esc(p)}</span>`).join('')}</div>`;
   }
@@ -1115,7 +1131,7 @@ function stopComputes(shape, ctx) {
   const steps = (shape.steps || []).filter(s => s.kind === 'set' || s.kind === 'each');
   if (!steps.length) return '';
   const sample = ctx.input !== undefined;
-  const sampleCell = name => sample ? `<td class="sample">${sampleHtml(getPath(ctx.pipeline, name), name)}</td>` : '';
+  const sampleCell = name => sample ? `<td class="sample">${sampleHtml(ctx.pipeline, name)}</td>` : '';
   const rows = steps.flatMap(s => {
     if (s.kind === 'set') {
       return [`<tr data-slot><td class="name">${esc(s.name)}</td><td class="eq">=</td>${sampleCell(s.name)}<td class="how">${codeHtml(s.code, ctx, s.literals)}</td></tr>`];
@@ -1275,15 +1291,17 @@ function buildEditor(ctx, e) {
   const fields = [];
   const grid = document.createElement('div');
   const v = e.value, secret = isSecretKey(e.name);
-  const addField = (label, key, original, mode) => {
+  // `veiled`: the value of a pair that names a credential, {name: "Authorization", value: …}
+  const addField = (label, key, original, mode, veiled = false) => {
     const text = mode === 'list' ? original.map(show).join(', ') : mode === 'rule' ? ruleToText(original) : show(original);
     if (label != null) grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(label)}</span><span class="arrow">${icon('chev')}</span>`);
     const input = document.createElement('input');
-    input.type = secret || (label != null && secretPath(label)) ? 'password' : 'text';
+    const hidden = secret || veiled || (label != null && secretPath(label));
+    input.type = hidden ? 'password' : 'text';
     input.autocomplete = 'off'; input.spellcheck = false; input.value = text;
     input.setAttribute('aria-label', label != null ? `${e.name}, ${label}` : e.name);
     grid.appendChild(input);
-    const field = {key, original, mode, text, input};
+    const field = {key, original, mode, text, input, hidden};
     fields.push(field);
     input.addEventListener('input', () => changed(field));
     input.addEventListener('keydown', ev => {
@@ -1300,10 +1318,10 @@ function buildEditor(ctx, e) {
       } else if (e.kind === 'mapping') {
         addField(k, k, val, 'rule');
       } else if (val !== null && typeof val === 'object') {
-        const ro = secret || isSecretKey(k) ? 'hidden' : trunc(maskDeep(val), 60);
+        const ro = secret || isSecretKey(k) || pairValue(v, k) ? 'hidden' : trunc(maskDeep(val), 60);
         grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(k)}</span><span class="arrow">${icon('chev')}</span><code class="ro" title="A nested value: change it in the code">${esc(ro)}</code>`);
       } else {
-        addField(k, k, val, 'value');
+        addField(k, k, val, 'value', pairValue(v, k));
       }
     }
   } else if (Array.isArray(v) && v.some(x => x !== null && typeof x === 'object')) {
@@ -1371,7 +1389,7 @@ function buildEditor(ctx, e) {
     field.input.readOnly = false;
     if (active !== field || field.input.value !== asked) return;  // undone meanwhile
     checked = asked;
-    const hide = secret || secretPath(field.key);
+    const hide = field.hidden || secretPath(field.key);
     result.innerHTML = res ? replayHtml(res, hide)
       : `<p><b>It could not be checked on recent events.</b> ${esc(String(error.message).slice(0, 300))}</p>`;
     result.hidden = false;
@@ -1413,13 +1431,17 @@ function eventLabel(r) {
   }
   return trunc(p || 'an event', 40);
 }
-function diffValues(x, y, path, out) {
+// `hidden`: a value maskDeep would hide, under a credential-named key or a pair that names one.
+function diffValues(x, y, path, out, hidden = false) {
   if (JSON.stringify(x) === JSON.stringify(y)) return;
   if (x && y && typeof x === 'object' && typeof y === 'object' && !Array.isArray(x) && !Array.isArray(y)) {
-    for (const k of uniq([...Object.keys(x), ...Object.keys(y)])) diffValues(x[k], y[k], path ? path + '.' + k : k, out);
+    for (const k of uniq([...Object.keys(x), ...Object.keys(y)])) {
+      const veiled = hidden || isSecretKey(k) || pairValue(x, k) || pairValue(y, k);
+      diffValues(x[k], y[k], path ? path + '.' + k : k, out, veiled);
+    }
     return;
   }
-  out.push([path || 'the payload', x, y]);
+  out.push([path || 'the payload', x, y, hidden]);
 }
 // One changed event in one line: the fields whose value changes, else the outputs.
 // `hide`: the value changed is a credential, so no value or error is shown.
@@ -1433,9 +1455,9 @@ function diffLine(r, hide) {
   const parts = [];
   be.forEach((e, i) => diffValues(e.payload, ae[i].payload, '', parts));
   if (!parts.length) return '<span class="muted">the same output</span>';
-  const val = (k, v) => v === undefined ? '<span class="muted">nothing</span>'
-    : hide || secretPath(k) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
-  return parts.slice(0, 3).map(([k, x, y]) => `<code>${esc(k)}</code> ${val(k, x)} ${sep} <b>${val(k, y)}</b>`).join('; ');
+  const val = (k, v, veiled) => v === undefined ? '<span class="muted">nothing</span>'
+    : hide || veiled || secretPath(k) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
+  return parts.slice(0, 3).map(([k, x, y, veiled]) => `<code>${esc(k)}</code> ${val(k, x, veiled)} ${sep} <b>${val(k, y, veiled)}</b>`).join('; ');
 }
 function replayHtml(res, hide) {
   if (!res.events) return '<p><b>No recent event to check it on.</b></p>';
@@ -1626,10 +1648,31 @@ function rankOf(u) {
 // consumed none (what a source let in) is a message alone. A flow's loop sends
 // several messages in one trace: one that failed is not undone by the others.
 const messageOf = h => h.flow + '|' + (h.stream_seq != null ? 's' + h.stream_seq : 'h' + h.seq);
-function lastAttempts(hops) {
-  const last = new Map();
-  for (const h of hops) { const k = messageOf(h), p = last.get(k); if (!p || h.seq > p.seq) last.set(k, h); }
-  return last;
+// A dead letter replayed comes back as a new message: the same payload, to the
+// same unit, in the trace it died in. The letter and its replay are one event.
+const replayOf = (n, m) => n.first.seq > m.last.seq && n.first.flow === m.first.flow && n.first.subject === m.first.subject
+  && !!m.first.trace_id && n.first.trace_id === m.first.trace_id && (n.first.preview || '') === (m.first.preview || '');
+// The messages of some hops, in the order they came: each with its last attempt,
+// which decides, and the attempts it took, replays included.
+function messagesOf(hops) {
+  const by = new Map();
+  for (const h of [...hops].sort((a, b) => a.seq - b.seq)) {
+    const k = messageOf(h), m = by.get(k);
+    if (!m) by.set(k, {first: h, last: h, attempts: Math.max(1, h.attempt || 0)});
+    else { m.last = h; m.attempts = Math.max(m.attempts + 1, h.attempt || 0); }
+  }
+  const all = [...by.values()], out = [];
+  for (const m of all) {
+    if (m.replayed) continue;
+    const one = {...m};
+    for (let at = m, next; !at.last.ok && /dead-lettered/.test(at.last.error || '')
+         && (next = all.find(n => !n.replayed && n !== at && replayOf(n, at))); at = next) {
+      next.replayed = true;
+      one.last = next.last; one.attempts += next.attempts;
+    }
+    out.push(one);
+  }
+  return out;
 }
 function traceGroups(events, flow) {
   const by = new Map();
@@ -1643,7 +1686,7 @@ function traceGroups(events, flow) {
     hops.sort((a, b) => (a.ts - b.ts) || (rankOf(a.flow) - rankOf(b.flow)) || (a.seq - b.seq));
     if (flow && !hops.some(h => h.flow === 'flow:' + flow)) continue;
     // a message retried until it went through went through: its last attempt decides
-    const failed = [...lastAttempts(hops).values()].sort((a, b) => a.seq - b.seq).find(h => !h.ok) || null;
+    const failed = messagesOf(hops).map(m => m.last).find(h => !h.ok) || null;
     groups.push({id, traced: !id.startsWith('seq-'), hops, ts: Math.min(...hops.map(h => h.ts || 0)), ok: !failed, failed});
   }
   return groups.sort((a, b) => b.ts - a.ts || b.hops[0].seq - a.hops[0].seq);
@@ -1652,11 +1695,16 @@ const unitHtml = (u, tries = 1) => `<span class="u">${icon(String(u).startsWith(
 // The flows of one event by how far down its path they are: a flow that read
 // what another sent comes after it; two that read the same subject sit side by side.
 function flowLevels(hops) {
-  const flows = hops.filter(h => rankOf(h.flow) === 1), level = new Map(flows.map(h => [h.flow, 0]));
+  const flows = hops.filter(h => rankOf(h.flow) === 1), first = new Map();
+  for (const h of flows) if (!first.has(h.flow) || h.seq < first.get(h.flow)) first.set(h.flow, h.seq);
+  const level = new Map([...first.keys()].map(u => [u, 0]));
   for (let pass = 0, moved = true; moved && pass <= flows.length; pass++) {
     moved = false;
     for (const h of flows) for (const p of flows) {
-      if (p.flow === h.flow || !(p.emits || []).includes(h.subject) || level.get(p.flow) + 1 <= level.get(h.flow)) continue;
+      // p fed h when h read what p sent; a flow that came first is never fed by
+      // one that came after it: that edge closes a cycle
+      if (p.flow === h.flow || first.get(h.flow) < first.get(p.flow) || !(p.emits || []).includes(h.subject)) continue;
+      if (level.get(p.flow) + 1 <= level.get(h.flow)) continue;
       level.set(h.flow, level.get(p.flow) + 1); moved = true;
     }
   }
@@ -1669,9 +1717,8 @@ function rowHtml(g) {
   const sep = icon('chev', 'sep');
   // What let it in, the flows that handled it in the order they did, where it
   // went. A unit retried reads once, with the attempts its message took.
-  const attempts = new Map(), tries = new Map();
-  for (const h of g.hops) { const k = messageOf(h); attempts.set(k, Math.max((attempts.get(k) || 0) + 1, h.attempt || 0)); }
-  for (const [k, n] of attempts) { const u = k.slice(0, k.lastIndexOf('|')); tries.set(u, Math.max(tries.get(u) || 0, n)); }
+  const tries = new Map();
+  for (const m of messagesOf(g.hops)) tries.set(m.first.flow, Math.max(tries.get(m.first.flow) || 0, m.attempts));
   const units = rank => uniq(g.hops.filter(h => rankOf(h.flow) === rank).map(h => h.flow));
   // what was sent that no unit here took: it left the runtime on the bus
   const taken = new Set(g.hops.filter(h => rankOf(h.flow) !== 0).map(h => h.subject));
