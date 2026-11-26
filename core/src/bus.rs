@@ -17,6 +17,9 @@
 //     two thousand sockets.
 //   * What the sync client gave for free is rebuilt here on purpose, because
 //     `async-nats` does not give it: see `Batch::confirm`.
+//
+// The AMQP and MQ connectors compile this file as it is (`#[path]`), so it
+// names no other module of the runtime: no `crate::` import.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -37,8 +40,6 @@ use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-
-use crate::trace;
 
 // ───────────────────────── the runtime ─────────────────────────
 
@@ -294,7 +295,7 @@ impl Bus {
         &self,
         subject: &str,
         payload: impl Into<Bytes>,
-        trace: &trace::Context,
+        trace: &impl TraceContext,
     ) -> Result<(), String> {
         let (client, payload) = (&self.0.link.client, payload.into());
         wait(sent(client.publish_with_headers(subject.to_string(), trace_headers(trace), payload)))
@@ -394,7 +395,7 @@ impl Batch {
         &mut self,
         subject: &str,
         payload: impl Into<Bytes>,
-        trace: &trace::Context,
+        trace: &impl TraceContext,
     ) -> Result<(), String> {
         self.hold(subject, Some(trace_headers(trace)), payload.into())
     }
@@ -500,12 +501,10 @@ impl Message {
         }
     }
 
-    /// The trace this message belongs to, read from its `traceparent` header
-    /// (ADR-0034). None when it has no valid one: the hop then starts a trace.
-    pub fn trace(&self) -> Option<trace::Context> {
-        let headers = self.headers.as_ref()?;
-        let parent = header(headers, trace::TRACEPARENT)?;
-        trace::Context::parse(parent, header(headers, trace::TRACESTATE))
+    /// A header of this message, whatever the case of its name: a producer
+    /// outside Vejas may write `TraceParent` (ADR-0034).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header(self.headers.as_ref()?, name)
     }
 
     /// The JetStream delivery behind this message, if it is one.
@@ -534,15 +533,23 @@ impl Message {
     }
 }
 
+/// What a traced publish takes from a trace context: its two W3C headers
+/// (ADR-0034). The runtime's `trace::Context` implements it, and reads a
+/// consumed message back with [`Message::header`].
+pub trait TraceContext {
+    fn traceparent(&self) -> String;
+    fn tracestate(&self) -> Option<&str>;
+}
+
 /// The headers that carry a trace on the bus (ADR-0034).
-fn trace_headers(trace: &trace::Context) -> HeaderMap {
+fn trace_headers(trace: &impl TraceContext) -> HeaderMap {
     // Constant names: no allocation for the name on every publish.
-    const TRACEPARENT: HeaderName = HeaderName::from_static(trace::TRACEPARENT);
-    const TRACESTATE: HeaderName = HeaderName::from_static(trace::TRACESTATE);
+    const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+    const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
     let mut headers = HeaderMap::new();
     headers.insert(TRACEPARENT, trace.traceparent());
-    if let Some(state) = &trace.state {
-        headers.insert(TRACESTATE, state.as_str());
+    if let Some(state) = trace.tracestate() {
+        headers.insert(TRACESTATE, state);
     }
     headers
 }
@@ -833,7 +840,7 @@ impl JetStream {
         &self,
         subject: &str,
         payload: impl AsRef<[u8]>,
-        trace: &trace::Context,
+        trace: &impl TraceContext,
     ) -> Result<u64, String> {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
         wait(async {
@@ -1246,11 +1253,21 @@ mod tests {
         assert!(servers_of("http://a:4222").is_err());
     }
 
+    /// A trace context as a connector would hold one: the two header values.
+    pub(super) struct Carried(pub &'static str, pub Option<&'static str>);
+    impl TraceContext for Carried {
+        fn traceparent(&self) -> String {
+            self.0.to_string()
+        }
+        fn tracestate(&self) -> Option<&str> {
+            self.1
+        }
+    }
+
     #[test]
     fn a_trace_header_is_read_whatever_its_case() {
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let context = trace::Context::parse(tp, Some("k=v")).unwrap();
-        let written = trace_headers(&context);
+        let written = trace_headers(&Carried(tp, Some("k=v")));
         assert_eq!(header(&written, "traceparent"), Some(tp));
         assert_eq!(header(&written, "tracestate"), Some("k=v"));
         // "NATS/1.0\r\n" + "traceparent: <55>\r\n" + "tracestate: k=v\r\n" + "\r\n"
@@ -1313,6 +1330,7 @@ mod tests {
 /// `cargo test bus::live -- --ignored`
 #[cfg(test)]
 mod live {
+    use super::tests::Carried;
     use super::*;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
@@ -1397,7 +1415,10 @@ mod live {
         let server = Server::start();
         let bus = connect(&server.url()).unwrap();
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let context = trace::Context::parse(tp, Some("vendor=1")).unwrap();
+        let context = Carried(tp, Some("vendor=1"));
+        let carries = |m: &Message| {
+            m.header("traceparent") == Some(tp) && m.header("tracestate") == Some("vendor=1")
+        };
         // Core publish and confirmed batch, read on a subscription.
         let mut sub = bus.subscribe("t.core").unwrap();
         bus.publish_traced("t.core", "one", &context).unwrap();
@@ -1407,10 +1428,10 @@ mod live {
         batch.confirm().unwrap();
         for _ in 0..2 {
             let message = sub.next_timeout(Duration::from_secs(5)).unwrap();
-            assert_eq!(message.trace().as_ref(), Some(&context));
+            assert!(carries(&message), "the trace headers arrive");
         }
         let untraced = sub.next_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(untraced.trace(), None, "no header, no context");
+        assert_eq!(untraced.header("traceparent"), None, "no header written");
         // JetStream publish, read by a pull consumer: the stream keeps it.
         let js = bus.jetstream();
         js.add_stream(&StreamConfig {
@@ -1425,7 +1446,7 @@ mod live {
         js.publish_traced("t.js", "four", &context).unwrap();
         let pulled: Vec<Message> = puller.round().unwrap().collect();
         assert_eq!(pulled.len(), 1);
-        assert_eq!(pulled[0].trace(), Some(context));
+        assert!(carries(&pulled[0]), "the stream keeps the headers");
     }
 
     #[test]

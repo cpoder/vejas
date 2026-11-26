@@ -89,6 +89,23 @@ fn lower_hex(s: &str) -> bool {
     s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
+/// The bus writes a context as its two headers (ADR-0035 keeps `bus.rs` free
+/// of runtime types, so the trait lives there).
+impl crate::bus::TraceContext for Context {
+    fn traceparent(&self) -> String {
+        Context::traceparent(self)
+    }
+    fn tracestate(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+}
+
+/// The trace a consumed message belongs to, from its headers. None when it
+/// has no valid `traceparent`: the hop then starts a trace.
+pub fn of(message: &crate::bus::Message) -> Option<Context> {
+    Context::parse(message.header(TRACEPARENT)?, message.header(TRACESTATE))
+}
+
 /// The span of one hop: its id, the trace it belongs to, and the span it hangs
 /// under (none on the hop that starts the trace).
 #[derive(Clone, Debug)]

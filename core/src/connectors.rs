@@ -1514,7 +1514,7 @@ fn run_sink(
                 // stopped mid-batch: leave the message un-acked, it redelivers
                 return Ok(());
             }
-            let hop = trace::Hop::begin(msg.trace());
+            let hop = trace::Hop::begin(trace::of(&msg));
             let carried = hop.context();
             let preview = trace_preview(&msg.data);
             let t0 = Instant::now();

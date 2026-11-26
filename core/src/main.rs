@@ -1255,7 +1255,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     }
                     // The hop continues the trace the message carries, or starts
                     // one; its emits and its dead letter carry it on (ADR-0034).
-                    let hop = trace::Hop::begin(msg.trace());
+                    let hop = trace::Hop::begin(trace::of(&msg));
                     let carried = hop.context();
                     let exporting = metrics::tracing();
                     // A sampled-out hop builds no span, unless it fails.
@@ -1761,7 +1761,7 @@ fn supervise_detect(handle: Arc<Handle>, _root: PathBuf) {
                         let t0 = Instant::now();
                         // The hop continues the trace of the message that closed
                         // or fed a window; what it emits carries it on (ADR-0034).
-                        let hop = trace::Hop::begin(msg.trace());
+                        let hop = trace::Hop::begin(trace::of(&msg));
                         let carried = hop.context();
                         let exporting = metrics::tracing();
                         let traced = exporting && hop.sampled;
