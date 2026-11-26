@@ -579,6 +579,315 @@ pub fn flow_rules(prog: &Program, src: &str, surface: &[SurfaceEntry]) -> Vec<Va
     rules
 }
 
+// ───────────────────────── flow shape (the panel's flow page) ─────────────────────────
+//
+// The rules-view widened to the whole flow: what it reads from the event, how
+// each value it computes is made, where it sends. Read-only like the
+// rules-view: the panel changes a flow's literals through the surface, never
+// through this.
+
+/// The comment block just above a literal: what its author wrote for whoever
+/// changes it ("Only payments strictly above this amount raise an alert"). The
+/// panel shows it as the literal's label. `value_start` is where the literal's
+/// value starts in `src`; a blank line or a file header (`# flow: name`) ends
+/// the block.
+pub fn literal_doc(src: &str, value_start: usize) -> Option<String> {
+    let before = src.get(..value_start)?;
+    let mut end = before.rfind('\n')?; // the newline that ends the line above
+    let mut docs = Vec::new();
+    loop {
+        let start = src[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let Some(text) = src[start..end].trim().strip_prefix('#') else { break };
+        let text = text.trim();
+        let header = ["flow:", "service:", "connector:", "package:"].iter().any(|h| text.starts_with(h));
+        if header {
+            break;
+        }
+        docs.push(text);
+        if start == 0 {
+            break;
+        }
+        end = start - 1;
+    }
+    docs.reverse();
+    let doc = docs.join(" ");
+    (!doc.trim().is_empty()).then_some(doc)
+}
+
+/// What a flow reads from its event, in the order the code first reads it:
+/// the bare names it never assigns (`id`, `email`), and the paths under them
+/// or under `event` (`shipping_address.country`, `event.total` as `total`).
+fn collect_reads(e: &Expr, own: &[String], out: &mut Vec<String>) {
+    let mut push = |name: String| {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    match e {
+        Expr::Var(n) if n != "event" && !own.contains(n) => push(n.clone()),
+        Expr::Field(..) => {
+            // the dotted path, when it bottoms out at a name
+            let mut segments = Vec::new();
+            let mut at = e;
+            while let Expr::Field(base, name, _) = at {
+                segments.push(name.clone());
+                at = base;
+            }
+            match at {
+                Expr::Var(root) if root == "event" || !own.contains(root) => {
+                    segments.reverse();
+                    if root != "event" {
+                        segments.insert(0, root.clone());
+                    }
+                    if !segments.is_empty() {
+                        push(segments.join("."));
+                    }
+                }
+                other => collect_reads(other, own, out),
+            }
+        }
+        Expr::Var(_) | Expr::Lit(_) => {}
+        Expr::FString(parts) => {
+            for p in parts {
+                if let FStringPart::Expr(e) = p {
+                    collect_reads(e, own, out);
+                }
+            }
+        }
+        Expr::Doc(fields) => fields.iter().for_each(|(_, v)| collect_reads(v, own, out)),
+        Expr::Array(items) => items.iter().for_each(|i| collect_reads(i, own, out)),
+        Expr::Projection(b) | Expr::Unary(_, b) => collect_reads(b, own, out),
+        Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => {
+            collect_reads(a, own, out);
+            collect_reads(b, own, out);
+        }
+        Expr::Call(_, args) => args.iter().for_each(|a| collect_reads(a, own, out)),
+        Expr::Invoke(_, args) => args.iter().for_each(|(_, v)| collect_reads(v, own, out)),
+    }
+}
+
+/// Every name a flow gives a value to, anywhere: its assignments, its loop
+/// variables, its business literals.
+fn collect_own(stmts: &[Stmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign(path, _) => {
+                if let Some(root) = path.first() {
+                    if !out.contains(root) {
+                        out.push(root.clone());
+                    }
+                }
+            }
+            Stmt::For(var, _, body) => {
+                if !out.contains(var) {
+                    out.push(var.clone());
+                }
+                collect_own(body, out);
+            }
+            Stmt::If(arms, otherwise) => {
+                arms.iter().for_each(|(_, _, body)| collect_own(body, out));
+                if let Some(body) = otherwise {
+                    collect_own(body, out);
+                }
+            }
+            Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+        }
+    }
+}
+
+fn reads_of_stmts(stmts: &[Stmt], own: &[String], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign(_, e) => collect_reads(e, own, out),
+            Stmt::For(_, iter, body) => {
+                collect_reads(iter, own, out);
+                reads_of_stmts(body, own, out);
+            }
+            Stmt::If(arms, otherwise) => {
+                for (cond, _, body) in arms {
+                    collect_reads(cond, own, out);
+                    reads_of_stmts(body, own, out);
+                }
+                if let Some(body) = otherwise {
+                    reads_of_stmts(body, own, out);
+                }
+            }
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+                collect_reads(a, own, out);
+                collect_reads(b, own, out);
+            }
+            Stmt::InvokeMerge(_, args) => args.iter().for_each(|(_, v)| collect_reads(v, own, out)),
+        }
+    }
+}
+
+/// The emits under `stmts`, wherever they sit, with the fields they send.
+fn collect_sends(stmts: &[Stmt], surface: &[SurfaceEntry], inside: Option<&str>, out: &mut Vec<Value>) {
+    for s in stmts {
+        match s {
+            Stmt::Emit(subject, body) => {
+                let constant = match subject {
+                    Expr::Var(n) if surface.iter().any(|e| &e.name == n) => Some(n.clone()),
+                    _ => None,
+                };
+                let fields: Vec<Value> = match body {
+                    Expr::Doc(pairs) => pairs
+                        .iter()
+                        .map(|(name, v)| json!({"name": name, "from": render_atom(v)}))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                out.push(json!({
+                    "subject": resolve_subject(subject, surface),
+                    "constant": constant,
+                    "fields": fields,
+                    "whole": match body { Expr::Doc(_) => None, other => render_atom(other) },
+                    "inside": inside,
+                }));
+            }
+            Stmt::If(arms, otherwise) => {
+                arms.iter().for_each(|(_, _, body)| collect_sends(body, surface, Some("when"), out));
+                if let Some(body) = otherwise {
+                    collect_sends(body, surface, Some("when"), out);
+                }
+            }
+            Stmt::For(_, _, body) => collect_sends(body, surface, Some("each"), out),
+            Stmt::Assign(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+        }
+    }
+}
+
+/// The source of top-level statement `i`: from its line to the line before the
+/// next statement's, without the blank and comment lines that trail it.
+fn statement_text(src_lines: &[&str], starts: &[u32], i: usize) -> String {
+    let Some(&first) = starts.get(i) else { return String::new() };
+    if first == 0 {
+        return String::new();
+    }
+    let next = starts[i + 1..].iter().copied().find(|&l| l > first).map(|l| l as usize - 1);
+    let last = next.unwrap_or(src_lines.len()).min(src_lines.len());
+    let mut lines: Vec<&str> = src_lines[first as usize - 1..last].to_vec();
+    while lines.last().is_some_and(|l| l.trim().is_empty() || l.trim_start().starts_with('#')) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// One flow as its page shows it: the event fields it reads, its top-level
+/// statements in order with their source text, and where it sends. A `set`
+/// step is a value the flow computes (`order_ref = split(id, "#")[1]`); `each`
+/// a loop and what it builds; `when` a condition, which the rules-view
+/// renders; `invoke` a service it composes. A business literal is no step: the
+/// surface carries it. `services` holds what each service the flow invokes
+/// gives a value to: those values come from the service, not the event.
+pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)]) -> Value {
+    let surface: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
+    let mut own = surface.clone();
+    collect_own(&prog.stmts, &mut own);
+    let mut made_by = serde_json::Map::new();
+    for (service, names) in services {
+        for name in names {
+            if !own.contains(name) {
+                own.push(name.clone());
+                made_by.entry(name.clone()).or_insert_with(|| json!(service));
+            }
+        }
+    }
+    let mut reads = Vec::new();
+    reads_of_stmts(&prog.stmts, &own, &mut reads);
+
+    // A value a loop builds (`positions = []`, then `positions = positions + …`
+    // in the loop) is one step, the loop's: its empty start is no step.
+    let mut built: Vec<String> = Vec::new();
+    for s in prog.stmts.iter() {
+        if let Stmt::For(_, _, body) = s {
+            collect_own(body, &mut built);
+        }
+    }
+
+    let src_lines: Vec<&str> = src.lines().collect();
+    let starts = &prog.stmts.lines;
+    let mut steps = Vec::new();
+    for (i, s) in prog.stmts.iter().enumerate() {
+        let line = starts[i];
+        if line == 0 {
+            continue; // a business literal
+        }
+        let text = statement_text(&src_lines, starts, i);
+        let uses = |e: &Expr| {
+            // every name it reads: event fields, values made before, literals
+            let (mut used, mut literals) = (Vec::new(), Vec::new());
+            collect_reads(e, &[], &mut used);
+            used.retain(|n| {
+                let root = n.split('.').next().unwrap_or(n);
+                if surface.iter().any(|s| s == root) {
+                    if !literals.contains(&root.to_string()) {
+                        literals.push(root.to_string());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            (used, literals)
+        };
+        match s {
+            Stmt::Assign(path, e) => {
+                let name = path.join(".");
+                let empty_start = matches!(e, Expr::Array(a) if a.is_empty())
+                    || matches!(e, Expr::Doc(d) if d.is_empty())
+                    || matches!(e, Expr::Lit(_));
+                if path.len() == 1 && built.contains(&path[0]) && empty_start {
+                    continue;
+                }
+                let code = text.split_once('=').map(|(_, rhs)| rhs.trim()).unwrap_or(&text).to_string();
+                let (used, literals) = uses(e);
+                steps.push(json!({"kind": "set", "line": line, "name": name, "code": code,
+                                  "uses": used, "literals": literals}));
+            }
+            Stmt::For(var, iter, body) => {
+                let mut builds = Vec::new();
+                collect_own(body, &mut builds);
+                builds.retain(|n| n != var);
+                let (used, literals) = uses(iter);
+                steps.push(json!({"kind": "each", "line": line, "var": var, "over": render_atom(iter),
+                                  "builds": builds, "code": text, "uses": used, "literals": literals}));
+            }
+            Stmt::If(..) => steps.push(json!({"kind": "when", "line": line, "code": text})),
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+                let kind = if matches!(s, Stmt::Emit(..)) { "emit" } else { "respond" };
+                let (mut used, mut literals) = uses(a);
+                let (more, more_literals) = uses(b);
+                used.extend(more.into_iter().filter(|n| !used.contains(n)).collect::<Vec<_>>());
+                literals.extend(more_literals.into_iter().filter(|n| !literals.contains(n)).collect::<Vec<_>>());
+                steps.push(json!({"kind": kind, "line": line, "code": text, "uses": used, "literals": literals}));
+            }
+            Stmt::InvokeMerge(service, args) => {
+                let (mut used, mut literals) = (Vec::new(), Vec::new());
+                for (_, v) in args {
+                    let (u, l) = uses(v);
+                    used.extend(u.into_iter().filter(|n| !used.contains(n)).collect::<Vec<_>>());
+                    literals.extend(l.into_iter().filter(|n| !literals.contains(n)).collect::<Vec<_>>());
+                }
+                steps.push(json!({"kind": "invoke", "line": line, "service": service, "code": text,
+                                  "uses": used, "literals": literals}))
+            }
+        }
+    }
+    let mut sends = Vec::new();
+    collect_sends(&prog.stmts, &prog.surface, None, &mut sends);
+    json!({
+        "reads": reads,
+        "steps": steps,
+        "sends": sends,
+        "invokes": prog.invokes,
+        "made_by": made_by,
+        "docs": prog.surface.iter()
+            .filter_map(|e| literal_doc(src, e.value_span.0).map(|d| (e.name.clone(), Value::String(d))))
+            .collect::<serde_json::Map<String, Value>>(),
+    })
+}
+
 // ───────────────────────────── parser ─────────────────────────────
 
 struct Parser<'a> {
@@ -1699,6 +2008,15 @@ impl Engine {
         self.exports.insert(pkg.to_string(), list.clone());
         Ok(list)
     }
+    /// The names an invoked service gives a value to: they land in the
+    /// caller's pipeline (the flow page says where a value comes from).
+    pub fn service_makes(&mut self, name: &str) -> Result<Vec<String>, String> {
+        let (pkg, svc) = self.resolve(name)?;
+        let service = self.service(&pkg, &svc)?;
+        let mut own = Vec::new();
+        collect_own(&service.stmts, &mut own);
+        Ok(own)
+    }
     /// Resolve an invoke target to (package, service) and enforce EXPORTS.
     fn resolve(&mut self, name: &str) -> Result<(String, String), String> {
         let (pkg, svc) = match name.split_once(':') {
@@ -2367,6 +2685,105 @@ mod tests {
         assert_eq!(rules[0]["then"][0], "→ vx.bench.out");
         assert_eq!(rules[0]["literals"][0], "MIN_TOTAL_EUR");
     }
+    // The flow page reads a flow top to bottom: what comes in, how each value
+    // is made, what it checks, where it sends.
+    const SHAPE_SRC: &str = "# flow: order_sync\n\
+source \"vx.shop.orders\"\n\
+\n\
+# The shop sends country names (\"France\"); the ERP wants ISO codes (\"FR\").\n\
+COUNTRY_CODES = {\"France\": \"FR\", \"Germany\": \"DE\"}\n\
+\n\
+MIN_TOTAL_EUR = 0\n\
+ERP_QUEUE = \"vx.erp.orders.upsert\"\n\
+\n\
+order_ref = split(id, \"#\")[1]\n\
+customer_email = lower(email)\n\
+total_eur = num(total_price)\n\
+country = COUNTRY_CODES[shipping_address.country] ?? shipping_address.country\n\
+\n\
+# project order lines into ERP positions\n\
+positions = []\n\
+for line in line_items:\n\
+    positions = positions + [{sku: line.sku, qty: num(line.quantity)}]\n\
+end\n\
+\n\
+if total_eur >= MIN_TOTAL_EUR:\n\
+    emit ERP_QUEUE, {order_ref: order_ref, country: country, positions: positions}\n\
+end\n";
+
+    #[test]
+    fn a_flow_shape_reads_the_event_then_each_value_then_the_sends() {
+        let prog = parse(SHAPE_SRC).unwrap();
+        let shape = flow_shape(&prog, SHAPE_SRC, &[]);
+        assert_eq!(
+            shape["reads"],
+            json!(["id", "email", "total_price", "shipping_address.country", "line_items"]),
+            "what the flow reads from its event, in the order it reads it; never a name it assigns or a loop variable"
+        );
+        let steps = shape["steps"].as_array().unwrap();
+        let kinds: Vec<&str> = steps.iter().map(|s| s["kind"].as_str().unwrap()).collect();
+        // no step for the literals, nor for the empty start of what the loop builds
+        assert_eq!(kinds, ["set", "set", "set", "set", "each", "when"]);
+        assert_eq!(steps[0]["name"], "order_ref");
+        assert_eq!(steps[0]["code"], "split(id, \"#\")[1]");
+        assert_eq!(steps[0]["line"], 10);
+        assert_eq!(steps[0]["uses"], json!(["id"]));
+        assert_eq!(steps[3]["name"], "country");
+        assert_eq!(steps[3]["literals"], json!(["COUNTRY_CODES"]), "the literal it uses, to edit in place");
+        assert_eq!(steps[3]["uses"], json!(["shipping_address.country"]));
+        assert_eq!(steps[4]["var"], "line");
+        assert_eq!(steps[4]["over"], "line_items");
+        assert_eq!(steps[4]["builds"], json!(["positions"]));
+        assert_eq!(steps[5]["line"], 21);
+        let sends = shape["sends"].as_array().unwrap();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0]["subject"], "vx.erp.orders.upsert");
+        assert_eq!(sends[0]["constant"], "ERP_QUEUE");
+        assert_eq!(sends[0]["inside"], "when");
+        assert_eq!(sends[0]["fields"][0], json!({"name": "order_ref", "from": "order_ref"}));
+        assert_eq!(
+            shape["docs"],
+            json!({"COUNTRY_CODES": "The shop sends country names (\"France\"); the ERP wants ISO codes (\"FR\")."}),
+            "a literal's comment is its label; a blank line or the file header ends it"
+        );
+    }
+
+    #[test]
+    fn a_value_an_invoked_service_makes_is_no_event_field() {
+        let src = "source \"vx.in\"\ninvoke fmt(sev: severity)\nemit \"vx.out\", {text: alert_text}\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[("fmt".into(), vec!["alert_text".into()])]);
+        assert_eq!(shape["reads"], json!(["severity"]));
+        assert_eq!(shape["made_by"], json!({"alert_text": "fmt"}));
+        let src = "source \"vx.in\"\nGREETING = \"hi\"\ninvoke fmt(text: f\"{GREETING} {origin}\")\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[]);
+        assert_eq!(shape["steps"][0]["kind"], "invoke");
+        assert_eq!(shape["steps"][0]["literals"], json!(["GREETING"]), "a literal an invoke passes is editable where it is passed");
+        assert_eq!(shape["steps"][0]["uses"], json!(["origin"]));
+    }
+
+    #[test]
+    fn a_literal_doc_joins_its_comment_lines_and_stops_at_a_blank_line() {
+        let src = "# flow: alerts\n# Only payments strictly above this amount\n#   raise a Slack alert.\nALERT = 250\n\n# unrelated\n\nOTHER = 1\n";
+        let prog = parse(src).unwrap();
+        let doc = |name: &str| {
+            let e = prog.surface.iter().find(|e| e.name == name).unwrap();
+            literal_doc(src, e.value_span.0)
+        };
+        assert_eq!(doc("ALERT").as_deref(), Some("Only payments strictly above this amount raise a Slack alert."));
+        assert_eq!(doc("OTHER"), None, "a comment cut off by a blank line belongs to nothing");
+    }
+
+    #[test]
+    fn a_flow_that_reads_its_event_by_name_lists_the_paths_under_it() {
+        let src = "source \"vx.in\"\nif event.total > 10 and event.customer.tier == \"gold\":\n  emit \"vx.out\", event\nend\n";
+        let prog = parse(src).unwrap();
+        let shape = flow_shape(&prog, src, &[]);
+        assert_eq!(shape["reads"], json!(["total", "customer.tier"]));
+        assert_eq!(shape["sends"][0]["whole"], "event");
+    }
+
     fn one_emit(src: &str, event: Value) -> Value {
         let emits = eval_flow(src, event).expect("run");
         assert_eq!(emits.len(), 1, "expected exactly one emit");

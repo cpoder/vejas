@@ -2542,6 +2542,7 @@ fn surface_json(root: &Path) -> Value {
         for e in prog.surface {
             entries.push(json!({
                 "file": path.display().to_string(),
+                "doc": vjs::literal_doc(&src, e.value_span.0),
                 "name": e.name,
                 "kind": vjs_kind_of(&e.name, &e.value),
                 "value": e.value,
@@ -2590,6 +2591,7 @@ fn surface_json(root: &Path) -> Value {
             let mut v = base.clone();
             let o = v.as_object_mut().unwrap();
             o.insert("name".into(), json!(e.name));
+            o.insert("doc".into(), json!(vjs::literal_doc(&src, e.value_span.0)));
             o.insert("kind".into(), json!(vjs_kind_of(&e.name, &e.value)));
             o.insert("value".into(), e.value.clone());
             o.insert("list".into(), json!(e.value.is_array()));
@@ -2651,6 +2653,28 @@ fn rules_json(root: &Path, file: &str) -> Result<String, String> {
     let prog = vjs::parse(&src)?;
     let rules = vjs::flow_rules(&prog, &src, &prog.surface);
     Ok(json!({"file": file, "rules": rules}).to_string())
+}
+
+/// A flow as its page shows it: what it reads from its event, each value it
+/// computes and from what, what it checks (the rules-view), where it sends,
+/// and the comment each business literal carries. Derived from the code,
+/// read-only: the panel changes literals through the surface.
+fn shape_json(root: &Path, file: &str) -> Result<String, String> {
+    let path = guard_path(root, file).ok_or("path not allowed")?;
+    let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let prog = vjs::parse(&src)?;
+    // what each invoked service makes, resolved as a run would resolve it
+    let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg_of_path(&path));
+    let services: Vec<(String, Vec<String>)> = prog
+        .invokes
+        .iter()
+        .filter_map(|name| engine.service_makes(name).ok().map(|made| (name.clone(), made)))
+        .collect();
+    let mut shape = vjs::flow_shape(&prog, &src, &services);
+    shape["file"] = json!(file);
+    shape["source"] = json!(prog.source);
+    shape["rules"] = Value::Array(vjs::flow_rules(&prog, &src, &prog.surface));
+    Ok(shape.to_string())
 }
 
 fn preview_json(root: &Path, file: &str) -> Result<String, String> {
@@ -4648,6 +4672,15 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 return respond(request, 400, "missing file".into(), "text/plain");
             };
             match rules_json(&root, &file) {
+                Ok(json) => respond(request, 200, json, "application/json"),
+                Err(err) => respond(request, 500, err, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Get, "/shape") => {
+            let Some(file) = qparam(&url, "file") else {
+                return respond(request, 400, "missing file".into(), "text/plain");
+            };
+            match shape_json(&root, &file) {
                 Ok(json) => respond(request, 200, json, "application/json"),
                 Err(err) => respond(request, 500, err, "text/plain"),
             }
