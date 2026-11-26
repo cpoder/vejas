@@ -236,6 +236,12 @@ the build departs from the text above, the reason is stated here.
   its environment (the OpenTelemetry carrier for a child process), detect
   units (ADR-0031) take part as flows do, and each entry of the event ring
   records its trace and span ids.
+- **A trace never costs a message.** The headers count toward the server's
+  `max_payload`, so a message they would push past it is published without
+  them (its next hop starts a trace), and a death envelope that its
+  `traceparent` would push past it goes without that field. The
+  `vx.dlq.events` announcement keeps the trace ids but not the caller's
+  `tracestate`, which is text from outside.
 - **Propagation stays on without an exporter, and is not free.** Point 6
   asked for zero cost with the exporter unset. The context has to travel even
   then: a downstream system that traces needs it on the sink's call, another

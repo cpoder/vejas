@@ -27,7 +27,10 @@ a span to that trace: the source or webhook that received it, each flow that
 processed it, each `invoke` a flow made, and the sink that delivered it. The
 context is the W3C `traceparent`. It travels in a NATS header on every
 message the runtime publishes, so the payload is untouched and a consumer
-outside Vejas can ignore it.
+outside Vejas can ignore it. The headers count toward the server's
+`max_payload`: a message so close to the limit that they would push it over
+goes without them, and its next hop starts a new trace. A trace is never the
+reason a message fails.
 
 The context also crosses the edges of the cell:
 
@@ -79,7 +82,9 @@ defines for it:
 | `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | Spans per export request, 512 by default |
 | `OTEL_BSP_MAX_QUEUE_SIZE` | Spans waiting for export, 4096 by default |
 
-Header values are credentials, and the runtime never writes them to its log.
+Header values are credentials, and the runtime never writes them to its log;
+an entry that HTTP cannot carry is skipped at start, with a warning that gives
+its position only. The endpoint is logged without its user info and query.
 On a graceful stop the runtime gives the exporter up to 3 seconds to send
 what is still queued, so the spans of the last events before a restart reach
 the backend.

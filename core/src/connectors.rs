@@ -1243,7 +1243,7 @@ pub fn to_dlq(
 ) -> Result<(), String> {
     ensure_dlq_stream(js);
     let now = epoch_secs();
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut envelope = serde_json::json!({
         "original_subject": subject,
         "unit": unit,
         "attempts": attempts,
@@ -1257,11 +1257,19 @@ pub fn to_dlq(
         // Raw text of the original message — replayed verbatim, so JSON and
         // non-JSON alike re-inject faithfully; the panel pretty-prints it if JSON.
         "payload": String::from_utf8_lossy(payload),
-        // The trace the message died in (ADR-0034): a replay continues it, so
-        // the death and the second chance read as one story.
-        "traceparent": trace.map(|t| t.traceparent()),
-    }))
-    .map_err(|e| e.to_string())?;
+    });
+    // The trace the message died in (ADR-0034): a replay continues it, so the
+    // death and the second chance read as one story. Never at the cost of the
+    // letter: if its 70 bytes push the envelope past the server's limit, the
+    // letter goes without it.
+    let mut body = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+    if let Some(t) = trace {
+        envelope["traceparent"] = t.traceparent().into();
+        let traced = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+        if traced.len() <= js.max_payload() {
+            body = traced;
+        }
+    }
     let dlq_subject = format!("{DLQ_ROOT}.{}", dlq_unit_token(unit));
     js.publish(&dlq_subject, body).map_err(|e| e.to_string())?;
     announce_dead_letter(js, unit, subject, attempts, version, trace);
@@ -1346,6 +1354,13 @@ fn publish_dlq_event(js: &bus::JetStream, (event, trace): &(Value, Option<trace:
     }
 }
 
+/// What the announcement keeps of a letter's trace: the ids, not the caller's
+/// `tracestate`. That is text from outside, and the event holds only what the
+/// runtime wrote.
+fn announced_trace(trace: Option<&trace::Context>) -> Option<trace::Context> {
+    trace.map(|t| trace::Context { state: None, ..t.clone() })
+}
+
 fn announce_dead_letter(
     js: &bus::JetStream,
     unit: &str,
@@ -1367,7 +1382,7 @@ fn announce_dead_letter(
         a.subject = subject.to_string();
         a.attempts = attempts;
         a.version = version.to_string();
-        a.trace = trace.cloned();
+        a.trace = announced_trace(trace);
         take_due_dlq_events(&mut pending, epoch_secs(), gap)
     };
     for event in &due {
@@ -2408,7 +2423,11 @@ mod tests {
         let mut pending = HashMap::new();
         letter(&mut pending, "flow:t");
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        pending.get_mut("flow:t").unwrap().trace = trace::Context::parse(tp, None);
+        let caller = trace::Context::parse(tp, Some("vendor=text from outside")).unwrap();
+        let kept = announced_trace(Some(&caller)).unwrap();
+        assert_eq!((kept.trace_id, kept.span_id), (caller.trace_id, caller.span_id));
+        assert_eq!(kept.state, None, "the caller's tracestate is not announced");
+        pending.get_mut("flow:t").unwrap().trace = Some(kept);
         let due = take_due_dlq_events(&mut pending, 1000, 0);
         assert_eq!(due[0].0["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(due[0].1.as_ref().map(|t| t.traceparent()).as_deref(), Some(tp));

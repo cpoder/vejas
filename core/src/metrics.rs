@@ -480,9 +480,9 @@ fn export_config(env: impl Fn(&str) -> Option<String>) -> Option<ExportConfig> {
             var("OTEL_EXPORTER_OTLP_ENDPOINT")?.trim().trim_end_matches('/')
         ),
     };
-    let headers = var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
-        .or_else(|| var("OTEL_EXPORTER_OTLP_HEADERS"))
-        .map(|h| key_values(&h, "OTEL_EXPORTER_OTLP_HEADERS"))
+    let headers = ["OTEL_EXPORTER_OTLP_TRACES_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS"]
+        .into_iter()
+        .find_map(|name| var(name).map(|h| sendable_headers(key_values(&h, name), name)))
         .unwrap_or_default();
     let timeout = var("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")
         .or_else(|| var("OTEL_EXPORTER_OTLP_TIMEOUT"))
@@ -530,6 +530,42 @@ fn key_values(list: &str, variable: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The headers an HTTP request can carry (a token for a name, visible ASCII
+/// for a value). Any other is skipped here, once, with a warning that names
+/// the variable and the entry's position only: sent, it would fail every
+/// export, and the client's error quotes the whole header line.
+fn sendable_headers(headers: Vec<(String, String)>, variable: &str) -> Vec<(String, String)> {
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    let visible = |b: u8| b == b'\t' || (0x20..=0x7e).contains(&b);
+    let mut kept = Vec::with_capacity(headers.len());
+    for (n, (k, v)) in headers.into_iter().enumerate() {
+        if !k.is_empty() && k.bytes().all(token) && v.bytes().all(visible) {
+            kept.push((k, v));
+        } else {
+            eprintln!(
+                "[vejas] {variable}: entry {} is not a valid HTTP header and is skipped (not shown: it may hold a credential)",
+                n + 1
+            );
+        }
+    }
+    kept
+}
+
+/// Where spans go, for the log: scheme, host and path, without the user
+/// info or query that may carry a credential.
+fn shown(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    if scheme.is_empty() {
+        format!("{host}{path}")
+    } else {
+        format!("{scheme}://{host}{path}")
+    }
+}
+
 fn percent_decode(s: &str) -> String {
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let b = s.as_bytes();
@@ -558,7 +594,7 @@ pub fn otlp_init() {
         // Bounded queue: if the collector stalls, spans are dropped (and
         // counted), never buffered without bound, and the hot loop never waits.
         let (tx, rx) = sync_channel::<Span>(config.queue);
-        eprintln!("[vejas] OTLP traces -> {}", config.url);
+        eprintln!("[vejas] OTLP traces -> {}", shown(&config.url));
         let spawned = std::thread::Builder::new().name("otlp-export".into()).spawn(move || {
             let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
             let mut batch: Vec<Span> = Vec::with_capacity(config.batch);
@@ -691,14 +727,19 @@ fn export(agent: &ureq::Agent, config: &ExportConfig, body: &str) -> Result<u64,
             }
             Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
             Err(ureq::Error::Transport(t)) => {
-                if attempt == ATTEMPTS {
-                    // The kind and the detail, not the Display: it would print the
-                    // URL, which may carry credentials.
-                    return Err(format!(
-                        "{:?}: {} after {ATTEMPTS} attempts",
-                        t.kind(),
-                        t.message().unwrap_or("transport error")
-                    ));
+                use ureq::ErrorKind::{ConnectionFailed, Dns, Io, ProxyConnect};
+                // Only the network clears on its own; a bad header or URL does
+                // not, so it is not retried.
+                let transient = matches!(t.kind(), ConnectionFailed | Dns | Io | ProxyConnect);
+                if !transient || attempt == ATTEMPTS {
+                    // The kind, and the detail only where it is the network's:
+                    // a bad header's detail is the whole header line, which may
+                    // be a credential, and the Display prints the URL.
+                    return Err(match (transient, t.message()) {
+                        (true, Some(detail)) => format!("{:?}: {detail} after {ATTEMPTS} attempts", t.kind()),
+                        (true, None) => format!("{:?} after {ATTEMPTS} attempts", t.kind()),
+                        (false, _) => format!("{:?}", t.kind()),
+                    });
                 }
                 backoff
             }
@@ -935,6 +976,23 @@ mod tests {
         // An empty batch is still a valid request body.
         let empty: serde_json::Value = serde_json::from_str(&otlp_payload(&[], &[])).unwrap();
         assert_eq!(empty["resourceSpans"][0]["scopeSpans"][0]["spans"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn neither_a_bad_header_nor_a_credential_in_a_url_reaches_the_log() {
+        let config = export_config(|k: &str| match k {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://c:4318".into()),
+            // a colon where `=` belongs, a control byte, then a good one
+            "OTEL_EXPORTER_OTLP_HEADERS" => {
+                Some("Authorization: Basic dXNlcjpwYXNzd29yZA==,x-bad=a%0Ab,api-key=s%3Dcret".into())
+            }
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.headers, vec![("api-key".to_string(), "s=cret".to_string())]);
+        assert_eq!(shown("https://user:tok@collector:4318/v1/traces?key=abc"), "https://collector:4318/v1/traces");
+        assert_eq!(shown("http://c:4318/v1/traces"), "http://c:4318/v1/traces");
+        assert_eq!(shown("c:4318"), "c:4318");
     }
 
     #[test]

@@ -298,7 +298,10 @@ impl Bus {
         trace: &impl TraceContext,
     ) -> Result<(), String> {
         let (client, payload) = (&self.0.link.client, payload.into());
-        wait(sent(client.publish_with_headers(subject.to_string(), trace_headers(trace), payload)))
+        match trace_headers_within(trace, payload.len(), client.max_payload()) {
+            Some(headers) => wait(sent(client.publish_with_headers(subject.to_string(), headers, payload))),
+            None => wait(sent(client.publish(subject.to_string(), payload))),
+        }
     }
 
     /// A batch of publishes that leave together, see [`Batch`].
@@ -397,7 +400,9 @@ impl Batch {
         payload: impl Into<Bytes>,
         trace: &impl TraceContext,
     ) -> Result<(), String> {
-        self.hold(subject, Some(trace_headers(trace)), payload.into())
+        let payload = payload.into();
+        let limit = self.bus.0.link.client.max_payload();
+        self.hold(subject, trace_headers_within(trace, payload.len(), limit), payload)
     }
 
     fn hold(&mut self, subject: &str, headers: Option<HeaderMap>, payload: Bytes) -> Result<(), String> {
@@ -552,6 +557,14 @@ fn trace_headers(trace: &impl TraceContext) -> HeaderMap {
         headers.insert(TRACESTATE, state);
     }
     headers
+}
+
+/// The trace headers of a payload, or none when they would push the message
+/// past the server's limit. A trace is never the reason a publish fails: that
+/// message goes untraced, and the next hop starts a trace (ADR-0034).
+fn trace_headers_within(trace: &impl TraceContext, payload_len: usize, limit: usize) -> Option<HeaderMap> {
+    let headers = trace_headers(trace);
+    (payload_len + headers_len(&headers) <= limit).then_some(headers)
 }
 
 /// What headers add to a message on the wire: the `NATS/1.0` line, each
@@ -802,6 +815,11 @@ impl JetStream {
         &(self.0).0
     }
 
+    /// The largest message the server takes, headers included.
+    pub fn max_payload(&self) -> usize {
+        self.shared().link.client.max_payload()
+    }
+
     /// The JetStream API, as the server speaks it: a request and a JSON reply.
     /// Administration goes this way rather than through the client's typed
     /// configs because each of those is free to carry defaults of its own, and
@@ -843,9 +861,13 @@ impl JetStream {
         trace: &impl TraceContext,
     ) -> Result<u64, String> {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
+        let headers = trace_headers_within(trace, bytes.len(), self.max_payload());
         wait(async {
             let js = &self.shared().js;
-            let ack = js.publish_with_headers(subject.to_string(), trace_headers(trace), bytes).await;
+            let ack = match headers {
+                Some(headers) => js.publish_with_headers(subject.to_string(), headers, bytes).await,
+                None => js.publish(subject.to_string(), bytes).await,
+            };
             let ack = ack.map_err(|e| e.to_string())?.await;
             ack.map(|ack| ack.sequence).map_err(|e| e.to_string())
         })
@@ -1272,6 +1294,11 @@ mod tests {
         assert_eq!(header(&written, "tracestate"), Some("k=v"));
         // "NATS/1.0\r\n" + "traceparent: <55>\r\n" + "tracestate: k=v\r\n" + "\r\n"
         assert_eq!(headers_len(&written), 10 + (11 + 55 + 4) + (10 + 3 + 4) + 2);
+        // Near the server's limit the message goes untraced rather than fail.
+        let carried = Carried(tp, Some("k=v"));
+        let room = headers_len(&written);
+        assert!(trace_headers_within(&carried, 1000 - room, 1000).is_some());
+        assert!(trace_headers_within(&carried, 1001 - room, 1000).is_none());
         let mut foreign = HeaderMap::new();
         foreign.insert("TraceParent", tp);
         assert_eq!(header(&foreign, "traceparent"), Some(tp));
