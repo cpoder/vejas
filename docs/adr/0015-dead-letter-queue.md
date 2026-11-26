@@ -113,10 +113,13 @@ every consumer of that subject read it: a flow that had handled the event the
 first time ran it again and sent it on again. The replay now names its unit in
 a `Vejas-Replay-For` header, and every other consumer acks it unread: the
 runtime's flows and sinks, and the MQ and AMQP bridges, which write no dead
-letter. Shadow-replay (ADR-0018) leaves replays out, as copies of events the
-stream already holds. A replay that cannot carry its unit within the server's
-limit is not sent, and a letter whose unit is no longer declared stays, with
-the reason, since nothing would take its replay.
+letter, and the `rpc:exec` responders. Shadow-replay (ADR-0018) leaves
+replays out, as copies of events the stream already holds. A letter now keeps
+the durable consumer its unit read it with (`consumer`). A replay that no one
+would take is not sent and its letter stays, with the reason: its unit is no
+longer declared, or its consumer no longer takes the letter's subject (a fix
+that moved the unit), or the replay cannot carry its unit within the server's
+limit.
 
 ## Alternatives considered
 

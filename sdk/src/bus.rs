@@ -1151,6 +1151,12 @@ impl JetStream {
             .map(|_| ())
     }
 
+    /// The subjects a durable consumer takes from its stream; none means all.
+    pub fn consumer_filters(&self, stream: &str, consumer: &str) -> Result<Vec<String>, String> {
+        let info = self.api(format!("CONSUMER.INFO.{stream}.{consumer}"), Bytes::new())?;
+        Ok(filters_of(&info["config"]))
+    }
+
     /// The stream sequence below which a consumer has acked everything.
     pub fn ack_floor(&self, stream: &str, consumer: &str) -> Result<u64, String> {
         let info = self.api(format!("CONSUMER.INFO.{stream}.{consumer}"), Bytes::new())?;
@@ -1743,6 +1749,8 @@ mod live {
         assert!(!got[1].replay_elsewhere("flow:r"));
         assert!(got[1].replay_elsewhere("connector:other"));
         assert!(!got[0].replay_elsewhere("connector:other"), "not a replay: everyone's");
+        assert_eq!(js.consumer_filters("T", "r").unwrap(), ["t.in"]);
+        assert!(js.consumer_filters("T", "missing").is_err());
         // too large to say whose it is: not sent
         let max = js.max_payload();
         let tight = vec![b'x'; max - 30];

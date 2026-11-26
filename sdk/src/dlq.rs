@@ -44,7 +44,8 @@ pub fn dlq_unit_token(unit: &str) -> String {
 /// Park one poison message in the DLQ as a death envelope. Returns Ok only when
 /// JetStream has stored it — the caller must ack the original only on Ok.
 /// `message`: the stream sequence of the message that died ([`bus::Delivery::message`]),
-/// which its replay names.
+/// which its replay names. `consumer`: the durable consumer the unit read it
+/// with, whose filter a replay checks still takes the subject.
 #[allow(clippy::too_many_arguments)]
 pub fn to_dlq(
     js: &bus::JetStream,
@@ -56,6 +57,7 @@ pub fn to_dlq(
     version: &str,
     trace: Option<&trace::Context>,
     message: Option<u64>,
+    consumer: &str,
 ) -> Result<(), String> {
     ensure_dlq_stream(js);
     let now = epoch_secs();
@@ -76,6 +78,9 @@ pub fn to_dlq(
         // The message that died, which its replay names (bus::REPLAY_OF): the
         // events ring reads the letter and its second chance as one message.
         "original_seq": message,
+        // The durable the unit read it with: a replay goes ahead only while its
+        // filter still takes `original_subject` (ADR-0015 Amendment C).
+        "consumer": consumer,
     });
     // The trace the message died in (ADR-0034): a replay continues it, so the
     // death and the second chance read as one story. Never at the cost of the

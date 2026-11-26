@@ -109,7 +109,7 @@ impl Ctx {
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
                         let parked = (delivered >= MAX_DELIVERIES)
-                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried), delivery.as_ref().map(bus::Delivery::message)));
+                            .then(|| to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried), delivery.as_ref().map(bus::Delivery::message), &durable));
                         let (ring_error, dead_lettered) = match &parked {
                             Some(Ok(())) => {
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);

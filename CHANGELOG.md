@@ -94,9 +94,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   where every consumer of that subject ran it again: a flow that had handled
   the event the first time sent it on a second time. The replay now carries
   its unit (`Vejas-Replay-For`), and every other consumer acks it unread: the
-  runtime's flows and sinks, and the MQ and AMQP bridges. A letter whose unit
-  is no longer declared stays, with the reason, instead of being replayed to
-  no one; the panel shows that reason instead of "Replayed.".
+  runtime's flows and sinks, the MQ and AMQP bridges, and `rpc:exec`. A letter
+  that no unit would take stays, with the reason, instead of being replayed to
+  no one: its unit is no longer declared, or no longer reads the letter's
+  subject (the envelope now keeps the unit's `consumer`). The panel shows that
+  reason instead of "Replayed.".
 
 ## [0.7.0] — 2026-11-26
 

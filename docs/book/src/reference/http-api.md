@@ -48,7 +48,7 @@ answer with a didactic refusal pointing at the proposal queue.
 | Route | Purpose |
 |---|---|
 | `GET /dlq` | Dead letters with death envelopes (version-tagged). |
-| `POST /dlq/replay` · `POST /dlq/purge` | Explicit replay / purge (ADR-0015), audited. A replay goes to the unit whose letter it is, and no other consumer of its subject runs it; a letter whose unit is no longer declared stays, and `errors` says why. In governed mode they want `X-Approval-Token`. |
+| `POST /dlq/replay` · `POST /dlq/purge` | Explicit replay / purge (ADR-0015), audited. A replay goes to the unit whose letter it is, and no other consumer of its subject runs it; a letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. In governed mode they want `X-Approval-Token`. |
 
 ## Versions, time-travel, canary (ADR-0021)
 

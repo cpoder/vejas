@@ -115,7 +115,7 @@ List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dr
 
 ## `vejas_dlq_replay`
 
-Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter whose unit is no longer declared stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.
+Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.
 
 ## `vejas_dlq_purge`
 

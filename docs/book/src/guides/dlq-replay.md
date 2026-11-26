@@ -25,8 +25,9 @@ trace (see [observability](observability.md)).
   is** (`Vejas-Replay-For`): the other consumers of that subject, which
   handled the event the first time, do not run it again. It names the
   message that died (`Vejas-Replay-Of`), so the panel and the trace read the
-  letter and its replays as one event. A letter whose unit is no longer
-  declared stays, and the answer's `errors` says why.
+  letter and its replays as one event. A letter that no unit would take
+  stays, and the answer's `errors` says why: its unit is no longer declared,
+  or no longer reads that subject.
 - In [governed mode](governed-mode.md) both are human acts: `vejas_dlq_replay`
   and `vejas_dlq_purge` are refused, and the HTTP routes want the
   `X-Approval-Token` header, which the panel sends.

@@ -314,6 +314,11 @@ impl Driver for ExecRpc {
             }
             match sub.next_timeout(Duration::from_millis(300)) {
                 Ok(msg) => {
+                    // A dead letter's replay is for the JetStream consumer the
+                    // letter died in, never a request (ADR-0015 Amendment C).
+                    if msg.replay_for().is_some() {
+                        continue;
+                    }
                     // One request line in, one reply line out (serialized).
                     let mut req = msg.data.to_vec();
                     req.push(b'\n');
