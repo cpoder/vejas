@@ -96,6 +96,8 @@ jobs:
         run: e2e/emit-subject.sh
       - name: http-in survives a burst and a thread limit
         run: e2e/http-in-bound.sh
+      - name: Signed webhooks on http-in refuse what their sender did not sign (ADR-0037)
+        run: e2e/http-in-signed.sh
       - name: Dead letters announce themselves, without feeding themselves
         run: e2e/dlq-events.sh
       - name: The trace record keeps each hop, masked (ADR-0034 lot B)

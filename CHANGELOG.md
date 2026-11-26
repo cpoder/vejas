@@ -7,6 +7,24 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **Signed webhooks on `http-in`** (ADR-0037, the first driver it calls for).
+  A manifest names its sender's scheme in `SIGNATURE` (`github`, `stripe`,
+  `slack`, `shopify`, `standard-webhooks`, `gitlab`, or `hmac-sha256` and
+  `token` for any other sender) and gives `SIGNING_SECRET = secret("…")`.
+  Each request must then carry a valid signature, checked in constant time
+  over the raw body before anything else is read, or it gets 401 with the
+  reason and is not published. Where a timestamp is signed, one more than
+  `SIGNATURE_TOLERANCE_SECS` (300) from the runtime's clock is refused.
+  Refusals are counted on `/metrics` (`vejas_signature_failures_total{unit,reason}`).
+  A manifest that asks for a signature without a secret the runtime can read
+  does not start. No new binary weight: `ring` and `base64` were in the tree
+  already. e2e `http-in-signed.sh` checks it in CI.
+
+### Changed
+- `http-in` takes a request's body as long as its `Content-Length` says;
+  bytes read after it are no longer part of the body.
+
 ## [0.7.0] — 2026-11-26
 
 ### Added

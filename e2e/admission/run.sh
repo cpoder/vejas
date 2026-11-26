@@ -192,16 +192,26 @@ sys.exit(0 if d.get('ok') or 'no test probe' in d.get('detail', '') else 1)" \
     if [ -n "$INGEST" ]; then
       # webhook source: POST the fixture to its own ingest, expect it on the bus
       IPORT=$(grep -oP 'PORT\s*=\s*\K[0-9]+' "$MANIFEST")
+      # a recipe whose sender signs (ADR-0037): the fixture goes signed, as the
+      # sender signs it, and the same request unsigned must get 401
+      SIGNED=()
+      while IFS= read -r h; do [ -n "$h" ] && SIGNED+=(-H "$h"); done \
+        < <(python3 e2e/admission/sign.py "$MANIFEST" "$DIR/fixture.json" || echo "")
       ( timeout 10 nats -s "nats://127.0.0.1:$NATS_P" sub "vx.$INGEST" --count=1 --raw 2>/dev/null | head -1 > "$STORE/inmsg" ) &
       WSUB=$!
       sleep 0.5
-      curl -sf -o /dev/null -X POST "http://127.0.0.1:$IPORT/ingest/$INGEST" -d @"$DIR/fixture.json" || true
+      curl -sf -o /dev/null -X POST "${SIGNED[@]}" "http://127.0.0.1:$IPORT/ingest/$INGEST" --data-binary @"$DIR/fixture.json" || true
       wait $WSUB 2>/dev/null || true
       [ -s "$STORE/inmsg" ] || { echo "  ✗ webhook: fixture never reached the bus"; ok=0; }
+      if grep -qE '^SIGNATURE\s*=' "$MANIFEST"; then
+        [ ${#SIGNED[@]} -gt 0 ] || { echo "  ✗ SIGNATURE: e2e/admission/sign.py could not sign for this sender"; ok=0; }
+        UCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$IPORT/ingest/$INGEST" --data-binary @"$DIR/fixture.json")
+        [ "$UCODE" = "401" ] || { echo "  ✗ SIGNATURE: an unsigned request was not refused (got $UCODE)"; ok=0; }
+      fi
       # if the recipe locks the port with ALLOW, a subject outside it must 403
       DENIED=$(python3 -c "import json,sys; print(json.load(open('$DIR/overrides.json')).get('denied_path',''))")
       if [ -n "$DENIED" ]; then
-        DCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$IPORT/ingest/$DENIED" -d @"$DIR/fixture.json")
+        DCODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${SIGNED[@]}" "http://127.0.0.1:$IPORT/ingest/$DENIED" --data-binary @"$DIR/fixture.json")
         [ "$DCODE" = "403" ] || { echo "  ✗ ALLOW: out-of-list subject '$DENIED' not refused (got $DCODE)"; ok=0; }
       fi
     elif [ -f "$DIR/fixture.json" ] && grep -q 'driver "http-poll"' "$MANIFEST"; then

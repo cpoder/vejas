@@ -26,8 +26,8 @@ the full delivery contract (redelivery, DLQ). The answer carries the event's
 `trace_id`; send a `traceparent` header and the event continues your trace,
 on this webhook as on an API flow (see [observability](observability.md)).
 
-**Lock the port to its subjects.** The `/ingest` port is unauthenticated by
-design — it only publishes. Without a limit, any caller can publish to any
+**Lock the port to its subjects.** The `/ingest` port is unauthenticated
+unless the sender signs (see below), and it only publishes. Without a limit, any caller can publish to any
 `vx.*` subject, a sink's subject included, triggering an outbound side
 effect with no flow in between. Set `ALLOW` to the subject suffixes this
 webhook is for:
@@ -43,6 +43,52 @@ Match is by subject segment: `"shop"` allows `shop` and `shop.orders`, not
 compatible) — set it whenever the port is reachable by anyone but the
 operator (ADR-0029). It is defence in depth, not authentication: put the
 port behind your ingress trust boundary as you would any webhook.
+
+**Make the sender prove itself.** `ALLOW` limits where a request goes, not
+who sent it. When the sender signs its webhooks, as GitHub, Stripe, Slack,
+Shopify and the senders of the Standard Webhooks specification do, name its
+scheme and give the port the secret you share with it:
+
+```
+# connector: stripe_webhook
+driver "http-in"
+PORT = 8787
+ALLOW = ["stripe"]
+SIGNATURE = "stripe"
+SIGNING_SECRET = secret("stripe/webhook")
+```
+
+Each request is then checked before anything else is read from it. One whose
+signature is missing, does not parse or does not match gets `401` with the
+reason, `{"error":"signature: the signature does not match"}`, and nothing
+reaches the bus. A caller without the secret gets `401` whatever the subject,
+so it learns nothing of `ALLOW`. The secret stays in the secret store, and
+neither the answer nor the log shows it.
+
+| `SIGNATURE` | The sender sends | Signed |
+|---|---|---|
+| `github` | `X-Hub-Signature-256: sha256=<hex>` | the body |
+| `stripe` | `Stripe-Signature: t=<ts>,v1=<hex>` | `<ts>.<body>`; any `v1` may match (two while a secret is rolled) |
+| `slack` | `X-Slack-Signature: v0=<hex>` and `X-Slack-Request-Timestamp` | `v0:<ts>:<body>` |
+| `shopify` | `X-Shopify-Hmac-Sha256: <base64>` | the body |
+| `standard-webhooks` | `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<base64>` (or their `svix-` names); the secret is written `whsec_…` | `<id>.<ts>.<body>` |
+| `gitlab` | `X-Gitlab-Token: <the secret>` | nothing: the token is the secret |
+| `hmac-sha256` | `SIGNATURE_HEADER`, after an optional `SIGNATURE_PREFIX`, in `SIGNATURE_ENCODING` `hex` (default) or `base64` | the body |
+| `token` | the secret itself, in `SIGNATURE_HEADER` | nothing |
+
+Every HMAC is SHA-256. Where a timestamp is signed, a request more than
+`SIGNATURE_TOLERANCE_SECS` (300) away from the runtime's clock is refused,
+which bounds how long a captured request can be played again. GitHub and
+Shopify sign no timestamp, so a flow that must not act twice keys on the
+sender's delivery id. The path is not signed either: keep `ALLOW`, so that a
+signed request reaches only the subjects it is for. Slack's Events API posts
+JSON; its slash commands post a form, which `http-in` does not take.
+
+Refusals are counted on `/metrics` as
+`vejas_signature_failures_total{unit,reason}`, the reason being `missing`,
+`malformed`, `stale` or `mismatch`, and the log counts them too. A manifest
+that sets `SIGNATURE` without a secret the runtime can read does not start:
+the port stays closed rather than open without its check.
 
 ## Sync: a flow that is an API
 

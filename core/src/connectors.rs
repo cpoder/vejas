@@ -184,7 +184,7 @@ impl Driver for HttpIn {
         "source:webhook"
     }
     fn about(&self) -> &'static str {
-        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT, MAX_CONNECTIONS (default 512, past it a 503), ALLOW (optional list of permitted subject suffixes/prefixes — this port is unauthenticated, so restrict it to your ingest subjects; without ALLOW any vx.* subject is reachable)."
+        "HTTP webhook: POST /ingest/<suffix> publishes the JSON body on vx.<suffix>. Config: PORT, MAX_CONNECTIONS (default 512, past it a 503), ALLOW (optional list of permitted subject suffixes/prefixes — without ALLOW any vx.* subject is reachable), SIGNATURE (optional: github, stripe, slack, shopify, standard-webhooks, gitlab, hmac-sha256 or token) with SIGNING_SECRET = secret(\"…\") — each request must then carry its sender's signature or gets 401, and SIGNATURE_TOLERANCE_SECS (default 300) bounds a signed timestamp. Without SIGNATURE the port is unauthenticated."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let port = ctx.config.u64_or("PORT", 8787) as u16;
@@ -204,13 +204,22 @@ impl Driver for HttpIn {
                 .map(|a| a.into_iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default(),
         );
+        // Optional SIGNATURE (ADR-0037): each request must carry its sender's
+        // signature. A manifest that asks for one the runtime cannot check stops
+        // here, before the port opens.
+        let signature: Option<Arc<crate::signature::Verifier>> =
+            crate::signature::Verifier::from_config(&ctx.config)?.map(Arc::new);
         let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).ok();
         eprintln!(
-            "[{}] http-in on :{port}, publishing under {}.*{}",
+            "[{}] http-in on :{port}, publishing under {}.*{}{}",
             ctx.name,
             ctx.subj_root,
-            if allow.is_empty() { String::new() } else { format!(" (ALLOW {:?})", allow) }
+            if allow.is_empty() { String::new() } else { format!(" (ALLOW {:?})", allow) },
+            signature
+                .as_ref()
+                .map(|v| format!(", {} signature required", v.scheme()))
+                .unwrap_or_default()
         );
         for s in listener.incoming() {
             if !ctx.alive() {
@@ -234,6 +243,7 @@ impl Driver for HttpIn {
                     let root = ctx.subj_root.clone();
                     let name = ctx.name.clone();
                     let allow = allow.clone();
+                    let signature = signature.clone();
                     // `thread::spawn` panics when the OS has no thread to give (a
                     // pids limit, memory), which here killed the connector and left
                     // it reported as running. The closure drops with the error,
@@ -241,7 +251,7 @@ impl Driver for HttpIn {
                     let spawned = thread::Builder::new().name(format!("{name}:conn")).spawn(
                         move || {
                             let _slot = slot;
-                            handle_http_in(&name, &mut sock, &js, &root, &allow)
+                            handle_http_in(&name, &mut sock, &js, &root, &allow, signature.as_deref())
                         },
                     );
                     if let Err(e) = spawned {
@@ -337,6 +347,7 @@ fn handle_http_in(
     js: &bus::JetStream,
     subj_root: &str,
     allow: &[String],
+    signature: Option<&crate::signature::Verifier>,
 ) {
     // TCP_NODELAY: without it, the small response write + the client's delayed
     // ACK collide with Nagle for a ~40ms stall on every keep-alive request.
@@ -372,7 +383,8 @@ fn handle_http_in(
                     }
                     if let Some(he) = header_end {
                         let clen = content_length(&String::from_utf8_lossy(&buf[..he]));
-                        if buf.len() >= he + clen {
+                        // Saturating: a forged Content-Length must not wrap.
+                        if buf.len() >= he.saturating_add(clen) {
                             break;
                         }
                     }
@@ -390,15 +402,38 @@ fn handle_http_in(
             break; // no complete request (client closed or idled out)
         }
         let (code, json): (&str, String) = {
-            let text = String::from_utf8_lossy(&buf);
-            let mut parts = text.split("\r\n").next().unwrap_or("").split(' ');
+            // The head is decoded on its own: an index into the lossy text of the
+            // whole buffer could fall inside a character.
+            let he = header_end.unwrap_or(0).min(buf.len());
+            let head = String::from_utf8_lossy(&buf[..he]);
+            let mut parts = head.split("\r\n").next().unwrap_or("").split(' ');
             let method = parts.next().unwrap_or("");
             let path = parts.next().unwrap_or("");
-            let body = header_end.map(|he| &buf[he.min(buf.len())..]).unwrap_or(&[]);
+            // The body is what Content-Length says: a signature covers those
+            // bytes, and nothing read past them.
+            let body = &buf[he..he.saturating_add(content_length(&head)).min(buf.len())];
             if method == "GET" && path == "/healthz" {
                 ("200 OK", "{\"ok\":true}".to_string())
             } else if method != "POST" || !path.starts_with("/ingest/") {
                 ("404 Not Found", "{\"error\":\"POST /ingest/<subject-suffix>\"}".to_string())
+            } else if let Some((verifier, refusal)) = signature.and_then(|v| {
+                // Before anything else is read from the request, so a caller without
+                // the secret learns nothing of the subjects ALLOW lets through.
+                v.check(|name| header_value(&head, name), body, epoch_secs())
+                    .err()
+                    .map(|refusal| (v, refusal))
+            }) {
+                let refused = verifier.note_refusal();
+                crate::metrics::inc_signature_failure(name, refusal.reason());
+                if refused.is_power_of_two() {
+                    eprintln!(
+                        "[{name}] {refused} request(s) refused so far for their signature, the last because {refusal}"
+                    );
+                }
+                (
+                    "401 Unauthorized",
+                    serde_json::json!({ "error": format!("signature: {refusal}") }).to_string(),
+                )
             } else {
                 let suffix = path.trim_start_matches("/ingest/").trim_matches('/');
                 if suffix.is_empty() {
@@ -416,9 +451,6 @@ fn handle_http_in(
                     let subject = format!("{subj_root}.{suffix}");
                     // A caller that traces sends its context; the event's trace
                     // then starts in the caller's (ADR-0034).
-                    // (The head is decoded on its own: an index into the lossy
-                    // text of the whole buffer could fall inside a character.)
-                    let head = String::from_utf8_lossy(&buf[..header_end.unwrap_or(0).min(buf.len())]);
                     let incoming = header_value(&head, trace::TRACEPARENT)
                         .and_then(|tp| trace::Context::parse(tp, header_value(&head, trace::TRACESTATE)));
                     match source_publish(name, js, &subject, body, incoming, Kind::Server) {

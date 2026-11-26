@@ -33,6 +33,7 @@ mod mqtt;
 mod proposals;
 mod record;
 mod secrets;
+mod signature;
 mod trace;
 mod versions;
 mod vjs;
