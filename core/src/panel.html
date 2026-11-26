@@ -1706,10 +1706,13 @@ function rowHtml(g) {
   const sep = icon('chev', 'sep');
   // What let it in, the flows that handled it in the order they did, where it
   // went. A unit retried reads once, with the attempts its message took.
+  // The count shown is the unit's most tried message; red while that one fails.
   const tries = new Map(), stuck = new Set();
   for (const m of messagesOf(g.hops)) {
-    tries.set(m.first.flow, Math.max(tries.get(m.first.flow) || 0, m.attempts));
-    if (!m.last.ok) stuck.add(m.first.flow);
+    const u = m.first.flow, shown = tries.get(u) || 0;
+    if (m.attempts < shown) continue;
+    if (m.attempts > shown) { tries.set(u, m.attempts); stuck.delete(u); }
+    if (!m.last.ok) stuck.add(u);
   }
   const units = rank => uniq(g.hops.filter(h => rankOf(h.flow) === rank).map(h => h.flow));
   // what was sent that no unit here took: it left the runtime on the bus
