@@ -523,16 +523,30 @@ const setLiteral = (file, name, key, value) => post('/surface/set', {file, name,
 const SECRET_KEY_PATTERN = "{{SECRET_PATTERN}}";
 const keyAsRead = k => String(k).replace(/([a-z0-9])(?=[A-Z])/g, '$1_');
 const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(keyAsRead(k));
-// A value as the panel may show it: every credential-named key masked, at any depth.
-const maskDeep = v => Array.isArray(v) ? v.map(maskDeep)
-  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, isSecretKey(k) ? 'hidden' : maskDeep(x)]))
-  : v;
+// A path to a value, `auth.pass` or a literal's key `auth/pass`: a credential
+// when any part of it names one, as maskDeep hides all that is under such a key.
+const secretPath = p => String(p).split(/[./]/).some(isSecretKey);
+// A pair names its credential in a value, {"name": "Authorization", "value":
+// "Bearer …"}: a header list, an environment, tags. Its value is masked too, as
+// the trace record masks it (ADR-0017). Only a name shaped like a key counts.
+const PAIR_NAMES = ['name', 'key', 'header', 'field', 'parameterkey', 'parametername'];
+const PAIR_VALUES = ['value', 'parametervalue'];
+const namesCredential = x => typeof x === 'string' && x.length <= 128 && !/\s/.test(x) && isSecretKey(x);
+// A value as the panel may show it: every credential masked, at any depth.
+function maskDeep(v) {
+  if (Array.isArray(v)) return v.map(maskDeep);
+  if (!v || typeof v !== 'object') return v;
+  const entries = Object.entries(v);
+  const named = entries.some(([k, x]) => PAIR_NAMES.includes(k.toLowerCase()) && namesCredential(x));
+  return Object.fromEntries(entries.map(([k, x]) => [k,
+    isSecretKey(k) || (named && x !== null && PAIR_VALUES.includes(k.toLowerCase())) ? 'hidden' : maskDeep(x)]));
+}
 const parsed = s => { if (typeof s !== 'string') return s; try { return JSON.parse(s); } catch { return s; } };
 const masked = v => maskDeep(parsed(v));
 
 // A live region rewritten under the reader keeps their place: the control they
 // had focused gets the focus back, the <details> they had opened stay open.
-const placeOf = el => [el.tagName, el.dataset.act, el.dataset.seq, el.dataset.id, el.dataset.do, el.dataset.key,
+const placeOf = el => [el.tagName, el.dataset.act, el.dataset.path, el.dataset.seq, el.dataset.id, el.dataset.do, el.dataset.key,
   el.getAttribute('href'), el.closest('[data-key]')?.dataset.key, el.closest('[data-id]')?.dataset.id].join('|');
 function holdPlace(region) {
   const a = document.activeElement;
@@ -541,8 +555,9 @@ function holdPlace(region) {
   return () => {
     for (const d of $$('details', region)) if (open.has(placeOf(d))) d.open = true;
     if (!focused) return;
-    const f = $$('a[href], button, input, select, textarea, summary, [tabindex]', region).find(x => placeOf(x) === focused);
-    if (f) f.focus({preventScroll: true});
+    // only a control that is surely the same one: Enter on another could replay or discard
+    const same = $$('a[href], button, input, select, textarea, summary, [tabindex]', region).filter(x => placeOf(x) === focused);
+    if (same.length === 1) same[0].focus({preventScroll: true});
   };
 }
 // A region the polls refresh is written only when what it shows changed.
@@ -724,10 +739,11 @@ function parseRoute() {
   const parts = path.split('/').filter(Boolean).map(decoded);
   return {page: parts[0] || 'map', arg: parts[1] || '', q: new URLSearchParams(query || ''), focus: []};
 }
-let R = parseRoute();
+let R = parseRoute();  // the route asked for
+let SHOWN = null;      // the route of the page on screen
 let pageToken = 0;
 async function render(opts = {}) {
-  R = parseRoute();
+  const r = R = parseRoute();
   const token = ++pageToken;
   markRail();
   const y = window.scrollY;
@@ -736,10 +752,10 @@ async function render(opts = {}) {
   // once it is on screen, never while an older page still is
   const hooks = {after: null, ctx: null};
   // the page name comes from the address bar: only our own pages, never a prototype's member
-  try { await (Object.hasOwn(PAGES, R.page) ? PAGES[R.page] : pageMissing)(view, R, hooks); }
+  try { await (Object.hasOwn(PAGES, r.page) ? PAGES[r.page] : pageMissing)(view, r, hooks); }
   catch (e) { hooks.ctx = null; view.innerHTML = `<div class="head"><h1>This page did not load</h1></div><p class="lede">${esc(e.message)}</p>`; }
   if (token !== pageToken) return;  // a newer route took over meanwhile
-  PAGE = hooks.ctx;
+  PAGE = hooks.ctx; SHOWN = r;
   view.id = 'page';
   $('#page').replaceWith(view);
   window.scrollTo(0, opts.keepScroll ? y : 0);
@@ -931,13 +947,13 @@ function chip(ctx, name, bare = false) {
 function chipValue(e) {
   const v = e.value;
   if (isSecretKey(e.name)) return 'hidden';
-  if (Array.isArray(v)) return esc(trunc(v.map(show).join(', '), 40));
+  if (Array.isArray(v)) return esc(trunc(maskDeep(v).map(show).join(', '), 40));
   if (v && typeof v === 'object') return plural(Object.keys(v).length, 'entry', 'entries');
   return esc(trunc(show(v), 40));
 }
 function chipLabel(e) {
   const v = e.value, scalar = !isSecretKey(e.name) && (Array.isArray(v) || !v || typeof v !== 'object');
-  return scalar ? `${esc(trunc(Array.isArray(v) ? v.map(show).join(', ') : show(v), 28))} <span class="n">${esc(e.name)}</span>`
+  return scalar ? `${esc(trunc(Array.isArray(v) ? maskDeep(v).map(show).join(', ') : show(v), 28))} <span class="n">${esc(e.name)}</span>`
     : `${esc(e.name)} <span class="n">${chipValue(e)}</span>`;
 }
 
@@ -1013,7 +1029,7 @@ function summarize(v) {
 }
 function sampleHtml(v, name) {
   if (v === undefined) return '<span class="none">not in the sample</span>';
-  if (name && isSecretKey(String(name).split('.').pop())) return '<span class="sv">hidden</span>';
+  if (name && secretPath(name)) return '<span class="sv">hidden</span>';
   return `<span class="sv" title="${esc(trunc(maskDeep(v), 600))}">${esc(summarize(v))}</span>`;
 }
 const stop = (cls, mark, title, rest, body) =>
@@ -1023,11 +1039,7 @@ function flowLede(f) {
   const evs = S.events.filter(e => e.flow === 'flow:' + f.name);
   if (!evs.length) return 'No event has gone through it yet.';
   // one event retried five times is one event: it failed if its last attempt did
-  const byEvent = new Map();
-  for (const e of evs) {
-    const id = e.trace_id || 'seq' + e.seq, prev = byEvent.get(id);
-    if (!prev || e.seq > prev.seq) byEvent.set(id, e);
-  }
+  const byEvent = lastAttempts(evs);
   const n = byEvent.size, failed = [...byEvent.values()].filter(e => !e.ok).length;
   const last = Math.max(...evs.map(e => e.ts || 0));
   const tally = failed ? `<b class="bad">${failed} of the last ${n} failed.</b>` : n === 1 ? 'It went through.' : `Of the last ${n}, none failed.`;
@@ -1267,7 +1279,7 @@ function buildEditor(ctx, e) {
     const text = mode === 'list' ? original.map(show).join(', ') : mode === 'rule' ? ruleToText(original) : show(original);
     if (label != null) grid.insertAdjacentHTML('beforeend', `<span class="from">${esc(label)}</span><span class="arrow">${icon('chev')}</span>`);
     const input = document.createElement('input');
-    input.type = secret || (label != null && String(label).split('.').some(isSecretKey)) ? 'password' : 'text';
+    input.type = secret || (label != null && secretPath(label)) ? 'password' : 'text';
     input.autocomplete = 'off'; input.spellcheck = false; input.value = text;
     input.setAttribute('aria-label', label != null ? `${e.name}, ${label}` : e.name);
     grid.appendChild(input);
@@ -1294,6 +1306,10 @@ function buildEditor(ctx, e) {
         addField(k, k, val, 'value');
       }
     }
+  } else if (Array.isArray(v) && v.some(x => x !== null && typeof x === 'object')) {
+    // a list of entries: a comma does not split it, and its keys can name a credential
+    grid.className = 'pairs single';
+    grid.innerHTML = `<code class="ro" title="A list of entries: change it in the code">${esc(secret ? 'hidden' : trunc(maskDeep(v), 120))}</code>`;
   } else {
     grid.className = 'pairs single';
     addField(null, '-', v, Array.isArray(v) ? 'list' : 'value');
@@ -1315,6 +1331,8 @@ function buildEditor(ctx, e) {
   function undo() {
     if (!active) return;
     const f = active;
+    // during a check too: its answer is then dropped
+    f.input.readOnly = false;
     f.input.value = f.text; changed(f); f.input.focus();
   }
   function value(f) {
@@ -1353,7 +1371,7 @@ function buildEditor(ctx, e) {
     field.input.readOnly = false;
     if (active !== field || field.input.value !== asked) return;  // undone meanwhile
     checked = asked;
-    const hide = secret || isSecretKey(String(field.key).split('/').pop());
+    const hide = secret || secretPath(field.key);
     result.innerHTML = res ? replayHtml(res, hide)
       : `<p><b>It could not be checked on recent events.</b> ${esc(String(error.message).slice(0, 300))}</p>`;
     result.hidden = false;
@@ -1416,7 +1434,7 @@ function diffLine(r, hide) {
   be.forEach((e, i) => diffValues(e.payload, ae[i].payload, '', parts));
   if (!parts.length) return '<span class="muted">the same output</span>';
   const val = (k, v) => v === undefined ? '<span class="muted">nothing</span>'
-    : hide || isSecretKey(String(k).split('.').pop()) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
+    : hide || secretPath(k) ? '<span class="muted">hidden</span>' : esc(trunc(maskDeep(v), 34));
   return parts.slice(0, 3).map(([k, x, y]) => `<code>${esc(k)}</code> ${val(k, x)} ${sep} <b>${val(k, y)}</b>`).join('; ');
 }
 function replayHtml(res, hide) {
@@ -1598,11 +1616,20 @@ const A = {flow: '', sig: '', seen: new Set()};
 // The events ring holds each unit's last events; the hops of one event share
 // its trace id (ADR-0034), so an event is one row whatever it went through.
 // Where a unit sits on an event's path: 0 a source that let it in, 1 a flow,
-// 2 a connector that took it out.
+// 2 a connector it went out through (a sink, or a call a flow made).
 function rankOf(u) {
   if (u.startsWith('flow:')) return 1;
   const c = (S.graph.connectors || []).find(c => 'connector:' + c.name === u);
-  return c && (c.subjects_in || []).length ? 2 : 0;
+  return c && /^(sink|rpc)/.test(c.kind || '') ? 2 : 0;
+}
+// One message a unit handled: its retries share its stream sequence; a hop that
+// consumed none (what a source let in) is a message alone. A flow's loop sends
+// several messages in one trace: one that failed is not undone by the others.
+const messageOf = h => h.flow + '|' + (h.stream_seq != null ? 's' + h.stream_seq : 'h' + h.seq);
+function lastAttempts(hops) {
+  const last = new Map();
+  for (const h of hops) { const k = messageOf(h), p = last.get(k); if (!p || h.seq > p.seq) last.set(k, h); }
+  return last;
 }
 function traceGroups(events, flow) {
   const by = new Map();
@@ -1615,37 +1642,48 @@ function traceGroups(events, flow) {
   for (const [id, hops] of by) {
     hops.sort((a, b) => (a.ts - b.ts) || (rankOf(a.flow) - rankOf(b.flow)) || (a.seq - b.seq));
     if (flow && !hops.some(h => h.flow === 'flow:' + flow)) continue;
-    // a unit retried until it went through went through: its last attempt decides
-    const last = new Map();
-    for (const h of hops) { const p = last.get(h.flow); if (!p || h.seq > p.seq) last.set(h.flow, h); }
-    const failed = [...last.values()].find(h => !h.ok) || null;
+    // a message retried until it went through went through: its last attempt decides
+    const failed = [...lastAttempts(hops).values()].sort((a, b) => a.seq - b.seq).find(h => !h.ok) || null;
     groups.push({id, traced: !id.startsWith('seq-'), hops, ts: Math.min(...hops.map(h => h.ts || 0)), ok: !failed, failed});
   }
   return groups.sort((a, b) => b.ts - a.ts || b.hops[0].seq - a.hops[0].seq);
 }
 const unitHtml = (u, tries = 1) => `<span class="u">${icon(String(u).startsWith('connector:') ? 'plug' : 'flow')}${esc(shortName(unitName(u)))}${tries > 1 ? ` <span class="tries">${tries} attempts</span>` : ''}</span>`;
+// The flows of one event by how far down its path they are: a flow that read
+// what another sent comes after it; two that read the same subject sit side by side.
+function flowLevels(hops) {
+  const flows = hops.filter(h => rankOf(h.flow) === 1), level = new Map(flows.map(h => [h.flow, 0]));
+  for (let pass = 0, moved = true; moved && pass <= flows.length; pass++) {
+    moved = false;
+    for (const h of flows) for (const p of flows) {
+      if (p.flow === h.flow || !(p.emits || []).includes(h.subject) || level.get(p.flow) + 1 <= level.get(h.flow)) continue;
+      level.set(h.flow, level.get(p.flow) + 1); moved = true;
+    }
+  }
+  const out = [];
+  for (const [u, l] of level) (out[l] = out[l] || []).push(u);
+  return out.filter(Boolean);
+}
 function rowHtml(g) {
   const first = g.hops[0], failed = g.failed;
   const sep = icon('chev', 'sep');
-  // What let it in, the flows that handled it, where it went: two flows that
-  // read the same subject handled it side by side, they never fed each other.
-  // A unit retried reads once, with its number of attempts.
-  const stages = [[], [], []], tries = new Map();
-  for (const h of g.hops) {
-    tries.set(h.flow, (tries.get(h.flow) || 0) + 1);
-    const st = stages[rankOf(h.flow)];
-    if (!st.includes(h.flow)) st.push(h.flow);
-  }
-  // what the flows sent that no unit here took: it left the runtime on the bus
-  const taken = new Set(g.hops.map(h => h.subject));
-  const left = failed ? [] : uniq(g.hops.filter(h => h.ok && rankOf(h.flow) === 1).flatMap(h => h.emits || [])).filter(s => !taken.has(s));
+  // What let it in, the flows that handled it in the order they did, where it
+  // went. A unit retried reads once, with the attempts its message took.
+  const attempts = new Map(), tries = new Map();
+  for (const h of g.hops) { const k = messageOf(h); attempts.set(k, Math.max((attempts.get(k) || 0) + 1, h.attempt || 0)); }
+  for (const [k, n] of attempts) { const u = k.slice(0, k.lastIndexOf('|')); tries.set(u, Math.max(tries.get(u) || 0, n)); }
+  const units = rank => uniq(g.hops.filter(h => rankOf(h.flow) === rank).map(h => h.flow));
+  // what was sent that no unit here took: it left the runtime on the bus
+  const taken = new Set(g.hops.filter(h => rankOf(h.flow) !== 0).map(h => h.subject));
+  const left = failed ? [] : uniq(g.hops.filter(h => h.ok && rankOf(h.flow) < 2).flatMap(h => h.emits || [])).filter(s => !taken.has(s));
   // in each stage, in the order of their names: the same flows read the same way row after row
   const byName = (a, b) => shortName(unitName(a)).localeCompare(shortName(unitName(b)));
   const stage = items => items.length ? `<span class="stage">${items.join('<span class="and">,</span>')}</span>` : '';
+  const named = us => us.sort(byName).map(u => unitHtml(u, tries.get(u)));
   const parts = [
-    stage(stages[0].sort(byName).map(u => unitHtml(u, tries.get(u)))),
-    stage(stages[1].sort(byName).map(u => unitHtml(u, tries.get(u)))),
-    stage([...stages[2].sort(byName).map(u => unitHtml(u, tries.get(u))), ...left.sort().map(s => `<span class="subject out">${esc(s)}</span>`)]),
+    stage(named(units(0))),
+    ...flowLevels(g.hops).map(us => stage(named(us))),
+    stage([...named(units(2)), ...left.sort().map(s => `<span class="subject out">${esc(s)}</span>`)]),
   ].filter(Boolean);
   return `<div class="it" data-id="${esc(g.id)}">
     <button class="row" type="button" data-act="trace" aria-expanded="false" title="${esc(first.preview || '')}">
@@ -1677,7 +1715,7 @@ async function pageActivity(view, r, hooks) {
 // events wait behind a button instead of reflowing the page.
 function activityRefresh(force) {
   const list = $('#events');
-  if (!list) return;
+  if (!list || (!force && SHOWN !== R)) return;  // another page is loading
   const groups = traceGroups(S.events, A.flow);
   const sig = groups.map(g => g.id + g.hops.length + (g.ok ? '' : 'x')).join('|');
   if (!force && sig === A.sig) return;
@@ -1822,13 +1860,15 @@ async function pageReview(view, r, hooks) {
 }
 const ago = ts => { const s = Math.max(0, Math.floor(Date.now() / 1000) - (ts || 0));
   return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min` : `${Math.floor(s / 3600)} h`; };
+// A proposal that changes a credential: its value, and what it changes, stay hidden.
+const changesSecret = p => (p.kind === 'set_literal' || p.kind === 'version')
+  && (isSecretKey((p.payload || {}).name || '') || secretPath((p.payload || {}).key || ''));
 // What a proposal would change, in one line, keyed on its kind.
 function proposalChange(p) {
   const pl = p.payload || {};
   if (p.kind === 'set_literal' || p.kind === 'version') {
     const target = `${esc(baseName(pl.file || '?'))}: ${esc(pl.name || '?')}` + (pl.key && pl.key !== '-' ? '.' + esc(pl.key) : '');
-    const secret = isSecretKey(pl.name || '') || String(pl.key || '').split('/').some(isSecretKey);
-    return `<code>${target}</code> ${icon('chev', 'sep')} <code>${esc(secret ? 'hidden' : trunc(maskDeep(pl.value), 60))}</code>`;
+    return `<code>${target}</code> ${icon('chev', 'sep')} <code>${esc(changesSecret(p) ? 'hidden' : trunc(maskDeep(pl.value), 60))}</code>`;
   }
   return `<code>${esc(p.kind)}</code> ${esc(trunc(JSON.stringify(maskDeep(pl)), 80))}`;
 }
@@ -1838,6 +1878,8 @@ function evidenceBlock(p) {
   const e = p.evidence;
   const empty = e == null || e === '' || (Array.isArray(e) && !e.length) || (typeof e === 'object' && !Array.isArray(e) && !Object.keys(e).length);
   if (empty) return `<p class="noev">${icon('alert')}No evidence attached: approving it is a blind change.</p>`;
+  // what the flow made before and after can carry the credential itself
+  if (changesSecret(p)) return '<p class="muted">Evidence attached, not shown: the value it changes is a credential.</p>';
   const m = masked(e);
   const oneLine = m && typeof m === 'object' ? Object.entries(m).map(([k, v]) => `${k}: ${trunc(v, 40)}`).join(', ') : String(m);
   return `<details class="more" data-key="ev-${esc(p.id)}"><summary>Evidence: ${esc(trunc(oneLine, 90))}</summary><pre class="json">${esc(pretty(m))}</pre></details>`;
@@ -2006,15 +2048,14 @@ document.addEventListener('click', ev => {
 });
 
 /* ---------- live data ---------- */
-// What the page on screen reads from the events ring. Activity reads the newest
-// of all; a flow's or a connector's page, and Activity for one flow, read that
-// unit's events with the other hops of each: a timer that sends every second
+// What the page reads from the events ring. Activity reads the newest of all,
+// and for one flow, that flow's events with the other hops of each; a flow's or
+// a connector's page reads that unit's own. A timer that sends every second
 // never pushes a quiet flow's events out of its own page.
 function eventsUrl(r = R) {
-  const one = r.page === 'activity' ? r.q.get('flow') : '';
-  const unit = r.page === 'flow' ? 'flow:' + r.arg : r.page === 'connector' ? 'connector:' + r.arg : one ? 'flow:' + one : '';
-  if (unit) return '/events?paths=1&flow=' + enc(unit);
-  return r.page === 'activity' ? '/events' : null;
+  if (r.page === 'activity') { const one = r.q.get('flow'); return one ? '/events?paths=1&flow=' + enc('flow:' + one) : '/events'; }
+  if (r.page === 'flow' || r.page === 'connector') return '/events?flow=' + enc(r.page + ':' + r.arg);
+  return null;
 }
 async function loadEvents(r = R) {
   const url = eventsUrl(r);
@@ -2025,11 +2066,15 @@ async function loadEvents(r = R) {
   S.events = events;
   return true;
 }
+// The poll refreshes the page on screen, and only while no other is loading:
+// R runs ahead of the screen as soon as a link is followed.
 async function pollEvents() {
-  if (!await loadEvents()) return;
-  if (R.page === 'activity') activityRefresh();
-  if (R.page === 'flow') {
-    const el = $('#flow-lede'), f = (S.graph.flows || []).find(x => x.name === R.arg);
+  const r = SHOWN;
+  if (!r || r !== R || (r.page !== 'activity' && r.page !== 'flow')) return;
+  if (!await loadEvents(r) || SHOWN !== r) return;
+  if (r.page === 'activity') activityRefresh();
+  else {
+    const el = $('#flow-lede'), f = (S.graph.flows || []).find(x => x.name === r.arg);
     if (el && f) rewrite(el, flowLede(f));
   }
 }
@@ -2039,7 +2084,7 @@ async function pollReview() {
     S.dlq = d.dead_letters || []; S.proposals = p.proposals || [];
   } catch { return; }
   renderReviewCount();
-  if (R.page === 'review') reviewRefresh();
+  if (SHOWN && SHOWN.page === 'review') reviewRefresh();
 }
 // A live promote superseded by a git deploy (ADR-0021).
 async function pollEvictions() {

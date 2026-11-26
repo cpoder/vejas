@@ -618,13 +618,23 @@ pub fn literal_doc(src: &str, value_start: usize) -> Option<String> {
 /// the bare names it never assigns (`id`, `email`), and the paths under them
 /// or under `event` (`shipping_address.country`, `event.total` as `total`).
 fn collect_reads(e: &Expr, own: &[String], out: &mut Vec<String>) {
+    reads_of(e, own, false, out)
+}
+
+/// `own` holds names (`total`) and the paths the flow set inside one
+/// (`customer.email`): a path under one of them is the flow's. `item_keys`:
+/// inside a filter's condition, `line_items[qty > 10]`, where a bare name is
+/// a key of each item, which only the run knows; there only the `event.`
+/// paths and the business literals are the flow's.
+fn reads_of(e: &Expr, own: &[String], item_keys: bool, out: &mut Vec<String>) {
     let mut push = |name: String| {
         if !out.contains(&name) {
             out.push(name);
         }
     };
+    let the_flows = |root: &str| !item_keys || is_upper_name(root);
     match e {
-        Expr::Var(n) if n != "event" && !own.contains(n) => push(n.clone()),
+        Expr::Var(n) if n != "event" && !own.contains(n) && the_flows(n) => push(n.clone()),
         Expr::Field(..) => {
             // the dotted path, when it bottoms out at a name
             let mut segments = Vec::new();
@@ -633,49 +643,50 @@ fn collect_reads(e: &Expr, own: &[String], out: &mut Vec<String>) {
                 segments.push(name.clone());
                 at = base;
             }
+            segments.reverse();
+            let set_by_the_flow = |root: &str| {
+                let mut path = root.to_string();
+                own.contains(&path)
+                    || segments.iter().any(|s| {
+                        path.push('.');
+                        path.push_str(s);
+                        own.contains(&path)
+                    })
+            };
             match at {
-                Expr::Var(root) if root == "event" || !own.contains(root) => {
-                    segments.reverse();
-                    if root != "event" {
-                        segments.insert(0, root.clone());
-                    }
+                Expr::Var(root) if root == "event" => {
                     if !segments.is_empty() {
                         push(segments.join("."));
                     }
                 }
-                other => collect_reads(other, own, out),
+                Expr::Var(root) if the_flows(root) && !set_by_the_flow(root) => {
+                    segments.insert(0, root.clone());
+                    push(segments.join("."));
+                }
+                other => reads_of(other, own, item_keys, out),
             }
         }
         Expr::Var(_) | Expr::Lit(_) => {}
         Expr::FString(parts) => {
             for p in parts {
                 if let FStringPart::Expr(e) = p {
-                    collect_reads(e, own, out);
+                    reads_of(e, own, item_keys, out);
                 }
             }
         }
-        Expr::Doc(fields) => fields.iter().for_each(|(_, v)| collect_reads(v, own, out)),
-        Expr::Array(items) => items.iter().for_each(|i| collect_reads(i, own, out)),
-        Expr::Projection(b) | Expr::Unary(_, b) => collect_reads(b, own, out),
+        Expr::Doc(fields) => fields.iter().for_each(|(_, v)| reads_of(v, own, item_keys, out)),
+        Expr::Array(items) => items.iter().for_each(|i| reads_of(i, own, item_keys, out)),
+        Expr::Projection(b) | Expr::Unary(_, b) => reads_of(b, own, item_keys, out),
         Expr::Index(a, b) | Expr::Bin(_, a, b) => {
-            collect_reads(a, own, out);
-            collect_reads(b, own, out);
+            reads_of(a, own, item_keys, out);
+            reads_of(b, own, item_keys, out);
         }
         Expr::Filter(items, cond) => {
-            collect_reads(items, own, out);
-            // `line_items[qty > 10]`: the condition reads each item's keys,
-            // which only the run knows. Of its names, only the business
-            // literals are the flow's.
-            let mut names = Vec::new();
-            collect_reads(cond, own, &mut names);
-            for n in names {
-                if is_upper_name(n.split('.').next().unwrap_or(&n)) && !out.contains(&n) {
-                    out.push(n);
-                }
-            }
+            reads_of(items, own, item_keys, out);
+            reads_of(cond, own, true, out);
         }
-        Expr::Call(_, args) => args.iter().for_each(|a| collect_reads(a, own, out)),
-        Expr::Invoke(_, args) => args.iter().for_each(|(_, v)| collect_reads(v, own, out)),
+        Expr::Call(_, args) => args.iter().for_each(|a| reads_of(a, own, item_keys, out)),
+        Expr::Invoke(_, args) => args.iter().for_each(|(_, v)| reads_of(v, own, item_keys, out)),
     }
 }
 
@@ -729,8 +740,10 @@ fn reads_in_order(stmts: &[Stmt], set: &mut Vec<String>, makes: &[(String, Vec<S
         match s {
             Stmt::Assign(path, e) => {
                 collect_reads(e, set, out);
-                if let Some(root) = path.first() {
-                    add(set, root);
+                // `customer.email = …` sets that field: the event's other
+                // fields under `customer` are still the event's
+                if !path.is_empty() {
+                    add(set, &path.join("."));
                 }
             }
             Stmt::For(var, iter, body) => {
@@ -2875,6 +2888,17 @@ end\n";
         let shape = flow_shape(&prog, src, &[]);
         assert_eq!(shape["reads"], json!(["line_items"]));
         assert_eq!(shape["steps"][0]["literals"], json!(["MIN_QTY"]));
+        // what the condition reads through `event.` is the event's
+        let src = "source \"vx.in\"\nbig = line_items[qty > event.min_qty and sku in event.wanted]\nemit \"vx.out\", {big: big}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["line_items", "min_qty", "wanted"]));
+    }
+
+    #[test]
+    fn setting_one_field_leaves_the_others_read_from_the_event() {
+        let src = "source \"vx.in\"\ncustomer.email = lower(customer.email)\nname = customer.name\nemit \"vx.out\", {email: customer.email, name: name, all: customer}\n";
+        let prog = parse(src).unwrap();
+        assert_eq!(flow_shape(&prog, src, &[])["reads"], json!(["customer.email", "customer.name", "customer"]));
     }
 
     #[test]

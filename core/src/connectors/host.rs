@@ -32,7 +32,7 @@ impl Host for Runtime {
             record::end(span, extras);
         }
         crate::record_trace_full(
-            hop.unit, hop.subject, ok, hop.error, hop.emits, hop.preview, None, hop.summary, hop.trace,
+            hop.unit, hop.subject, ok, hop.error, hop.emits, hop.preview, None, hop.summary, hop.trace, hop.delivery,
         );
     }
 }

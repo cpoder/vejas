@@ -132,8 +132,9 @@ pub fn record_trace(
     preview: String,
     event: Option<Value>,
     trace: Option<&trace::Hop>,
+    delivery: Option<bus::Delivery>,
 ) {
-    record_trace_full(flow, subject, ok, error, emits, preview, event, None, trace)
+    record_trace_full(flow, subject, ok, error, emits, preview, event, None, trace, delivery)
 }
 
 /// Full form: `response` carries a sink's response-body summary (what the
@@ -150,6 +151,7 @@ pub fn record_trace_full(
     event: Option<Value>,
     response: Option<String>,
     trace: Option<&trace::Hop>,
+    delivery: Option<bus::Delivery>,
 ) {
     // The trace this hop belongs to (ADR-0034): what an operator copies into
     // the tracing backend to see the whole path of this event.
@@ -164,6 +166,10 @@ pub fn record_trace_full(
         "seq": seq, "ts": now_secs(), "flow": unit, "subject": subject,
         "ok": ok, "error": error, "emits": emits, "preview": preview,
         "response": response, "trace_id": trace_id, "span_id": span_id,
+        // the JetStream message the hop consumed and which delivery of it this
+        // was: a retry shares the message, another message of the trace does not
+        "stream_seq": delivery.as_ref().map(|d| d.stream_seq),
+        "attempt": delivery.as_ref().map(|d| d.delivered),
         // the full event, kept for shadow-replay; stripped from /events output
         "event": event,
     }));
@@ -186,41 +192,63 @@ fn events_with_paths_json(unit: &str) -> String {
     events_out(Some(unit), true)
 }
 
+/// The other hops `/events?paths=1` gives with a unit's events, the newest.
+const PATH_HOPS_MAX: usize = 200;
+
 fn events_out(flow: Option<&str>, paths: bool) -> String {
-    let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    let traces: std::collections::HashSet<&str> = match (flow, paths) {
-        (Some(f), true) => map
-            .get(f)
-            .map(|ring| ring.iter().filter_map(|e| e["trace_id"].as_str()).collect())
-            .unwrap_or_default(),
-        _ => Default::default(),
+    let newest_first = |hops: &mut Vec<&Value>| {
+        hops.sort_unstable_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)))
     };
-    let traces = &traces;
-    let mut all: Vec<Value> = map
-        .iter()
-        .flat_map(|(name, ring)| {
-            let mine = flow.is_none_or(|f| f == name.as_str());
-            ring.iter()
-                .filter(move |e| mine || e["trace_id"].as_str().is_some_and(|t| traces.contains(t)))
-                .map(|e| {
-                    let mut e = e.clone();
-                    if let Some(o) = e.as_object_mut() {
-                        // Hot loops store the event and no preview (one JSON walk
-                        // less per message); derive it here, on read.
-                        if o.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
-                            let pv = o.get("event").map(preview_of).unwrap_or_default();
-                            o.insert("preview".into(), Value::String(pv));
-                        }
-                        o.remove("event");
+    // Every message's hop waits on this lock: under it, only the choice and a
+    // copy of what goes out; the serialising after.
+    let events: Vec<Value> = {
+        let map = TRACES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let mut picked: Vec<&Value> = match flow {
+            Some(f) => {
+                // the unit's own ring (50) whole; the other hops capped, so a
+                // busy path never pushes the unit's oldest events out
+                let mut own: Vec<&Value> = map.get(f).map(|ring| ring.iter().collect()).unwrap_or_default();
+                if paths {
+                    let traces: HashSet<&str> = own.iter().filter_map(|e| e["trace_id"].as_str()).collect();
+                    let mut others: Vec<&Value> = map
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != f)
+                        .flat_map(|(_, ring)| ring.iter())
+                        .filter(|e| e["trace_id"].as_str().is_some_and(|t| traces.contains(t)))
+                        .collect();
+                    newest_first(&mut others);
+                    others.truncate(PATH_HOPS_MAX);
+                    own.extend(others);
+                }
+                own
+            }
+            None => map.values().flat_map(|ring| ring.iter()).collect(),
+        };
+        newest_first(&mut picked);
+        if flow.is_none() {
+            picked.truncate(100);
+        }
+        picked
+            .into_iter()
+            .map(|e| {
+                let mut out = serde_json::Map::new();
+                if let Some(o) = e.as_object() {
+                    // the stored event stays in (replay fuel); a copy of the rest
+                    for (k, v) in o.iter().filter(|(k, _)| k.as_str() != "event") {
+                        out.insert(k.clone(), v.clone());
                     }
-                    e
-                })
-        })
-        .collect();
-    all.sort_by_key(|e| std::cmp::Reverse(e["seq"].as_u64().unwrap_or(0)));
-    // a unit's ring holds 50; with the other hops of those events, 200 holds them
-    all.truncate(if paths { 200 } else { 100 });
-    json!({ "events": all }).to_string()
+                    // Hot loops store the event and no preview (one JSON walk
+                    // less per message); derive it here, on read.
+                    if out.get("preview").and_then(Value::as_str).is_none_or(str::is_empty) {
+                        let pv = o.get("event").map(preview_of).unwrap_or_default();
+                        out.insert("preview".into(), Value::String(pv));
+                    }
+                }
+                Value::Object(out)
+            })
+            .collect()
+    };
+    json!({ "events": events }).to_string()
 }
 
 /// A unit's file as traces and the panel name it: relative to the project
@@ -1316,12 +1344,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 Ok(()) => {
                                     metrics::inc_dead_letter(&handle.spec.name);
                                     record_trace(&handle.spec.name, &msg.subject, false,
-                                        Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop));
+                                        Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.ack();
                                 }
                                 Err(de) => {
                                     record_trace(&handle.spec.name, &msg.subject, false,
-                                        Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None, Some(&hop));
+                                        Some(format!("{err} — DLQ publish failed: {de}")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.nak();
                                 }
                             }
@@ -1383,6 +1411,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 String::new(),
                                 Some(event),
                                 Some(&hop),
+                                msg.delivery(),
                             );
                             to_ack.push(msg); // acked after the batch flush
                         }
@@ -1402,19 +1431,19 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                         metrics::inc_dead_letter(&handle.spec.name);
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
-                                            vec![], String::new(), Some(event.clone()), Some(&hop));
+                                            vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.ack();
                                     }
                                     Err(de) => {
                                         record_trace(&handle.spec.name, &msg.subject, false,
                                             Some(format!("{e} — DLQ publish failed: {de}")),
-                                            vec![], String::new(), Some(event.clone()), Some(&hop));
+                                            vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.nak();
                                     }
                                 }
                             } else {
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], String::new(), Some(event.clone()), Some(&hop));
+                                    vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                 // no ack -> redelivery after ack_wait
                             }
                             if observing {
@@ -1905,6 +1934,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     connectors::trace_preview(&msg.data),
                                     None,
                                     Some(&hop),
+                                    msg.delivery(),
                                 );
                                 if ok {
                                     to_ack.push((msg, seq));
@@ -1939,7 +1969,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
                                 }
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop));
+                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
                                 set_state(&handle, |st| st.last_error = Some(e));
                             }
                         }
@@ -5392,8 +5422,8 @@ mod tests {
             "source \"vx.rp.test\"\nTH = 500\nif amount > TH:\n  emit \"vx.out\", {a: amount}\nend\n",
         )
         .unwrap();
-        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec!["vx.out".into()], "{}".into(), Some(json!({"amount": 700})), None);
-        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec![], "{}".into(), Some(json!({"amount": 300})), None);
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec!["vx.out".into()], "{}".into(), Some(json!({"amount": 700})), None, None);
+        record_trace("flow:replay_probe", "vx.rp.test", true, None, vec![], "{}".into(), Some(json!({"amount": 300})), None, None);
         let diff = replay_literal(&root, "flows/replay_probe.vjs", "TH", "-", &json!(200), 20).unwrap();
         assert_eq!(diff["events"], 2);
         // 700 emitted before and after; 300 emits only after the change
@@ -5577,7 +5607,7 @@ mod tests {
 
     #[test]
     fn events_json_strips_the_full_event() {
-        record_trace("flow:strip_probe", "vx.sp.test", true, None, vec![], "{\"a\":1}".into(), Some(json!({"a": 1})), None);
+        record_trace("flow:strip_probe", "vx.sp.test", true, None, vec![], "{\"a\":1}".into(), Some(json!({"a": 1})), None, None);
         let out: Value = serde_json::from_str(&events_json(Some("flow:strip_probe"))).unwrap();
         let entry = &out["events"][0];
         assert_eq!(entry["flow"], "flow:strip_probe");
@@ -5589,17 +5619,54 @@ mod tests {
     fn a_units_events_come_with_the_other_hops_of_their_path() {
         let hook = trace::Hop::begin(None);
         let flow = hook.child();
-        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&hook));
-        record_trace("flow:paths_probe", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&flow));
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&hook), None);
+        record_trace("flow:paths_probe", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&flow), None);
         let elsewhere = trace::Hop::begin(None);
-        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&elsewhere));
-        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, None);
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, Some(&elsewhere), None);
+        record_trace("connector:paths_hook", "vx.paths.in", true, None, vec![], "{}".into(), None, None, None);
         let out: Value = serde_json::from_str(&events_with_paths_json("flow:paths_probe")).unwrap();
         let units: Vec<&str> = out["events"].as_array().unwrap().iter().filter_map(|e| e["flow"].as_str()).collect();
         assert_eq!(units, ["flow:paths_probe", "connector:paths_hook"],
                    "the flow's event and the webhook's hop of it, not the webhook's other events");
         let alone: Value = serde_json::from_str(&events_json(Some("flow:paths_probe"))).unwrap();
         assert_eq!(alone["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_busy_path_never_pushes_the_units_own_events_out() {
+        let hook = trace::Hop::begin(None);
+        let flow = hook.child();
+        record_trace("flow:cap_probe", "vx.cap.in", true, None, vec![], "{}".into(), None, Some(&flow), None);
+        // newer hops of the same trace, more than the cap, over five rings of 50
+        for i in 0..PATH_HOPS_MAX + 10 {
+            let unit = format!("connector:cap_hook_{}", i % 5);
+            record_trace(&unit, "vx.cap.in", true, None, vec![], "{}".into(), None, Some(&hook), None);
+        }
+        let out: Value = serde_json::from_str(&events_with_paths_json("flow:cap_probe")).unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), PATH_HOPS_MAX + 1);
+        assert_eq!(events.last().unwrap()["flow"], "flow:cap_probe", "the oldest, and still there");
+    }
+
+    #[test]
+    fn a_retry_and_another_message_of_one_trace_read_apart() {
+        let hop = trace::Hop::begin(None);
+        let delivery = |delivered, stream_seq| Some(bus::Delivery { delivered, stream_seq });
+        record_trace("flow:retry_probe", "vx.rt.in", false, Some("refused".into()), vec![], "{}".into(), None, Some(&hop), delivery(1, 41));
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(2, 41));
+        record_trace("flow:retry_probe", "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), delivery(1, 42));
+        let out: Value = serde_json::from_str(&events_json(Some("flow:retry_probe"))).unwrap();
+        let read: Vec<(u64, i64)> = out["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["stream_seq"].as_u64().unwrap(), e["attempt"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(read, [(42, 1), (41, 2), (41, 1)], "the retry shares its message; the other message has its own");
+        let source = "connector:retry_probe_source";
+        record_trace(source, "vx.rt.in", true, None, vec![], "{}".into(), None, Some(&hop), None);
+        let out: Value = serde_json::from_str(&events_json(Some(source))).unwrap();
+        assert_eq!(out["events"][0]["stream_seq"], Value::Null, "a hop that consumed nothing names no message");
     }
 
     #[test]

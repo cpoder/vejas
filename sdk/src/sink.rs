@@ -88,6 +88,7 @@ impl Ctx {
                             input: Some(&msg.data),
                             answer: response.as_deref(),
                             latency: Some(latency),
+                            delivery: msg.delivery(),
                             ..HopEvent::default()
                         });
                         let _ = msg.ack();
@@ -129,6 +130,7 @@ impl Ctx {
                             input: Some(&msg.data),
                             latency: Some(latency),
                             dead_lettered,
+                            delivery: msg.delivery(),
                             ..HopEvent::default()
                         });
                         if dead_lettered {

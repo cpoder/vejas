@@ -29,9 +29,16 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   its checks (the rules projection), what it sends and where, and the comment
   written above each literal. `/surface` entries carry that comment as `doc`.
 - **`GET /events?flow=<unit>&paths=1`**: one unit's events, each with the other
-  hops of its path (same trace id). The panel's flow and connector pages read
-  it, so a unit that sends often (a timer) no longer pushes a quiet flow's
-  events out of its own page, as it did out of the newest hundred of all units.
+  hops of its path (same trace id). Activity for one flow reads it, and the
+  flow and connector pages read `?flow=<unit>`, so a unit that sends often (a
+  timer) no longer pushes a quiet flow's events out of its page, as it did out
+  of the newest hundred of all units. The unit's own events are all there; the
+  other hops are capped at the newest 200.
+- An event in the ring names the JetStream message its hop consumed and which
+  delivery it was (`stream_seq`, `attempt`; null for a source's publish). A
+  retry shares its message; the other messages a flow's loop sends in the same
+  trace do not, so one of them that failed is no longer hidden by the others
+  that went through.
 
 ### Changed
 - **The panel is redesigned around two people.** A menu on the left; a page
