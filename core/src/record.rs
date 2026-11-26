@@ -1194,8 +1194,11 @@ impl Scrub {
                 }
             } else if let Some(w) = whole {
                 // JSON that stops before its end: read as JSON as far as it
-                // goes, so that a pair is masked in it as in the whole
-                if let Some(json) = self.cut_json(text, &w, cut, drop, nest) {
+                // goes, so that a pair is masked in it as in the whole. When
+                // what it ends on is no value there (`[{…} 12`), it is read
+                // again without it.
+                let again = || made_whole(text, false).and_then(|w| self.cut_json(text, &w, cut, drop, nest));
+                if let Some(json) = self.cut_json(text, &w, cut, drop, nest).or_else(|| if drop { None } else { again() }) {
                     json_string(out, &clip(&json, max));
                     return;
                 }
@@ -1445,6 +1448,12 @@ fn made_whole(text: &str, ends_here: bool) -> Option<Whole> {
                         .is_ok_and(|v| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null))
                 };
                 if at + len == bytes.len() && !(ends_here && scalar()) {
+                    // a number a producer cut after its dot or its exponent:
+                    // its digits are the value, the rest follows as a text
+                    let digits = std::str::from_utf8(&bytes[at..]).unwrap_or("").trim_end_matches(['.', 'e', 'E', '+', '-']);
+                    if ends_here && serde_json::from_str::<Value>(digits).is_ok_and(|v| v.is_number()) {
+                        safe = (at + digits.len(), open.len());
+                    }
                     break;
                 }
                 at += len;
@@ -3088,6 +3097,23 @@ mod tests {
             assert!(!shown.contains("12345678"), "{shown}");
             let shown = shown_json(&scrub(&[]), &serde_json::json!({ "body": t })).to_string();
             assert!(!shown.contains("12345678"), "{shown}");
+        }
+        // nor one cut after a number's dot or exponent
+        for t in [
+            r#"{"env":[{"name":"DB_PASSWORD","value":12345678."#,
+            r#"{"env":[{"name":"DB_PASSWORD","value":-12345678e"#,
+            r#"{"env":[{"name":"DB_PASSWORD","value":1234567.5e-"#,
+        ] {
+            let shown = text(t, &[], false);
+            assert!(!shown.contains("1234"), "{shown}");
+        }
+        // one that ends on what JSON takes no value at still reads as JSON
+        for t in [
+            r#"{"env":[{"name":"DB_PASSWORD","value":"QQZXJ-sk-9"}],12"#,
+            r#"[{"name":"DB_PASSWORD","value":"QQZXJ-sk-9"} 12"#,
+        ] {
+            let shown = text(t, &[], false);
+            assert!(!shown.contains("QQZXJ") && shown.ends_with("12"), "{shown}");
         }
         // one that ends on what does not read as a value keeps it as a text
         assert_eq!(text(r#"{"a":1,"b":tru"#, &[], false), r#"{"a":1,"b":tru"#);
