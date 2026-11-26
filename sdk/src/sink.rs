@@ -69,6 +69,11 @@ impl Ctx {
                     // stopped mid-batch: leave the message un-acked, it redelivers
                     return Ok(());
                 }
+                // the replay of another unit's dead letter (ADR-0015 Amendment C)
+                if msg.replay_elsewhere(&ctx.name) {
+                    let _ = msg.ack();
+                    continue;
+                }
                 let hop = trace::Hop::begin(trace::of(&msg));
                 let carried = hop.context();
                 let preview = trace_preview(&msg.data);

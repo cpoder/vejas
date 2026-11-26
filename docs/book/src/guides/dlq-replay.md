@@ -21,6 +21,12 @@ trace (see [observability](observability.md)).
   automatic: if the logic was wrong, replaying before fixing just kills the
   message again. Purge (`/dlq/purge`) is equally explicit. Both are recorded
   in `VEJAS_AUDIT` with the actor and the count.
+- A replay goes back on the original subject **for the unit whose letter it
+  is** (`Vejas-Replay-For`): the other consumers of that subject, which
+  handled the event the first time, do not run it again. It names the
+  message that died (`Vejas-Replay-Of`), so the panel and the trace read the
+  letter and its replays as one event. A letter whose unit is no longer
+  declared stays, and the answer's `errors` says why.
 - In [governed mode](governed-mode.md) both are human acts: `vejas_dlq_replay`
   and `vejas_dlq_purge` are refused, and the HTTP routes want the
   `X-Approval-Token` header, which the panel sends.

@@ -113,6 +113,12 @@ fn run_sink(
             if !alive() {
                 return Ok(());
             }
+            // a dead letter's replay is for the unit the letter died in, never
+            // this bridge, which writes none (ADR-0015 Amendment C)
+            if m.replay_for().is_some() {
+                let _ = m.ack();
+                continue;
+            }
             match sink.publish_confirmed(&m.data, routing_key) {
                 Ok(true) => {
                     let _ = m.ack(); // confirmed by the broker → safe to ack the bus

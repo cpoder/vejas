@@ -72,6 +72,10 @@ pub fn hydrate_recent(
         }
         for m in &batch {
             scanned += 1;
+            // a dead letter's replay: a copy of an event the stream holds already
+            if m.replay_for().is_some() {
+                continue;
+            }
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data) {
                 // the stream sequence is the intrinsic join key for time-travel /
                 // canary diffs (ADR-0021) — no per-flow key to invent.

@@ -88,6 +88,16 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   1 MiB used to be cut at 1 MiB and refused as JSON that does not parse, and a
   chunked body was refused the same way.
 
+### Fixed
+- **A dead letter's replay runs again only in the unit whose letter it is**
+  (ADR-0015 Amendment C). It went back on the subject the letter came from,
+  where every consumer of that subject ran it again: a flow that had handled
+  the event the first time sent it on a second time. The replay now carries
+  its unit (`Vejas-Replay-For`), and every other consumer acks it unread: the
+  runtime's flows and sinks, and the MQ and AMQP bridges. A letter whose unit
+  is no longer declared stays, with the reason, instead of being replayed to
+  no one; the panel shows that reason instead of "Replayed.".
+
 ## [0.7.0] — 2026-11-26
 
 ### Added

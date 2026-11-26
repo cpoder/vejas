@@ -537,6 +537,12 @@ impl Delivery {
 /// replay as one message by it.
 pub const REPLAY_OF: &str = "Vejas-Replay-Of";
 
+/// The header a dead letter's replay carries: the unit whose letter it is
+/// (ADR-0015 Amendment C). The replay goes back on the subject the letter came
+/// from, where every consumer of that subject reads it; the others ack it
+/// unread ([`Message::replay_elsewhere`]).
+pub const REPLAY_FOR: &str = "Vejas-Replay-For";
+
 impl Message {
     fn new(message: async_nats::Message, link: Arc<Link>) -> Message {
         Message {
@@ -552,6 +558,18 @@ impl Message {
     /// outside Vejas may write `TraceParent` (ADR-0034).
     pub fn header(&self, name: &str) -> Option<&str> {
         header(self.headers.as_ref()?, name)
+    }
+
+    /// The unit this message is the replay of a dead letter for, if it is one
+    /// ([`REPLAY_FOR`]).
+    pub fn replay_for(&self) -> Option<&str> {
+        self.header(REPLAY_FOR)
+    }
+
+    /// A dead letter's replay for another unit than `unit`: the consumer acks
+    /// it and goes on, so that a replay runs again only where the letter died.
+    pub fn replay_elsewhere(&self, unit: &str) -> bool {
+        self.replay_for().is_some_and(|u| u != unit)
     }
 
     /// The JetStream delivery behind this message, if it is one.
@@ -913,29 +931,34 @@ impl JetStream {
         self.store(subject, headers, bytes)
     }
 
-    /// A dead letter's second chance (ADR-0015): traced, and naming the message
-    /// that died ([`REPLAY_OF`]). Neither header is ever the reason it fails:
-    /// past the server's limit, the replay goes without them, the name first.
+    /// A dead letter's second chance (ADR-0015): for the unit whose letter it
+    /// is ([`REPLAY_FOR`]), naming the message that died ([`REPLAY_OF`]), in
+    /// the trace it died in. Past the server's limit, the replay keeps the unit
+    /// alone; a replay that cannot say whose it is is not sent, as every
+    /// consumer of the subject would run it again.
     pub fn publish_replay(
         &self,
         subject: &str,
         payload: impl AsRef<[u8]>,
         trace: &impl TraceContext,
+        unit: &str,
         replay_of: Option<u64>,
     ) -> Result<u64, String> {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
         let limit = self.max_payload();
-        let mut headers = trace_headers_within(trace, bytes.len(), limit);
+        let mut headers = trace_headers(trace);
+        headers.insert(REPLAY_FOR, unit);
         if let Some(seq) = replay_of {
-            let mut named = headers.take().unwrap_or_default();
-            named.insert(REPLAY_OF, seq.to_string().as_str());
-            headers = if bytes.len() + headers_len(&named) <= limit {
-                Some(named)
-            } else {
-                trace_headers_within(trace, bytes.len(), limit)
-            };
+            headers.insert(REPLAY_OF, seq.to_string().as_str());
         }
-        self.store(subject, headers, bytes)
+        if bytes.len() + headers_len(&headers) > limit {
+            headers = HeaderMap::new();
+            headers.insert(REPLAY_FOR, unit);
+            if bytes.len() + headers_len(&headers) > limit {
+                return Err(format!("a replay for {unit} would pass the server's limit"));
+            }
+        }
+        self.store(subject, Some(headers), bytes)
     }
 
     fn store(&self, subject: &str, headers: Option<HeaderMap>, bytes: Bytes) -> Result<u64, String> {
@@ -1703,7 +1726,7 @@ mod live {
         let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         let died = js.publish_traced("t.in", "event", &Carried(tp, None)).unwrap();
         let replay = js
-            .publish_replay("t.in", "event", &Carried(tp, None), Some(died))
+            .publish_replay("t.in", "event", &Carried(tp, None), "flow:r", Some(died))
             .unwrap();
         let mut got: Vec<Message> = Vec::new();
         let start = Instant::now();
@@ -1715,6 +1738,15 @@ mod live {
         let d = got[1].delivery().unwrap();
         assert_eq!((d.stream_seq, d.replay_of, d.message()), (replay, Some(died), died));
         assert_eq!(got[1].header("traceparent"), Some(tp), "still in the trace it died in");
+        // for the unit whose letter it is; any other consumer of the subject leaves it
+        assert_eq!(got[1].replay_for(), Some("flow:r"));
+        assert!(!got[1].replay_elsewhere("flow:r"));
+        assert!(got[1].replay_elsewhere("connector:other"));
+        assert!(!got[0].replay_elsewhere("connector:other"), "not a replay: everyone's");
+        // too large to say whose it is: not sent
+        let max = js.max_payload();
+        let tight = vec![b'x'; max - 30];
+        assert!(js.publish_replay("t.in", &tight, &Carried(tp, None), "flow:r", Some(died)).is_err());
     }
 
     #[test]
