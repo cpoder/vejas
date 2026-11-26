@@ -1880,12 +1880,32 @@ pub struct Engine {
     /// The service whose statements are running, for `steps`; None in the
     /// flow itself.
     in_service: Option<Arc<str>>,
+    /// Whether an invoke of a service that answers reaches its system: never
+    /// in a run that is shown (ADR-0032).
+    calls: Calls,
+    /// Why a call of the last run got no answer: what its message does next.
+    failure: Option<crate::connectors::answer::Failure>,
+    /// The trace a call carries when the run's invokes have no span.
+    carried: Option<crate::trace::Context>,
+}
+
+/// Whether a run's calls reach a system (ADR-0032).
+#[derive(Clone, Copy, PartialEq)]
+enum Calls {
+    Made,
+    /// A run that is shown (a preview, a replay, the canary): it reads the
+    /// answers recorded with the event, and calls nothing.
+    Shown,
 }
 
 /// A service as the engine runs it: its statements, and the version of the
 /// source they came from, which the trace record joins the code with.
 struct Service {
     stmts: Block,
+    /// A service that answers from a system instead of running statements
+    /// (ADR-0032): its driver, and its declaration's settings with their
+    /// secrets resolved by the engine that loaded it.
+    answers: Option<(Arc<str>, crate::connectors::Config)>,
     /// `package:service`, as its steps name it.
     name: Arc<str>,
     /// Its source, hashed into its version the first time a run that records
@@ -2080,7 +2100,9 @@ impl Engine {
     /// placeholder, never the value (see `secrets::RedactedStore`).
     pub fn shadow(project_root: PathBuf, caller_pkg: String) -> Self {
         let store = crate::secrets::RedactedStore::new(crate::secrets::default_store());
-        Self::with_secrets(project_root, caller_pkg, Arc::new(store))
+        let mut engine = Self::with_secrets(project_root, caller_pkg, Arc::new(store));
+        engine.calls = Calls::Shown;
+        engine
     }
     pub fn with_secrets(
         project_root: PathBuf,
@@ -2097,7 +2119,47 @@ impl Engine {
             trace: None,
             steps: None,
             in_service: None,
+            calls: Calls::Made,
+            failure: None,
+            carried: None,
         }
+    }
+    /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
+    /// invoke's span, or else of the run. A run that is shown calls nothing.
+    fn answer(
+        &mut self,
+        name: &str,
+        driver: &str,
+        config: &crate::connectors::Config,
+        args: &Map<String, Value>,
+        hop: Option<&crate::trace::Hop>,
+    ) -> Result<Map<String, Value>, String> {
+        if self.calls == Calls::Shown {
+            let mut shown: String = args.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ");
+            if shown.len() > 200 {
+                let cut = (0..=200).rev().find(|&i| shown.is_char_boundary(i)).unwrap_or(0);
+                shown.truncate(cut);
+                shown.push('…');
+            }
+            return Err(format!(
+                "{name}({shown}) answers from a system, and a run that is shown calls none: no answer was recorded for it"
+            ));
+        }
+        let trace = hop.map(|hop| hop.context()).or_else(|| self.carried.clone());
+        crate::connectors::answer::call(name, driver, config, args, trace.as_ref()).map_err(|failure| {
+            let error = failure.error.clone();
+            self.failure = Some(failure);
+            error
+        })
+    }
+    /// Why a call of the last run got no answer, if one did not (ADR-0032).
+    pub fn take_failure(&mut self) -> Option<crate::connectors::answer::Failure> {
+        self.failure.take()
+    }
+    /// The trace the runs that follow carry to the systems they call, when
+    /// their invokes have no span of their own.
+    pub fn carry(&mut self, context: Option<crate::trace::Context>) {
+        self.carried = context;
     }
     /// Record a span per `invoke` under `hop` in the runs that follow, or stop
     /// recording (None). What was recorded and not taken is dropped.
@@ -2198,6 +2260,9 @@ impl Engine {
     pub fn service_makes(&mut self, name: &str) -> Result<Vec<String>, String> {
         let (pkg, svc) = self.resolve(name)?;
         let service = self.service(&pkg, &svc)?;
+        if service.answers.is_some() {
+            return Ok(["status", "body", "headers"].map(String::from).to_vec());
+        }
         let mut own = Vec::new();
         collect_own(&service.stmts, &mut own);
         Ok(own)
@@ -2233,7 +2298,33 @@ impl Engine {
         let src = std::fs::read_to_string(&path)
             .map_err(|_| format!("unknown service {key:?} (no {})", path.display()))?;
         let prog = parse(&src).map_err(|e| format!("service {key}: {e}"))?;
+        let answers = match &prog.driver {
+            None => None,
+            Some(driver) if crate::connectors::answer::DRIVERS.contains(&driver.as_str()) => {
+                // Its settings are its UPPERCASE names, evaluated as a
+                // connector's manifest is: secret() resolves here. A run that
+                // is shown calls nothing, so it resolves nothing either.
+                let config = match self.calls {
+                    Calls::Shown => Map::new(),
+                    Calls::Made => {
+                        let mut settings =
+                            Engine::with_secrets(self.project_root.clone(), pkg.to_string(), self.secrets.clone());
+                        let ctx = run(&prog, &Value::Object(Map::new()), &mut settings)
+                            .map_err(|e| format!("service {key}: {e}"))?;
+                        ctx.vars.into_iter().filter(|(k, _)| is_upper_name(k)).collect()
+                    }
+                };
+                Some((Arc::from(driver.as_str()), crate::connectors::Config(config)))
+            }
+            Some(driver) => {
+                return Err(format!(
+                    "service {key} declares driver {driver:?}, which answers no call: a service declares {}",
+                    crate::connectors::answer::DRIVERS.join(", ")
+                ))
+            }
+        };
         let service = Arc::new(Service {
+            answers,
             stmts: prog.stmts,
             name: Arc::from(key.as_str()),
             src: src.into_boxed_str(),
@@ -2252,6 +2343,7 @@ pub struct Ctx {
 }
 
 pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, String> {
+    engine.failure = None;
     let mut vars = Map::new();
     if let Value::Object(obj) = event {
         for (k, v) in obj {
@@ -2300,9 +2392,18 @@ fn run_service(
     });
     // The invoked service's own invokes resolve within ITS package.
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
-    let mut ctx = Ctx { vars: args.clone(), emits: Vec::new(), response: None };
-    ctx.vars.insert("event".into(), Value::Object(args));
-    let result = exec_block(&service.stmts, &mut ctx, engine);
+    let mut ctx = Ctx { vars: Map::new(), emits: Vec::new(), response: None };
+    let result = match &service.answers {
+        Some((driver, config)) => {
+            let hop = span.as_ref().map(|(hop, _)| hop);
+            engine.answer(name, driver, config, &args, hop).map(|answer| ctx.vars = answer)
+        }
+        None => {
+            ctx.vars = args.clone();
+            ctx.vars.insert("event".into(), Value::Object(args));
+            exec_block(&service.stmts, &mut ctx, engine)
+        }
+    };
     engine.caller_pkg = saved_pkg;
     if let Some(saved) = saved_service {
         engine.in_service = saved;
@@ -3275,6 +3376,134 @@ end\n";
             let e = eval_flow(&format!("emit \"vx.t\", {{v: \"{bad}\"}}"), json!({})).unwrap_err();
             assert!(e.contains("\\u"), "{bad}: {e}");
         }
+    }
+
+    /// A system to call on 127.0.0.1. It answers each request with what
+    /// `reply` gives for its URL (a status, a body, a delay in ms), and keeps
+    /// what it was sent: the method and URL, then each header.
+    fn system(reply: fn(&str) -> (u16, &'static str, u64)) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let mut sent = format!("{} {}", request.method(), request.url());
+                for h in request.headers() {
+                    sent.push_str(&format!("\n{}: {}", h.field, h.value));
+                }
+                kept.lock().unwrap().push(sent.to_ascii_lowercase());
+                // each answer on a thread of its own: a slow one holds up no other
+                std::thread::spawn(move || {
+                    let (status, body, delay) = reply(request.url());
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    let json = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
+                    let answer = tiny_http::Response::from_string(body).with_status_code(status).with_header(json);
+                    let _ = request.respond(answer);
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// A project whose service `get_order` answers from `url`, with `extra`
+    /// settings; its token is a secret.
+    fn declared(name: &str, url: &str, extra: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("vejas-answers-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        let declaration = r#"driver "http-rpc"
+BASE_URL = "@URL@"
+URL = "{BASE_URL}/orders/{id}"
+HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
+"#
+        .replace("@URL@", url)
+            + extra;
+        std::fs::write(root.join("services").join("get_order.vjs"), declaration).unwrap();
+        root
+    }
+
+    fn live(root: PathBuf) -> Engine {
+        let store = MapStore([("orders/token".to_string(), "s3cr3t-token".to_string())].into());
+        Engine::with_secrets(root, "default".into(), Arc::new(store))
+    }
+
+    /// The error of a run that must fail.
+    fn failed(run: Result<Ctx, String>) -> String {
+        match run {
+            Err(e) => e,
+            Ok(ctx) => panic!("the run did not fail: {:?}", ctx.emits),
+        }
+    }
+
+    #[test]
+    fn a_flow_reads_what_a_service_answers() {
+        let (url, seen) = system(|_| (200, r#"{"total": 42}"#, 0));
+        let mut engine = live(declared("reads", &url, ""));
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        engine.carry(crate::trace::Context::parse(tp, None));
+        let prog = parse(
+            "o = invoke get_order(id: event.id)\nemit \"vx.t\", {status: o.status, total: o.body.total, kind: o.headers[\"content-type\"]}\n",
+        )
+        .unwrap();
+        let ctx = run(&prog, &json!({"id": "A/1"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"status": 200, "total": 42, "kind": "application/json"}));
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(sent.starts_with("get /orders/a%2f1\n"), "{sent}");
+        assert!(sent.contains("\nauthorization: bearer s3cr3t-token"), "{sent}");
+        assert!(sent.contains("\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-"), "{sent}");
+        assert_eq!(engine.service_makes("get_order").unwrap(), ["status", "body", "headers"]);
+    }
+
+    #[test]
+    fn a_service_that_gives_no_answer_fails_the_run_and_says_what_comes_next() {
+        let (url, _) = system(|path| match path {
+            p if p.ends_with("/down") => (503, r#"{"error":"down"}"#, 0),
+            p if p.ends_with("/gone") => (404, "", 0),
+            p if p.ends_with("/slow") => (200, "{}", 600),
+            _ => (200, "{}", 0),
+        });
+        let prog = parse("o = invoke get_order(id: event.id)\nemit \"vx.t\", {s: o.status}\n").unwrap();
+        let mut engine = live(declared("fails", &url, "ATTEMPTS = 2\nDELAY_MS = 250\nTIMEOUT_MS = 200\n"));
+        let e = failed(run(&prog, &json!({"id": "down"}), &mut engine));
+        assert_eq!(e, "get_order: HTTP 503: {\"error\":\"down\"}");
+        let f = engine.take_failure().unwrap();
+        assert!(f.retry && !f.timed_out, "{f:?}");
+        assert_eq!((f.attempts, f.delay), (2, std::time::Duration::from_millis(250)));
+        assert_eq!(failed(run(&prog, &json!({"id": "gone"}), &mut engine)), "get_order: HTTP 404");
+        assert!(!engine.take_failure().unwrap().retry, "a 404 is not tried again");
+        assert_eq!(failed(run(&prog, &json!({"id": "slow"}), &mut engine)), "get_order: timeout after 200 ms");
+        let f = engine.take_failure().unwrap();
+        assert!(f.retry && f.timed_out, "{f:?}");
+        // A run that gets its answer leaves no failure behind.
+        run(&prog, &json!({"id": "ok"}), &mut engine).unwrap();
+        assert!(engine.take_failure().is_none());
+        // A status the service lists is an answer the flow decides on.
+        let mut engine = live(declared("answers", &url, "ANSWERS = [200, 404]\n"));
+        assert_eq!(run(&prog, &json!({"id": "gone"}), &mut engine).unwrap().emits[0].1, json!({"s": 404}));
+        // Nothing listens: a later delivery may get through.
+        let mut engine = live(declared("network", "http://127.0.0.1:9", ""));
+        let e = failed(run(&prog, &json!({"id": "x"}), &mut engine));
+        assert!(e.starts_with("get_order: network: "), "{e}");
+        assert!(engine.take_failure().unwrap().retry);
+        // An argument the URL does not take is an error, not a request without it.
+        let typo = parse("o = invoke get_order(id: 1, idd: 2)\n").unwrap();
+        let e = failed(run(&typo, &json!({}), &mut live(declared("typo", &url, ""))));
+        assert!(e.contains("idd appears nowhere"), "{e}");
+    }
+
+    #[test]
+    fn a_run_that_is_shown_calls_no_system() {
+        let (url, seen) = system(|_| (200, "{}", 0));
+        let root = declared("shown", &url, "");
+        std::fs::write(root.join("services").join("post_it.vjs"), "driver \"http-out\"\nURL = \"http://x\"\n").unwrap();
+        let prog = parse("o = invoke get_order(id: event.id)\nemit \"vx.t\", {s: o.status}\n").unwrap();
+        let mut engine = Engine::shadow(root.clone(), "default".into());
+        let e = failed(run(&prog, &json!({"id": "A1"}), &mut engine));
+        assert!(e.starts_with("get_order(id: \"A1\") answers from a system") && e.contains("calls none"), "{e}");
+        assert!(seen.lock().unwrap().is_empty(), "the system was called");
+        // Only a driver that answers can stand behind a service.
+        let e = failed(run(&parse("o = invoke post_it(a: 1)\n").unwrap(), &json!({}), &mut live(root)));
+        assert!(e.contains("declares driver \"http-out\", which answers no call"), "{e}");
     }
 
     struct MapStore(std::collections::HashMap<String, String>);

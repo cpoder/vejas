@@ -1,6 +1,6 @@
 # 0032 — `invoke` calls any service: code, or a connector that answers
 
-- Status: Proposed
+- Status: Accepted (partial). `http-rpc` is built: the call, its retries as deliveries, its dead letters, the `api` flow's 502 and 504, the trace carried on. A shown run refuses the call; recording answers and replaying them is not built.
 - Date: 2026-11-26
 
 ## Context

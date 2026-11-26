@@ -23,6 +23,7 @@
 // pool), two runtime services that lived here (audit, snapshots), and the
 // bundled drivers in connectors/drivers/, one module per protocol.
 
+pub mod answer;
 mod audit;
 mod drivers;
 mod host;

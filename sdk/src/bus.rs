@@ -599,6 +599,12 @@ impl Message {
         self.answer(Bytes::from_static(b"-NAK"))
     }
 
+    /// Ask for this message again after `delay`, not at once: a call that got
+    /// no answer gives its system that long (ADR-0032).
+    pub fn nak_after(&self, delay: Duration) -> Result<(), String> {
+        self.answer(Bytes::from(format!("-NAK {{\"delay\":{}}}", delay.as_nanos())))
+    }
+
     /// Answer a request. A message that expects no answer is left alone.
     pub fn respond(&self, payload: impl AsRef<[u8]>) -> Result<(), String> {
         self.answer(Bytes::copy_from_slice(payload.as_ref()))

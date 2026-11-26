@@ -65,32 +65,107 @@ pub(super) fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8
     }
 }
 
-/// POST for the sinks. With a trace, the request carries it as `traceparent`
+/// The headers a request sends: with a trace, it carries it as `traceparent`
 /// (and `tracestate`), replacing any the manifest set (ADR-0034).
+fn traced(headers: &[(String, String)], trace: Option<&trace::Context>) -> Vec<(String, String)> {
+    let Some(trace) = trace else {
+        return headers.to_vec();
+    };
+    let is_trace =
+        |k: &str| k.eq_ignore_ascii_case(trace::TRACEPARENT) || k.eq_ignore_ascii_case(trace::TRACESTATE);
+    let mut h: Vec<(String, String)> = headers.iter().filter(|(k, _)| !is_trace(k)).cloned().collect();
+    h.push((trace::TRACEPARENT.into(), trace.traceparent()));
+    if let Some(state) = &trace.state {
+        h.push((trace::TRACESTATE.into(), state.clone()));
+    }
+    h
+}
+
+/// What a system answered a call (ADR-0032): its status, its headers (names in
+/// lower case, a repeated one's values joined) and its body.
+pub(crate) struct Answer {
+    pub status: u16,
+    pub headers: serde_json::Map<String, serde_json::Value>,
+    pub body: Vec<u8>,
+}
+
+/// Why a call got no answer.
+pub(crate) enum NoAnswer {
+    /// None came within the call's timeout.
+    TimedOut,
+    /// The request did not get through, or its answer did not come back
+    /// whole: a later try may get one.
+    Network(String),
+    /// The request cannot be made, or its answer cannot be taken, however
+    /// often it is tried: a URL that does not parse, an answer over the cap.
+    Broken(String),
+}
+
+/// The most of an answer a call reads.
+const ANSWER_MAX: u64 = 8 << 20;
+
+/// One call of a service that answers: any method, a timeout of its own, the
+/// run's trace carried on. Every status is an answer here; the service decides
+/// which ones it takes.
+pub(crate) fn http_call(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    timeout: Duration,
+    trace: Option<&trace::Context>,
+) -> Result<Answer, NoAnswer> {
+    use std::io::Read as _;
+    let timed_out = |e: &std::io::Error| e.kind() == std::io::ErrorKind::TimedOut;
+    let mut req = http_agent().request(method, url).timeout(timeout);
+    for (k, v) in traced(headers, trace) {
+        req = req.set(&k, &v);
+    }
+    let sent = match body {
+        Some(b) => req.send_bytes(b),
+        None => req.call(),
+    };
+    let response = match sent {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(t)) => {
+            let cause = std::error::Error::source(&t).and_then(|s| s.downcast_ref::<std::io::Error>());
+            return Err(match t.kind() {
+                _ if cause.is_some_and(timed_out) => NoAnswer::TimedOut,
+                ureq::ErrorKind::Dns
+                | ureq::ErrorKind::ConnectionFailed
+                | ureq::ErrorKind::Io
+                | ureq::ErrorKind::BadStatus
+                | ureq::ErrorKind::ProxyConnect => NoAnswer::Network(t.to_string()),
+                _ => NoAnswer::Broken(t.to_string()),
+            });
+        }
+    };
+    let status = response.status();
+    let mut names = serde_json::Map::new();
+    for name in response.headers_names() {
+        let values = response.all(&name).join(", ");
+        names.insert(name.to_ascii_lowercase(), values.into());
+    }
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(ANSWER_MAX + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| if timed_out(&e) { NoAnswer::TimedOut } else { NoAnswer::Network(e.to_string()) })?;
+    if body.len() as u64 > ANSWER_MAX {
+        return Err(NoAnswer::Broken(format!("its answer is over {} MiB", ANSWER_MAX >> 20)));
+    }
+    Ok(Answer { status, headers: names, body })
+}
+
+/// POST for the sinks, carrying the trace (see [`traced`]).
 pub(super) fn http_post(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
     trace: Option<&trace::Context>,
 ) -> Result<Vec<u8>, String> {
-    let traced: Vec<(String, String)>;
-    let headers = match trace {
-        Some(trace) => {
-            let is_trace = |k: &str| {
-                k.eq_ignore_ascii_case(trace::TRACEPARENT) || k.eq_ignore_ascii_case(trace::TRACESTATE)
-            };
-            let mut h: Vec<(String, String)> =
-                headers.iter().filter(|(k, _)| !is_trace(k)).cloned().collect();
-            h.push((trace::TRACEPARENT.into(), trace.traceparent()));
-            if let Some(state) = &trace.state {
-                h.push((trace::TRACESTATE.into(), state.clone()));
-            }
-            traced = h;
-            &traced[..]
-        }
-        None => headers,
-    };
-    match http_request("POST", url, headers, Some(body))? {
+    match http_request("POST", url, &traced(headers, trace), Some(body))? {
         (code, out) if (200..300).contains(&code) => Ok(out),
         (code, out) => Err(format!(
             "HTTP {code}: {}",

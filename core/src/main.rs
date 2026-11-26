@@ -1509,6 +1509,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let t0 = Instant::now();
                     // Each `invoke` leaves a span under the hop, while spans are exported.
                     engine.trace_under(traced.then_some(&hop));
+                    // A system the run calls continues the message's trace (ADR-0032).
+                    engine.carry(Some(carried.clone()));
                     // The record says which statements the event went through.
                     engine.record_steps(record::on());
                     // Holding an emit is local, so a refusal is final for this message:
@@ -1572,8 +1574,14 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             // before ack, nak if the DLQ write fails.
                             let delivered =
                                 msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                            // A call that got no answer (ADR-0032): the message tries
+                            // again at its next delivery, after the service's delay,
+                            // while the service allows it; a call no later try can
+                            // change, or whose attempts are spent, is a dead letter now.
+                            let failure = engine.take_failure();
+                            let spent = failure.as_ref().is_some_and(|f| !f.retry || delivered >= f.attempts);
                             let mut dead_lettered = false;
-                            if delivered >= MAX_DELIVERIES {
+                            if delivered >= MAX_DELIVERIES || spent {
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
                                     Ok(()) => {
                                         dead_lettered = true;
@@ -1593,7 +1601,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             } else {
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
                                     vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
-                                // no ack -> redelivery after ack_wait
+                                // no ack -> redelivery after ack_wait; after a call,
+                                // after the service's delay
+                                if let Some(failure) = &failure {
+                                    let _ = msg.nak_after(failure.delay);
+                                }
                             }
                             if observing {
                                 let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos);
@@ -2350,7 +2362,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
             let driver = connectors::driver_for(&driver_name)
-                .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+                .ok_or_else(|| unknown_driver(&driver_name))?;
             // Resolve config by EVALUATING the manifest (so secret("…") in a
             // config value resolves to the real value, fail-closed). The
             // manifest's UPPERCASE variables are the driver's config.
@@ -3035,6 +3047,7 @@ Rules:
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
+- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}`, and a call that gets no answer fails the run with the service's name and the cause.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -3353,6 +3366,16 @@ fn provision(
     }))
 }
 
+/// Why a manifest's driver runs no connector: a driver a service declares
+/// answers a flow's invoke from `services/` (ADR-0032).
+fn unknown_driver(driver: &str) -> String {
+    if connectors::answer::DRIVERS.contains(&driver) {
+        format!("driver {driver:?} answers a flow's invoke: declare it in services/, and invoke the service")
+    } else {
+        format!("unknown driver {driver:?}")
+    }
+}
+
 /// One synchronous test of a connector instance: evaluate its manifest with
 /// the REAL secrets (a missing one fails here, in words), then run the
 /// driver's probe — reach the remote side, touch nothing.
@@ -3363,7 +3386,7 @@ fn probe_connector(root: &Path, file: &str) -> Value {
         let prog = vjs::parse(&src)?;
         let driver_name = prog.driver.clone().ok_or("not a connector manifest (no `driver`)")?;
         let driver = connectors::driver_for(&driver_name)
-            .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+            .ok_or_else(|| unknown_driver(&driver_name))?;
         let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
@@ -4145,6 +4168,7 @@ fn run_api_flow(
     let mut route = String::new();
     let mut invoked = Vec::new();
     let mut steps = None;
+    let mut failure = None;
     let result = (|| -> Result<vjs::Ctx, String> {
         let path = path.as_deref().ok_or("path not allowed")?;
         let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -4158,10 +4182,12 @@ fn run_api_flow(
             .to_string();
         let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(path));
         engine.trace_under(traced.then_some(&hop));
+        engine.carry(Some(hop.context()));
         engine.record_steps(record::on());
         let run = vjs::run(&prog, input, &mut engine);
         invoked = engine.take_spans();
         steps = engine.take_steps();
+        failure = engine.take_failure();
         run
     })();
     // The emits leave before the answer: a caller told 2xx can count on them.
@@ -4189,7 +4215,12 @@ fn run_api_flow(
                 json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
             ),
         },
-        (Err(e), _) => (500, json!({"error": e}).to_string()),
+        // A service that answered nothing (ADR-0032): the caller may try again.
+        (Err(e), _) => match &failure {
+            Some(f) if f.timed_out => (504, json!({"error": e}).to_string()),
+            Some(_) => (502, json!({"error": e}).to_string()),
+            None => (500, json!({"error": e}).to_string()),
+        },
     };
     if traced || (metrics::tracing() && failed) {
         for span in invoked {

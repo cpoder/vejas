@@ -8,6 +8,20 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **`invoke` calls a service that answers from a system** (ADR-0032). A file in
+  `services/` may declare `driver "http-rpc"` instead of holding code: `URL`
+  with `{arg}` placeholders, `METHOD`, `HEADERS` (with `secret()`),
+  `TIMEOUT_MS`, `ATTEMPTS`, `DELAY_MS`, `ANSWERS`, `RETRY_ON`. A flow writes
+  `o = invoke get_order(id: x)` and reads `o.status`, `o.body`, `o.headers`.
+  A call that gets no answer fails the run with the service's name and the
+  cause; when a later try may change it, the message comes back after the
+  service's delay, up to its attempts (a delayed nak, not `ack_wait`), and
+  otherwise it is a dead letter at once. An `api` flow answers 502, or 504
+  after a timeout. The call carries the message's `traceparent`. A run that
+  is shown (preview, replay, time travel, canary, golden) calls no system and
+  says so; replaying recorded answers comes next. No new crate: the call uses
+  the runtime's HTTP client. e2e `invoke-http.sh` checks it in CI.
+
 - **Signed webhooks on `http-in`** (ADR-0037, the first driver it calls for).
   A manifest names its sender's scheme in `SIGNATURE` (`github`, `stripe`,
   `slack`, `shopify`, `standard-webhooks`, `gitlab`, or `hmac-sha256` and
