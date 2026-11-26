@@ -36,6 +36,12 @@ getrandom = "0.2"
 regex = "1"
 aho-corasick = "1"
 serde = "1"
+# Signed webhooks on http-in (ADR-0037): HMAC-SHA256 and its constant-time
+# check, and the base64 some senders sign in. Both were in the tree already
+# (ring under rustls and async-nats, base64 under async-nats), so no new
+# binary weight.
+ring = "0.17"
+base64 = "0.22"
 # The Varpulis CEP engine, embedded as a library (ADR-0031): compile a VPL
 # program, feed it events, publish its emits. No async runtime in its tree —
 # its own CI (scripts/check-engine-deps.py) fails if one ever appears.

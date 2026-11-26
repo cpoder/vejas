@@ -33,6 +33,7 @@ mod mqtt;
 mod proposals;
 mod record;
 mod secrets;
+mod signature;
 mod trace;
 mod versions;
 mod vjs;
@@ -625,7 +626,11 @@ fn header_actor(request: &tiny_http::Request, default: &str) -> String {
 /// differing byte, so a token/approval-token check leaks no timing side-channel
 /// (ADR-0029 R7). Length mismatch folds into the accumulator, not a short-circuit.
 fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
+    ct_eq_bytes(a.as_bytes(), b.as_bytes())
+}
+
+/// The same on bytes: a webhook's signature against the tag it should be.
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u64;
     let n = a.len().max(b.len());
     for i in 0..n {

@@ -7,6 +7,31 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **Signed webhooks on `http-in`** (ADR-0037, the first driver it calls for).
+  A manifest names its sender's scheme in `SIGNATURE` (`github`, `stripe`,
+  `slack`, `shopify`, `standard-webhooks`, `gitlab`, or `hmac-sha256` and
+  `token` for any other sender) and gives `SIGNING_SECRET = secret("…")`.
+  Each request must then carry a valid signature, checked in constant time
+  over the raw body before anything else is read, or it gets 401 with the
+  reason and is not published. Where a timestamp is signed, one more than
+  `SIGNATURE_TOLERANCE_SECS` (300) from the runtime's clock is refused. Slack's
+  check of a Request URL gets its challenge back and is not published.
+  Refusals are counted on `/metrics` (`vejas_signature_failures_total{unit,reason}`).
+  A manifest that names a key of the check without a check the runtime can run
+  (an unknown scheme, no secret it can read, `SIGNING_SECRET` without
+  `SIGNATURE`) does not start. No new crate in the build: `ring` and `base64`
+  were in it already. e2e `http-in-signed.sh` checks it in CI.
+
+### Changed
+- `http-in` takes a request's body as long as its `Content-Length` says;
+  bytes read after it are no longer part of the body. A request without
+  `Content-Length` is taken as before, its body what came with its head. A
+  request over 1 MiB, head and body, gets 413, a `Content-Length` that is not
+  one number 400, a chunked body 411, and the connection closes. A request over
+  1 MiB used to be cut at 1 MiB and refused as JSON that does not parse, and a
+  chunked body was refused the same way.
+
 ## [0.7.0] — 2026-11-26
 
 ### Added

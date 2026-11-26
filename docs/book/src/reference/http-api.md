@@ -78,4 +78,4 @@ answer with a didactic refusal pointing at the proposal queue.
 | Route | Purpose |
 |---|---|
 | `POST /mcp` | JSON-RPC 2.0 — the runtime **is** the MCP server. See [MCP tools](mcp-tools.md). |
-| `POST /ingest/<suffix>` *(http-in connector, own port)* | Webhook ingestion → `vx.<suffix>` on the bus, 202 after the JetStream pub-ack, answering `{"published":"vx.<suffix>","trace_id":"…"}`; a caller's `traceparent` is continued. At most `MAX_CONNECTIONS` at once (default 512), then 503. |
+| `POST /ingest/<suffix>` *(http-in connector, own port)* | Webhook ingestion → `vx.<suffix>` on the bus, 202 after the JetStream pub-ack, answering `{"published":"vx.<suffix>","trace_id":"…"}`; a caller's `traceparent` is continued. At most `MAX_CONNECTIONS` at once (default 512), then 503. The body is what `Content-Length` says, or, without one, what came with the head. A request over 1 MiB, head and body, gets 413, a `Content-Length` that is not one number 400, a chunked body 411, and the connection closes. With `SIGNATURE` in the manifest, a request without its sender's valid signature gets 401 and is not published (see [expose an API](../guides/expose-an-api.md)). |

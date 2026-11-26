@@ -24,6 +24,9 @@ struct Unit {
     emits: u64,
     dead: u64,
     rejected: u64,
+    /// Requests an http-in connector refused for their signature, by
+    /// `signature::REASONS`.
+    signature_failures: [u64; 4],
     /// Pull rounds the consumer loop made, and messages they returned.
     /// `messages / rounds` is the mean batch: the number that says whether a
     /// unit is paying one pull round-trip per message or per sixty-four.
@@ -138,6 +141,16 @@ pub fn inc_dead_letter(unit: &str) {
 pub fn inc_rejected(unit: &str) {
     let mut map = units().lock().unwrap();
     map.entry(unit.to_string()).or_default().rejected += 1;
+}
+
+/// A request an http-in connector refused for its signature (ADR-0037), by its
+/// reason, one of `signature::REASONS`.
+pub fn inc_signature_failure(unit: &str, reason: &str) {
+    let Some(at) = crate::signature::REASONS.iter().position(|r| *r == reason) else {
+        return;
+    };
+    let mut map = units().lock().unwrap();
+    map.entry(unit.to_string()).or_default().signature_failures[at] += 1;
 }
 
 fn esc(s: &str) -> String {
@@ -275,6 +288,18 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
             esc(unit),
             u.rejected
         ));
+    }
+    out.push_str("# HELP vejas_signature_failures_total Requests an http-in connector refused for their signature, by reason.\n");
+    out.push_str("# TYPE vejas_signature_failures_total counter\n");
+    for (unit, u) in map.iter() {
+        for (reason, n) in crate::signature::REASONS.iter().zip(u.signature_failures) {
+            if n > 0 {
+                out.push_str(&format!(
+                    "vejas_signature_failures_total{{unit=\"{}\",reason=\"{reason}\"}} {n}\n",
+                    esc(unit)
+                ));
+            }
+        }
     }
     out.push_str("# HELP vejas_dead_letters_total Messages a unit dead-lettered (ADR-0015).\n");
     out.push_str("# TYPE vejas_dead_letters_total counter\n");
@@ -946,6 +971,16 @@ mod tests {
         assert!(text.contains("vejas_event_duration_seconds_count{unit=\"flow:t\"} 2"));
         assert!(text.contains("le=\"+Inf\"} 2"));
         assert!(text.contains("vejas_flow_restarts{unit=\"flow:t\"} 1"));
+        // A reason the counter does not know is not counted, not a panic.
+        inc_signature_failure("connector:hook", "mismatch");
+        inc_signature_failure("connector:hook", "mismatch");
+        inc_signature_failure("connector:hook", "stale");
+        inc_signature_failure("connector:hook", "bogus");
+        let text = render(&[]);
+        assert!(text.contains("vejas_signature_failures_total{unit=\"connector:hook\",reason=\"mismatch\"} 2"));
+        assert!(text.contains("vejas_signature_failures_total{unit=\"connector:hook\",reason=\"stale\"} 1"));
+        assert!(!text.contains("reason=\"missing\""), "a reason never seen is not rendered");
+        assert!(!text.contains("bogus"));
         // Cumulative buckets must be monotone and top out at count (2), never
         // exceed it — guards the double-accumulation bug. 0.003 lands in ≤0.005,
         // 0.02 in ≤0.025: nothing ≤0.001, one ≤0.005, both ≤0.025.

@@ -1,3 +1,5 @@
 {
-  "ingest_path": "shopify.orders"
+  "ingest_path": "shopify.orders",
+  "denied_path": "orders",
+  "secrets": {"shopify/webhook": "shpss_admission_dummy"}
 }

@@ -1,5 +1,10 @@
 # connector: shopify_order_webhook — receive Shopify order webhooks.
-# Shopify POSTs orders/create to /ingest/shopify.orders; verify the HMAC in a
-# flow (X-Shopify-Hmac-Sha256) before acting — the entry only publishes.
+# Shopify POSTs orders/create to /ingest/shopify.orders and signs each request
+# with the app's client secret (X-Shopify-Hmac-Sha256, base64 HMAC-SHA256 of
+# the body). A request Shopify did not sign gets 401 and never reaches the bus
+# (ADR-0037); ALLOW keeps a signed request to the shopify subjects.
 driver "http-in"
 PORT = 8787
+ALLOW = ["shopify"]
+SIGNATURE = "shopify"
+SIGNING_SECRET = secret("shopify/webhook")
