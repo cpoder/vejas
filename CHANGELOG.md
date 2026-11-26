@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-26
+
 ### Added
 - **One trace per business event** (ADR-0034, lot A). The runtime carries a W3C
   `traceparent` in a NATS header on every message it publishes, so the spans of
@@ -99,12 +101,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   These cursors now take no acks.
 
 ### Corrected
-- The observability guide said an end-to-end request shows up as a trace across the
-  pipeline. It does not: every span carries a fresh trace id and no parent, so a
-  request that crosses three flows is three unrelated traces in the collector. The
-  guide now says so, and says the cost of the OTLP exporter and of the event ring has
-  not been measured separately. ADR-0034 decided how one trace per event gets
-  built, and it is built in this release: see Added.
+- Up to 0.6.0, the observability guide said an end-to-end request shows up as a
+  trace across the pipeline. It did not: every span carried a fresh trace id and
+  no parent, so a request that crossed three flows made three unrelated traces in
+  the collector. This release builds that trace (see Added), and the guide now
+  describes what a trace holds and what it costs.
 
 ### Security
 - **url 2.5.8 → 2.5.9** in the runtime and in the `mq` and `amqp` connectors, for
@@ -527,7 +528,8 @@ production (NIS2 evidence collection across four EU countries).
   token; governed mode adds a distinct approval token. Path traversal
   (including symlink escape) contained and regression-tested in CI.
 
-[Unreleased]: https://github.com/cpoder/vejas/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/cpoder/vejas/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/cpoder/vejas/releases/tag/v0.7.0
 [0.6.0]: https://github.com/cpoder/vejas/releases/tag/v0.6.0
 [0.5.1]: https://github.com/cpoder/vejas/releases/tag/v0.5.1
 [0.5.0]: https://github.com/cpoder/vejas/releases/tag/v0.5.0
