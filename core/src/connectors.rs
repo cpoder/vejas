@@ -624,9 +624,8 @@ pub fn hydrate_recent(
     // but keep it bounded (an operator action, not the hot path).
     let window = (n as u64).saturating_mul(8).max(256).min(200_000);
     let start = last.saturating_sub(window).max(1);
-    // Never acked: the consumer is ephemeral and discarded, so un-acked messages
-    // simply expire with it — nothing redelivers to the flow, nothing is consumed
-    // off the stream.
+    // A cursor that takes no acks: the consumer is ephemeral and discarded, so
+    // nothing redelivers to the flow and nothing is consumed off the stream.
     let cfg = bus::EphemeralConfig {
         filter: subject,
         start_seq: Some(start),
@@ -1163,10 +1162,13 @@ fn source_publish(
         if kind == Kind::Server {
             span = span.attr("http.request.method", "POST");
         }
-        metrics::span(match &published {
-            Ok(_) => span,
-            Err(e) => span.failed(format!("publish: {e}")),
-        });
+        crate::record::end(
+            match &published {
+                Ok(_) => span,
+                Err(e) => span.failed(format!("publish: {e}")),
+            },
+            crate::record::Extras::new().emits(vec![subject.to_string()]).input(bytes),
+        );
     }
     match &published {
         Ok(_) => crate::record_trace_full(
@@ -1179,6 +1181,15 @@ fn source_publish(
         ),
     }
     (hop, published)
+}
+
+/// What a sink's downstream answered, whole. The trace record scrubs it before
+/// it cuts it, so a JSON answer is still JSON when its credentials are masked;
+/// the events ring keeps `summarize` of it.
+fn answer_text(bytes: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// A sink's response-body summary (what the downstream API answered).
@@ -1538,10 +1549,14 @@ fn run_sink(
                 Ok(response) => {
                     metrics::observe(&ctx.name, true, 0, t0.elapsed().as_secs_f64());
                     if metrics::wants(hop.sampled, false) {
-                        metrics::span(sink_span(&hop, &msg, start_nanos));
+                        crate::record::end(
+                            sink_span(&hop, &msg, start_nanos),
+                            crate::record::Extras::new().input(&msg.data).answer(response.as_deref()),
+                        );
                     }
+                    let summary = response.as_deref().and_then(|r| summarize(r.as_bytes()));
                     crate::record_trace_full(
-                        &ctx.name, subject, true, None, vec![], preview, None, response, Some(&hop),
+                        &ctx.name, subject, true, None, vec![], preview, None, summary, Some(&hop),
                     );
                     let _ = msg.ack();
                 }
@@ -1583,10 +1598,10 @@ fn run_sink(
                         );
                         let _ = msg.nak();
                     }
-                    if metrics::tracing() {
+                    if metrics::observing() {
                         let span = sink_span(&hop, &msg, start_nanos);
                         let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                        metrics::span(span.failed(e));
+                        crate::record::end(span.failed(e), crate::record::Extras::new().input(&msg.data));
                     }
                 }
             }
@@ -1621,7 +1636,7 @@ impl Driver for SlackOut {
             } else {
                 let payload = serde_json::json!({ "text": text }).to_string();
                 let headers = [("Content-Type".to_string(), "application/json".to_string())];
-                http_post(&webhook, &headers, payload.as_bytes(), Some(trace)).map(|b| summarize(&b))
+                http_post(&webhook, &headers, payload.as_bytes(), Some(trace)).map(answer_text)
             }
         })
     }
@@ -1668,7 +1683,7 @@ impl Driver for HttpOut {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
         run_sink(ctx, &subject, move |data, trace| {
-            http_post(&url, &headers, data, Some(trace)).map(|b| summarize(&b))
+            http_post(&url, &headers, data, Some(trace)).map(answer_text)
         })
     }
 }
@@ -1761,7 +1776,7 @@ impl Driver for ExecSink {
                 .map_err(|e| e.to_string())?;
             let out = child.wait_with_output().map_err(|e| e.to_string())?;
             if out.status.success() {
-                Ok(summarize(&out.stdout))
+                Ok(answer_text(out.stdout))
             } else {
                 Err(format!("{name}: exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()))
             }

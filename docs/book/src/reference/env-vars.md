@@ -56,6 +56,9 @@ directory is a complete system.
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, `key=value,…`. |
 | `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | Sampler (`parentbased_always_on`) and its ratio; failures are exported whatever it says. |
 | `OTEL_BSP_SCHEDULE_DELAY` / `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` / `OTEL_BSP_MAX_QUEUE_SIZE` | Export batching: 1000 ms, 512 spans per request, 4096 spans queued. |
+| `VEJAS_TRACES` | The trace record (ADR-0034): `on` (default) keeps each hop in the `VEJAS_TRACES` stream for the panel, `GET /traces` and `vejas_trace`; `off` records nothing. |
+| `VEJAS_TRACES_PAYLOADS` | `off` keeps the record free of payloads and answers (default `on`, scrubbed). Errors stay, scrubbed too. |
+| `VEJAS_TRACES_MAX_HOPS` / `VEJAS_TRACES_MAX_BYTES` / `VEJAS_TRACES_MAX_AGE_SECS` | The record's retention: 100000 hops, 268435456 bytes, 604800 s (seven days), whichever comes first. |
 
 See [observability](../guides/observability.md) for what a trace holds.
 

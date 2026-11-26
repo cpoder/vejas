@@ -1,8 +1,9 @@
 # Observability
 
-Three windows into a running runtime, all built in — no sidecar, no agent
+Four windows into a running runtime, all built in — no sidecar, no agent
 to install (ADR-0016): a **metrics** endpoint to scrape, **traces** to a
-collector, and a live **event ring** to see what each flow just did.
+collector, the **trace record** that keeps each event's path in NATS for the
+panel and your agent, and a live **event ring** to see what each flow just did.
 
 ## Metrics — Prometheus
 
@@ -47,7 +48,9 @@ The context also crosses the edges of the cell:
   sink and starts again at an `mqtt-in` source.
 
 Each entry of the event ring carries its `trace_id`, so a row of **Recent
-events** leads to the trace in your tracing backend.
+events** leads to its trace: in the panel's **Trace** card (see
+[the trace record](#the-trace-record--one-event-hop-by-hop) below), or in your
+tracing backend.
 
 ### Exporting spans
 
@@ -137,9 +140,149 @@ from before tracing. Resident memory grows by 0.7 MB,
 and by 2.6 MB with the exporter and its queue. The details are on the
 [benchmarks](../reference/benchmarks.md) page.
 
-The panel does not draw traces yet. The path of one event hop by hop, with
-the flow version and its provenance, is the second lot of ADR-0034; until
-then the trace is read in your tracing backend.
+## The trace record — one event, hop by hop
+
+The runtime also keeps the traces itself, with no backend to run. Each hop the
+sampler keeps, and every hop that fails, is written to the JetStream stream
+`VEJAS_TRACES` under the subject `vxtrace.<trace id>`, so one read returns a
+whole trace. NATS stays the only infrastructure (ADR-0002).
+
+- Panel: the **Trace** card. Open it from a row of **Recent events**
+  (`⇢ trace`), or type a trace id, or anything the event carried: an order
+  number, a customer id.
+- API: `GET /traces/{trace id}` returns the hops in the order they started.
+  `GET /traces?search=4711` returns the latest traces with a hop that
+  mentions the text, newest first; it looks through the last 50 000 hops.
+- Agent: `vejas_trace`, with `trace_id` or `search`. Asked "what happened to
+  order 4711", an agent answers from the record.
+
+A hop's record is its span, the one the exporter sends, plus what a span has
+no room for:
+
+```json
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "5e1c0c3a77b4e2d1",
+  "parent_id": "00f067aa0ba902b7",
+  "unit": "flow:order_sync",
+  "kind": "consumer",
+  "start_us": 1764118847112345,
+  "duration_us": 412,
+  "ok": true,
+  "error": null,
+  "subject": "vx.orders.in",
+  "emits": ["vx.orders.validated"],
+  "input": {"order": "4711", "card_token": "<masked>"},
+  "answer": null,
+  "attributes": {"vejas.flow.version": "d5768a2de6e8cbb0", "vejas.delivery.attempt": 1}
+}
+```
+
+- `parent_id` is the hop that published what this one consumed, or the
+  caller's span for the first hop. The panel indents a hop under its parent.
+- `input` is the payload the hop received; for a source, what it let in. A
+  payload over 16 KB keeps its size and the start of its text, and the
+  runtime copies no more of it than that.
+- `answer` is what a sink's downstream or an `api` flow answered. It is
+  scrubbed whole, then cut to 2 KB, so a JSON answer keeps its shape.
+- Each failed delivery is a hop of its own, with `vejas.delivery.attempt` in
+  its attributes, and the one that went to the DLQ has `vejas.dlq: true`.
+
+**What a record does not carry.** Every field is scrubbed before it is
+written, on the record's own thread:
+
+- The values of credential-named keys, with the panel's own pattern, become
+  `<masked>`: in JSON at any depth, JSON held in a string included, and in
+  text that names a key and gives its value. That covers a query, a form or a
+  connection string (`api_key=…`, `Password=my pass;`, a percent-encoded key
+  too), JSON that was cut or escaped in a string (`"password": "…`), a header
+  or a YAML line or block (`Authorization: …`, `password: |`), a Python, Ruby
+  or PHP dump (`'password': '…'`, `"password" => "…"`, `[password] => …`,
+  var_dump's `["password"]=>`), HCL (`"password" = "…"`), a command line
+  (`--password …`), an XML element up to its end tag
+  (`<Password>…</Password>`, CDATA included) and the userinfo of a URL. A
+  text's escapes are read before its keys are looked for: XML sent as
+  entities inside SOAP, a query percent-encoded inside a query, a
+  `password=\"…\"` inside a JSON log line.
+- Every value a secret store handed out in this process becomes `<secret>`,
+  wherever it appears: in a string, an object key or a number, as it is or
+  once a text's escapes are read (JSON's and `\'`, a URL's `%XX`, XML's
+  entities, one inside the other too). A flow that forwards a vault value
+  does not leave it in the record, a value that is a JSON document (a
+  service account's key file) included, and an error that quotes the start
+  of one, where a connector cut a downstream's answer, loses that start. The
+  runtime remembers the last 4 096 values, dropping first the one read least
+  recently, and skips values shorter than four characters.
+- A payload nested more than 100 levels deep is kept as scrubbed text, so
+  every record reads as JSON. Past 64 credentials in one text, the rest of
+  it is masked.
+
+Masking works on key names and on exact values. A secret that a flow
+transforms (encodes, splits, parses and rebuilds) before emitting it is not
+recognised, and neither is a credential under a key the pattern does not
+name: a camelCase `accessToken`, a `{"name": "DB_PASSWORD", "value": …}`
+pair, a key worded for people (`Invalid API key: …`), a SQL statement
+(`WITH PASSWORD '…'`), a multipart form field. Keep secrets in
+credential-named fields.
+
+**What is kept.** The exporter's sampler decides: by default every trace the
+runtime starts is kept, and a caller that sends `traceparent` with the
+sampled flag off is followed. Failures are kept whatever the sampler says.
+The stream keeps the last 100 000 hops, 256 MB and seven days at most,
+whichever limit comes first, oldest out first.
+
+| Variable | Default | |
+|---|---|---|
+| `VEJAS_TRACES` | `on` | `off` records nothing and creates no stream. |
+| `VEJAS_TRACES_PAYLOADS` | `on` | `off` keeps what each hop did without the data it did it to: no `input`, no `answer`. The `error` stays, scrubbed the same way, and an error can quote the data that caused it. |
+| `VEJAS_TRACES_MAX_HOPS` | `100000` | Hops kept. |
+| `VEJAS_TRACES_MAX_BYTES` | `268435456` | Bytes kept (256 MB). |
+| `VEJAS_TRACES_MAX_AGE_SECS` | `604800` | Seconds a hop is kept (seven days). |
+
+The limits are applied to the stream at each start, so a change holds from
+the next restart; in a cluster, give every instance the same values. The
+stream starts with one replica. Raise it with `nats stream edit`: the runtime
+changes only the three limits and keeps everything else you set.
+
+**What it costs NATS.** One subject per trace kept, which the server indexes
+in memory. Measured on NATS 2.10 and 2.15 with 100 000 hops kept, that is
+200 to 450 bytes per trace: 20 to 45 MB when every trace is a single hop, 7
+to 15 MB when traces have three hops. Raising `VEJAS_TRACES_MAX_HOPS` raises
+it in proportion.
+
+**What it costs the runtime.** On the isolated flow hop of the benchmarks
+page, recording every hop takes 17.5 to 20 µs of CPU per event over two
+series, against 74 to 75.5 for the hop with the record off; 12 to 13.5 µs
+with payloads kept out, about 4 µs when the sampler keeps one trace in ten.
+About 13 µs of it runs on the record's own thread, which the flow does not
+wait for. The NATS server spends a few µs more per event storing the hops.
+`bench/trace-cost.sh` measures it.
+
+**Who can read it.** The record holds payloads, masked but otherwise as they
+came. `GET /traces` is a read, open like `GET /events` and `GET /dlq`: keep
+the panel on loopback (the default) or behind your proxy's authentication.
+With `VEJAS_TOKEN` set, `vejas_trace` needs it like every MCP call. When your
+events carry personal data, so does the record: its limits are your
+retention policy for it, and `VEJAS_TRACES_PAYLOADS=off` keeps the data out.
+
+The record writes on a NATS connection of its own, so its traffic never
+queues in front of a unit's emits and acks. A record is lost rather than
+ever holding up a message. The queue holds 4 096 hops and 32 MB at most, and
+a record the stream did not take is dropped and counted. The stream
+acknowledges the last record of each batch, which confirms the ones before
+it and that the stream is there. A stream removed by hand, or lost with a
+NATS store, is created again on the next batch.
+
+```
+vejas_trace_records_total 18342
+vejas_trace_records_dropped_total{reason="queue_full"} 0
+vejas_trace_records_dropped_total{reason="publish_failed"} 0
+```
+
+Not built yet (ADR-0034, lot B): the statements a flow executed with its
+variables at each `invoke`, `emit` and `respond`, and the provenance of each
+flow version (who wrote it, who approved it, the replay diff before it was
+promoted).
 
 ## The event ring — what just happened
 

@@ -1,9 +1,10 @@
 #!/bin/bash
-# What tracing costs on the flow hop (ADR-0034, point 6). Runs
-# bench/flow-only.sh RUNS times per configuration, interleaved so that drift
-# hits every configuration alike, and prints the medians: throughput, and the
-# runtime's own CPU time per event (the better measure, since four publishers
-# bound the throughput).
+# What tracing costs on the flow hop (ADR-0034, point 6): the OTLP exporter
+# (lot A) and the trace record (lot B). Runs bench/flow-only.sh RUNS times per
+# configuration, interleaved so that drift hits every configuration alike, and
+# prints the medians: throughput, the runtime's own CPU time per event (the
+# better measure, since four publishers bound the throughput), and the NATS
+# server's, which stores the records.
 #   bench/trace-cost.sh [runs] [events]          (needs the `nats` CLI)
 # BIN is the runtime under test (core/target/release/vejas-runtime). BASE_BIN,
 # if set, is a runtime from before tracing (v0.6.0): the difference is what
@@ -39,12 +40,17 @@ for r in $(seq "$RUNS"); do
     one "before tracing"           BIN="$BASE_BIN"
     one "before, caller header"    BIN="$BASE_BIN" BENCH_TRACEPARENT="$TP"
   fi
-  one "no exporter"                BIN="$BIN"
-  one "no exporter, caller header" BIN="$BIN" BENCH_TRACEPARENT="$TP"
-  one "export all"                 BIN="$BIN" OTEL_EXPORTER_OTLP_ENDPOINT="$EP"
-  one "export all, caller header"  BIN="$BIN" BENCH_TRACEPARENT="$TP" OTEL_EXPORTER_OTLP_ENDPOINT="$EP"
-  one "export 1 in 10"             BIN="$BIN" OTEL_EXPORTER_OTLP_ENDPOINT="$EP" \
+  # lot A: propagation and export, the record off
+  one "no exporter"                BIN="$BIN" VEJAS_TRACES=off
+  one "no exporter, caller header" BIN="$BIN" VEJAS_TRACES=off BENCH_TRACEPARENT="$TP"
+  one "export all"                 BIN="$BIN" VEJAS_TRACES=off OTEL_EXPORTER_OTLP_ENDPOINT="$EP"
+  one "export 1 in 10"             BIN="$BIN" VEJAS_TRACES=off OTEL_EXPORTER_OTLP_ENDPOINT="$EP" \
                                    OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
+  # lot B: the record, on by default
+  one "record"                     BIN="$BIN"
+  one "record, no payloads"        BIN="$BIN" VEJAS_TRACES_PAYLOADS=off
+  one "record 1 in 10"             BIN="$BIN" OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
+  one "record and export all"      BIN="$BIN" OTEL_EXPORTER_OTLP_ENDPOINT="$EP"
 done
 python3 - "$OUT" <<'PY'
 import json, statistics, sys
@@ -56,11 +62,17 @@ ref = "before tracing" if "before tracing" in by else "no exporter"
 med = lambda rows, k: statistics.median(r[k] for r in rows)
 base_rate = med(by[ref], "flow_rate_per_s")
 base_cpu = med(by[ref], "runtime_cpu_us_per_event")
-print(f"{'configuration':<28}{'events/s':>9}{'':>9}{'CPU µs/event':>14}{'':>9}{'RSS MB':>8}")
+base_srv = med(by[ref], "server_cpu_us_per_event") if "server_cpu_us_per_event" in by[ref][0] else 0
+print(f"{'configuration':<28}{'events/s':>9}{'':>9}{'runtime µs':>12}{'':>9}{'NATS µs':>9}{'':>9}{'RSS MB':>8}{'records':>9}")
 for name, rows in by.items():
     rate, cpu = med(rows, "flow_rate_per_s"), med(rows, "runtime_cpu_us_per_event")
+    srv = med(rows, "server_cpu_us_per_event") if "server_cpu_us_per_event" in rows[0] else 0
+    kept = med(rows, "trace_records_kept") if "trace_records_kept" in rows[0] else 0
+    lost = max(r.get("trace_records_dropped", 0) for r in rows)
     print(f"{name:<28}{rate:>9.0f}{(rate / base_rate - 1) * 100:>+8.1f}%"
-          f"{cpu:>14.1f}{(cpu / base_cpu - 1) * 100:>+8.1f}%{med(rows, 'runtime_rss_mb'):>8}")
-print(f"(medians of {len(by[ref])} runs; percentages against '{ref}')")
+          f"{cpu:>12.1f}{(cpu / base_cpu - 1) * 100:>+8.1f}%"
+          f"{srv:>9.1f}{((srv / base_srv - 1) * 100 if base_srv else 0):>+8.1f}%"
+          f"{med(rows, 'runtime_rss_mb'):>8}{kept:>9.0f}" + (f" ({lost} lost)" if lost else ""))
+print(f"(medians of {len(by[ref])} runs; percentages against '{ref}'; µs are CPU time per event)")
 PY
 echo "spans received by the collector: $(cat "$COUNT")"

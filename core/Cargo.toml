@@ -27,6 +27,15 @@ webpki-roots = "0.26"
 # Seeds the trace and span ids (ADR-0034). Already in the tree through ring, so
 # no new binary weight.
 getrandom = "0.2"
+# The trace record's scrub (ADR-0034): the credential mask, compiled from the
+# one pattern the panel and the admission lint use; the values the secret
+# stores handed out, found in one pass however many there are; and JSON read
+# and written again without a tree in between. All three were in the tree
+# already (regex and aho-corasick through async-nats and varpulis, serde under
+# serde_json), so no new binary weight.
+regex = "1"
+aho-corasick = "1"
+serde = "1"
 # The Varpulis CEP engine, embedded as a library (ADR-0031): compile a VPL
 # program, feed it events, publish its emits. No async runtime in its tree —
 # its own CI (scripts/check-engine-deps.py) fails if one ever appears.

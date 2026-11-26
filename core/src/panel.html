@@ -231,6 +231,18 @@
     <div id="events"><span style="color:var(--muted)">No events yet — send one to a source subject.</span></div>
   </div>
 
+  <div class="card" id="trace-card">
+    <h2>Trace <code id="trace-id"></code></h2>
+    <p class="sub">One event end to end, from the trace record (ADR-0034): every hop it went through, in the order they started.
+      Open one from a row above, or find it by its id or by what it carried: an order number, a customer id.</p>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input id="trace-search" class="rule" style="max-width:420px" placeholder="trace id, or any text the event carried"
+        onkeydown="if (event.key === 'Enter') findTrace()">
+      <button class="apply" onclick="findTrace()">find</button>
+    </div>
+    <div id="trace"></div>
+  </div>
+
   <div class="card" id="dlq-card" style="display:none">
     <h2>Dead letters</h2>
     <p class="sub">Poison messages parked instead of dropped (ADR-0015). Fix the cause (edit the literal above, shadow-replay it), then replay — or discard.</p>
@@ -896,6 +908,8 @@ async function loadEvents() {
           : esc(e.preview || '')}</td>
         <td>${e.ok && String(e.flow || '').startsWith('flow:') && e.seq != null
           ? `<button class="apply" title="Save this real event as a golden test (tests/vjs)" onclick="saveGolden('${esc(String(e.flow))}',${e.seq})">★ golden</button>`
+          : ''}${/^[0-9a-f]{32}$/.test(e.trace_id || '')
+          ? ` <button class="apply" title="The whole path of this event, hop by hop" onclick="openTrace('${e.trace_id}')">⇢ trace</button>`
           : ''}</td>
       </tr>`;
     }).join('');
@@ -913,6 +927,67 @@ async function saveGolden(flow, seq) {
 }
 loadEvents();
 setInterval(loadEvents, 4000);
+
+/* ---------- one event end to end (ADR-0034) ---------- */
+// The record keeps payloads masked server-side; the panel shows them as stored.
+async function openTrace(id) {
+  $('#trace-id').textContent = id;
+  const box = $('#trace');
+  box.innerHTML = '<span style="color:var(--muted)">reading the record…</span>';
+  $('#trace-card').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  try {
+    const r = await fetch('/traces/' + encodeURIComponent(id));
+    if (!r.ok) { box.innerHTML = `<span style="color:var(--muted)">${esc(await r.text())}</span>`; return; }
+    const hops = (await r.json()).hops || [];
+    const t0 = hops.length ? hops[0].start_us : 0;
+    // a hop sits one step right of the hop that published what it consumed
+    const depth = {};
+    for (const h of hops) depth[h.span_id] = h.parent_id in depth ? depth[h.parent_id] + 1 : 0;
+    const rows = hops.map(h => {
+      const a = h.attributes || {};
+      const attempt = a['vejas.delivery.attempt'] > 1 ? ` <span class="sample">attempt ${a['vejas.delivery.attempt']}</span>` : '';
+      const outcome = (h.ok
+        ? ((h.emits || []).length ? h.emits.map(s => `<code>${esc(s)}</code>`).join(' ') : '<span style="color:var(--muted)">done</span>')
+        : `<span style="color:var(--err)">${esc(trunc(h.error || 'error', 80))}${a['vejas.dlq'] ? ' · dead-lettered' : ''}</span>`)
+        + (h.answer ? ` <span class="sample" title="${esc(h.answer)}">↩ ${esc(trunc(h.answer, 32))}</span>` : '');
+      const version = a['vejas.flow.version'] ? ` <span class="sample" title="flow version ${esc(a['vejas.flow.version'])}">${esc(String(a['vejas.flow.version']).slice(0, 8))}</span>` : '';
+      const input = h.input == null ? '' : `<details><summary>${esc(trunc(h.input, 46))}</summary><pre class="payload-full">${esc(JSON.stringify(h.input, null, 2))}</pre></details>`;
+      return `<tr>
+        <td class="sample">+${((h.start_us - t0) / 1000).toFixed(1)} ms</td>
+        <td class="field" style="padding-left:${6 + 16 * (depth[h.span_id] || 0)}px"><code>${esc(h.unit)}</code> <span class="sample">${esc(h.kind)}</span>${attempt}</td>
+        <td class="sample">${esc(h.subject || '')}</td>
+        <td>${outcome}</td>
+        <td class="sample">${(h.duration_us / 1000).toFixed(1)} ms${version}</td>
+        <td class="sample payload">${input}</td>
+      </tr>`;
+    }).join('');
+    box.innerHTML = `<table><tr><th>at</th><th>hop</th><th>on</th><th>outcome</th><th>took</th><th>payload</th></tr>${rows}</table>`;
+  } catch (e) { box.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+async function findTrace() {
+  const q = ($('#trace-search').value || '').trim();
+  if (!q) return;
+  if (/^[0-9a-fA-F]{32}$/.test(q)) return openTrace(q.toLowerCase());
+  $('#trace-id').textContent = '';
+  const box = $('#trace');
+  try {
+    const r = await fetch('/traces?search=' + encodeURIComponent(q));
+    if (!r.ok) { box.innerHTML = `<span style="color:var(--muted)">${esc(await r.text())}</span>`; return; }
+    const d = await r.json();
+    if (!(d.traces || []).length) {
+      box.innerHTML = `<span style="color:var(--muted)">${d.searched_hops
+        ? `No trace among the last ${d.searched_hops} hops mentions “${esc(q)}”.`
+        : 'The trace record holds nothing yet: VEJAS_TRACES is off, or no hop has ended.'}</span>`;
+      return;
+    }
+    box.innerHTML = `<table><tr><th>when</th><th>hop that mentions it</th><th>on</th><th></th></tr>${d.traces.map(t => `<tr>
+      <td class="sample">${new Date(t.start_us / 1000).toLocaleString()}</td>
+      <td class="field"><code>${esc(t.unit)}</code>${t.ok ? '' : ` <span style="color:var(--err)">${esc(trunc(t.error || 'error', 50))}</span>`}</td>
+      <td class="sample">${esc(t.subject || '')}</td>
+      <td>${/^[0-9a-f]{32}$/.test(t.trace_id || '') ? `<button class="apply" onclick="openTrace('${t.trace_id}')">⇢ trace</button>` : ''}</td>
+    </tr>`).join('')}</table>`;
+  } catch (e) { box.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
 
 // In governed mode a replay or a discard is a human act (ADR-0024): the server
 // answers 409 or 401 and the approval token goes with the retry. Outside it the

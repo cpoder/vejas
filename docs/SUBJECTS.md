@@ -66,6 +66,12 @@ transient and must never be captured by a stream (a stream on the command
 subject would hijack request/reply with its pub-ack). Specification:
 [CONTROL.md](CONTROL.md), decision: ADR-0013.
 
+The runtime keeps its own records on three more sibling roots, each in a
+stream of its own, so no flow consumes them by accident: `vxdlq.>` for dead
+letters (`VEJAS_DLQ`, ADR-0015), `vxaudit.>` for the promote audit trail
+(`VEJAS_AUDIT`, ADR-0018) and `vxtrace.<trace id>` for the trace record
+(`VEJAS_TRACES`, ADR-0034), one subject per trace.
+
 ## Events the platform publishes
 
 Ordinary subjects under the same root, so a flow or a sink reacts to them like to

@@ -269,6 +269,13 @@ fn servers_of(url: &str) -> Result<Vec<ServerAddr>, String> {
         .collect()
 }
 
+/// A `Bus` on a connection of its own, outside the one every unit shares: for
+/// traffic that must never queue in front of a unit's emits and acks (the
+/// trace record, ADR-0034). It reconnects on its own like the shared one.
+pub fn connect_own(url: &str) -> Result<Bus, String> {
+    open(url)
+}
+
 fn open(url: &str) -> Result<Bus, String> {
     let servers = servers_of(url)?;
     wait(async move {
@@ -386,9 +393,8 @@ impl Batch {
     /// protocol cannot carry, a payload over the server's limit), and only this
     /// one: the caller treats its source message as a failed run, and the rest of
     /// the batch goes on.
-    /// Without a trace: every publish of the runtime carries one now (ADR-0034),
-    /// so only the tests hold these.
-    #[cfg(test)]
+    /// Without a trace: what the runtime writes about a trace (its hop records,
+    /// ADR-0034) is not part of one. Every message of a flow carries one.
     pub fn publish(&mut self, subject: &str, payload: impl Into<Bytes>) -> Result<(), String> {
         self.hold(subject, None, payload.into())
     }
@@ -772,6 +778,9 @@ pub struct StreamConfig {
     pub name: String,
     pub subjects: Vec<String>,
     pub max_msgs: i64,
+    /// Sent only when set, so the streams that never had one keep the
+    /// server's default.
+    pub max_bytes: i64,
     pub max_msgs_per_subject: i64,
     pub max_age: Duration,
     pub discard: Discard,
@@ -825,11 +834,16 @@ impl JetStream {
     /// configs because each of those is free to carry defaults of its own, and
     /// an in-place upgrade must find the same streams and consumers it left.
     fn api(&self, verb: String, body: Bytes) -> Result<Value, String> {
+        self.api_coded(verb, body).map_err(|(_, what)| what)
+    }
+
+    /// The same, with the server's error code when it gave one (`err_code`).
+    fn api_coded(&self, verb: String, body: Bytes) -> Result<Value, (Option<u64>, String)> {
         let client = &self.shared().link.client;
-        let reply =
-            wait(client.request(format!("$JS.API.{verb}"), body)).map_err(|e| e.to_string())?;
-        let answer: Value =
-            serde_json::from_slice(&reply.payload).map_err(|e| format!("unreadable reply: {e}"))?;
+        let reply = wait(client.request(format!("$JS.API.{verb}"), body))
+            .map_err(|e| (None, e.to_string()))?;
+        let answer: Value = serde_json::from_slice(&reply.payload)
+            .map_err(|e| (None, format!("unreadable reply: {e}")))?;
         match answer.get("error") {
             None => Ok(answer),
             Some(error) => {
@@ -837,7 +851,7 @@ impl JetStream {
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or("error");
-                Err(what.to_string())
+                Err((error.get("err_code").and_then(Value::as_u64), what.to_string()))
             }
         }
     }
@@ -876,6 +890,10 @@ impl JetStream {
     /// Create a stream, or leave it as it is: one that exists is never changed,
     /// and a different config on it is an error the caller may ignore.
     pub fn add_stream(&self, config: &StreamConfig) -> Result<(), String> {
+        self.create_stream(config).map_err(|(_, what)| what)
+    }
+
+    fn create_stream(&self, config: &StreamConfig) -> Result<(), (Option<u64>, String)> {
         let discard = match config.discard {
             Discard::Old => "old",
             Discard::New => "new",
@@ -890,17 +908,54 @@ impl JetStream {
             "retention": "limits",
             "storage": "file",
         });
+        if config.max_bytes != 0 {
+            body["max_bytes"] = json!(config.max_bytes);
+        }
         if config.allow_rollup {
             body["allow_rollup_hdrs"] = json!(true);
         }
         if config.deny_delete {
             body["deny_delete"] = json!(true);
         }
-        self.api(
+        self.api_coded(
             format!("STREAM.CREATE.{}", config.name),
             body.to_string().into(),
         )
         .map(|_| ())
+    }
+
+    /// Create a stream, or bring the limits of the one that exists to those of
+    /// `config`: what the operator sets in the environment holds from the next
+    /// start. Only the three limits change; everything else an existing stream
+    /// has, replicas included, is sent back as the server reported it, but for
+    /// a duplicate window longer than the new age, which the server refuses.
+    pub fn put_stream(&self, config: &StreamConfig) -> Result<(), String> {
+        /// JSStreamNameExistErr: the name is taken, with another config.
+        const NAME_IN_USE: u64 = 10058;
+        match self.create_stream(config) {
+            Err((Some(NAME_IN_USE), _)) => {
+                let info = self.api(format!("STREAM.INFO.{}", config.name), Bytes::new())?;
+                let mut current = info
+                    .get("config")
+                    .cloned()
+                    .ok_or("the server sent no stream config")?;
+                let unlimited = |n: i64| if n == 0 { -1 } else { n };
+                let max_age = config.max_age.as_nanos() as u64;
+                current["max_msgs"] = json!(unlimited(config.max_msgs));
+                current["max_bytes"] = json!(unlimited(config.max_bytes));
+                current["max_age"] = json!(max_age);
+                let window = current["duplicate_window"].as_u64().unwrap_or(0);
+                if max_age > 0 && window > max_age {
+                    current["duplicate_window"] = json!(max_age);
+                }
+                self.api(
+                    format!("STREAM.UPDATE.{}", config.name),
+                    current.to_string().into(),
+                )
+                .map(|_| ())
+            }
+            other => other.map_err(|(_, what)| what),
+        }
     }
 
     #[cfg(test)]
@@ -1034,12 +1089,14 @@ impl JetStream {
         self.puller(stream, durable, None)
     }
 
-    /// A read-only cursor over a stream: a consumer of its own, never acked, so
-    /// nothing a live consumer does or sees changes.
+    /// A read-only cursor over a stream: a consumer of its own that takes no
+    /// acks, so nothing a live consumer does or sees changes. With acks asked
+    /// and never given, the server would stop after its default of 1000
+    /// pending messages, and a cursor would end there unseen.
     pub fn pull_ephemeral(&self, stream: &str, config: &EphemeralConfig) -> Result<Puller, String> {
         let mut consumer = json!({
             "deliver_policy": "new",
-            "ack_policy": "explicit",
+            "ack_policy": "none",
             "filter_subject": config.filter,
             "replay_policy": "instant",
             "inactive_threshold": config.inactive_threshold.as_nanos() as u64,

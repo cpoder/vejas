@@ -67,10 +67,16 @@ RSS_KB=$(ps -o rss= -p $RUNTIME_PID | tr -d ' ')
 # The runtime's own CPU time (user + system, Linux): what a change costs the
 # runtime, apart from the publishers and the server it shares the machine with.
 CPU_MS=$(awk -v hz="$(getconf CLK_TCK)" '{printf "%d", ($14 + $15) * 1000 / hz}' "/proc/$RUNTIME_PID/stat" 2>/dev/null || echo 0)
+# The server's too: what the runtime writes to NATS (the trace record) is
+# stored there, and that work is not in the runtime's own time.
+NATS_CPU_MS=$(awk -v hz="$(getconf CLK_TCK)" '{printf "%d", ($14 + $15) * 1000 / hz}' "/proc/$NATS_PID/stat" 2>/dev/null || echo 0)
+# Hop records kept and lost (ADR-0034), once the record's last tick is out.
+sleep 0.5
+RECORDS=$(curl -s http://127.0.0.1:8688/metrics | awk '/^vejas_trace_records_total /{k=$2} /^vejas_trace_records_dropped_total/{d+=$2} END{printf "%d %d", k, d}')
 
-python3 - "$N" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" "$CPU_MS" << 'PY'
+python3 - "$N" "$PUB_MS" "$TOTAL_MS" "$RSS_KB" "$CPU_MS" "$NATS_CPU_MS" $RECORDS << 'PY'
 import json, sys
-n, pub_ms, total_ms, rss, cpu_ms = (int(a) for a in sys.argv[1:6])
+n, pub_ms, total_ms, rss, cpu_ms, nats_cpu_ms, kept, dropped = (int(a) for a in sys.argv[1:9])
 print(json.dumps({
   "scenario": "bus -> flow (lookup + conversions + projection loop) -> bus, no HTTP anywhere",
   "events": n,
@@ -80,5 +86,8 @@ print(json.dumps({
   "runtime_rss_mb": round(rss / 1024, 1),
   "runtime_cpu_ms": cpu_ms,
   "runtime_cpu_us_per_event": round(cpu_ms * 1000 / n, 1),
+  "server_cpu_us_per_event": round(nats_cpu_ms * 1000 / n, 1),
+  "trace_records_kept": kept,
+  "trace_records_dropped": dropped,
 }, indent=2))
 PY

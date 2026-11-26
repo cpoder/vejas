@@ -23,6 +23,31 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   retries connection errors, 429, 502, 503 and 504 with backoff, flushes its
   queue on a graceful stop, and counts on `/metrics` what it sends and what it
   loses (`vejas_spans_exported_total`, `vejas_spans_dropped_total{reason}`).
+- **The trace record** (ADR-0034, lot B, first part). Each hop the sampler
+  keeps, and every hop that fails, is written to a new JetStream stream,
+  `VEJAS_TRACES`, under `vxtrace.<trace id>`: the span plus the subjects the
+  hop emitted, the payload it received and what a sink or an `api` flow
+  answered. Before it is written, each record loses the values of
+  credential-named keys (the panel's pattern), in JSON at any depth, JSON held
+  in a string included, and in text that names a key and gives its value (a
+  query, a form or a connection string, a header or a YAML line or block,
+  XML, a URL's userinfo, a Python, Ruby or PHP dump, HCL, a command line),
+  escaped or not, and every value a secret store handed out, in any string,
+  key or number, however a text escapes it (JSON, `%XX`, XML entities, one
+  inside the other). A
+  record is written on a NATS connection of its own, from a queue bounded in
+  hops and in bytes, and the stream acknowledges each batch; a stream removed
+  by hand comes back on the next batch. The panel's new **Trace** card
+  shows one event hop by hop, opened from **Recent events** or found by id or
+  by what the event carried; `GET /traces/{id}`, `GET /traces?search=` and the
+  MCP tool `vejas_trace` read the same record. On by default; `VEJAS_TRACES=off`
+  turns it off, `VEJAS_TRACES_PAYLOADS=off` keeps payloads out, and
+  `VEJAS_TRACES_MAX_HOPS`, `_MAX_BYTES` and `_MAX_AGE_SECS` bound it (100 000
+  hops, 256 MB, seven days). Counted on `/metrics`
+  (`vejas_trace_records_total`, `vejas_trace_records_dropped_total{reason}`).
+  Recording every hop costs 17.5 to 20 µs of CPU per flow hop over two
+  benchmark series, about 13 of them on the record's own thread, and about
+  4 µs at one trace in ten (see the benchmarks page). e2e `trace-record.sh` checks it in CI.
 
 ### Changed
 - Spans have a new shape. The name is still the unit and the old attributes
@@ -35,6 +60,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 - The trace context travels even without an exporter, so a downstream system
   and the event ring get it. It costs about 3 µs of CPU per flow hop; exporting
   every span about 10 µs (see the benchmarks page).
+
+### Fixed
+- **A read-only cursor stopped after 1 000 messages.** The ephemeral consumers
+  behind the shadow replay's history, the canary and the trace search asked for
+  acks and never gave any, so the server stopped delivering at its default of
+  1 000 pending messages. A shadow replay asked for more than about 125 events
+  read the oldest 1 000 messages of its window instead of the newest, and a
+  canary stopped comparing after its first 1 000 live events, without a word.
+  These cursors now take no acks.
 
 ### Corrected
 - The observability guide said an end-to-end request shows up as a trace across the

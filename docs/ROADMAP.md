@@ -77,9 +77,11 @@ What turns "nice project" into "I can run this in production":
 2. **Real observability** · built (ADR-0016): OTLP/HTTP-JSON traces + a
    Prometheus `/metrics` endpoint, hand-rolled to keep the footprint. The
    manifesto claims it again now that it ships. One trace per business
-   event across hops is built (ADR-0034 lot A, transport test T6 in CI). The
-   end-to-end view in the panel that links each hop to its version, approval
-   and replay evidence is lot B (proposed, not built).
+   event across hops is built (ADR-0034 lot A, transport test T6 in CI). Lot
+   B, the end-to-end view in the panel, is built in part: the trace record in
+   NATS, the panel's Trace card, search by content and `vejas_trace`. The
+   statement-by-statement view and the links from each hop to its version,
+   approval and replay evidence are not built yet.
 3. **Full shadow-replay** · built (ADR-0018): JetStream-hydrated history,
    promote audit trail (git + `VEJAS_AUDIT`), forward-only rollback.
 4. **Published, reproducible benchmarks**: throughput, memory, image size,

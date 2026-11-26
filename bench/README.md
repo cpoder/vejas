@@ -189,6 +189,56 @@ Two findings on the way, both fixed before the numbers above:
   span. Reading the queue on a 25 ms tick while spans are pending brought
   export to between 5.5 and 9 µs.
 
+### The trace record (lot B)
+
+The same script runs the record's configurations, interleaved with lot A's
+(the record is on by default, so lot A's rows set `VEJAS_TRACES=off`).
+2026-11-26, same machine, a first series on the first complete scrub:
+
+| Configuration | Flow-hop rate | Runtime CPU per event | NATS CPU per event | RSS |
+|---|---|---|---|---|
+| Record off, no exporter | 9 302/s | 75.5 µs | 168.5 µs | 10.2 MB |
+| Record | 9 238/s | 93.0 µs | 177.0 µs | 13.5 MB |
+| Record, payloads off | 9 112/s | 87.5 µs | 180.0 µs | 13.1 MB |
+| Record, one trace in ten | 9 191/s | 79.5 µs | 167.5 µs | 12.1 MB |
+| Record and every span exported | 9 162/s | 99.0 µs | 176.0 µs | 15.2 MB |
+
+A second series, on the scrub as it shipped after its second review (the
+event above goes through the same steps of it):
+
+| Configuration | Flow-hop rate | Runtime CPU per event | NATS CPU per event | RSS |
+|---|---|---|---|---|
+| Record off, no exporter | 9 066/s | 74.0 µs | 167.5 µs | 10.1 MB |
+| Record | 8 450/s | 94.0 µs | 170.0 µs | 13.2 MB |
+| Record, payloads off | 8 865/s | 87.5 µs | 166.5 µs | 12.6 MB |
+| Record, one trace in ten | 9 033/s | 77.5 µs | 158.5 µs | 11.8 MB |
+| Record and every span exported | 8 933/s | 102.5 µs | 166.0 µs | 15.0 MB |
+
+Each full run recorded its 20 000 events, and the one-in-ten runs about
+2 000. Recording every hop costs the runtime 17.5 to 20 µs of CPU per event
+over the two series, 12 to 13.5 without payloads, 3.5 to 4 at one trace in
+ten. The NATS server's CPU per event moves by several µs from one series to
+the next: storing the hops costs it 2.5 to 8.5 µs. A profile of a
+100 000-event run puts about 13 µs of the record's cost on its own thread,
+which the flow hands its hop to and does not wait for.
+
+- **#10 A JSON tree per record.** The first record built a
+  `serde_json::Value` for each hop, payload included, and masked it in
+  place: 25.5 µs per event, and a profile put 22 % of the runtime's CPU on the
+  record's thread, most of it allocating and freeing the tree. Writing the
+  record straight to JSON text, the payload transcoded through serde without
+  a tree, brought it to 17.5 µs, although the scrub does more (text forms,
+  every vault value in one pass).
+- **The subject index.** One subject per trace lets one filtered read return a
+  trace, and the server indexes every subject in memory.
+  `bench/trace-subjects.py` publishes hop records of about 400 bytes into a
+  file stream, one subject per trace or one subject for all, and reads the
+  server's memory at peak and after a restart. On NATS 2.10.24 and 2.15.3 a
+  subject per trace costs 200 to 450 bytes per trace: 20 to 45 MB for
+  100 000 one-hop traces, 7 to 15 MB for 100 000 hops in traces of three. A KV
+  bucket mapping trace id to sequences, the fallback ADR-0034 named, keeps a
+  subject per key, so it would cost the same.
+
 ## The true hop ceiling and multi-flow scaling
 
 With parallel publishers, the single-flow hop tops out around **14–16 k/s**
