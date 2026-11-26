@@ -10,6 +10,9 @@ use crate::span::{now_nanos, Kind, Span};
 use crate::trace;
 use crate::{Ctx, MAX_DELIVERIES};
 
+/// What a sink does with one message: see [`Ctx::consume`].
+type Handler<'a> = dyn Fn(&[u8], &trace::Context) -> Result<Option<String>, String> + 'a;
+
 impl Ctx {
     /// The sink loop: a durable pull consumer on `subject`, one call of
     /// `handler` per message; ack on Ok, nak on Err, and past
@@ -25,6 +28,16 @@ impl Ctx {
         &self,
         subject: &str,
         handler: impl Fn(&[u8], &trace::Context) -> Result<Option<String>, String>,
+    ) -> Result<(), String> {
+        self.consume_with(subject, &handler)
+    }
+
+    /// The loop itself, compiled once for every sink: a closure per driver
+    /// would compile it again for each (see the note in `bus`).
+    fn consume_with(
+        &self,
+        subject: &str,
+        handler: &Handler,
     ) -> Result<(), String> {
         let ctx = self;
         let js = ctx.jetstream()?;

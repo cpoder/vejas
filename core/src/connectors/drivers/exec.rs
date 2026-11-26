@@ -221,7 +221,7 @@ impl Driver for ExecStreamSource {
                                         }
                                     }
                                 }
-                                // recorded in the ring by source_publish
+                                // ctx.publish recorded the failure
                                 Err(_) => {}
                             }
                         } else {
