@@ -76,10 +76,10 @@ What turns "nice project" into "I can run this in production":
    re-injected explicitly after the fix. The sister loop of ADR-0005.
 2. **Real observability** · built (ADR-0016): OTLP/HTTP-JSON traces + a
    Prometheus `/metrics` endpoint, hand-rolled to keep the footprint. The
-   manifesto claims it again now that it ships. Every span is still its own
-   trace: one trace per event across hops, and an end-to-end view in the
-   panel that links each hop to its version, approval and replay evidence,
-   is ADR-0034 (proposed, not built).
+   manifesto claims it again now that it ships. One trace per business
+   event across hops is built (ADR-0034 lot A, transport test T6 in CI). The
+   end-to-end view in the panel that links each hop to its version, approval
+   and replay evidence is lot B (proposed, not built).
 3. **Full shadow-replay** · built (ADR-0018): JetStream-hydrated history,
    promote audit trail (git + `VEJAS_AUDIT`), forward-only rollback.
 4. **Published, reproducible benchmarks**: throughput, memory, image size,

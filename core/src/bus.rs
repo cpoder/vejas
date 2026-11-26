@@ -28,13 +28,17 @@ use std::time::{Duration, Instant};
 use async_nats::client::{Request, Statistics};
 use async_nats::connection::State;
 use async_nats::jetstream::{self, kv, object_store};
-use async_nats::{Client, ConnectOptions, Event, ServerAddr, StatusCode, Subject, Subscriber};
+use async_nats::{
+    Client, ConnectOptions, Event, HeaderMap, HeaderName, ServerAddr, StatusCode, Subject, Subscriber,
+};
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+
+use crate::trace;
 
 // ───────────────────────── the runtime ─────────────────────────
 
@@ -285,6 +289,17 @@ impl Bus {
         wait(sent(client.publish(subject.to_string(), payload)))
     }
 
+    /// The same, carrying the trace it belongs to (ADR-0034).
+    pub fn publish_traced(
+        &self,
+        subject: &str,
+        payload: impl Into<Bytes>,
+        trace: &trace::Context,
+    ) -> Result<(), String> {
+        let (client, payload) = (&self.0.link.client, payload.into());
+        wait(sent(client.publish_with_headers(subject.to_string(), trace_headers(trace), payload)))
+    }
+
     /// A batch of publishes that leave together, see [`Batch`].
     pub fn batch(&self) -> Batch {
         Batch {
@@ -359,7 +374,7 @@ impl Bus {
 /// whatever has arrived, so a quiet flow's emit leaves as soon as it is made.
 pub struct Batch {
     bus: Bus,
-    held: Vec<(Subject, Bytes)>,
+    held: Vec<(Subject, Option<HeaderMap>, Bytes)>,
 }
 
 impl Batch {
@@ -367,19 +382,34 @@ impl Batch {
     /// protocol cannot carry, a payload over the server's limit), and only this
     /// one: the caller treats its source message as a failed run, and the rest of
     /// the batch goes on.
+    /// Without a trace: every publish of the runtime carries one now (ADR-0034),
+    /// so only the tests hold these.
+    #[cfg(test)]
     pub fn publish(&mut self, subject: &str, payload: impl Into<Bytes>) -> Result<(), String> {
-        let payload = payload.into();
+        self.hold(subject, None, payload.into())
+    }
+
+    /// The same, carrying the trace it belongs to (ADR-0034).
+    pub fn publish_traced(
+        &mut self,
+        subject: &str,
+        payload: impl Into<Bytes>,
+        trace: &trace::Context,
+    ) -> Result<(), String> {
+        self.hold(subject, Some(trace_headers(trace)), payload.into())
+    }
+
+    fn hold(&mut self, subject: &str, headers: Option<HeaderMap>, payload: Bytes) -> Result<(), String> {
         if subject.is_empty() || subject.contains([' ', '\t', '\r', '\n']) {
             return Err(format!("invalid subject {subject:?}"));
         }
+        // The server's limit covers the headers too.
+        let size = payload.len() + headers.as_ref().map(headers_len).unwrap_or(0);
         let limit = self.bus.0.link.client.max_payload();
-        if payload.len() > limit {
-            return Err(format!(
-                "{} bytes is over the server's limit of {limit}",
-                payload.len()
-            ));
+        if size > limit {
+            return Err(format!("{size} bytes is over the server's limit of {limit}"));
         }
-        self.held.push((subject.to_string().into(), payload));
+        self.held.push((subject.to_string().into(), headers, payload));
         Ok(())
     }
 
@@ -410,8 +440,11 @@ impl Batch {
         let epoch = link.epoch();
         let held = &mut self.held;
         wait(async {
-            for (subject, payload) in held.drain(..) {
-                sent(link.client.publish(subject, payload)).await?;
+            for (subject, headers, payload) in held.drain(..) {
+                match headers {
+                    Some(headers) => sent(link.client.publish_with_headers(subject, headers, payload)).await?,
+                    None => sent(link.client.publish(subject, payload)).await?,
+                }
             }
             link.barrier_since(epoch).await
         })
@@ -444,6 +477,7 @@ pub struct Message {
     pub subject: String,
     pub data: Bytes,
     reply: Option<Subject>,
+    headers: Option<HeaderMap>,
     link: Arc<Link>,
 }
 
@@ -461,8 +495,17 @@ impl Message {
             subject: message.subject.to_string(),
             data: message.payload,
             reply: message.reply,
+            headers: message.headers,
             link,
         }
+    }
+
+    /// The trace this message belongs to, read from its `traceparent` header
+    /// (ADR-0034). None when it has no valid one: the hop then starts a trace.
+    pub fn trace(&self) -> Option<trace::Context> {
+        let headers = self.headers.as_ref()?;
+        let parent = header(headers, trace::TRACEPARENT)?;
+        trace::Context::parse(parent, header(headers, trace::TRACESTATE))
     }
 
     /// The JetStream delivery behind this message, if it is one.
@@ -489,6 +532,45 @@ impl Message {
         };
         wait(sent(self.link.client.publish(reply.clone(), payload)))
     }
+}
+
+/// The headers that carry a trace on the bus (ADR-0034).
+fn trace_headers(trace: &trace::Context) -> HeaderMap {
+    // Constant names: no allocation for the name on every publish.
+    const TRACEPARENT: HeaderName = HeaderName::from_static(trace::TRACEPARENT);
+    const TRACESTATE: HeaderName = HeaderName::from_static(trace::TRACESTATE);
+    let mut headers = HeaderMap::new();
+    headers.insert(TRACEPARENT, trace.traceparent());
+    if let Some(state) = &trace.state {
+        headers.insert(TRACESTATE, state.as_str());
+    }
+    headers
+}
+
+/// What headers add to a message on the wire: the `NATS/1.0` line, each
+/// `name: value` line, and the blank line that ends them.
+fn headers_len(headers: &HeaderMap) -> usize {
+    let lines: usize = headers
+        .iter()
+        .map(|(name, values)| {
+            let name: &str = name.as_ref();
+            values.iter().map(|v| name.len() + v.as_str().len() + 4).sum::<usize>()
+        })
+        .sum();
+    10 + lines + 2
+}
+
+/// A header's first value. NATS keeps the case a header was written with, so a
+/// name is matched without regard to case; the exact spelling is tried first.
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    if let Some(value) = headers.get(name) {
+        return Some(value.as_str());
+    }
+    headers
+        .iter()
+        .find(|(k, _)| AsRef::<str>::as_ref(*k).eq_ignore_ascii_case(name))
+        .and_then(|(_, values)| values.first())
+        .map(|v| v.as_str())
 }
 
 /// `$JS.ACK.<stream>.<consumer>.<delivered>.<stream seq>.<consumer seq>.<ts>.<pending>`,
@@ -741,6 +823,22 @@ impl JetStream {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
         wait(async {
             let ack = self.shared().js.publish(subject.to_string(), bytes).await;
+            let ack = ack.map_err(|e| e.to_string())?.await;
+            ack.map(|ack| ack.sequence).map_err(|e| e.to_string())
+        })
+    }
+
+    /// The same, carrying the trace it belongs to (ADR-0034).
+    pub fn publish_traced(
+        &self,
+        subject: &str,
+        payload: impl AsRef<[u8]>,
+        trace: &trace::Context,
+    ) -> Result<u64, String> {
+        let bytes = Bytes::copy_from_slice(payload.as_ref());
+        wait(async {
+            let js = &self.shared().js;
+            let ack = js.publish_with_headers(subject.to_string(), trace_headers(trace), bytes).await;
             let ack = ack.map_err(|e| e.to_string())?.await;
             ack.map(|ack| ack.sequence).map_err(|e| e.to_string())
         })
@@ -1149,6 +1247,21 @@ mod tests {
     }
 
     #[test]
+    fn a_trace_header_is_read_whatever_its_case() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let context = trace::Context::parse(tp, Some("k=v")).unwrap();
+        let written = trace_headers(&context);
+        assert_eq!(header(&written, "traceparent"), Some(tp));
+        assert_eq!(header(&written, "tracestate"), Some("k=v"));
+        // "NATS/1.0\r\n" + "traceparent: <55>\r\n" + "tracestate: k=v\r\n" + "\r\n"
+        assert_eq!(headers_len(&written), 10 + (11 + 55 + 4) + (10 + 3 + 4) + 2);
+        let mut foreign = HeaderMap::new();
+        foreign.insert("TraceParent", tp);
+        assert_eq!(header(&foreign, "traceparent"), Some(tp));
+        assert_eq!(header(&foreign, "tracestate"), None);
+    }
+
+    #[test]
     fn statuses_end_a_round_or_a_consumer() {
         let status = |code: StatusCode, description: &str| async_nats::Message {
             subject: "_INBOX.x".into(),
@@ -1276,6 +1389,43 @@ mod live {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn every_publish_carries_its_trace_to_the_consumer() {
+        let server = Server::start();
+        let bus = connect(&server.url()).unwrap();
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let context = trace::Context::parse(tp, Some("vendor=1")).unwrap();
+        // Core publish and confirmed batch, read on a subscription.
+        let mut sub = bus.subscribe("t.core").unwrap();
+        bus.publish_traced("t.core", "one", &context).unwrap();
+        let mut batch = bus.batch();
+        batch.publish_traced("t.core", "two", &context).unwrap();
+        batch.publish("t.core", "three").unwrap();
+        batch.confirm().unwrap();
+        for _ in 0..2 {
+            let message = sub.next_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(message.trace().as_ref(), Some(&context));
+        }
+        let untraced = sub.next_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(untraced.trace(), None, "no header, no context");
+        // JetStream publish, read by a pull consumer: the stream keeps it.
+        let js = bus.jetstream();
+        js.add_stream(&StreamConfig {
+            name: "T".into(),
+            subjects: vec!["t.js".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = ["t.js".to_string()];
+        js.create_pull_consumer("T", "d", &filter, Duration::ZERO, None).unwrap();
+        let puller = js.pull_durable("T", "d", Some("t.js")).unwrap();
+        js.publish_traced("t.js", "four", &context).unwrap();
+        let pulled: Vec<Message> = puller.round().unwrap().collect();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].trace(), Some(context));
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Observability: a Prometheus `/metrics` exposition and an OTLP/HTTP-JSON span
 //! exporter — both hand-rolled so the runtime keeps its single-digit-MB RSS and
-//! tiny binary (no `opentelemetry` crate tree). Metrics are pull-scraped; traces
-//! are pushed to an OTLP collector ONLY when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
-//! (zero cost, no exporter thread, when it is not).
+//! tiny binary (no `opentelemetry` crate tree). Metrics are pull-scraped; spans
+//! are pushed to an OTLP collector ONLY when an endpoint is set
+//! (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`): no
+//! exporter thread and no span built when it is not.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Histogram bucket upper bounds (seconds). A flow hop is ms-scale, so the
 // buckets crowd the low end; the last (+Inf) is implicit in rendering.
@@ -285,6 +286,23 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
         ));
     }
 
+    out.push_str("# HELP vejas_spans_exported_total Spans the OTLP exporter delivered to the collector.\n");
+    out.push_str("# TYPE vejas_spans_exported_total counter\n");
+    out.push_str(&format!(
+        "vejas_spans_exported_total {}\n",
+        SPANS_EXPORTED.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP vejas_spans_dropped_total Spans lost before the collector had them: the export queue was full, or the export failed after its retries.\n");
+    out.push_str("# TYPE vejas_spans_dropped_total counter\n");
+    out.push_str(&format!(
+        "vejas_spans_dropped_total{{reason=\"queue_full\"}} {}\n",
+        SPANS_DROPPED_QUEUE.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "vejas_spans_dropped_total{{reason=\"export_failed\"}} {}\n",
+        SPANS_DROPPED_EXPORT.load(Ordering::Relaxed)
+    ));
+
     out.push_str("# HELP vejas_event_duration_seconds In-process per-event processing time.\n");
     out.push_str("# TYPE vejas_event_duration_seconds histogram\n");
     for (unit, u) in map.iter() {
@@ -314,126 +332,510 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
 }
 
 // ───────────────────────── OTLP/HTTP-JSON trace export ─────────────────────────
+//
+// One span per hop, with the parent the trace context names (ADR-0034): the
+// source that let an event in, each flow it crossed, each `invoke`, each sink
+// that delivered it, all under one trace id. Spans are built only while an
+// exporter is configured (`tracing()`), so the hot path pays nothing for them
+// otherwise; the context itself travels either way (see `trace.rs`).
+
+/// OpenTelemetry span kinds, numbered as OTLP numbers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Internal = 1,
+    Server = 2,
+    Client = 3,
+    Producer = 4,
+    Consumer = 5,
+}
+
+pub enum Attr {
+    Str(String),
+    /// A constant: no allocation on the hot path.
+    Static(&'static str),
+    Int(i64),
+    Bool(bool),
+}
+
+impl From<&str> for Attr {
+    fn from(v: &str) -> Attr {
+        Attr::Str(v.to_string())
+    }
+}
+impl From<String> for Attr {
+    fn from(v: String) -> Attr {
+        Attr::Str(v)
+    }
+}
+impl From<i64> for Attr {
+    fn from(v: i64) -> Attr {
+        Attr::Int(v)
+    }
+}
+impl From<u64> for Attr {
+    fn from(v: u64) -> Attr {
+        Attr::Int(v.min(i64::MAX as u64) as i64)
+    }
+}
+impl From<bool> for Attr {
+    fn from(v: bool) -> Attr {
+        Attr::Bool(v)
+    }
+}
 
 /// One finished span, queued for the background exporter.
 pub struct Span {
-    pub unit: String,
-    pub subject: String,
-    pub ok: bool,
-    pub error: Option<String>,
+    pub name: String,
+    pub kind: Kind,
+    pub trace_id: u128,
+    pub span_id: u64,
+    pub parent: Option<u64>,
+    pub sampled: bool,
     pub start_nanos: u128,
     pub end_nanos: u128,
-    pub emits: u64,
+    /// The failure, if the hop failed; a success leaves the status unset, as the
+    /// semantic conventions ask of instrumentation.
+    pub error: Option<String>,
+    pub attrs: Vec<(&'static str, Attr)>,
+}
+
+impl Span {
+    /// The span of `hop`, named after the unit that ran it, from `start_nanos`
+    /// to now.
+    pub fn hop(hop: &crate::trace::Hop, kind: Kind, unit: &str, start_nanos: u128) -> Span {
+        Span {
+            name: unit.to_string(),
+            kind,
+            trace_id: hop.trace_id,
+            span_id: hop.span_id,
+            parent: hop.parent,
+            sampled: hop.sampled,
+            start_nanos,
+            end_nanos: now_nanos(),
+            error: None,
+            attrs: {
+                let mut attrs = Vec::with_capacity(10);
+                attrs.push(("vejas.unit", Attr::Str(unit.to_string())));
+                attrs
+            },
+        }
+    }
+
+    pub fn attr(mut self, key: &'static str, value: impl Into<Attr>) -> Span {
+        self.attrs.push((key, value.into()));
+        self
+    }
+
+    /// The messaging attributes of a hop on the bus: `operation` is `process`
+    /// for a consumer, `send` for a producer.
+    pub fn messaging(mut self, operation: &'static str, subject: &str) -> Span {
+        self.attrs.push(("messaging.system", Attr::Static("nats")));
+        self.attrs.push(("messaging.operation.type", Attr::Static(operation)));
+        self.attr("messaging.destination.name", subject)
+    }
+
+    pub fn failed(mut self, error: impl Into<String>) -> Span {
+        self.error = Some(error.into());
+        self
+    }
 }
 
 static TX: OnceLock<Option<SyncSender<Span>>> = OnceLock::new();
-static SPAN_SEQ: AtomicU64 = AtomicU64::new(1);
+static SPANS_EXPORTED: AtomicU64 = AtomicU64::new(0);
+static SPANS_DROPPED_QUEUE: AtomicU64 = AtomicU64::new(0);
+static SPANS_DROPPED_EXPORT: AtomicU64 = AtomicU64::new(0);
 
-fn id_hex(bytes: usize) -> String {
-    let seq = SPAN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let n = now_nanos();
-    if bytes == 16 {
-        // 128-bit trace id: nanos in the high half, a mixed counter in the low.
-        let lo = (seq).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        format!("{:016x}{:016x}", n as u64, lo)
-    } else {
-        // 64-bit span id.
-        format!("{:016x}", (seq ^ (n as u64)).wrapping_mul(0xD6E8_FEB8_6659_FD93))
-    }
+/// Is an exporter configured? Call sites test this before building a span, so
+/// that without one the hot path builds nothing (ADR-0016).
+pub fn tracing() -> bool {
+    matches!(TX.get(), Some(Some(_)))
 }
 
-/// Spawn the exporter thread iff `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Idempotent
-/// (the OnceLock guards it). When unset, TX holds None and `span()` is a no-op.
+/// Is this hop's span worth building: an exporter is configured, and the
+/// sampler kept the trace or the hop failed (errors are always exported).
+pub fn wants(sampled: bool, failed: bool) -> bool {
+    (sampled || failed) && tracing()
+}
+
+/// Where and how spans go: the OTEL_* variables the specification defines for
+/// an OTLP/HTTP exporter, the traces-specific ones first.
+struct ExportConfig {
+    url: String,
+    headers: Vec<(String, String)>,
+    timeout: Duration,
+    resource: Vec<(String, String)>,
+    /// The batch span processor's knobs, under the specification's names.
+    delay: Duration,
+    batch: usize,
+    queue: usize,
+}
+
+fn export_config(env: impl Fn(&str) -> Option<String>) -> Option<ExportConfig> {
+    let var = |k: &str| env(k).filter(|v| !v.trim().is_empty());
+    // The traces endpoint is used as given; the generic one gets the signal path.
+    let url = match var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+        Some(url) => url.trim().to_string(),
+        None => format!(
+            "{}/v1/traces",
+            var("OTEL_EXPORTER_OTLP_ENDPOINT")?.trim().trim_end_matches('/')
+        ),
+    };
+    let headers = var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+        .or_else(|| var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .map(|h| key_values(&h, "OTEL_EXPORTER_OTLP_HEADERS"))
+        .unwrap_or_default();
+    let timeout = var("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")
+        .or_else(|| var("OTEL_EXPORTER_OTLP_TIMEOUT"))
+        .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .unwrap_or(10_000);
+    let mut resource: Vec<(String, String)> = var("OTEL_RESOURCE_ATTRIBUTES")
+        .map(|r| key_values(&r, "OTEL_RESOURCE_ATTRIBUTES"))
+        .unwrap_or_default();
+    let service = var("OTEL_SERVICE_NAME")
+        .or_else(|| resource.iter().find(|(k, _)| k == "service.name").map(|(_, v)| v.clone()))
+        .unwrap_or_else(|| "vejas".to_string());
+    resource.retain(|(k, _)| k != "service.name" && k != "service.version");
+    resource.insert(0, ("service.name".into(), service));
+    resource.insert(1, ("service.version".into(), env!("CARGO_PKG_VERSION").into()));
+    let number = |k: &str, default: u64| var(k).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
+    // 1 s rather than the specification's 5 s, so that a trace shows up while
+    // its sender still looks; under load a full batch leaves at once anyway.
+    let delay = Duration::from_millis(number("OTEL_BSP_SCHEDULE_DELAY", 1000));
+    let queue = number("OTEL_BSP_MAX_QUEUE_SIZE", 4096).clamp(1, 1 << 20) as usize;
+    let batch = (number("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512).max(1) as usize).min(queue);
+    Some(ExportConfig {
+        url,
+        headers,
+        timeout: Duration::from_millis(timeout.max(1)),
+        resource,
+        delay,
+        batch,
+        queue,
+    })
+}
+
+/// `k=v,k2=v2` with percent-encoded values, the format of the OTEL_* lists. A
+/// malformed entry is skipped with a warning that names the variable, never
+/// the value: header values are credentials.
+fn key_values(list: &str, variable: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match entry.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() => {
+                out.push((percent_decode(k.trim()), percent_decode(v.trim())))
+            }
+            _ => eprintln!("[vejas] {variable}: an entry without `key=` is skipped"),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Spawn the exporter thread iff an OTLP endpoint is configured. Idempotent
+/// (the OnceLock guards it). Without one, TX holds None, `tracing()` is false
+/// and `span()` is a no-op.
 pub fn otlp_init() {
     TX.get_or_init(|| {
-        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
-        let endpoint = endpoint.trim_end_matches('/').to_string();
-        let url = format!("{endpoint}/v1/traces");
-        let service =
-            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "vejas".to_string());
-        // Bounded queue: if the collector stalls, spans are dropped (a metric
-        // path must never block the flow hot loop), never buffered unboundedly.
-        let (tx, rx) = sync_channel::<Span>(4096);
-        eprintln!("[vejas] OTLP traces -> {url}");
-        std::thread::spawn(move || {
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(5))
-                .build();
-            let mut batch: Vec<Span> = Vec::with_capacity(512);
+        let config = export_config(|k| std::env::var(k).ok())?;
+        // Bounded queue: if the collector stalls, spans are dropped (and
+        // counted), never buffered without bound, and the hot loop never waits.
+        let (tx, rx) = sync_channel::<Span>(config.queue);
+        eprintln!("[vejas] OTLP traces -> {}", config.url);
+        let spawned = std::thread::Builder::new().name("otlp-export".into()).spawn(move || {
+            let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
+            let mut batch: Vec<Span> = Vec::with_capacity(config.batch);
+            let mut oldest: Option<Instant> = None;
+            let mut last_report: Option<Instant> = None;
             loop {
-                // Block for the first span, then drain whatever else is queued.
-                match rx.recv() {
-                    Ok(s) => batch.push(s),
-                    Err(_) => break, // sender gone: shutdown
-                }
-                while batch.len() < 512 {
-                    match rx.try_recv() {
-                        Ok(s) => batch.push(s),
-                        Err(_) => break,
+                let flush = FLUSH_ASKED.load(Ordering::SeqCst);
+                if batch.is_empty() && flush <= FLUSH_DONE.load(Ordering::SeqCst) {
+                    // Nothing pending: wait on the queue itself, so an idle
+                    // runtime leaves this thread asleep. Only the first span
+                    // after a quiet spell pays for waking it.
+                    match rx.recv_timeout(IDLE_WAIT) {
+                        Ok(s) => {
+                            batch.push(s);
+                            oldest = Some(Instant::now());
+                        }
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                let body = otlp_payload(&service, &batch);
-                let _ = agent
-                    .post(&url)
-                    .set("content-type", "application/json")
-                    .send_string(&body);
-                batch.clear();
+                // While spans are pending, take what is queued without waiting
+                // on the queue: a producer
+                // never has to wake this thread, so a span costs the hot path
+                // one push. A full batch leaves at once.
+                while let Ok(s) = rx.try_recv() {
+                    batch.push(s);
+                    oldest.get_or_insert_with(Instant::now);
+                    if batch.len() >= config.batch {
+                        ship(&agent, &config, &mut batch, &mut last_report);
+                        oldest = None;
+                    }
+                }
+                let flushing = flush > FLUSH_DONE.load(Ordering::SeqCst);
+                let due = oldest.is_some_and(|t| t.elapsed() >= config.delay);
+                if !batch.is_empty() && (flushing || due) {
+                    ship(&agent, &config, &mut batch, &mut last_report);
+                    oldest = None;
+                }
+                if flushing {
+                    FLUSH_DONE.store(flush, Ordering::SeqCst);
+                }
+                std::thread::sleep(EXPORT_TICK);
             }
         });
-        Some(tx)
+        match spawned {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                eprintln!("[vejas] OTLP exporter not started: {e}");
+                None
+            }
+        }
     });
 }
 
-/// Queue a finished span for export. No-op unless the exporter is enabled; never
-/// blocks — a full queue drops the span rather than stalling the caller.
-pub fn span(s: Span) {
-    if let Some(Some(tx)) = TX.get() {
-        let _ = tx.try_send(s);
+/// How often the exporter looks at its queue while spans are pending. At
+/// 25 ms a 4096-span queue holds 160 000 spans a second.
+const EXPORT_TICK: Duration = Duration::from_millis(25);
+/// How long an idle exporter sleeps on its queue before it looks for a flush
+/// request: a graceful stop with nothing to export waits at most this long.
+const IDLE_WAIT: Duration = Duration::from_millis(250);
+static FLUSH_ASKED: AtomicU64 = AtomicU64::new(0);
+static FLUSH_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Export what is queued now and wait for it, at most `within`. Called on a
+/// graceful stop: the spans of the last moments before a restart are the
+/// ones an operator comes looking for.
+pub fn otlp_flush(within: Duration) {
+    if !tracing() {
+        return;
+    }
+    let ticket = FLUSH_ASKED.fetch_add(1, Ordering::SeqCst) + 1;
+    let start = Instant::now();
+    while FLUSH_DONE.load(Ordering::SeqCst) < ticket && start.elapsed() < within {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn otlp_payload(service: &str, spans: &[Span]) -> String {
-    let spans_json: Vec<serde_json::Value> = spans
-        .iter()
-        .map(|s| {
-            let mut attrs = vec![
-                serde_json::json!({"key":"vejas.unit","value":{"stringValue": s.unit}}),
-                serde_json::json!({"key":"messaging.destination.name","value":{"stringValue": s.subject}}),
-                serde_json::json!({"key":"vejas.emits","value":{"intValue": s.emits}}),
-            ];
-            if let Some(e) = &s.error {
-                attrs.push(
-                    serde_json::json!({"key":"error.message","value":{"stringValue": e}}),
-                );
+/// Export one batch, count the outcome, and say so in the log at most once a
+/// minute: a dead collector must not flood it.
+fn ship(agent: &ureq::Agent, config: &ExportConfig, batch: &mut Vec<Span>, last_report: &mut Option<Instant>) {
+    let body = otlp_payload(&config.resource, batch);
+    let n = batch.len() as u64;
+    batch.clear();
+    let failure = match export(agent, config, &body) {
+        Ok(0) => {
+            SPANS_EXPORTED.fetch_add(n, Ordering::Relaxed);
+            None
+        }
+        Ok(rejected) => {
+            let rejected = rejected.min(n);
+            SPANS_EXPORTED.fetch_add(n - rejected, Ordering::Relaxed);
+            SPANS_DROPPED_EXPORT.fetch_add(rejected, Ordering::Relaxed);
+            Some(format!("the collector rejected {rejected} of {n} spans"))
+        }
+        Err(e) => {
+            SPANS_DROPPED_EXPORT.fetch_add(n, Ordering::Relaxed);
+            Some(format!("{e}; {n} spans dropped"))
+        }
+    };
+    if let Some(why) = failure {
+        if last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            eprintln!("[vejas] OTLP export: {why} (vejas_spans_dropped_total counts them all)");
+            *last_report = Some(Instant::now());
+        }
+    }
+}
+
+/// One POST, retried with backoff on what the OTLP specification calls
+/// retryable (connection errors, 429, 502, 503, 504) and honouring
+/// `Retry-After`. Ok carries the spans the collector said it rejected.
+fn export(agent: &ureq::Agent, config: &ExportConfig, body: &str) -> Result<u64, String> {
+    const ATTEMPTS: u32 = 4;
+    let mut backoff = Duration::from_millis(500);
+    for attempt in 1..=ATTEMPTS {
+        let mut request = agent.post(&config.url).set("content-type", "application/json");
+        for (k, v) in &config.headers {
+            request = request.set(k, v);
+        }
+        let wait = match request.send_string(body) {
+            Ok(response) => return Ok(rejected_spans(&response.into_string().unwrap_or_default())),
+            Err(ureq::Error::Status(code, response)) if matches!(code, 429 | 502 | 503 | 504) => {
+                if attempt == ATTEMPTS {
+                    return Err(format!("HTTP {code} after {ATTEMPTS} attempts"));
+                }
+                response
+                    .header("retry-after")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|secs| Duration::from_secs(secs.min(30)))
+                    .unwrap_or(backoff)
             }
-            serde_json::json!({
-                "traceId": id_hex(16),
-                "spanId": id_hex(8),
-                "name": s.unit,
-                // SPAN_KIND_CONSUMER: this unit consumed a message off the bus.
-                "kind": 5,
-                "startTimeUnixNano": s.start_nanos.to_string(),
-                "endTimeUnixNano": s.end_nanos.to_string(),
-                "attributes": attrs,
-                // status: 2 = ERROR, 1 = OK.
-                "status": {"code": if s.ok { 1 } else { 2 }},
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "resourceSpans": [{
-            "resource": {
-                "attributes": [
-                    {"key":"service.name","value":{"stringValue": service}}
-                ]
-            },
-            "scopeSpans": [{
-                "scope": {"name": "vejas.runtime"},
-                "spans": spans_json
-            }]
-        }]
-    })
-    .to_string()
+            Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+            Err(ureq::Error::Transport(t)) => {
+                if attempt == ATTEMPTS {
+                    // The kind and the detail, not the Display: it would print the
+                    // URL, which may carry credentials.
+                    return Err(format!(
+                        "{:?}: {} after {ATTEMPTS} attempts",
+                        t.kind(),
+                        t.message().unwrap_or("transport error")
+                    ));
+                }
+                backoff
+            }
+        };
+        let jitter = Duration::from_millis(crate::trace::span_id() % 250);
+        std::thread::sleep(wait + jitter);
+        backoff *= 2;
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// `partialSuccess.rejectedSpans` of an OTLP answer, 0 when absent.
+fn rejected_spans(answer: &str) -> u64 {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(answer) else {
+        return 0;
+    };
+    let r = &v["partialSuccess"]["rejectedSpans"];
+    r.as_u64().or_else(|| r.as_str().and_then(|s| s.parse().ok())).unwrap_or(0)
+}
+
+/// Queue a finished span for export. A no-op without an exporter; never
+/// blocks: a full queue drops the span (counted) rather than stall the caller.
+/// A span the sampler left out is not exported, unless it failed: errors and
+/// dead letters are always exported, whatever the ratio.
+pub fn span(s: Span) {
+    if let Some(Some(tx)) = TX.get() {
+        if !s.sampled && s.error.is_none() {
+            return;
+        }
+        if tx.try_send(s).is_err() {
+            SPANS_DROPPED_QUEUE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The OTLP/HTTP JSON body for a batch, written straight into one string: the
+/// exporter thread runs this for every span, and a `serde_json::Value` tree per
+/// span cost several times the write.
+fn otlp_payload(resource: &[(String, String)], spans: &[Span]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(256 + spans.len() * 640);
+    out.push_str(r#"{"resourceSpans":[{"resource":{"attributes":["#);
+    for (i, (k, v)) in resource.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        attribute(&mut out, k, &Attr::Str(v.clone()));
+    }
+    out.push_str(r#"]},"scopeSpans":[{"scope":{"name":"vejas.runtime","version":"#);
+    json_string(&mut out, env!("CARGO_PKG_VERSION"));
+    out.push_str(r#"},"spans":["#);
+    for (i, s) in spans.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{{"traceId":"{:032x}","spanId":"{:016x}""#, s.trace_id, s.span_id);
+        if let Some(parent) = s.parent {
+            let _ = write!(out, r#","parentSpanId":"{parent:016x}""#);
+        }
+        out.push_str(r#","name":"#);
+        json_string(&mut out, &s.name);
+        let _ = write!(
+            out,
+            r#","kind":{},"startTimeUnixNano":"{}","endTimeUnixNano":"{}","attributes":["#,
+            s.kind as u8,
+            s.start_nanos,
+            s.end_nanos.max(s.start_nanos)
+        );
+        for (j, (k, v)) in s.attrs.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            attribute(&mut out, k, v);
+        }
+        match &s.error {
+            Some(e) => {
+                let message: String = e.chars().take(1024).collect();
+                if !s.attrs.is_empty() {
+                    out.push(',');
+                }
+                attribute(&mut out, "error.type", &Attr::Static("_OTHER"));
+                out.push(',');
+                attribute(&mut out, "error.message", &Attr::Str(message.clone()));
+                // status code 2 = ERROR; a success leaves it unset.
+                out.push_str(r#"],"status":{"code":2,"message":"#);
+                json_string(&mut out, &message);
+                out.push_str("}}");
+            }
+            None => out.push_str("]}"),
+        }
+    }
+    out.push_str("]}]}]}");
+    out
+}
+
+fn attribute(out: &mut String, key: &str, value: &Attr) {
+    out.push_str(r#"{"key":"#);
+    json_string(out, key);
+    out.push_str(r#","value":{"#);
+    match value {
+        Attr::Str(s) => {
+            out.push_str(r#""stringValue":"#);
+            json_string(out, s);
+        }
+        Attr::Static(s) => {
+            out.push_str(r#""stringValue":"#);
+            json_string(out, s);
+        }
+        // int64 travels as a decimal string in OTLP/JSON (proto3 mapping).
+        Attr::Int(n) => {
+            out.push_str(r#""intValue":""#);
+            out.push_str(&n.to_string());
+            out.push('"');
+        }
+        Attr::Bool(b) => out.push_str(if *b { r#""boolValue":true"# } else { r#""boolValue":false"# }),
+    }
+    out.push_str("}}");
+}
+
+/// A JSON string literal, escaped as RFC 8259 requires.
+fn json_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -467,21 +869,126 @@ mod tests {
 
     #[test]
     fn otlp_payload_is_valid_otlp_json() {
-        let s = Span {
-            unit: "flow:x".into(),
-            subject: "vx.a.b".into(),
-            ok: false,
-            error: Some("boom".into()),
-            start_nanos: 1,
-            end_nanos: 2,
-            emits: 3,
-        };
-        let body = otlp_payload("vejas", &[s]);
+        let incoming = crate::trace::Context::parse(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            None,
+        );
+        let hop = crate::trace::Hop::begin(incoming);
+        let failed = Span::hop(&hop, Kind::Consumer, "flow:x", 1)
+            .messaging("process", "vx.a.b")
+            .attr("vejas.emits", 3u64)
+            .failed("boom");
+        let child = hop.child();
+        let ok = Span::hop(&child, Kind::Internal, "invoke p:s", 2);
+        let resource = vec![("service.name".to_string(), "vejas".to_string())];
+        let body = otlp_payload(&resource, &[failed, ok]);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "flow:x");
-        assert_eq!(span["status"]["code"], 2);
-        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
-        assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
+        let spans = &v["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        let (first, second) = (&spans[0], &spans[1]);
+        assert_eq!(first["name"], "flow:x");
+        assert_eq!(first["kind"], 5);
+        assert_eq!(first["status"]["code"], 2);
+        assert_eq!(first["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(first["parentSpanId"], "00f067aa0ba902b7");
+        assert_eq!(first["spanId"].as_str().unwrap().len(), 16);
+        let attr = |span: &serde_json::Value, key: &str| {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == key)
+                .map(|a| a["value"].clone())
+        };
+        assert_eq!(attr(first, "messaging.destination.name").unwrap()["stringValue"], "vx.a.b");
+        assert_eq!(attr(first, "vejas.emits").unwrap()["intValue"], "3");
+        assert_eq!(attr(first, "error.message").unwrap()["stringValue"], "boom");
+        // The child hangs under the hop, in the same trace; a success leaves
+        // the status unset.
+        assert_eq!(second["traceId"], first["traceId"]);
+        assert_eq!(second["parentSpanId"], first["spanId"]);
+        assert!(second.get("status").is_none());
+        assert_eq!(v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"], "vejas");
+    }
+
+    #[test]
+    fn the_payload_stays_json_whatever_the_strings_hold() {
+        let hop = crate::trace::Hop::begin(None);
+        let nasty = "a \"quoted\" \\ back\nline\ttab\u{1}ctl é ✓";
+        let span = Span::hop(&hop, Kind::Client, nasty, 5)
+            .attr("vejas.note", nasty)
+            .attr("vejas.ok", true)
+            .attr("vejas.n", -3i64)
+            .failed(nasty);
+        let body = otlp_payload(&[("service.name".into(), nasty.into())], &[span]);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let s = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(s["name"], nasty);
+        assert_eq!(s["status"]["message"], nasty);
+        assert!(s.get("parentSpanId").is_none(), "a root has no parent");
+        let attrs = s["attributes"].as_array().unwrap();
+        let value = |k: &str| attrs.iter().find(|a| a["key"] == k).unwrap()["value"].clone();
+        assert_eq!(value("vejas.note")["stringValue"], nasty);
+        assert_eq!(value("vejas.ok")["boolValue"], true);
+        assert_eq!(value("vejas.n")["intValue"], "-3");
+        assert_eq!(value("error.type")["stringValue"], "_OTHER");
+        assert_eq!(v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"], nasty);
+        // An empty batch is still a valid request body.
+        let empty: serde_json::Value = serde_json::from_str(&otlp_payload(&[], &[])).unwrap();
+        assert_eq!(empty["resourceSpans"][0]["scopeSpans"][0]["spans"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_exporter_reads_the_otel_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert!(export_config(env(&[])).is_none(), "no endpoint, no exporter");
+        let generic = export_config(env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318/")])).unwrap();
+        assert_eq!(generic.url, "http://c:4318/v1/traces");
+        assert_eq!(generic.timeout, Duration::from_secs(10));
+        assert_eq!((generic.delay, generic.batch, generic.queue), (Duration::from_secs(1), 512, 4096));
+        let tuned = export_config(env(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+            ("OTEL_BSP_SCHEDULE_DELAY", "200"),
+            ("OTEL_BSP_MAX_QUEUE_SIZE", "100"),
+            ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "1000"),
+        ]))
+        .unwrap();
+        assert_eq!(tuned.delay, Duration::from_millis(200));
+        assert_eq!((tuned.batch, tuned.queue), (100, 100), "a batch never exceeds the queue");
+        let specific = export_config(env(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://t.example/otlp/traces"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "x-generic=no"),
+            ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "authorization=Basic%20abc%3D,x-team = ops ,broken"),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT", "2500"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "service.name=from-resource,deployment.environment=prod"),
+            ("OTEL_SERVICE_NAME", "cell-a"),
+        ]))
+        .unwrap();
+        assert_eq!(specific.url, "https://t.example/otlp/traces", "the traces endpoint is used as given");
+        assert_eq!(
+            specific.headers,
+            vec![("authorization".to_string(), "Basic abc=".to_string()), ("x-team".to_string(), "ops".to_string())]
+        );
+        assert_eq!(specific.timeout, Duration::from_millis(2500));
+        assert_eq!(specific.resource[0], ("service.name".to_string(), "cell-a".to_string()));
+        assert_eq!(specific.resource[1].0, "service.version");
+        assert!(specific.resource.contains(&("deployment.environment".to_string(), "prod".to_string())));
+        assert_eq!(specific.resource.iter().filter(|(k, _)| k == "service.name").count(), 1);
+        assert_eq!(rejected_spans(r#"{"partialSuccess":{"rejectedSpans":"3"}}"#), 3);
+        assert_eq!(rejected_spans(r#"{"partialSuccess":{}}"#), 0);
+        assert_eq!(rejected_spans(""), 0);
+        assert_eq!(percent_decode("a%2Cb%zz%4"), "a,b%zz%4");
+    }
+
+    #[test]
+    fn spans_are_neither_built_nor_counted_without_an_exporter() {
+        // No endpoint in the test environment: span() is a no-op.
+        assert!(!tracing());
+        span(Span::hop(&crate::trace::Hop::begin(None), Kind::Producer, "connector:t", 0));
+        let text = render(&[]);
+        assert!(text.contains("vejas_spans_dropped_total{reason=\"queue_full\"} 0"));
+        assert!(text.contains("vejas_spans_dropped_total{reason=\"export_failed\"} 0"));
     }
 }

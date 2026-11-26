@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::bus;
+use crate::metrics::{self, Kind, Span};
+use crate::trace;
 
 // ───────────────────────── config & context ─────────────────────────
 
@@ -412,15 +414,19 @@ fn handle_http_in(
                     ("403 Forbidden", format!("{{\"error\":\"subject {suffix:?} not permitted by ALLOW\"}}"))
                 } else {
                     let subject = format!("{subj_root}.{suffix}");
-                    match js.publish(&subject, body) {
-                        Ok(_) => {
-                            trace_pub(name, &subject, body);
-                            ("202 Accepted", format!("{{\"published\":\"{subject}\"}}"))
-                        }
-                        Err(e) => {
-                            trace_fail(name, &subject, format!("publish: {e}"));
-                            ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}"))
-                        }
+                    // A caller that traces sends its context; the event's trace
+                    // then starts in the caller's (ADR-0034).
+                    // (The head is decoded on its own: an index into the lossy
+                    // text of the whole buffer could fall inside a character.)
+                    let head = String::from_utf8_lossy(&buf[..header_end.unwrap_or(0).min(buf.len())]);
+                    let incoming = header_value(&head, trace::TRACEPARENT)
+                        .and_then(|tp| trace::Context::parse(tp, header_value(&head, trace::TRACESTATE)));
+                    match source_publish(name, js, &subject, body, incoming, Kind::Server) {
+                        (hop, Ok(_)) => (
+                            "202 Accepted",
+                            format!("{{\"published\":\"{subject}\",\"trace_id\":\"{}\"}}", hop.trace_hex()),
+                        ),
+                        (_, Err(e)) => ("502 Bad Gateway", format!("{{\"error\":\"{e}\"}}")),
                     }
                 }
             }
@@ -436,6 +442,14 @@ fn handle_http_in(
             break; // client sent its last request, then closed
         }
     }
+}
+
+/// A request header's value, its name matched without regard to case.
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
 }
 
 fn content_length(head: &str) -> usize {
@@ -489,10 +503,9 @@ impl Driver for Timer {
                 waited = 0;
                 let bytes = serde_json::to_vec(&stamp_ts(&payload, crate::now_secs()))
                     .unwrap_or_default();
-                if let Err(e) = js.publish(&subject, &bytes) {
+                if let (_, Err(e)) = source_publish(&ctx.name, &js, &subject, &bytes, None, Kind::Producer) {
                     return Err(format!("publish: {e}"));
                 }
-                trace_pub(&ctx.name, &subject, &bytes);
             }
         }
     }
@@ -547,8 +560,7 @@ impl Driver for HttpPoll {
                             } else {
                                 raw.clone()
                             };
-                            let _ = js.publish(&subject, &bytes);
-                            trace_pub(&ctx.name, &subject, &bytes);
+                            let _ = source_publish(&ctx.name, &js, &subject, &bytes, None, Kind::Producer);
                         }
                         Err(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
                     },
@@ -890,10 +902,9 @@ impl Driver for OAuthPoll {
                         "body": parsed,
                     });
                     let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
-                    if let Err(e) = js.publish(&subject, &bytes) {
+                    if let (_, Err(e)) = source_publish(&ctx.name, js, &subject, &bytes, None, Kind::Producer) {
                         return Err(format!("publish: {e}"));
                     }
-                    trace_pub(&ctx.name, &subject, &bytes);
                     Ok(())
                 };
             for ep in &endpoints {
@@ -1119,17 +1130,55 @@ pub fn trace_preview(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().take(160).collect()
 }
 
-/// A source publish, in the trace ring (the panel's "is it flowing?").
+/// A reply that went out, in the trace ring (the panel's "is it flowing?").
 fn trace_pub(name: &str, subject: &str, bytes: &[u8]) {
     crate::record_trace_full(
         name, subject, true, None,
-        vec![subject.to_string()], trace_preview(bytes), None, None,
+        vec![subject.to_string()], trace_preview(bytes), None, None, None,
     );
 }
 
 /// A source-side failure worth showing in the panel.
 fn trace_fail(name: &str, subject: &str, err: String) {
-    crate::record_trace_full(name, subject, false, Some(err), vec![], String::new(), None, None);
+    crate::record_trace_full(name, subject, false, Some(err), vec![], String::new(), None, None, None);
+}
+
+/// Publish what a source let in, as the first hop of its trace (ADR-0034): a
+/// new trace, or the caller's when the request carried one. The message
+/// carries the trace on; the hop's span is a PRODUCER (a SERVER for http-in),
+/// and the trace ring records the publish or its failure.
+fn source_publish(
+    name: &str,
+    js: &bus::JetStream,
+    subject: &str,
+    bytes: &[u8],
+    incoming: Option<trace::Context>,
+    kind: Kind,
+) -> (trace::Hop, Result<u64, String>) {
+    let hop = trace::Hop::begin(incoming);
+    let start_nanos = metrics::now_nanos();
+    let published = js.publish_traced(subject, bytes, &hop.context());
+    if metrics::wants(hop.sampled, published.is_err()) {
+        let mut span = Span::hop(&hop, kind, name, start_nanos).messaging("send", subject);
+        if kind == Kind::Server {
+            span = span.attr("http.request.method", "POST");
+        }
+        metrics::span(match &published {
+            Ok(_) => span,
+            Err(e) => span.failed(format!("publish: {e}")),
+        });
+    }
+    match &published {
+        Ok(_) => crate::record_trace_full(
+            name, subject, true, None,
+            vec![subject.to_string()], trace_preview(bytes), None, None, Some(&hop),
+        ),
+        Err(e) => crate::record_trace_full(
+            name, subject, false, Some(format!("publish: {e}")),
+            vec![], String::new(), None, None, Some(&hop),
+        ),
+    }
+    (hop, published)
 }
 
 /// A sink's response-body summary (what the downstream API answered).
@@ -1190,6 +1239,7 @@ pub fn to_dlq(
     last_error: &str,
     payload: &[u8],
     version: &str,
+    trace: Option<&trace::Context>,
 ) -> Result<(), String> {
     ensure_dlq_stream(js);
     let now = epoch_secs();
@@ -1207,11 +1257,14 @@ pub fn to_dlq(
         // Raw text of the original message — replayed verbatim, so JSON and
         // non-JSON alike re-inject faithfully; the panel pretty-prints it if JSON.
         "payload": String::from_utf8_lossy(payload),
+        // The trace the message died in (ADR-0034): a replay continues it, so
+        // the death and the second chance read as one story.
+        "traceparent": trace.map(|t| t.traceparent()),
     }))
     .map_err(|e| e.to_string())?;
     let dlq_subject = format!("{DLQ_ROOT}.{}", dlq_unit_token(unit));
     js.publish(&dlq_subject, body).map_err(|e| e.to_string())?;
-    announce_dead_letter(js, unit, subject, attempts, version);
+    announce_dead_letter(js, unit, subject, attempts, version, trace);
     Ok(())
 }
 
@@ -1233,6 +1286,9 @@ struct DlqAnnouncement {
     subject: String,
     attempts: i64,
     version: String,
+    /// The trace of the last letter: the event continues it, so whatever it
+    /// wakes shows up in that trace.
+    trace: Option<trace::Context>,
 }
 
 static DLQ_ANNOUNCEMENTS: OnceLock<Mutex<HashMap<String, DlqAnnouncement>>> = OnceLock::new();
@@ -1259,7 +1315,7 @@ fn take_due_dlq_events(
     pending: &mut HashMap<String, DlqAnnouncement>,
     now: u64,
     gap: u64,
-) -> Vec<Value> {
+) -> Vec<(Value, Option<trace::Context>)> {
     pending
         .iter_mut()
         .filter(|(_, a)| a.count > 0 && now.saturating_sub(a.last_sent) >= gap)
@@ -1268,19 +1324,24 @@ fn take_due_dlq_events(
                 "transition": "dead-lettered", "ts": now, "unit": unit,
                 "subject": a.subject, "attempts": a.attempts, "version": a.version,
                 "count": a.count,
+                "trace_id": a.trace.as_ref().map(|t| format!("{:032x}", t.trace_id)),
             });
             a.last_sent = now;
             a.count = 0;
-            event
+            (event, a.trace.take())
         })
         .collect()
 }
 
 /// Best-effort, like the proposal events: the letter is stored and the caller
 /// goes on to ack, whatever happens to its announcement.
-fn publish_dlq_event(js: &bus::JetStream, event: &Value) {
+fn publish_dlq_event(js: &bus::JetStream, (event, trace): &(Value, Option<trace::Context>)) {
     let body = serde_json::to_vec(event).unwrap_or_default();
-    if let Err(e) = js.publish(&dlq_events_subject(), body) {
+    let published = match trace {
+        Some(trace) => js.publish_traced(&dlq_events_subject(), body, trace),
+        None => js.publish(&dlq_events_subject(), body),
+    };
+    if let Err(e) = published {
         eprintln!("[vejas] dead-letter event not published: {e}");
     }
 }
@@ -1291,6 +1352,7 @@ fn announce_dead_letter(
     subject: &str,
     attempts: i64,
     version: &str,
+    trace: Option<&trace::Context>,
 ) {
     // A reader of these events that keeps failing dead-letters them in turn. If
     // that were announced too, the reader would feed itself forever.
@@ -1305,6 +1367,7 @@ fn announce_dead_letter(
         a.subject = subject.to_string();
         a.attempts = attempts;
         a.version = version.to_string();
+        a.trace = trace.cloned();
         take_due_dlq_events(&mut pending, epoch_secs(), gap)
     };
     for event in &due {
@@ -1416,10 +1479,14 @@ pub fn audit_recent(
 /// Shared sink loop: durable pull consumer -> handler; ack on Ok, nak on Err.
 /// The handler may return a response summary, recorded in the trace ring so
 /// the panel shows what the downstream answered (rejected facts, skips…).
+/// The sink loop. `handler` does the side effect for one message and gets the
+/// trace context to hand on (ADR-0034): an HTTP sink sends it as `traceparent`,
+/// an exec sink as `TRACEPARENT` in the child's environment, so a downstream
+/// system that traces hangs its spans under the sink's.
 fn run_sink(
     ctx: &Ctx,
     subject: &str,
-    handler: impl Fn(&[u8]) -> Result<Option<String>, String>,
+    handler: impl Fn(&[u8], &trace::Context) -> Result<Option<String>, String>,
 ) -> Result<(), String> {
     let js = ctx.jetstream()?;
     let durable = ctx.name.replace([':', '.', '-'], "_");
@@ -1427,6 +1494,17 @@ fn run_sink(
     let _ = js.create_pull_consumer(&ctx.stream, &durable, &filter, ack_wait(), None);
     let sub = js.pull_durable(&ctx.stream, &durable, Some(subject))?;
     eprintln!("[{}] consuming {subject}", ctx.name);
+    // The span of one delivery: kind CLIENT, as the runtime is the client of
+    // the system the sink delivers to.
+    let sink_span = |hop: &trace::Hop, msg: &bus::Message, start_nanos: u128| {
+        let mut span = Span::hop(hop, Kind::Client, &ctx.name, start_nanos).messaging("process", &msg.subject);
+        if let Some(d) = msg.delivery() {
+            span = span
+                .attr("messaging.message.id", d.stream_seq.to_string())
+                .attr("vejas.delivery.attempt", d.delivered);
+        }
+        span
+    };
     loop {
         if !ctx.alive() {
             return Ok(());
@@ -1436,41 +1514,40 @@ fn run_sink(
                 // stopped mid-batch: leave the message un-acked, it redelivers
                 return Ok(());
             }
+            let hop = trace::Hop::begin(msg.trace());
+            let carried = hop.context();
             let preview = trace_preview(&msg.data);
             let t0 = Instant::now();
-            let start_nanos = crate::metrics::now_nanos();
-            match handler(&msg.data) {
+            let start_nanos = metrics::now_nanos();
+            match handler(&msg.data, &carried) {
                 Ok(response) => {
-                    crate::metrics::observe(&ctx.name, true, 0, t0.elapsed().as_secs_f64());
-                    crate::metrics::span(crate::metrics::Span {
-                        unit: ctx.name.clone(), subject: subject.to_string(), ok: true,
-                        error: None, start_nanos, end_nanos: crate::metrics::now_nanos(), emits: 0,
-                    });
+                    metrics::observe(&ctx.name, true, 0, t0.elapsed().as_secs_f64());
+                    if metrics::wants(hop.sampled, false) {
+                        metrics::span(sink_span(&hop, &msg, start_nanos));
+                    }
                     crate::record_trace_full(
-                        &ctx.name, subject, true, None, vec![], preview, None, response,
+                        &ctx.name, subject, true, None, vec![], preview, None, response, Some(&hop),
                     );
                     let _ = msg.ack();
                 }
                 Err(e) => {
-                    crate::metrics::observe(&ctx.name, false, 0, t0.elapsed().as_secs_f64());
-                    crate::metrics::span(crate::metrics::Span {
-                        unit: ctx.name.clone(), subject: subject.to_string(), ok: false,
-                        error: Some(e.clone()), start_nanos, end_nanos: crate::metrics::now_nanos(), emits: 0,
-                    });
+                    metrics::observe(&ctx.name, false, 0, t0.elapsed().as_secs_f64());
                     // poison guard: give up after MAX_DELIVERIES attempts
                     let delivered =
                         msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                    let mut dead_lettered = false;
                     if delivered >= crate::MAX_DELIVERIES {
                         // Poison: park it in the DLQ, then ack — publish before ack
                         // so it is never lost (ADR-0015). On DLQ failure, nak.
-                        match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "") {
+                        match to_dlq(&js, &ctx.name, subject, delivered, &e, &msg.data, "", Some(&carried)) {
                             Ok(()) => {
-                                crate::metrics::inc_dead_letter(&ctx.name);
+                                dead_lettered = true;
+                                metrics::inc_dead_letter(&ctx.name);
                                 eprintln!("[{}] {e} -> DLQ after {delivered} deliveries", ctx.name);
                                 crate::record_trace_full(
                                     &ctx.name, subject, false,
                                     Some(format!("{e} — dead-lettered after {delivered} deliveries")),
-                                    vec![], preview, None, None,
+                                    vec![], preview, None, None, Some(&hop),
                                 );
                                 let _ = msg.ack();
                             }
@@ -1479,7 +1556,7 @@ fn run_sink(
                                 crate::record_trace_full(
                                     &ctx.name, subject, false,
                                     Some(format!("{e} — DLQ publish failed: {de}")),
-                                    vec![], preview, None, None,
+                                    vec![], preview, None, None, Some(&hop),
                                 );
                                 let _ = msg.nak();
                             }
@@ -1487,9 +1564,14 @@ fn run_sink(
                     } else {
                         eprintln!("[{}] {e} -> nak", ctx.name);
                         crate::record_trace_full(
-                            &ctx.name, subject, false, Some(e), vec![], preview, None, None,
+                            &ctx.name, subject, false, Some(e.clone()), vec![], preview, None, None, Some(&hop),
                         );
                         let _ = msg.nak();
+                    }
+                    if metrics::tracing() {
+                        let span = sink_span(&hop, &msg, start_nanos);
+                        let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
+                        metrics::span(span.failed(e));
                     }
                 }
             }
@@ -1513,7 +1595,7 @@ impl Driver for SlackOut {
             .or_else(|| std::env::var("SLACK_WEBHOOK_URL").ok())
             .unwrap_or_default();
         let name = ctx.name.clone();
-        run_sink(ctx, &subject, move |data| {
+        run_sink(ctx, &subject, move |data, trace| {
             let text = serde_json::from_slice::<Value>(data)
                 .ok()
                 .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
@@ -1524,7 +1606,7 @@ impl Driver for SlackOut {
             } else {
                 let payload = serde_json::json!({ "text": text }).to_string();
                 let headers = [("Content-Type".to_string(), "application/json".to_string())];
-                http_post(&webhook, &headers, payload.as_bytes()).map(|b| summarize(&b))
+                http_post(&webhook, &headers, payload.as_bytes(), Some(trace)).map(|b| summarize(&b))
             }
         })
     }
@@ -1570,7 +1652,9 @@ impl Driver for HttpOut {
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
-        run_sink(ctx, &subject, move |data| http_post(&url, &headers, data).map(|b| summarize(&b)))
+        run_sink(ctx, &subject, move |data, trace| {
+            http_post(&url, &headers, data, Some(trace)).map(|b| summarize(&b))
+        })
     }
 }
 
@@ -1619,8 +1703,7 @@ impl Driver for ExecSource {
                         continue;
                     }
                     if serde_json::from_slice::<Value>(line).is_ok() {
-                        let _ = js.publish(&subject, line);
-                        trace_pub(&ctx.name, &subject, line);
+                        let _ = source_publish(&ctx.name, &js, &subject, line, None, Kind::Producer);
                     } else {
                         eprintln!("[{}] exec: non-JSON line skipped", ctx.name);
                     }
@@ -1643,9 +1726,13 @@ impl Driver for ExecSink {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let name = ctx.name.clone();
         let env = ctx.config.env_vars();
-        run_sink(ctx, &subject, move |data| {
+        run_sink(ctx, &subject, move |data, trace| {
             let mut child = shell(&cmd)
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                // The OpenTelemetry carrier for a child process: a program that
+                // traces picks its parent up from here (ADR-0034).
+                .env("TRACEPARENT", trace.traceparent())
+                .env("TRACESTATE", trace.state.as_deref().unwrap_or(""))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1766,9 +1853,8 @@ impl Driver for ExecStreamSource {
                             continue;
                         }
                         if let Ok(rec) = serde_json::from_str::<Value>(line) {
-                            match js.publish(&subject, line) {
+                            match source_publish(&ctx.name, &js, &subject, line.as_bytes(), None, Kind::Producer).1 {
                                 Ok(_) => {
-                                    trace_pub(&ctx.name, &subject, line.as_bytes());
                                     // publish-before-commit: advance the offset in
                                     // MEMORY only after the record is on the bus; the
                                     // cadence loop (above) writes it to KV. No KV put
@@ -1781,9 +1867,8 @@ impl Driver for ExecStreamSource {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    trace_fail(&ctx.name, &subject, format!("publish: {e}"))
-                                }
+                                // recorded in the ring by source_publish
+                                Err(_) => {}
                             }
                         } else {
                             eprintln!("[{}] stream: non-JSON line skipped", ctx.name);
@@ -1940,9 +2025,9 @@ impl Driver for MqttIn {
                             // publish-before-ack: bus first (await JetStream pub-ack),
                             // THEN PUBACK — a crash before the bus write re-delivers
                             // from the broker (ADR-0025).
-                            js.publish(&subject, &payload)
+                            source_publish(&ctx.name, &js, &subject, &payload, None, Kind::Producer)
+                                .1
                                 .map_err(|e| format!("bus publish: {e}"))?;
-                            trace_pub(&ctx.name, &subject, &payload);
                             if pq > 0 {
                                 client.puback(pid)?;
                             }
@@ -1992,7 +2077,8 @@ impl Driver for MqttOut {
         // one MQTT session, reconnected on error (Mutex<Option<_>> for the Fn handler)
         let slot: std::sync::Mutex<Option<crate::mqtt::Client<MqttTransport>>> =
             std::sync::Mutex::new(None);
-        run_sink(ctx, &subject, move |data| {
+        // MQTT 3.1.1 has no headers: the trace stops at the broker.
+        run_sink(ctx, &subject, move |data, _trace| {
             let mut guard = slot.lock().unwrap();
             if guard.is_none() {
                 *guard = Some(mqtt_connect(
@@ -2197,7 +2283,31 @@ fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> 
     }
 }
 
-fn http_post(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<Vec<u8>, String> {
+/// POST for the sinks. With a trace, the request carries it as `traceparent`
+/// (and `tracestate`), replacing any the manifest set (ADR-0034).
+fn http_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    trace: Option<&trace::Context>,
+) -> Result<Vec<u8>, String> {
+    let traced: Vec<(String, String)>;
+    let headers = match trace {
+        Some(trace) => {
+            let is_trace = |k: &str| {
+                k.eq_ignore_ascii_case(trace::TRACEPARENT) || k.eq_ignore_ascii_case(trace::TRACESTATE)
+            };
+            let mut h: Vec<(String, String)> =
+                headers.iter().filter(|(k, _)| !is_trace(k)).cloned().collect();
+            h.push((trace::TRACEPARENT.into(), trace.traceparent()));
+            if let Some(state) = &trace.state {
+                h.push((trace::TRACESTATE.into(), state.clone()));
+            }
+            traced = h;
+            &traced[..]
+        }
+        None => headers,
+    };
     match http_request("POST", url, headers, Some(body))? {
         (code, out) if (200..300).contains(&code) => Ok(out),
         (code, out) => Err(format!(
@@ -2283,14 +2393,38 @@ mod tests {
         letter(&mut pending, "flow:a");
         let first = take_due_dlq_events(&mut pending, 1000, 60);
         assert_eq!(first.len(), 1, "the first letter is news at once");
-        assert_eq!(first[0]["count"], 1);
+        assert_eq!(first[0].0["count"], 1);
         for _ in 0..3 {
             letter(&mut pending, "flow:a");
         }
         assert!(take_due_dlq_events(&mut pending, 1030, 60).is_empty(), "inside the window");
         let held = take_due_dlq_events(&mut pending, 1060, 60);
-        assert_eq!(held[0]["count"], 3, "the window delays news, it loses none");
+        assert_eq!(held[0].0["count"], 3, "the window delays news, it loses none");
         assert!(take_due_dlq_events(&mut pending, 2000, 60).is_empty(), "nothing pending");
+    }
+
+    #[test]
+    fn the_event_carries_the_trace_of_the_last_letter() {
+        let mut pending = HashMap::new();
+        letter(&mut pending, "flow:t");
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        pending.get_mut("flow:t").unwrap().trace = trace::Context::parse(tp, None);
+        let due = take_due_dlq_events(&mut pending, 1000, 0);
+        assert_eq!(due[0].0["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(due[0].1.as_ref().map(|t| t.traceparent()).as_deref(), Some(tp));
+        letter(&mut pending, "flow:t");
+        let next = take_due_dlq_events(&mut pending, 2000, 0);
+        assert!(next[0].1.is_none() && next[0].0["trace_id"].is_null(), "taken once, not repeated");
+    }
+
+    #[test]
+    fn a_request_header_is_found_whatever_its_case() {
+        let head = "POST /ingest/orders HTTP/1.1\r\nHost: x\r\nTraceParent:  00-ab  \r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(header_value(head, "traceparent"), Some("00-ab"));
+        assert_eq!(header_value(head, "content-length"), Some("2"));
+        assert_eq!(header_value(head, "tracestate"), None);
+        // The request line is not a header, whatever it holds.
+        assert_eq!(header_value("GET /a:b HTTP/1.1\r\n\r\n", "get /a"), None);
     }
 
     #[test]
@@ -2302,7 +2436,7 @@ mod tests {
         letter(&mut pending, "flow:b");
         let due = take_due_dlq_events(&mut pending, 1001, 60);
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0]["unit"], "flow:b");
+        assert_eq!(due[0].0["unit"], "flow:b");
         assert_eq!(take_due_dlq_events(&mut pending, 1001, 0).len(), 1, "gap 0 lets flow:a through");
     }
 

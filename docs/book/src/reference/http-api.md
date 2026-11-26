@@ -76,4 +76,4 @@ answer with a didactic refusal pointing at the proposal queue.
 | Route | Purpose |
 |---|---|
 | `POST /mcp` | JSON-RPC 2.0 — the runtime **is** the MCP server. See [MCP tools](mcp-tools.md). |
-| `POST /ingest/<suffix>` *(http-in connector, own port)* | Webhook ingestion → `vx.<suffix>` on the bus, 202 after the JetStream pub-ack. At most `MAX_CONNECTIONS` at once (default 512), then 503. |
+| `POST /ingest/<suffix>` *(http-in connector, own port)* | Webhook ingestion → `vx.<suffix>` on the bus, 202 after the JetStream pub-ack, answering `{"published":"vx.<suffix>","trace_id":"…"}`; a caller's `traceparent` is continued. At most `MAX_CONNECTIONS` at once (default 512), then 503. |
