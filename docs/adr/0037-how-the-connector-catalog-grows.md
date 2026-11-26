@@ -1,6 +1,7 @@
 # 0037 — How the connector catalog grows: vendors as certified recipes on protocol drivers
 
-- Status: Proposed (for discussion with the founder; nothing built)
+- Status: Accepted, not built (the founder answered the three open questions
+  on 2026-11-26; the answers close this record)
 - Date: 2026-11-26
 
 ## Context
@@ -160,12 +161,21 @@ review", which is the adoption argument a smaller catalog can make.
 
 ## Open questions for the founder
 
+Answered on 2026-11-26: the founder kept the recommendation on all three.
+
 1. Is the order right? This proposal puts signed webhooks first (small,
    security), then Postgres (the most asked-for system of record), then the
    agent's proof loop. The proof loop could come first if the catalog story
    matters more than the database story for the next prospects.
+   **Answer:** the order stands: signed webhooks, then Postgres, then the
+   proof loop.
 2. Is a 20 MB budget for the stock binary the right line, or should the
    families ship as standalone binaries from the start and keep the runtime
    at its current size?
+   **Answer:** the 20 MB budget. A family with a pure Rust client goes into
+   the runtime once its size and cold start are measured; a vendor C client
+   (Oracle, DB2) ships as a standalone binary, as SAP did.
 3. Should the recipe-writing scope wait for the integration agent of
    ADR-0036, or ship first as an MCP tool and a guide that any agent follows?
+   **Answer:** the MCP tool and the guide come first. The agent of ADR-0036
+   uses them when it is built.
