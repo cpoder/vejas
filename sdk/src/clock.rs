@@ -1,6 +1,6 @@
 //! The wall clock: seconds since the epoch, and ISO 8601 UTC.
 
-pub(super) fn epoch_secs() -> u64 {
+pub fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -51,7 +51,7 @@ pub fn hydrate_recent(
     }
     // Over-scan so we still find n matching events when other subjects interleave,
     // but keep it bounded (an operator action, not the hot path).
-    let window = (n as u64).saturating_mul(8).max(256).min(200_000);
+    let window = (n as u64).saturating_mul(8).clamp(256, 200_000);
     let start = last.saturating_sub(window).max(1);
     // A cursor that takes no acks: the consumer is ephemeral and discarded, so
     // nothing redelivers to the flow and nothing is consumed off the stream.

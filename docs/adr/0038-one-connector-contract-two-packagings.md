@@ -1,6 +1,6 @@
 # 0038 — One connector contract, two packagings
 
-- Status: Accepted, not built (the founder chose this on 2026-11-26)
+- Status: Accepted (partial). Steps 1 and 2 are built: `connectors.rs` is split, and the crate is at `sdk/`, with the runtime, IBM MQ and AMQP on it. Request/reply serving stays in `exec-rpc` until a second driver needs it. Steps 3 and 4 are not built. (The founder chose this on 2026-11-26.)
 - Date: 2026-11-26
 
 ## Context

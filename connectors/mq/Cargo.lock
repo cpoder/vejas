@@ -906,14 +906,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
-name = "vejas-mq"
+name = "vejas-connector"
 version = "0.1.0"
 dependencies = [
  "async-nats",
  "bytes",
  "futures-util",
+ "getrandom 0.2.17",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "vejas-mq"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vejas-connector",
 ]
 
 [[package]]

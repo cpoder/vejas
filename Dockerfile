@@ -3,8 +3,10 @@
 # explicit -trixie pins on both.
 FROM rust:1-slim-trixie AS build
 WORKDIR /build
-COPY core/ .
-RUN cargo build --release
+# The runtime and the connector crate it is built on (ADR-0038).
+COPY sdk/ sdk/
+COPY core/ core/
+RUN cargo build --release --manifest-path core/Cargo.toml
 
 FROM debian:trixie-slim
 # ca-certificates only: the runtime's HTTP (webhooks, oauth-poll, http-poll) goes
@@ -19,7 +21,7 @@ COPY services/ services/
 COPY packages/ packages/
 COPY connectors/ connectors/
 COPY docs/ docs/
-COPY --from=build /build/target/release/vejas-runtime /usr/local/bin/vejas-runtime
+COPY --from=build /build/core/target/release/vejas-runtime /usr/local/bin/vejas-runtime
 ENV VEJAS_ROOT=/app
 # The binary alone stays on loopback. In a container that would reach nothing, and
 # publishing the port is the deliberate act: docker-compose.yml keeps it on localhost.

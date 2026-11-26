@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  # The connector crate (ADR-0038) and the standalone connectors built on it:
+  # a change to the crate must leave each of them building and green.
+  connector-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The crate's unit tests
+        run: cargo test --manifest-path sdk/Cargo.toml
+
+      - name: IBM MQ on the crate
+        run: cargo test --manifest-path connectors/mq/Cargo.toml
+
+      - name: AMQP on the crate
+        run: cargo test --manifest-path connectors/amqp/Cargo.toml
+
   test:
     runs-on: ubuntu-latest
     steps:

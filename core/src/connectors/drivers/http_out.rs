@@ -1,8 +1,8 @@
 //! http-out: POSTs each message of a subject to a URL.
 
-use crate::connectors::hops::{answer_text, summarize};
+use vejas_connector::{answer_text, summarize};
+
 use crate::connectors::http_client::{http_post, http_request};
-use crate::connectors::sink::run_sink;
 use crate::connectors::{Ctx, Driver, humanize};
 
 pub(super) struct HttpOut;
@@ -45,7 +45,7 @@ impl Driver for HttpOut {
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
-        run_sink(ctx, &subject, move |data, trace| {
+        ctx.consume(&subject, move |data, trace| {
             http_post(&url, &headers, data, Some(trace)).map(answer_text)
         })
     }

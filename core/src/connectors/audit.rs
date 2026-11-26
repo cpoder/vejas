@@ -1,8 +1,9 @@
 //! The promote audit trail (ADR-0018).
 
+use vejas_connector::dlq::dlq_unit_token;
+use vejas_connector::pull::hydrate_recent;
+
 use crate::bus;
-use crate::connectors::dlq::dlq_unit_token;
-use crate::connectors::pull::hydrate_recent;
 
 pub const AUDIT_STREAM: &str = "VEJAS_AUDIT";
 pub const AUDIT_ROOT: &str = "vxaudit";

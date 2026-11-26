@@ -8,11 +8,8 @@ description = "Vejas AMQP 0-9-1 (RabbitMQ) connector spike: sync pure-Rust via a
 [dependencies]
 amiquip = { version = "0.4", default-features = false }
 crossbeam-channel = "0.5"
-# The bus: this crate compiles the runtime's core/src/bus.rs (ADR-0035).
-async-nats = { version = "0.52", default-features = false, features = ["jetstream", "kv", "object-store", "ring", "server_2_10"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
-bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The bus, from the connector crate (ADR-0038).
+vejas-connector = { path = "../../sdk" }
 serde_json = "1"
 # Pure-Rust TLS for amqps:// — rustls (already in the tree via async-nats, ring
 # provider; no openssl-sys) wrapped over amiquip's mio-0.6 stream via a small Evented

@@ -4,10 +4,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use vejas_connector::clock::iso8601_utc;
 
 use crate::bus;
-use crate::connectors::clock::iso8601_utc;
-use crate::connectors::hops::{source_publish, trace_fail};
 use crate::connectors::http_client::{http_request, join_url, next_url, urlencode};
 use crate::connectors::{Config, Ctx, Driver, humanize};
 use crate::metrics::Kind;
@@ -241,7 +240,7 @@ impl Driver for OAuthPoll {
             // a broken token config never comes back on its own: validate it
             // once per tick, and fail the run (supervised backoff) if not
             tc.bearer().map_err(|e| {
-                trace_fail(&ctx.name, &subject, e.clone());
+                ctx.failed(&subject, e.clone());
                 e
             })?;
             let publish_page =
@@ -252,7 +251,7 @@ impl Driver for OAuthPoll {
                         "body": parsed,
                     });
                     let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
-                    if let (_, Err(e)) = source_publish(&ctx.name, js, &subject, &bytes, None, Kind::Producer) {
+                    if let (_, Err(e)) = ctx.publish(js, &subject, &bytes, None, Kind::Producer) {
                         return Err(format!("publish: {e}"));
                     }
                     Ok(())
@@ -286,12 +285,12 @@ impl Driver for OAuthPoll {
                                 String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
                             );
                             eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
-                            trace_fail(&ctx.name, &subject, msg);
+                            ctx.failed(&subject, msg);
                             break;
                         }
                         Err(e) => {
                             eprintln!("[{}] {ep}: {e} — endpoint skipped this tick", ctx.name);
-                            trace_fail(&ctx.name, &subject, format!("{ep}: {e}"));
+                            ctx.failed(&subject, format!("{ep}: {e}"));
                             break;
                         }
                     }
@@ -383,12 +382,12 @@ impl Driver for OAuthPoll {
                                 String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
                             );
                             eprintln!("[{}] {msg} — expand skipped this tick", ctx.name);
-                            trace_fail(&ctx.name, &subject, msg);
+                            ctx.failed(&subject, msg);
                             break;
                         }
                         Err(e) => {
                             eprintln!("[{}] {}: {e} — expand skipped this tick", ctx.name, spec.name);
-                            trace_fail(&ctx.name, &subject, format!("{}: {e}", spec.name));
+                            ctx.failed(&subject, format!("{}: {e}", spec.name));
                             break;
                         }
                     }

@@ -5,12 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use vejas_connector::answer_text;
+use vejas_connector::offsets::{offset_get, offset_put, open_offset_store};
 
 use crate::bus;
-use crate::connectors::hops::{answer_text, source_publish, trace_fail, trace_pub};
-use crate::connectors::offsets::{offset_get, offset_put, open_offset_store};
 use crate::connectors::process::shell;
-use crate::connectors::sink::run_sink;
 use crate::connectors::{Ctx, Driver};
 use crate::metrics::Kind;
 
@@ -50,7 +49,7 @@ impl Driver for ExecSource {
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     eprintln!("[{}] exec: {err}", ctx.name);
-                    trace_fail(&ctx.name, &subject, format!("exec: {err}"));
+                    ctx.failed(&subject, format!("exec: {err}"));
                 }
                 for line in out.stdout.split(|&b| b == b'\n') {
                     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -58,7 +57,7 @@ impl Driver for ExecSource {
                         continue;
                     }
                     if serde_json::from_slice::<Value>(line).is_ok() {
-                        let _ = source_publish(&ctx.name, &js, &subject, line, None, Kind::Producer);
+                        let _ = ctx.publish(&js, &subject, line, None, Kind::Producer);
                     } else {
                         eprintln!("[{}] exec: non-JSON line skipped", ctx.name);
                     }
@@ -81,7 +80,7 @@ impl Driver for ExecSink {
         let subject = ctx.subject(&ctx.config.str("SUBJECT").ok_or("SUBJECT required")?);
         let name = ctx.name.clone();
         let env = ctx.config.env_vars();
-        run_sink(ctx, &subject, move |data, trace| {
+        ctx.consume(&subject, move |data, trace| {
             let mut child = shell(&cmd)
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 // The OpenTelemetry carrier for a child process: a program that
@@ -208,7 +207,7 @@ impl Driver for ExecStreamSource {
                             continue;
                         }
                         if let Ok(rec) = serde_json::from_str::<Value>(line) {
-                            match source_publish(&ctx.name, &js, &subject, line.as_bytes(), None, Kind::Producer).1 {
+                            match ctx.publish(&js, &subject, line.as_bytes(), None, Kind::Producer).1 {
                                 Ok(_) => {
                                     // publish-before-commit: advance the offset in
                                     // MEMORY only after the record is on the bus; the
@@ -222,7 +221,7 @@ impl Driver for ExecStreamSource {
                                         }
                                     }
                                 }
-                                // recorded in the ring by source_publish
+                                // ctx.publish recorded the failure
                                 Err(_) => {}
                             }
                         } else {
@@ -327,7 +326,7 @@ impl Driver for ExecRpc {
                         Ok(0) => return Err("child stdout closed".into()),
                         Ok(_) => {
                             let _ = msg.respond(line.trim().as_bytes());
-                            trace_pub(&ctx.name, &subject, line.trim().as_bytes());
+                            ctx.replied(&subject, line.trim().as_bytes());
                         }
                         Err(e) => return Err(e.to_string()),
                     }

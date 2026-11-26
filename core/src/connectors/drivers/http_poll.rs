@@ -4,9 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
+use vejas_connector::clock::iso8601_utc;
 
-use crate::connectors::clock::iso8601_utc;
-use crate::connectors::hops::{source_publish, trace_fail};
 use crate::connectors::http_client::http_get;
 use crate::connectors::{Ctx, Driver, humanize};
 use crate::metrics::Kind;
@@ -58,13 +57,13 @@ impl Driver for HttpPoll {
                             } else {
                                 raw.clone()
                             };
-                            let _ = source_publish(&ctx.name, &js, &subject, &bytes, None, Kind::Producer);
+                            let _ = ctx.publish(&js, &subject, &bytes, None, Kind::Producer);
                         }
                         Err(_) => eprintln!("[{}] poll: non-JSON body, skipped", ctx.name),
                     },
                     Err(e) => {
                         eprintln!("[{}] poll: {e}", ctx.name);
-                        trace_fail(&ctx.name, &subject, e);
+                        ctx.failed(&subject, e);
                     }
                 }
             }

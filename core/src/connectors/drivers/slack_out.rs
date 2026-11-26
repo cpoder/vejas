@@ -1,10 +1,9 @@
 //! slack-out: posts each message of vx.slack.out to a Slack webhook.
 
 use serde_json::Value;
+use vejas_connector::answer_text;
 
-use crate::connectors::hops::answer_text;
 use crate::connectors::http_client::http_post;
-use crate::connectors::sink::run_sink;
 use crate::connectors::{Ctx, Driver};
 
 pub(super) struct SlackOut;
@@ -23,7 +22,7 @@ impl Driver for SlackOut {
             .or_else(|| std::env::var("SLACK_WEBHOOK_URL").ok())
             .unwrap_or_default();
         let name = ctx.name.clone();
-        run_sink(ctx, &subject, move |data, trace| {
+        ctx.consume(&subject, move |data, trace| {
             let text = serde_json::from_slice::<Value>(data)
                 .ok()
                 .and_then(|v| v["text"].as_str().map(|s| s.to_string()))

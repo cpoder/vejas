@@ -1388,16 +1388,25 @@ name = "vejas-amqp"
 version = "0.1.0"
 dependencies = [
  "amiquip",
- "async-nats",
- "bytes",
  "crossbeam-channel",
- "futures-util",
  "mio 0.6.23",
  "rustls",
  "rustls-pemfile",
  "serde_json",
- "tokio",
+ "vejas-connector",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "vejas-connector"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "bytes",
+ "futures-util",
+ "getrandom 0.2.17",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

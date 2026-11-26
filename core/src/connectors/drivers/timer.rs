@@ -4,9 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
+use vejas_connector::clock::iso8601_utc;
 
-use crate::connectors::clock::iso8601_utc;
-use crate::connectors::hops::source_publish;
 use crate::connectors::{Ctx, Driver};
 use crate::metrics::Kind;
 
@@ -50,7 +49,7 @@ impl Driver for Timer {
                 waited = 0;
                 let bytes = serde_json::to_vec(&stamp_ts(&payload, crate::now_secs()))
                     .unwrap_or_default();
-                if let (_, Err(e)) = source_publish(&ctx.name, &js, &subject, &bytes, None, Kind::Producer) {
+                if let (_, Err(e)) = ctx.publish(&js, &subject, &bytes, None, Kind::Producer) {
                     return Err(format!("publish: {e}"));
                 }
             }

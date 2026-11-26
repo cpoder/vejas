@@ -18,8 +18,9 @@
 //   * What the sync client gave for free is rebuilt here on purpose, because
 //     `async-nats` does not give it: see `Batch::confirm`.
 //
-// The AMQP and MQ connectors compile this file as it is (`#[path]`), so it
-// names no other module of the runtime: no `crate::` import.
+// It lives in the connector crate (ADR-0038), which the runtime and the
+// standalone connectors (IBM MQ, AMQP) depend on, and it names no other module
+// of it: no `crate::` import.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -93,6 +94,13 @@ async fn sent<T, E: std::fmt::Display>(
 }
 
 // ───────────────────────── connections ─────────────────────────
+//
+// A public method that takes `impl Into<Bytes>`, `impl AsRef<[u8]>` or a trace
+// converts its arguments and hands them to a private method that takes concrete
+// types. Generic code is compiled again in every crate that calls it: the
+// runtime and each connector call the bus, so the async body, with the NATS
+// client code it pulls in, lives in the private method and is compiled once,
+// here.
 
 /// One NATS connection, and the way to prove the server has read it.
 struct Link {
@@ -293,8 +301,7 @@ impl Bus {
     /// Publish one message now, with no promise: for what stands for nothing to
     /// ack. An error means it was never handed to the connection.
     pub fn publish(&self, subject: &str, payload: impl Into<Bytes>) -> Result<(), String> {
-        let (client, payload) = (&self.0.link.client, payload.into());
-        wait(sent(client.publish(subject.to_string(), payload)))
+        self.send(subject, None, payload.into())
     }
 
     /// The same, carrying the trace it belongs to (ADR-0034).
@@ -304,8 +311,14 @@ impl Bus {
         payload: impl Into<Bytes>,
         trace: &impl TraceContext,
     ) -> Result<(), String> {
-        let (client, payload) = (&self.0.link.client, payload.into());
-        match trace_headers_within(trace, payload.len(), client.max_payload()) {
+        let payload = payload.into();
+        let headers = trace_headers_within(trace, payload.len(), self.0.link.client.max_payload());
+        self.send(subject, headers, payload)
+    }
+
+    fn send(&self, subject: &str, headers: Option<HeaderMap>, payload: Bytes) -> Result<(), String> {
+        let client = &self.0.link.client;
+        match headers {
             Some(headers) => wait(sent(client.publish_with_headers(subject.to_string(), headers, payload))),
             None => wait(sent(client.publish(subject.to_string(), payload))),
         }
@@ -325,12 +338,14 @@ impl Bus {
         &self,
         messages: impl IntoIterator<Item = &'a Message>,
     ) -> Result<(), String> {
+        self.ack_replies(messages.into_iter().filter_map(|m| m.reply.clone()).collect())
+    }
+
+    fn ack_replies(&self, replies: Vec<Subject>) -> Result<(), String> {
         let client = &self.0.link.client;
         wait(async {
-            for message in messages {
-                if let Some(reply) = &message.reply {
-                    sent(client.publish(reply.clone(), Bytes::new())).await?;
-                }
+            for reply in replies {
+                sent(client.publish(reply, Bytes::new())).await?;
             }
             Ok(())
         })
@@ -343,7 +358,11 @@ impl Bus {
         payload: impl Into<Bytes>,
         within: Duration,
     ) -> Result<Message, String> {
-        let request = Request::new().payload(payload.into()).timeout(Some(within));
+        self.request_bytes(subject, payload.into(), within)
+    }
+
+    fn request_bytes(&self, subject: &str, payload: Bytes, within: Duration) -> Result<Message, String> {
+        let request = Request::new().payload(payload).timeout(Some(within));
         let answer = wait(
             self.0
                 .link
@@ -553,7 +572,7 @@ pub trait TraceContext {
 }
 
 /// The headers that carry a trace on the bus (ADR-0034).
-fn trace_headers(trace: &impl TraceContext) -> HeaderMap {
+fn trace_headers(trace: &dyn TraceContext) -> HeaderMap {
     // Constant names: no allocation for the name on every publish.
     const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
     const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
@@ -568,7 +587,7 @@ fn trace_headers(trace: &impl TraceContext) -> HeaderMap {
 /// The trace headers of a payload, or none when they would push the message
 /// past the server's limit. A trace is never the reason a publish fails: that
 /// message goes untraced, and the next hop starts a trace (ADR-0034).
-fn trace_headers_within(trace: &impl TraceContext, payload_len: usize, limit: usize) -> Option<HeaderMap> {
+fn trace_headers_within(trace: &dyn TraceContext, payload_len: usize, limit: usize) -> Option<HeaderMap> {
     let headers = trace_headers(trace);
     (payload_len + headers_len(&headers) <= limit).then_some(headers)
 }
@@ -859,12 +878,7 @@ impl JetStream {
     /// Publish and wait for the stream to say it stored the message. Ok means
     /// persisted; the stream sequence comes back.
     pub fn publish(&self, subject: &str, payload: impl AsRef<[u8]>) -> Result<u64, String> {
-        let bytes = Bytes::copy_from_slice(payload.as_ref());
-        wait(async {
-            let ack = self.shared().js.publish(subject.to_string(), bytes).await;
-            let ack = ack.map_err(|e| e.to_string())?.await;
-            ack.map(|ack| ack.sequence).map_err(|e| e.to_string())
-        })
+        self.store(subject, None, Bytes::copy_from_slice(payload.as_ref()))
     }
 
     /// The same, carrying the trace it belongs to (ADR-0034).
@@ -876,6 +890,10 @@ impl JetStream {
     ) -> Result<u64, String> {
         let bytes = Bytes::copy_from_slice(payload.as_ref());
         let headers = trace_headers_within(trace, bytes.len(), self.max_payload());
+        self.store(subject, headers, bytes)
+    }
+
+    fn store(&self, subject: &str, headers: Option<HeaderMap>, bytes: Bytes) -> Result<u64, String> {
         wait(async {
             let js = &self.shared().js;
             let ack = match headers {
@@ -958,7 +976,9 @@ impl JetStream {
         }
     }
 
-    #[cfg(test)]
+    /// Tests only: their own tests, and a connector's through the `test-support`
+    /// feature. Nothing in a build that runs deletes a stream.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delete_stream(&self, stream: &str) -> Result<(), String> {
         self.api(format!("STREAM.DELETE.{stream}"), Bytes::new())
             .map(|_| ())
@@ -1197,20 +1217,29 @@ impl Kv {
     }
 
     pub fn put(&self, key: &str, value: impl AsRef<[u8]>) -> Result<u64, String> {
-        let value = Bytes::copy_from_slice(value.as_ref());
+        self.put_bytes(key, Bytes::copy_from_slice(value.as_ref()))
+    }
+
+    fn put_bytes(&self, key: &str, value: Bytes) -> Result<u64, String> {
         wait(self.store.put(key, value)).map_err(|e| e.to_string())
     }
 
     /// Atomic create-if-absent: a deleted key counts as absent. The revision
     /// comes back; a key that exists is an error.
     pub fn create(&self, key: &str, value: impl AsRef<[u8]>) -> Result<u64, String> {
-        let value = Bytes::copy_from_slice(value.as_ref());
+        self.create_bytes(key, Bytes::copy_from_slice(value.as_ref()))
+    }
+
+    fn create_bytes(&self, key: &str, value: Bytes) -> Result<u64, String> {
         wait(self.store.create(key, value)).map_err(|e| e.to_string())
     }
 
     /// Compare-and-set: fails unless `revision` is still the key's latest.
     pub fn update(&self, key: &str, value: impl AsRef<[u8]>, revision: u64) -> Result<u64, String> {
-        let value = Bytes::copy_from_slice(value.as_ref());
+        self.update_bytes(key, Bytes::copy_from_slice(value.as_ref()), revision)
+    }
+
+    fn update_bytes(&self, key: &str, value: Bytes, revision: u64) -> Result<u64, String> {
         wait(self.store.update(key, value, revision)).map_err(|e| e.to_string())
     }
 
