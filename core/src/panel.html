@@ -69,6 +69,16 @@
                      margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
                      background: var(--card2, rgba(127,127,127,.08));
                      font: 11px/1.5 ui-monospace, SFMono-Regular, monospace; color: var(--ink2); }
+  /* the statements a hop went through (ADR-0034, point 8) */
+  .steps { margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
+           background: var(--card2, rgba(127,127,127,.08));
+           font: 11px/1.6 var(--mono); color: var(--ink2); white-space: pre-wrap; word-break: break-word; }
+  .steps .n { color: var(--muted); display: inline-block; min-width: 3.2em; text-align: right; margin-right: .8em; }
+  .steps .in { padding-left: 1.6em; }
+  .steps .did, .steps .gap { color: var(--muted); }
+  .steps .fail { color: var(--err); }
+  .steps .fail .n, .steps .failed { color: var(--err); font-weight: 600; }
+  #trace summary { cursor: pointer; color: var(--accent); }
 
   #pipe { width: 100%; height: auto; display: block; }
   .pill { fill: var(--wash); stroke: var(--line); }
@@ -945,13 +955,30 @@ async function openTrace(id) {
     for (const h of hops) depth[h.span_id] = h.parent_id in depth ? depth[h.parent_id] + 1 : 0;
     const rows = hops.map(h => {
       const a = h.attributes || {};
+      // a record is data anyone on the bus could write: shapes are checked
+      const emits = Array.isArray(h.emits) ? h.emits : [];
       const attempt = a['vejas.delivery.attempt'] > 1 ? ` <span class="sample">attempt ${a['vejas.delivery.attempt']}</span>` : '';
       const outcome = (h.ok
-        ? ((h.emits || []).length ? h.emits.map(s => `<code>${esc(s)}</code>`).join(' ') : '<span style="color:var(--muted)">done</span>')
+        ? (emits.length ? emits.map(s => `<code>${esc(s)}</code>`).join(' ') : '<span style="color:var(--muted)">done</span>')
         : `<span style="color:var(--err)">${esc(trunc(h.error || 'error', 80))}${a['vejas.dlq'] ? ' · dead-lettered' : ''}</span>`)
         + (h.answer ? ` <span class="sample" title="${esc(h.answer)}">↩ ${esc(trunc(h.answer, 32))}</span>` : '');
       const version = a['vejas.flow.version'] ? ` <span class="sample" title="flow version ${esc(a['vejas.flow.version'])}">${esc(String(a['vejas.flow.version']).slice(0, 8))}</span>` : '';
       const input = h.input == null ? '' : `<details><summary>${esc(trunc(h.input, 46))}</summary><pre class="payload-full">${esc(JSON.stringify(h.input, null, 2))}</pre></details>`;
+      // the statements it went through, with their code when the file has not changed since
+      const steps = Array.isArray(h.steps) ? h.steps.filter(st => st && typeof st === 'object') : [];
+      const ran = steps.reduce((n, st) => n + (st.line != null ? 1 : (Number(st.skipped) || 0)), 0);
+      const lines = steps.map(st => {
+        if (st.skipped) return `<div class="gap">      … ${esc(String(st.skipped))} more …</div>`;
+        const failed = st.failed === true ? ' <span class="failed">✗ failed here</span>' : '';
+        const indent = st.service ? ' in' : '';
+        if (st.version) return `<div class="did${indent}">↳ ${esc(st.service)} <span title="version ${esc(st.version)}">${esc(String(st.version).slice(0, 8))}</span></div>`;
+        const did = st.emit != null ? ` <span class="did">→ ${esc(st.emit)}</span>`
+          : st.respond != null ? ` <span class="did">↩ ${esc(String(st.respond))}</span>` : '';
+        return `<div class="${indent.trim()}${failed ? ' fail' : ''}"><span class="n">${esc(String(st.line))}</span>${esc(st.code || '')}${did}${failed}</div>`;
+      }).join('');
+      const changed = steps.some(st => st.line != null && st.code == null)
+        ? '<div class="gap">Some lines show their number only: the code that ran them is no longer on disk or in the version store.</div>' : '';
+      const stepsRow = ran ? `<tr><td></td><td colspan="5"><details><summary class="sample">${ran} statement${ran === 1 ? '' : 's'}</summary><div class="steps">${changed}${lines}</div></details></td></tr>` : '';
       return `<tr>
         <td class="sample">+${((h.start_us - t0) / 1000).toFixed(1)} ms</td>
         <td class="field" style="padding-left:${6 + 16 * (depth[h.span_id] || 0)}px"><code>${esc(h.unit)}</code> <span class="sample">${esc(h.kind)}</span>${attempt}</td>
@@ -959,7 +986,7 @@ async function openTrace(id) {
         <td>${outcome}</td>
         <td class="sample">${(h.duration_us / 1000).toFixed(1)} ms${version}</td>
         <td class="sample payload">${input}</td>
-      </tr>`;
+      </tr>${stepsRow}`;
     }).join('');
     box.innerHTML = `<table><tr><th>at</th><th>hop</th><th>on</th><th>outcome</th><th>took</th><th>payload</th></tr>${rows}</table>`;
   } catch (e) { box.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }

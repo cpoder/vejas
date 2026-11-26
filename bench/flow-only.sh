@@ -8,6 +8,7 @@
 # BENCH_TRACEPARENT=<traceparent> the events carry that header, so the flow
 # continues a trace instead of starting one; OTEL_EXPORTER_OTLP_ENDPOINT, if
 # set, reaches the runtime and turns span export on (ADR-0034, point 6).
+# THREADS_OUT=<file> writes each thread's CPU time there.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -64,6 +65,14 @@ PUB_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 wait $SUB_PID
 TOTAL_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 RSS_KB=$(ps -o rss= -p $RUNTIME_PID | tr -d ' ')
+# With THREADS_OUT=<file>, the CPU time of each of the runtime's threads, in
+# clock ticks: name, user, system (bench/pairs.sh reads it).
+if [ -n "${THREADS_OUT:-}" ]; then
+  for t in /proc/$RUNTIME_PID/task/*/stat; do
+    awk '{ s = $0; sub(/^[0-9]+ \(/, "", s); name = substr(s, 1, index(s, ") ") - 1)
+           split(substr(s, index(s, ") ") + 2), f, " "); print name "\t" f[12] "\t" f[13] }' "$t"
+  done > "$THREADS_OUT"
+fi
 # The runtime's own CPU time (user + system, Linux): what a change costs the
 # runtime, apart from the publishers and the server it shares the machine with.
 CPU_MS=$(awk -v hz="$(getconf CLK_TCK)" '{printf "%d", ($14 + $15) * 1000 / hz}' "/proc/$RUNTIME_PID/stat" 2>/dev/null || echo 0)

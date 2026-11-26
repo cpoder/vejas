@@ -239,6 +239,83 @@ which the flow hands its hop to and does not wait for.
   bucket mapping trace id to sequences, the fallback ADR-0034 named, keeps a
   subject per key, so it would cost the same.
 
+### The steps (point 8)
+
+A flow hop's record also lists the statements its run went through; the
+benchmark's flow runs eleven per event. With `BASE_BIN` set to the runtime
+from before the steps (master at `a8f0a6a`, the record on by default),
+`bench/trace-cost.sh` runs it in its "before tracing" rows. Three series on
+2026-11-26, runtime CPU per event:
+
+| Series | Record without steps (`a8f0a6a`) | Record with steps | Difference | Record off |
+|---|---|---|---|---|
+| 1 | 95.5 µs | 100.0 µs | +4.5 µs | 74.5 µs |
+| 2 | 97.0 µs | 102.0 µs | +5.0 µs | 75.5 µs |
+| 3 | 95.5 µs | 103.0 µs | +7.5 µs | 75.5 µs |
+
+The first two ran the steps before their review, the third after it and
+after #11 below. The difference moves more from one series to the next than
+anything that changed between them, so `bench/pairs.sh` runs the two
+runtimes in eight alternating pairs (A then B, B then A) and reads each
+thread's CPU time from `/proc`. A is `a8f0a6a`, B the steps:
+
+```
+µs of CPU per event        A       B                                          B - A, each pair   median
+runtime                 99.2   104.5            +9.0 +12.5  +3.0  +3.5 +20.5  +5.0  +6.0  +5.0     +5.5
+flow:bench_orde         72.0    75.5            +5.5  +8.0  +2.0  +1.5 +14.0  +3.5  +4.0  +3.0     +3.8
+vejas-record            15.0    17.0            +2.0  +3.0  +1.5  +2.5  +5.0  +2.0  +2.5  +2.0     +2.2
+vejas-bus               10.5    11.2            +1.0  +2.0  +0.0  +0.0  +2.0  +0.5  -0.5  +0.0     +0.2
+(medians of 8 pairs; hop records kept, A: 20000 to 20000, B: 20000 to 20000)
+```
+
+A first series of eight pairs, run the same way before the script existed,
+gave a median of +3.5 µs, +1.5 on the record's thread and +2.5 on the
+flow's. The steps cost 3.5 to 5.5 µs of CPU per event, about 2 of them on
+the record's thread, which the flow does not wait for.
+
+CPU time moves with whatever else the machine does; the instructions a
+thread runs hardly do. `perf stat -e instructions:u --per-thread` on the
+runtime over the same run, three runs each (thousands of instructions per
+event, the same to 0.1 k from run to run):
+
+| | Record off | Record on | Flow's thread, on | Record's thread |
+|---|---|---|---|---|
+| `a8f0a6a` | 198.9 k | 262.4 k | 197.1 k | 54.2 k |
+| The steps | 197.5 k | 266.2 k | 197.5 k | 57.5 k |
+
+With the record off, the interpreter runs slightly fewer instructions than
+before. With it on, the steps are 3.8 k instructions per event, 3.3 k of
+them on the record's thread; on the flow's thread they are 0.5 k, a push
+per statement, but cost about 2 µs of its user time (its system time does
+not move). Its cycles grow with its cache misses, 10 to 25 % more
+(`cache-misses:u`, two runs each): memory the flow's thread now shares with
+the record's thread. With the record off, the same pairs swing both ways,
+from -6.0 to +9.5 µs, where the instructions say the work is the same:
+
+```
+µs of CPU per event        A       B                                          B - A, each pair   median
+runtime                 79.0    80.5            +5.0  +3.5  -5.5  +2.5  -3.5  +6.0  -6.0  +9.5     +3.0
+flow:bench_orde         67.2    68.2            +4.0  +3.0  -3.5  +2.0  -0.5  +4.5  -3.5  +6.0     +2.5
+vejas-bus               11.0    11.5            +0.0  +1.0  -1.0  +0.5  -3.0  +1.0  -2.5  +3.0     +0.2
+(medians of 8 pairs; hop records kept, A: 0 to 0, B: 0 to 0)
+```
+
+- **#11 Handing the steps over.** Recording a statement is a push into a
+  vector. In three interleaved runs each, a build that recorded the steps and
+  dropped them on the flow's thread cost what master did, and the first
+  build, which handed them to the record's thread, cost 6.5 µs more. That
+  build gave each run a new vector, which the record's thread freed once
+  written: glibc's malloc then takes the lock of the arena the flow's thread
+  allocates from, and a profile showed the record's thread waiting on it
+  (`__lll_lock_wait_private`). A run now takes its vector from a small pool
+  that the record's thread gives it back to, a line number is written
+  without `fmt`, a repeated subject is copied from the record already
+  written, and the attributes the runtime computes are shared instead of
+  copied for every span. The flow's thread still pays more than the pushes
+  do. A profile of it puts about 40 % of its time in glibc's malloc and
+  free, most of it for the interpreter's own values, so an allocator built
+  for threads that free each other's memory is the next thing to measure.
+
 ## The true hop ceiling and multi-flow scaling
 
 With parallel publishers, the single-flow hop tops out around **14–16 k/s**

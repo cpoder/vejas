@@ -2,10 +2,12 @@
 
 - Status: Accepted (partial): lot A is built and T6 gates it in CI (points 1
   to 6, and 12 with them); of lot B, the trace record and its screen are
-  built (point 7, points 8 and 9 in part), the statement snapshots, the
-  replay actions on the trace screen and provenance (point 10) are not
+  built (point 7, points 8 and 9 in part) with the statements each hop ran;
+  the pipeline snapshots, the replay actions on the trace screen and
+  provenance (point 10) are not
 - Date: 2026-10-24; measured state re-read on v0.6.0 on 2026-11-26; lot A
-  built 2026-11-26; lot B first part built 2026-11-26
+  built 2026-11-26; lot B first part built 2026-11-26; the steps built
+  2026-11-26
 
 ## Context
 
@@ -357,6 +359,78 @@ stated here.
   building and freeing a `serde_json::Value` tree per record; writing the
   JSON directly brought it to 17.5, of which about 13 run on the record's own
   thread. The numbers are in `bench/README.md` and on the benchmarks page.
+
+## What is built (2026-11-26): lot B, the steps
+
+Point 8's statements are built, its pipeline snapshots are not, and
+`e2e/trace-record.sh` checks the steps of a bus flow that succeeds, of one
+that fails and of an `api` call that invokes a service.
+
+- **Each statement knows its line.** A block of the AST holds the line each
+  statement starts on. While the record is on, the interpreter records each
+  statement it runs: the flow's lines, an invoked service's lines with the
+  service's name, and where a service starts, the version of its source. An
+  `emit` adds the subject it sent to, a flow's `respond` the status it set.
+  A `respond` in a service answers no one (the interpreter drops it) and
+  stays a plain line. A business-surface constant is left out: every run
+  assigns it the same way.
+- **Bounded.** A run keeps its first 192 steps and its last 64 and counts
+  those between, so a loop over a long array costs a bounded record. A step
+  holds a line number, a service name the runtime checked, a status code,
+  and a subject, which goes through the scrub like the emits and is cut to
+  256 bytes. Steps carry no payload and stay when payloads are off. Each
+  record also lists the services the run invoked with their versions, at
+  most 32, so a service's lines find their code when the step where it
+  started is among those left out.
+- **A failed run ends on the statement that failed.** The innermost statement
+  that fails says so once: if steps came after its own, an `invoke` it ran
+  before failing, it is recorded again, and the statements around it add
+  nothing. That last step says `"failed": true`, so a reader, human or agent,
+  is told where the run stopped instead of inferring it.
+- **Every hop records them, sampled or not.** The sampler keeps a failure
+  whatever it decided, and a failure is where the steps matter most, so the
+  steps of a sampled-out success are thrown away instead of never taken.
+- **The code is joined when a trace is read, not stored.** Spans carry
+  `code.file.path`. Reading a trace gives each step the text of its line from
+  the file named, when that file still hashes to the version that ran: the
+  flow's `vejas.flow.version`, the version the record's `services` gives a
+  service. A flow promoted over its file in a cluster (ADR-0024) runs a
+  version the file does not hold: the join takes it from `VEJAS_VERSIONS`
+  while the store's current overlay is that version. A record stays small,
+  and a version found nowhere shows its line numbers only; point 10 will look
+  for older versions in the store's history and in git. The join reads files
+  under the project root only, through the same guard as `GET /file`, which
+  serves them already.
+- **A record is not trusted at read time.** Anyone who can publish on the bus
+  can write a record. A read drops any `code` a record carries, reads each
+  file once whatever versions the hops name, and stops at 64 files, 257
+  steps a hop and 1 MB of code. The first build read a file once per
+  distinct version a record named and joined every step: a forged record
+  could make one read take seconds and return twenty times its size.
+- **What the record writes without the scrub** is typed: an attribute the
+  runtime computes from its own state (the file, the version hashes) is an
+  `Attr::Computed`, and a step's service name and version are the
+  interpreter's. A value built from an event cannot take that path by its
+  key's name. A record scrubs each subject once wherever it names it, for
+  the first 16 distinct subjects.
+- **Cost.** On the benchmark's flow, eleven statements per event, the steps
+  add 3.5 to 5.5 µs of CPU per hop to the record (two series of eight
+  alternating pairs against the runtime from before them, `bench/pairs.sh`)
+  and 3.8 k instructions, 3.3 k of them on the record's thread. With the
+  record off, the interpreter runs no more instructions than before. On the
+  flow's thread the steps are 0.5 k instructions, a push per statement, yet
+  about 2 µs: its cache misses grow by 10 to 25 %, on memory it now shares
+  with the record's thread. The first build cost 6.5 µs; it gave each run a
+  new vector, which the record's thread freed once written, and glibc's
+  malloc made the two threads wait on one lock. A pool of vectors that the
+  record's thread gives back to brought it down. The numbers are in
+  `bench/README.md`.
+- **Not built yet: the pipeline snapshots.** A variable can hold a secret the
+  flow transformed, such as a `Basic` header built from a password, and
+  neither the key mask nor the vault finds it. Before any variable's value is
+  recorded, the interpreter will follow the variables a `secret()` value
+  flows into, through assignments and invoked services, and write
+  `<secret>` in their place.
 
 ## Consequences
 
