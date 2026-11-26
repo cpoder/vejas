@@ -215,7 +215,7 @@ fn as_shown(mut v: Value) -> Value {
                         // where it went: a subject can carry a value of the event
                         ("subject" | "original_subject", Value::String(s)) => *s = scrub.text(s, false),
                         // what went through, whole
-                        ("payload" | "event" | "emits" | "evidence", x) => {
+                        ("payload" | "event" | "emits", x) => {
                             let shown = scrub.json(x);
                             *x = shown;
                         }
@@ -229,6 +229,18 @@ fn as_shown(mut v: Value) -> Value {
     }
     walk(&mut v, &record::shown());
     v
+}
+
+/// Proposals as pages and agents are shown them: the change as it was
+/// proposed, since it goes into the repository as it is and an agent may
+/// revise it; the evidence, events of the bus, masked (ADR-0034).
+fn proposals_shown(mut list: Vec<Value>) -> Vec<Value> {
+    let scrub = record::shown();
+    for evidence in list.iter_mut().filter_map(|p| p.get_mut("evidence")) {
+        let shown = scrub.json(evidence);
+        *evidence = shown;
+    }
+    list
 }
 
 fn events_out(flow: Option<&str>, paths: bool) -> String {
@@ -4357,7 +4369,7 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let evidence = args.get("evidence").cloned().unwrap_or(Value::Null);
             text(submit_proposal(root, kind, payload, "mcp", evidence)?.to_string())
         }
-        "vejas_proposals" => text(as_shown(json!({"proposals": reconcile_and_list(root)?})).to_string()),
+        "vejas_proposals" => text(json!({"proposals": proposals_shown(reconcile_and_list(root)?)}).to_string()),
         "vejas_preview" => {
             let file = args["file"].as_str().ok_or("file required")?;
             text(preview_json(root, file)?)
@@ -4679,7 +4691,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
 
     match (method, path_only.as_str()) {
         (tiny_http::Method::Get, "/proposals") => match reconcile_and_list(&root) {
-            Ok(list) => respond(request, 200, as_shown(json!({"proposals": list})).to_string(), "application/json"),
+            Ok(list) => respond(request, 200, json!({"proposals": proposals_shown(list)}).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
         (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/panel") => respond(
@@ -5776,10 +5788,14 @@ mod tests {
         let shown = replay.to_string();
         assert!(!shown.contains("t-998877") && !shown.contains("s-1"), "{shown}");
         assert_eq!(replay["results"][0]["before"]["emits"][0]["subject"], "vx.a");
-        let proposal = as_shown(json!({"proposals": [{"id": "p1", "kind": "set_literal",
-            "payload": {"file": "flows/a.vjs", "name": "ERP_HEADERS", "key": "Authorization", "value": "Bearer xyz"}}]}));
-        assert!(!proposal.to_string().contains("Bearer xyz"), "{proposal}");
-        assert_eq!(proposal["proposals"][0]["id"], "p1");
+        // a proposal: its evidence is masked, the change it proposes is not
+        let candidate = "password = event.password\nemit \"vx.a\" { password }\n";
+        let proposals = proposals_shown(vec![json!({"id": "p1", "kind": "version",
+            "payload": {"file": "flows/a.vjs", "candidate": candidate},
+            "evidence": {"results": [{"seq": 3, "after": {"emits": [{"subject": "vx.a", "payload": {"password": "pw-4455"}}]}}]}})]);
+        assert!(!proposals[0]["evidence"].to_string().contains("pw-4455"), "{}", proposals[0]);
+        assert_eq!(proposals[0]["payload"]["candidate"], candidate);
+        assert_eq!(proposals[0]["id"], "p1");
     }
 
     #[test]

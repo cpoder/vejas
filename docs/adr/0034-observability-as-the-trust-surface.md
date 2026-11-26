@@ -446,11 +446,12 @@ that fails and of an `api` call that invokes a service.
   what went through the bus, by their names in the runtime's answers: a
   preview and a sink's answer as the start of a longer text, an error and a
   last error as the record scrubs an error, a subject as a text, and a
-  payload, an event, the emits and the evidence whole. The rest stays as it
-  is: units, sequences, times, trace ids. Pages find events and letters by
-  them, and a value handed out that is a number would otherwise turn a
-  sequence into `<secret>`. A new field that carries bus data has to be
-  named there.
+  payload, an event and the emits whole. The rest stays as it is: units,
+  sequences, times, trace ids. Pages find events and letters by them, and a
+  value handed out that is a number would otherwise turn a sequence into
+  `<secret>`. A new field that carries bus data has to be named there. A
+  proposal's evidence is masked whole; the change it proposes is not, since
+  it goes into the repository as it is and an agent may revise it.
 - **A cut JSON text is read as JSON as far as it goes.** A preview is the
   first 160 characters of the event, so the pair rule of the JSON path
   (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
