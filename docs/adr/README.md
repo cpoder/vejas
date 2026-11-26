@@ -46,6 +46,7 @@ the old one.
 | [0035](0035-async-nats-bus-island.md) | The NATS client moves to async-nats, behind one synchronous module | Accepted |
 | [0036](0036-integration-agent-separate-binary.md) | The integration agent is a separate binary, a client of `/mcp` | Accepted, not built |
 | [0037](0037-how-the-connector-catalog-grows.md) | How the connector catalog grows: vendors as certified recipes on protocol drivers | Accepted (partial) |
+| [0038](0038-one-connector-contract-two-packagings.md) | One connector contract, two packagings: a crate, in the runtime or standalone | Accepted, not built |
 
 ## Template
 
