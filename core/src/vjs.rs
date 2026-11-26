@@ -103,10 +103,18 @@ fn err_at(pos: usize, src: &str, msg: &str) -> String {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
+    // a byte-order mark, which some editors write, is not code
+    let from = if src.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    lex_from(src, from)
+}
+
+/// The tokens of `src` from `from` to its end, at their places in `src`. An
+/// f-string's `{…}` is lexed in place, `src` cut at its closing brace, so that
+/// an error in it, and the parser's after it, say the line of the file.
+fn lex_from(src: &str, from: usize) -> Result<Vec<Spanned>, String> {
     let b = src.as_bytes();
     let mut out = Vec::new();
-    // a byte-order mark, which some editors write, is not code
-    let mut i = if b.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    let mut i = from;
     while i < b.len() {
         let c = b[i] as char;
         match c {
@@ -212,6 +220,53 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>, String> {
     Ok(out)
 }
 
+/// One escape in a string, the backslash at `at`: what it stands for goes to
+/// `out`, and its length comes back. These are JSON's escapes, since a literal
+/// set live is written back as JSON (`set_literal`), and `\{` `\}` for a brace
+/// in an f-string. Any other is an error: it used to keep its letter alone, so
+/// a CR set live came back as an `r`.
+fn unescape(src: &str, at: usize, out: &mut Vec<u8>) -> Result<usize, String> {
+    let b = src.as_bytes();
+    let byte = match b.get(at + 1) {
+        Some(b'n') => b'\n',
+        Some(b't') => b'\t',
+        Some(b'r') => b'\r',
+        Some(b'b') => 0x08,
+        Some(b'f') => 0x0c,
+        Some(&c @ (b'"' | b'\\' | b'/' | b'{' | b'}')) => c,
+        Some(b'u') => {
+            let unit = |i: usize| {
+                src.get(i..i + 4)
+                    .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+            };
+            let alone = || {
+                err_at(at, src, "a \\u surrogate stands alone: a character above U+FFFF is written as a pair of \\u escapes")
+            };
+            let hi = unit(at + 2).ok_or_else(|| err_at(at, src, "\\u takes four hex digits"))?;
+            let (code, len) = if (0xD800..0xDC00).contains(&hi) {
+                let lo = (b.get(at + 6..at + 8) == Some(&b"\\u"[..]))
+                    .then(|| unit(at + 8))
+                    .flatten()
+                    .filter(|lo| (0xDC00..0xE000).contains(lo))
+                    .ok_or_else(alone)?;
+                (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 12)
+            } else {
+                (hi, 6)
+            };
+            let c = char::from_u32(code).ok_or_else(alone)?;
+            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            return Ok(len);
+        }
+        _ => {
+            let c = src[at + 1..].chars().next().unwrap_or(' ');
+            return Err(err_at(at, src, &format!("unknown escape \\{c} in a string: a backslash is written \\\\")));
+        }
+    };
+    out.push(byte);
+    Ok(2)
+}
+
 fn lex_string(src: &str, start: usize) -> Result<(String, usize), String> {
     let b = src.as_bytes();
     let mut s: Vec<u8> = Vec::new();
@@ -219,14 +274,7 @@ fn lex_string(src: &str, start: usize) -> Result<(String, usize), String> {
     while i < b.len() {
         match b[i] {
             b'"' => return Ok((String::from_utf8_lossy(&s).into_owned(), i + 1)),
-            b'\\' if i + 1 < b.len() => {
-                s.push(match b[i + 1] {
-                    b'n' => b'\n',
-                    b't' => b'\t',
-                    other => other,
-                });
-                i += 2;
-            }
+            b'\\' if i + 1 < b.len() => i += unescape(src, i, &mut s)?,
             other => {
                 s.push(other);
                 i += 1;
@@ -277,18 +325,11 @@ fn lex_fstring(src: &str, quote: usize) -> Result<(Vec<FPart>, usize), String> {
                 if depth != 0 {
                     return Err(err_at(i, src, "unterminated { in f-string"));
                 }
-                let inner = lex(&src[start..j - 1])?;
+                let inner = lex_from(&src[..j - 1], start)?;
                 parts.push(FPart::Expr(inner));
                 i = j;
             }
-            b'\\' if i + 1 < b.len() => {
-                lit.push(match b[i + 1] {
-                    b'n' => b'\n',
-                    b't' => b'\t',
-                    other => other,
-                });
-                i += 2;
-            }
+            b'\\' if i + 1 < b.len() => i += unescape(src, i, &mut lit)?,
             other => {
                 lit.push(other);
                 i += 1;
@@ -2740,18 +2781,19 @@ pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Resul
     // DATA extension (N1, ADR-0019) — a new transcoding row, not a structural
     // change — so the expert does it from the panel without an agent. Only a
     // dict/table can gain a key; a constant or list cannot.
-    let (vstart, vend) = entry.value_span;
-    let vend = vend.min(src.len());
-    let val_text = src[vstart..vend].trim_end();
-    let parsed: Value = serde_json::from_str(val_text)
-        .map_err(|_| format!("{name} has no key {key:?} and is not an editable table"))?;
-    let obj = parsed
+    let obj = entry
+        .value
         .as_object()
         .ok_or_else(|| format!("{name} has no key {key:?} and is not a table — cannot add a key"))?;
-    let close = vstart
-        + val_text
-            .rfind('}')
-            .ok_or_else(|| format!("{name}: malformed table literal"))?;
+    // The table's own closing brace is its last `}` token: a brace in one of
+    // its strings, or in a comment after it, is no token.
+    let (vstart, vend) = entry.value_span;
+    let close = lex(src)?
+        .iter()
+        .filter(|t| (vstart..vend).contains(&t.pos) && matches!(t.tok, Tok::RBrace))
+        .map(|t| t.pos)
+        .last()
+        .ok_or_else(|| format!("{name}: malformed table literal"))?;
     let k = serde_json::to_string(&Value::String(key.to_string())).unwrap();
     let v = serde_json::to_string(new_value).map_err(|e| e.to_string())?;
     // span-exact insert before the closing brace; no leading comma into an empty {}
@@ -3179,6 +3221,60 @@ end\n";
         assert!(set_literal(src, "N", "bloquante", &json!("x")).is_err());
         assert!(set_literal(src, "L", "bloquante", &json!("x")).is_err());
         assert!(set_literal(src, "NOPE", "-", &json!(1)).is_err());
+    }
+
+    /// A JSON escape spelled out: a backslash, a u, four hex digits.
+    fn esc(hex: &str) -> String {
+        format!("{}u{hex}", '\\')
+    }
+
+    #[test]
+    fn an_error_in_an_fstring_says_the_line_it_is_on() {
+        let e = parse("x = 1\ny = 2\nz = f\"{x ?? \"C:\\q\"}\"\n").err().unwrap();
+        assert!(e.starts_with("line 3: unknown escape"), "{e}");
+        let e = parse("x = 1\n\nz = f\"a {x +} b\"\n").err().unwrap();
+        assert!(e.starts_with("line 3: "), "{e}");
+        // what the f-string's {…} holds still runs
+        assert_eq!(one_emit("a = 2\nz = f\"{a + 1}{{x}}\"\nemit \"vx.t\", {z: z}\n", json!({})), json!({"z": "3{x}"}));
+    }
+
+    #[test]
+    fn a_table_gains_a_key_whatever_its_text_holds() {
+        // an escape JSON does not read, bare keys, and a brace in a comment after it
+        let src = "T = {\"a\": \"x\\{y\", b: \"}\"}  # rows like {a: b}\n";
+        let out = set_literal(src, "T", "c", &json!("z")).unwrap();
+        assert_eq!(get_literal(&out, "T", "-").unwrap(), json!({"a": "x{y", "b": "}", "c": "z"}));
+        assert!(out.ends_with("# rows like {a: b}\n"), "{out}");
+        let empty = set_literal("T = {}\n", "T", "k", &json!(1)).unwrap();
+        assert_eq!(get_literal(&empty, "T", "-").unwrap(), json!({"k": 1}));
+        assert!(set_literal("N = 5\n", "N", "k", &json!(1)).unwrap_err().contains("not a table"));
+    }
+
+    #[test]
+    fn a_literal_set_live_reads_back_as_it_was_set() {
+        // `set_literal` writes JSON: a CR, a control character, a quote and a
+        // backslash come back as they were set, not as their letter.
+        for v in ["a\r\nb", "\u{1}bell", "say \"hi\"", "back\\slash", "tab\there", "é😀"] {
+            let src = set_literal("V = \"x\"\nemit \"vx.t\", {v: V}\n", "V", "-", &json!(v)).unwrap();
+            assert_eq!(one_emit(&src, json!({}))["v"], v, "{src}");
+        }
+        // JSON's escapes written by hand, in a string and in an f-string.
+        let src = format!(
+            "emit \"vx.t\", {{a: \"{e}{pair}\\/\\b\\f\", b: f\"{e}\\{{x\\}}\"}}",
+            e = esc("00e9"),
+            pair = esc("d83d") + &esc("de00"),
+        );
+        let p = one_emit(&src, json!({}));
+        assert_eq!(p["a"], "é😀/\u{8}\u{c}");
+        assert_eq!(p["b"], "é{x}");
+        // An escape that stands for nothing says how a backslash is written.
+        let e = eval_flow("emit \"vx.t\", {v: \"C:\\qa\"}", json!({})).unwrap_err();
+        assert!(e.contains("line 1") && e.contains("unknown escape \\q") && e.contains("\\\\"), "{e}");
+        // A surrogate alone, or a \u without its four digits.
+        for bad in [esc("d83d") + "x", esc("de00"), esc("12") + "\""] {
+            let e = eval_flow(&format!("emit \"vx.t\", {{v: \"{bad}\"}}"), json!({})).unwrap_err();
+            assert!(e.contains("\\u"), "{bad}: {e}");
+        }
     }
 
     struct MapStore(std::collections::HashMap<String, String>);

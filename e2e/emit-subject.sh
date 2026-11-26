@@ -2,26 +2,56 @@
 # An emit subject cannot carry protocol. A subject built from an event field used
 # to reach the NATS wire as it was: a line break in the field became protocol
 # commands, and through http-in that needed no credential. A refused subject fails
-# the run like any other error, so the message reaches the DLQ.
+# the run like any other error, so the message reaches the DLQ. So does an emit
+# over the server's limit, in a flow or a detect unit, and the emits its run made
+# before it never leave.
 #   e2e/emit-subject.sh                      (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="$PWD/core/target/release/vejas-runtime"
 [ -x "$BIN" ] || { echo "build first" >&2; exit 1; }
 S=$(mktemp -d); R=$(mktemp -d)
-RT=""; NP=""; SUB=""; EVIL=""
-trap 'kill $RT $NP $SUB $EVIL 2>/dev/null; wait $RT $NP $SUB $EVIL 2>/dev/null; rm -rf "$S" "$R"' EXIT
+RT=""; NP=""; SUB=""; EVIL=""; FIRST=""; BLOB=""
+trap 'kill $RT $NP $SUB $EVIL $FIRST $BLOB 2>/dev/null; wait $RT $NP $SUB $EVIL $FIRST $BLOB 2>/dev/null; rm -rf "$S" "$R"' EXIT
 fail=0
 ok(){ echo "  ✓ $1"; }
 ko(){ echo "  ✗ $1"; fail=1; }
 
 URL=nats://127.0.0.1:4281; H="http://127.0.0.1:8753"; IN=18794
-mkdir -p "$R/flows" "$R/connectors"
+mkdir -p "$R/flows" "$R/connectors" "$R/detects"
 printf '# flow: dyn\nsource "vx.dyn.in"\nemit f"vx.out.{tenant}", {id: id}\n' > "$R/flows/dyn.vjs"
 printf '# connector: http_in\ndriver "http-in"\nPORT = %s\n' $IN > "$R/connectors/http_in.vjs"
 # an emit over the server's 1 MB limit: 16 bytes doubled seventeen times
 printf '# flow: big\nsource "vx.big.in"\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.big.out", {s: s}\n' \
   > "$R/flows/big.vjs"
+# the same, after an emit that the refusal must take back with it
+printf '# flow: pair\nsource "vx.pair.in"\nemit "vx.pair.first", {n: 1}\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.pair.big", {s: s}\n' \
+  > "$R/flows/pair.vjs"
+
+# an api flow whose emit is over the limit: none of its events can leave
+printf '# flow: bigapi\napi "POST /bigapi"\nemit "vx.bigapi.first", {n: 1}\ns = "xxxxxxxxxxxxxxxx"\nfor i in items:\n    s = s + s\nend\nemit "vx.bigapi.out", {s: s}\nrespond 201, {ok: true}\n' \
+  > "$R/flows/bigapi.vjs"
+# a detect unit with two emits for each event, the second over the limit:
+# five copies of a field the engine keeps 256 KiB of
+cat > "$R/detects/blob.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Blob:
+    s: str
+
+stream Blobs = Blob
+    .from(Bus, topic: "vx.blob.in")
+
+stream First = Blob
+    .emit(rule: "first")
+    .to(Bus, topic: "vx.blob.first")
+
+stream Huge = Blob
+    .emit(a: s, b: s, c: s, d: s, e: s)
+    .to(Bus, topic: "vx.blob.big")
+VPL
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4281 > /dev/null 2>&1 & NP=$!
 sleep 0.5
@@ -68,6 +98,37 @@ import json, sys
 print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:big"]))'; }
 for _ in $(seq 1 150); do [ "$(big_letters)" = "1" ] && break; sleep 0.1; done
 [ "$(big_letters)" = "1" ] && ok "an oversized emit reached the DLQ" || ko "the oversized emit never reached the DLQ"
+
+echo "── what the refused run emitted before the refusal never leaves"
+nats -s $URL sub vx.pair.first --raw > "$S/first" 2>/dev/null & FIRST=$!
+sleep 0.5
+curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' \
+  -d '{"items":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]}' "http://127.0.0.1:$IN/ingest/pair.in"
+pair_letters(){ curl -s -m 5 "$H/dlq" | python3 -c '
+import json, sys
+print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:pair"]))'; }
+for _ in $(seq 1 150); do [ "$(pair_letters)" = "1" ] && break; sleep 0.1; done
+[ "$(pair_letters)" = "1" ] && ok "the run reached the DLQ after its deliveries" || ko "the run never reached the DLQ"
+[ -s "$S/first" ] && ko "the first emit left $(wc -l < "$S/first") times" || ok "the first emit never left"
+
+echo "── an api flow says that sending its request again changes nothing"
+C=$(curl -s -m 10 -o "$S/bigapi" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d '{"items":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]}' "$H/api/bigapi")
+[ "$C" = "500" ] && grep -q "over the server's limit" "$S/bigapi" && grep -q "none of this request's events left" "$S/bigapi" \
+  && ok "answered $C: $(head -c 160 "$S/bigapi")" || ko "answered $C: $(head -c 200 "$S/bigapi")"
+
+echo "── a detect unit's refused emit takes back the others too"
+nats -s $URL sub vx.blob.first --raw > "$S/blob-first" 2>/dev/null & BLOB=$!
+sleep 0.5
+python3 -c 'import json; print(json.dumps({"event_type": "Blob", "s": "x" * 400000}))' > "$S/blob.json"
+curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' --data-binary @"$S/blob.json" \
+  "http://127.0.0.1:$IN/ingest/blob.in"
+blob_letters(){ curl -s -m 5 "$H/dlq" | python3 -c '
+import json, sys
+print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "detect:blob"]))'; }
+for _ in $(seq 1 150); do [ "$(blob_letters)" = "1" ] && break; sleep 0.1; done
+[ "$(blob_letters)" = "1" ] && ok "the message reached the DLQ after its deliveries" || ko "the message never reached the DLQ"
+[ -s "$S/blob-first" ] && ko "the first emit left $(grep -c . "$S/blob-first") times" || ok "the first emit never left"
 
 echo "── a shadow run shows the same error"
 curl -s -m 10 -H 'Content-Type: application/json' -d \

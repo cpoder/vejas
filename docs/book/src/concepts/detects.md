@@ -75,10 +75,17 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
   stream's `.to(...)` names, or to `<root>.detect.<unit>.<stream>` without
   one, and it is published before the source messages are acked
   ([ADR-0002](../../../adr/0002-nats-only-infrastructure.md)): a crash
-  re-delivers, it never loses an alert.
+  re-delivers, it never loses an alert. The emits of one event leave together
+  or not at all: one the server refuses, over its limit, fails the event, and
+  the others go back out with it.
 - **Poison.** A payload that is not JSON, or an event the engine refuses
   after `MAX_DELIVERIES` attempts, is parked in the DLQ
   ([ADR-0015](../../../adr/0015-dead-letter-queue.md)) like a flow's would be.
+  So is an event whose emit the server refuses.
+- **What the engine keeps of an event.** Its decoder keeps the first 256 KiB
+  of a string, the first 10 000 elements of an array and the first 1 024
+  fields. It cuts the rest, and the runtime is not told: the trace shows the
+  event as it came, and an emit that copies a cut field carries the cut value.
 - **The connector declaration.** VPL binds sources and sinks to a named
   connector; Vejas ignores its `url` — the bus is `NATS_URL`, there is one.
 

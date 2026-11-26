@@ -430,6 +430,18 @@ impl Batch {
         self.hold(subject, trace_headers_within(trace, payload.len(), limit), payload)
     }
 
+    /// How many publishes are held: the mark to give [`Batch::rollback`].
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Let go of what was held after `mark`, unsent. A run whose emit is refused
+    /// takes the emits it held before it back out, so that a run's emits leave
+    /// all together or not at all (ADR-0032).
+    pub fn rollback(&mut self, mark: usize) {
+        self.held.truncate(mark);
+    }
+
     fn hold(&mut self, subject: &str, headers: Option<HeaderMap>, payload: Bytes) -> Result<(), String> {
         if subject.is_empty() || subject.contains([' ', '\t', '\r', '\n']) {
             return Err(format!("invalid subject {subject:?}"));
@@ -1636,6 +1648,28 @@ mod live {
         let pulled: Vec<Message> = puller.round().unwrap().collect();
         assert_eq!(pulled.len(), 1);
         assert!(carries(&pulled[0]), "the stream keeps the headers");
+    }
+
+    #[test]
+    #[ignore]
+    fn what_a_batch_lets_go_of_never_leaves() {
+        let server = Server::start();
+        let bus = connect(&server.url()).unwrap();
+        let mut sub = bus.subscribe("t.rollback").unwrap();
+        let mut batch = bus.batch();
+        batch.publish("t.rollback", "kept").unwrap();
+        let mark = batch.held();
+        batch.publish("t.rollback", "taken back").unwrap();
+        let over = vec![b'x'; bus.0.link.client.max_payload() + 1];
+        assert!(batch.publish("t.rollback", over).is_err(), "over the server's limit");
+        batch.rollback(mark);
+        batch.publish("t.rollback", "after").unwrap();
+        batch.confirm().unwrap();
+        let mut seen = Vec::new();
+        while let Ok(message) = sub.next_timeout(Duration::from_millis(500)) {
+            seen.push(String::from_utf8_lossy(&message.data).into_owned());
+        }
+        assert_eq!(seen, ["kept", "after"]);
     }
 
     #[test]

@@ -1513,7 +1513,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     engine.record_steps(record::on());
                     // Holding an emit is local, so a refusal is final for this message:
                     // it can never leave, however often it redelivers. That makes it
-                    // a failed run, capped by MAX_DELIVERIES and dead-lettered.
+                    // a failed run, capped by MAX_DELIVERIES and dead-lettered, and
+                    // the emits it held before the refusal go back out of the batch:
+                    // a run's emits leave all together or not at all (ADR-0032).
+                    let held = batch.held();
                     let outcome = vjs::run(&prog, &event, &mut engine).and_then(|ctx| {
                         for (subj, payload) in &ctx.emits {
                             let bytes = serde_json::to_vec(payload).unwrap_or_default();
@@ -1524,6 +1527,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                         Ok(ctx)
                     });
+                    if outcome.is_err() {
+                        batch.rollback(held);
+                    }
                     if traced {
                         for invoked in engine.take_spans() {
                             metrics::span(invoke_span(&handle.spec.name, invoked));
@@ -2055,74 +2061,80 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     );
                                 }
                             }
-                            Ok(emits) => {
-                                let mut ok = true;
-                                let mut subjects = Vec::with_capacity(emits.len());
-                                for emit in &emits {
-                                    let subject = emit_subject(emit, &subj_root, &stem);
-                                    if let Err(e) = outbox.publish_traced(&subject, emit.to_payload(), &carried) {
-                                        eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
-                                        ok = false;
+                            fed => {
+                                // A run's emits leave all together or not at all
+                                // (ADR-0032): one the batch refuses, a payload over
+                                // the server's limit, takes the others back out of
+                                // the batch, and the message fails as a run that
+                                // errs does, dead-lettered once its deliveries are
+                                // spent. Its emits used to leave at every delivery.
+                                let mark = outbox.held();
+                                let run = fed.map_err(|e| e.to_string()).and_then(|emits| {
+                                    let mut subjects = Vec::with_capacity(emits.len());
+                                    for emit in &emits {
+                                        let subject = emit_subject(emit, &subj_root, &stem);
+                                        outbox
+                                            .publish_traced(&subject, emit.to_payload(), &carried)
+                                            .map_err(|e| format!("publish {subject}: {e}"))?;
+                                        subjects.push(subject);
                                     }
-                                    subjects.push(subject);
-                                }
-                                metrics::observe(&handle.spec.name, ok, emits.len() as u64, t0.elapsed().as_secs_f64());
-                                if observing && (hop.sampled || !ok) {
-                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos)
-                                        .attr("vejas.emits", emits.len() as u64);
-                                    let extras = record::Extras::new().emits(subjects.clone()).input(&msg.data);
-                                    if ok {
-                                        done.push((span, extras));
-                                    } else {
-                                        record::end(span.failed("publish failed (will redeliver)"), extras);
-                                    }
-                                }
-                                record_trace(
-                                    &handle.spec.name,
-                                    &msg.subject,
-                                    ok,
-                                    (!ok).then(|| "publish failed (will redeliver)".to_string()),
-                                    subjects,
-                                    connectors::trace_preview(&msg.data),
-                                    None,
-                                    Some(&hop),
-                                    msg.delivery(),
-                                );
-                                if ok {
-                                    to_ack.push((msg, seq));
-                                }
-                            }
-                            Err(e) => {
-                                let e = e.to_string();
-                                eprintln!("[vejas] {}: {e}", handle.spec.name);
-                                metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
-                                let delivered =
-                                    msg.delivery().map(|i| i.delivered).unwrap_or(1);
-                                let mut dead_lettered = false;
-                                if delivered >= MAX_DELIVERIES {
-                                    match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
-                                        Ok(()) => {
-                                            dead_lettered = true;
-                                            metrics::inc_dead_letter(&handle.spec.name);
-                                            let _ = msg.ack();
-                                            retrying.remove(&seq);
+                                    Ok(subjects)
+                                });
+                                match run {
+                                    Ok(subjects) => {
+                                        let emits = subjects.len() as u64;
+                                        metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
+                                        if observing && hop.sampled {
+                                            let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos)
+                                                .attr("vejas.emits", emits);
+                                            done.push((span, record::Extras::new().emits(subjects.clone()).input(&msg.data)));
                                         }
-                                        Err(_) => {
-                                            let _ = msg.nak();
-                                            retrying.insert(seq);
-                                        }
+                                        record_trace(
+                                            &handle.spec.name,
+                                            &msg.subject,
+                                            true,
+                                            None,
+                                            subjects,
+                                            connectors::trace_preview(&msg.data),
+                                            None,
+                                            Some(&hop),
+                                            msg.delivery(),
+                                        );
+                                        to_ack.push((msg, seq));
                                     }
-                                } else {
-                                    retrying.insert(seq); // left un-acked: redelivers after ack_wait
+                                    Err(e) => {
+                                        outbox.rollback(mark);
+                                        eprintln!("[vejas] {}: {e}", handle.spec.name);
+                                        metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
+                                        let delivered =
+                                            msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                                        let mut dead_lettered = false;
+                                        if delivered >= MAX_DELIVERIES {
+                                            match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
+                                                Ok(()) => {
+                                                    dead_lettered = true;
+                                                    metrics::inc_dead_letter(&handle.spec.name);
+                                                    let _ = msg.ack();
+                                                    retrying.remove(&seq);
+                                                }
+                                                Err(_) => {
+                                                    let _ = msg.nak();
+                                                    retrying.insert(seq);
+                                                }
+                                            }
+                                        } else {
+                                            retrying.insert(seq); // left un-acked: redelivers after ack_wait
+                                        }
+                                        if observing {
+                                            let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
+                                            let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
+                                            record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
+                                        }
+                                        record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
+                                            vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
+                                        set_state(&handle, |st| st.last_error = Some(e));
+                                    }
                                 }
-                                if observing {
-                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
-                                    let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                                    record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
-                                }
-                                record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
-                                set_state(&handle, |st| st.last_error = Some(e));
                             }
                         }
                     }
@@ -3020,6 +3032,7 @@ Rules:
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
 - A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
+- A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
@@ -4046,20 +4059,39 @@ fn parse_query(url: &str) -> Value {
     Value::Object(q)
 }
 
-/// Run a flow and return its full context (emits + response).
-/// Publish an API flow's side-effect emits to the bus (best-effort), carrying
-/// the request's trace.
-fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) {
+/// Publish an API flow's emits to the bus, carrying the request's trace. An
+/// error means the bus did not confirm them all, so the caller must not take
+/// the request as done: it is answered 503 and sends it again (ADR-0002).
+fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) -> Result<(), Unsent> {
     if emits.is_empty() {
-        return;
+        return Ok(());
     }
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    if let Ok(nc) = bus::connect(&url) {
-        let mut batch = nc.batch();
-        for (subj, payload) in emits {
-            let _ = batch.publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried);
+    let nc = bus::connect(&url).map_err(|e| Unsent::Unconfirmed(format!("NATS unreachable: {e}")))?;
+    let mut batch = nc.batch();
+    for (subj, payload) in emits {
+        batch
+            .publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried)
+            .map_err(|e| Unsent::Refused(format!("publish {subj}: {e}")))?;
+    }
+    batch.confirm().map_err(Unsent::Unconfirmed)
+}
+
+/// Why an api flow's emits did not all leave.
+enum Unsent {
+    /// The batch refused one, a payload over the server's limit or a subject
+    /// it cannot carry: none left, and sending the request again changes nothing.
+    Refused(String),
+    /// The bus did not confirm them: some may be missing, and the request can
+    /// be sent again.
+    Unconfirmed(String),
+}
+
+impl Unsent {
+    fn error(&self) -> &str {
+        match self {
+            Unsent::Refused(e) | Unsent::Unconfirmed(e) => e,
         }
-        let _ = batch.confirm();
     }
 }
 
@@ -4132,28 +4164,39 @@ fn run_api_flow(
         steps = engine.take_steps();
         run
     })();
-    let ok = result.is_ok();
-    let emits = result.as_ref().map(|c| c.emits.len() as u64).unwrap_or(0);
-    metrics::observe(&unit, ok, emits, t0.elapsed().as_secs_f64());
-    let (code, body) = match &result {
-        Ok(ctx) => {
-            publish_emits(&ctx.emits, &hop.context());
-            match &ctx.response {
-                Some((status, body)) => (vjs::http_status(status), body.to_string()),
-                None => (
-                    200,
-                    json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
-                ),
-            }
-        }
-        Err(e) => (500, json!({"error": e}).to_string()),
+    // The emits leave before the answer: a caller told 2xx can count on them.
+    let unsent = result.as_ref().ok().and_then(|ctx| publish_emits(&ctx.emits, &hop.context()).err());
+    let failed = result.is_err() || unsent.is_some();
+    // A failed request counts no emit, as a failed run of the flow loop.
+    let emits = match &result {
+        Ok(ctx) if !failed => ctx.emits.len() as u64,
+        _ => 0,
     };
-    if traced || (metrics::tracing() && result.is_err()) {
+    metrics::observe(&unit, !failed, emits, t0.elapsed().as_secs_f64());
+    let (code, body) = match (&result, &unsent) {
+        (Ok(_), Some(Unsent::Refused(e))) => (
+            500,
+            json!({"error": format!("{e}, so none of this request's events left")}).to_string(),
+        ),
+        (Ok(_), Some(Unsent::Unconfirmed(e))) => (
+            503,
+            json!({"error": format!("the bus did not confirm this request's events ({e}), so some may be missing: send the request again")}).to_string(),
+        ),
+        (Ok(ctx), None) => match &ctx.response {
+            Some((status, body)) => (vjs::http_status(status), body.to_string()),
+            None => (
+                200,
+                json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
+            ),
+        },
+        (Err(e), _) => (500, json!({"error": e}).to_string()),
+    };
+    if traced || (metrics::tracing() && failed) {
         for span in invoked {
             metrics::span(invoke_span(&unit, span));
         }
     }
-    if metrics::wants(hop.sampled, result.is_err()) {
+    if metrics::wants(hop.sampled, failed) {
         let subjects: Vec<String> = match &result {
             Ok(ctx) => ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
             Err(_) => Vec::new(),
@@ -4171,7 +4214,7 @@ fn run_api_flow(
         if let Some(path) = &path {
             span = span.attr("code.file.path", metrics::Attr::Computed(relative_to(root, path).into()));
         }
-        if let Err(e) = result {
+        if let Some(e) = result.err().or(unsent.map(|u| u.error().to_string())) {
             span = span.failed(e);
         }
         record::end(
@@ -5555,6 +5598,25 @@ mod supervision_tests {
         })
         .join();
         assert!(connectors::Slot::try_take(&open, 1).is_some(), "the slot came back");
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::LANGUAGE_VJS;
+
+    /// The book's language reference is the text `vejas_language` serves every
+    /// agent, word for word: a rule added to one only is a rule half the
+    /// readers never see.
+    #[test]
+    fn the_book_shows_the_language_agents_read() {
+        let book = include_str!("../../docs/book/src/reference/vejascript.md");
+        let shown = book.split("```text\n").nth(1).and_then(|b| b.split("```").next());
+        assert_eq!(
+            shown.map(str::trim_end),
+            Some(LANGUAGE_VJS.trim_end()),
+            "docs/book/src/reference/vejascript.md and LANGUAGE_VJS differ"
+        );
     }
 }
 
