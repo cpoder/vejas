@@ -119,10 +119,10 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   mask on names. The shadow replay, time travel, the canary and golden
   capture now read the events masked, as they already read `secret()`. A
   golden case no longer writes an event's credentials into the repository.
-  Flags, nulls and numbers not named as a credential stay as they are, so a
-  branch on them goes as live; a result names in `hidden` the fields its
-  code reads that the run did not see, and the panel says so under its
-  verdict.
+  Flags and nulls stay as they are, so a branch on them goes as live; a
+  number stays as the record shows it. A result names in `hidden` the fields
+  its code may read that the run did not see, and the panel says so under
+  its verdict.
 - A cut JSON text is read as JSON as far as it goes, so a pair
   (`{"name": "Authorization", "value": "Bearer …"}`) is masked in an event's
   preview, and in the record's preview of a payload past 16 KB, as it is in

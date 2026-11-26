@@ -42,9 +42,8 @@ What keeps the rule real, rather than aspirational:
   `<secret:path/key>`. It stays fail-closed: a missing secret still aborts.
   The real events a shadow replay, time travel, the canary or a golden
   capture reads are masked first: a credential-named field or a pair reads
-  `<masked>`, a value a store handed out `<secret>`. Flags, nulls and
-  numbers not named as a credential stay as they are, so a branch on them
-  goes as it goes live. A result names in
+  `<masked>`, a value a store handed out `<secret>`. Flags and nulls stay
+  as they are, so a branch on them goes as it goes live. A result names in
   `hidden` the fields its code reads that the run did not see, and the
   panel says so under its verdict: a rule on one of them may go another way
   live. A candidate is

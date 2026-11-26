@@ -462,13 +462,14 @@ that fails and of an `api` call that invokes a service.
   candidate that copies `event.password` under another name carried the
   value past any mask on names. The events these runs read are now masked
   first, as `secret()` already was in shadow: the value never enters the
-  run. A flag and a null stay as they are, and so does a number, unless it
-  is named as a credential (a code often is one, `mfa_token: 482913`) or is
-  a value handed out, whole (`18443` is not `8443`). A branch on a masked
-  field can still go another way than live: a replay that branched on
-  `auth_level` reported that nothing would change. So each result names in
-  `hidden` the fields its code reads that the run did not see, and the
-  panel says so under its verdict.
+  run. A flag and a null stay as they are, whatever their name. A number
+  stays as the record shows it: masked when named as a credential (a code
+  often is one, `mfa_token: 482913`), taken out when it holds a value handed
+  out, since a candidate is any code and `18443 - 10000` gives `8443` back.
+  A branch on a masked field can still go another way than live: a replay
+  that branched on `auth_level` reported that nothing would change. So
+  each result names in `hidden` the fields its code may read that the run
+  did not see, and the panel says so under its verdict.
 - **A cut JSON text is read as JSON as far as it goes.** A preview is the
   first 160 characters of the event, so the pair rule of the JSON path
   (`{"name": "Authorization", "value": "Bearer …"}`) missed it there, and in
@@ -478,8 +479,10 @@ that fails and of an `api` call that invokes a service.
   cut short, so an XML element or a query in it is masked to its end; when
   it is the name of a pair, the pair rule reads that name first. A key, a
   number or a literal the cut fell in is dropped from a text cut here. A
-  text that came cut, a payload a producer truncated, keeps it, scrubbed as
-  a text after the rest: `[WARN` stays `[WARN`, and the pair in
+  text that came cut, a payload a producer truncated, ends there for real:
+  a number or a literal that runs to its end is a value, so the pair in
+  `{"name":"DB_PASSWORD","value":12345678` is masked, and a key it stops in
+  follows, scrubbed as a text. `[WARN` stays `[WARN`, and the pair in
   `{"headers": [...], "amount":12` is masked, in the record too. Escapes
   that do not read are scrubbed as a text where they are. Text that is not
   JSON keeps the text rules. A test cuts documents with a credential in

@@ -732,17 +732,19 @@ fn is_upper_name(name: &str) -> bool {
 /// A branch or a loop body starts from what was set before it, and what it
 /// sets counts after it. An invoke gives back its arguments and what the
 /// service sets (`makes`, keyed by the name the invoke uses).
-/// The top-level fields of its event a flow reads, or `event` alone when it
-/// reads the event whole (`event[KEY]`, `emit "x", event`): what a field
-/// hidden from a shadow run can change (ADR-0034). A value a service it
-/// invokes makes counts as read, which errs on the side of naming a field.
+/// The top-level fields of its event a flow may read, or `event` alone when
+/// it reads the event whole (`event[KEY]`, `emit "x", event`): what a field
+/// hidden from a shadow run can change (ADR-0034). Every name the code reads
+/// counts, but its business literals, even one a branch sets first: the
+/// other branch leaves it to the event. That errs on the side of naming a
+/// field.
 pub fn event_reads(prog: &Program) -> Vec<String> {
     if stmts_read_whole_event(&prog.stmts) {
         return vec!["event".to_string()];
     }
-    let mut set: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
+    let own: Vec<String> = prog.surface.iter().map(|e| e.name.clone()).collect();
     let mut reads = Vec::new();
-    reads_in_order(&prog.stmts, &mut set, &[], &mut reads);
+    reads_of_stmts(&prog.stmts, &own, &mut reads);
     let mut top: Vec<String> = Vec::new();
     for r in reads {
         let name = r.split('.').next().unwrap_or(&r).to_string();
@@ -2770,6 +2772,14 @@ pub fn set_literal(src: &str, name: &str, key: &str, new_value: &Value) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn what_a_branch_may_leave_to_the_event_is_read_from_it() {
+        let prog = super::parse("source \"vx.a\"\nif urgent:\n  password = \"a\"\nend\nemit \"vx.o\", {p: password}\n").unwrap();
+        assert_eq!(super::event_reads(&prog), ["urgent", "password"]);
+        let prog = super::parse("source \"vx.a\"\nK = \"id\"\nemit \"vx.o\", {v: event[K]}\n").unwrap();
+        assert_eq!(super::event_reads(&prog), ["event"]);
+    }
+
     use super::*;
     use serde_json::json;
 

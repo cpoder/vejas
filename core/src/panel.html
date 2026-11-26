@@ -1472,7 +1472,8 @@ function replayHtml(res, hide) {
 // The fields the flow reads that the check ran without: the runtime hides
 // what may hold a credential, so a rule on one of them may decide otherwise live.
 function unseen(results) {
-  const names = [...new Set((results || []).flatMap(r => (r.hidden || []).map(p => String(p).split(/[.[]/)[0])))];
+  // a path names its top field; one of an array event, or of an unnamed key, names the event
+  const names = [...new Set((results || []).flatMap(r => (r.hidden || []).map(p => String(p).split(/[.[]/)[0] || 'event')))];
   if (!names.length) return '';
   const shown = names.slice(0, 3).map(n => `<code>${esc(n)}</code>`);
   const rest = names.length > 3 ? ` and ${plural(names.length - 3, 'other')}` : '';

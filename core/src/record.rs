@@ -967,18 +967,6 @@ impl Scrub {
     }
 
     /// Does `text` hold a value handed out?
-    /// Is `text` a value handed out, whole? A number is compared as JSON
-    /// reads it too.
-    fn hands_out(&self, text: &str) -> bool {
-        match &self.vault {
-            Vault::Empty => false,
-            Vault::Unusable => true,
-            Vault::Values { values, numbers, .. } => {
-                values.iter().any(|v| v == text) || text.parse::<f64>().is_ok_and(|f| numbers.contains(&f.to_bits()))
-            }
-        }
-    }
-
     fn holds_secret(&self, text: &str) -> bool {
         match &self.vault {
             Vault::Empty => false,
@@ -1193,7 +1181,7 @@ impl Scrub {
         let first = text.trim_start().as_bytes().first().copied();
         if nest < NEST_MAX && matches!(first, Some(b'{' | b'[' | b'"')) && !self.spans_json(text.as_bytes()) {
             let text = if cut { &text[..self.vault_start_at_end(text)] } else { text };
-            let whole = made_whole(text);
+            let whole = made_whole(text, !drop);
             let complete = match &whole {
                 Some(w) => w.closers.is_empty() && w.string.is_none() && w.keep == text.len(),
                 None => !cut && first == Some(b'"'),
@@ -1386,9 +1374,10 @@ struct Whole {
 /// `text`, JSON that may stop anywhere, made whole. It closes after a value,
 /// after the `[` or `{` that opens one, and inside a string that is a value;
 /// a key, a number or a literal it stops in goes, with what led to it since
-/// the last value. None when it is not an array or an object as far as it
-/// goes, or holds more than one.
-fn made_whole(text: &str) -> Option<Whole> {
+/// the last value. When the text `ends_here`, it was not cut there: a number
+/// or a literal that runs to its end and reads as one is a value. None when
+/// it is not an array or an object as far as it goes, or holds more than one.
+fn made_whole(text: &str, ends_here: bool) -> Option<Whole> {
     let close = |open: &[u8]| open.iter().rev().copied().map(char::from).collect::<String>();
     let bytes = text.as_bytes();
     let mut at = bytes.iter().take_while(|b| b.is_ascii_whitespace()).count();
@@ -1451,7 +1440,11 @@ fn made_whole(text: &str) -> Option<Whole> {
                     .iter()
                     .take_while(|b| !matches!(b, b',' | b'}' | b']' | b':' | b'"') && !b.is_ascii_whitespace())
                     .count();
-                if at + len == bytes.len() {
+                let scalar = || {
+                    serde_json::from_slice::<Value>(&bytes[at..at + len])
+                        .is_ok_and(|v| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null))
+                };
+                if at + len == bytes.len() && !(ends_here && scalar()) {
                     break;
                 }
                 at += len;
@@ -2147,28 +2140,29 @@ impl Shown {
     }
 
     /// A real event as a shadow run reads it, and the paths of what it does
-    /// not see (`event` for the whole). Masked as `json` masks it, with what
-    /// holds no credential put back, so a branch on it goes as it goes live:
-    /// a flag, a null, and a number that only holds a value handed out
-    /// (`18443` for `8443`). A number named as a credential stays masked: a
-    /// code often is one (`mfa_token: 482913`), and a candidate is any code.
+    /// not see (`event` for the whole). Masked as `json` masks it, with its
+    /// flags and nulls put back, so a branch on them goes as it goes live. A
+    /// number stays as `json` shows it, since a candidate is any code: masked
+    /// when named as a credential (a code often is one, `mfa_token: 482913`),
+    /// taken out when it holds a value handed out (`18443 - 10000` gives
+    /// `8443` back).
     pub fn shadow_input(&self, event: &Value) -> (Value, Vec<String>) {
         let mut hidden = Vec::new();
-        let read = restored(&self.0, event, shown_json(&self.0, event), "", &mut hidden);
+        let read = restored(event, shown_json(&self.0, event), "", &mut hidden);
         (read, hidden)
     }
 }
 
-/// `orig` as `shown` masks it, with what holds no credential put back
+/// `orig` as `shown` masks it, with its flags and nulls put back
 /// (`Shown::shadow_input`); the path of each value that still differs goes
 /// to `hidden`, `event` for the whole.
-fn restored(scrub: &Scrub, orig: &Value, shown: Value, path: &str, hidden: &mut Vec<String>) -> Value {
+fn restored(orig: &Value, shown: Value, path: &str, hidden: &mut Vec<String>) -> Value {
     let below = |key: &str| if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
     let read = match (orig, shown) {
         (Value::Object(o), Value::Object(s)) => {
             let read = s.into_iter().map(|(k, sv)| match o.get(&k) {
                 Some(ov) => {
-                    let v = restored(scrub, ov, sv, &below(&k), hidden);
+                    let v = restored(ov, sv, &below(&k), hidden);
                     (k, v)
                 }
                 // a key the scrub changed: what it holds stays as shown
@@ -2181,29 +2175,16 @@ fn restored(scrub: &Scrub, orig: &Value, shown: Value, path: &str, hidden: &mut 
         }
         (Value::Array(o), Value::Array(s)) if o.len() == s.len() => {
             let read = s.into_iter().zip(o).enumerate();
-            return Value::Array(read.map(|(i, (sv, ov))| restored(scrub, ov, sv, &format!("{path}[{i}]"), hidden)).collect());
+            return Value::Array(read.map(|(i, (sv, ov))| restored(ov, sv, &format!("{path}[{i}]"), hidden)).collect());
         }
         // a flag or a null holds no credential, whatever its name
         (Value::Bool(_) | Value::Null, _) => orig.clone(),
-        // a number taken out for holding a value handed out, not one masked
-        // for its name
-        (Value::Number(n), Value::String(taken)) if taken == TAKEN_OUT => kept_number(scrub, n),
         (_, shown) => shown,
     };
     if read != *orig {
         hidden.push(if path.is_empty() { "event".to_string() } else { path.to_string() });
     }
     read
-}
-
-/// A number as a shadow run reads it: as it is, unless it is a value handed
-/// out, whole. A number that only holds one (`18443` for `8443`) is another.
-fn kept_number(scrub: &Scrub, n: &serde_json::Number) -> Value {
-    if scrub.hands_out(&n.to_string()) {
-        Value::String(TAKEN_OUT.to_string())
-    } else {
-        Value::Number(n.clone())
-    }
 }
 
 fn shown_text(scrub: &Scrub, text: &str, cut: bool) -> String {
@@ -3015,7 +2996,7 @@ mod tests {
     #[test]
     fn a_cut_json_text_is_made_whole_to_be_read_as_json() {
         let whole = |t: &str| {
-            made_whole(t).map(|w| format!("{}{}{}", &t[..w.keep], if w.string.is_some() { "\"" } else { "" }, w.closers))
+            made_whole(t, false).map(|w| format!("{}{}{}", &t[..w.keep], if w.string.is_some() { "\"" } else { "" }, w.closers))
         };
         for (cut, made) in [
             (r#"{"a":1,"b":"x"#, r#"{"a":1,"b":"x"}"#),
@@ -3097,6 +3078,23 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_text_that_stops_on_a_pairs_value_masks_it() {
+        for t in [
+            r#"{"env":[{"name":"DB_PASSWORD","value":12345678"#,
+            r#"{"env":[{"name":"DB_PASSWORD","value":true,"n":1},{"name":"api_key","value":12345678"#,
+            r#"{"a":1,"password":12345678"#,
+        ] {
+            let shown = text(t, &[], false);
+            assert!(!shown.contains("12345678"), "{shown}");
+            let shown = shown_json(&scrub(&[]), &serde_json::json!({ "body": t })).to_string();
+            assert!(!shown.contains("12345678"), "{shown}");
+        }
+        // one that ends on what does not read as a value keeps it as a text
+        assert_eq!(text(r#"{"a":1,"b":tru"#, &[], false), r#"{"a":1,"b":tru"#);
+        assert_eq!(text(r#"{"a":[1,2e"#, &[], false), r#"{"a":[1,2e"#);
+    }
+
+    #[test]
     fn a_text_that_came_cut_keeps_its_end_and_its_pairs_masked() {
         let t = r#"{"headers":[{"name":"Authorization","value":"Bearer HVQZXJ1164"}],"amount":12"#;
         let shown = text(t, &[], false);
@@ -3122,16 +3120,20 @@ mod tests {
             "auth_level": 3, "password_expired": true, "auth_type": "basic", "amount": 18443, "port": 8443,
             "auth": {"user": "bob", "mfa": false}, "next_token": null, "note": "tok-HANDED-7741",
             "headers": [{"name": "Authorization", "value": "Bearer x-1"}], "id": 5, "mfa_token": 482913,
-            "pair": {"name": "api_key", "value": 77120},
+            "pair": {"name": "api_key", "value": 77120}, "neg": -8443, "total": 120,
         });
         let (read, hidden) = shown.shadow_input(&event);
+        // a number that holds a value handed out gives it back to any code
+        // (`amount - 10000`): it stays out, and is named
         assert_eq!(read, json!({
-            "auth_level": MASKED, "password_expired": true, "auth_type": MASKED, "amount": 18443, "port": TAKEN_OUT,
+            "auth_level": MASKED, "password_expired": true, "auth_type": MASKED, "amount": TAKEN_OUT, "port": TAKEN_OUT,
             "auth": MASKED, "next_token": null, "note": TAKEN_OUT,
             "headers": [{"name": "Authorization", "value": MASKED}], "id": 5, "mfa_token": MASKED,
-            "pair": {"name": "api_key", "value": MASKED},
+            "pair": {"name": "api_key", "value": MASKED}, "neg": TAKEN_OUT, "total": 120,
         }));
-        let paths = ["auth", "auth_level", "auth_type", "headers[0].value", "mfa_token", "note", "pair.value", "port"];
+        let paths = [
+            "amount", "auth", "auth_level", "auth_type", "headers[0].value", "mfa_token", "neg", "note", "pair.value", "port",
+        ];
         assert_eq!(hidden, paths);
         // what it cannot read at all, it does not read
         let mut deep = json!("leaf");
