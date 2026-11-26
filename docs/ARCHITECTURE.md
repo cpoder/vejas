@@ -10,7 +10,9 @@ core/                     the runtime (Rust, one binary)
   Cargo.toml
   src/main.rs             supervision, HTTP surface, panel, MCP server, CLI
   src/vjs.rs              VejasScript: lexer, parser, interpreter, editing, tests
-  src/connectors.rs       the driver SDK + bundled drivers (sources, sinks, exec bridges)
+  src/connectors.rs       the driver contract: Config, Ctx, the Driver trait
+  src/connectors/         what drivers share: hop record, sink loop, pull rounds, DLQ, offsets, HTTP client
+  src/connectors/drivers/ the bundled drivers, one module per protocol (sources, sinks, exec bridges)
   src/control.rs          the remote-control channel (leaf-node collectors, ADR-0013)
   src/secrets.rs          the SecretStore trait + Vault/File/Env backends
   src/panel.html          the dashboard (embedded at compile time)
