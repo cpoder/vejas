@@ -9,3 +9,6 @@
 e2e/film-out/
 docs/book/book/
 /sdk/target/
+# the vendored tiny_http is built inside core; a lockfile from testing it alone stays out
+/third_party/tiny_http/Cargo.lock
+/third_party/tiny_http/target/

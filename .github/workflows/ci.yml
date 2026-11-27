@@ -30,6 +30,9 @@ jobs:
       - name: Language unit tests
         run: cargo test --manifest-path core/Cargo.toml
 
+      - name: The vendored tiny_http's own tests (third_party/tiny_http/README.md)
+        run: cargo test --lib --manifest-path third_party/tiny_http/Cargo.toml
+
       - name: Build the runtime
         run: cargo build --release --manifest-path core/Cargo.toml
 
@@ -115,6 +118,8 @@ jobs:
         run: e2e/emit-subject.sh
       - name: http-in survives a burst and a thread limit
         run: e2e/http-in-bound.sh
+      - name: The panel and api server bounds every client (body, time, connections)
+        run: e2e/http-limits.sh
       - name: Signed webhooks on http-in refuse what their sender did not sign (ADR-0037)
         run: e2e/http-in-signed.sh
       - name: Dead letters announce themselves, without feeding themselves
