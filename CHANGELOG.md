@@ -7,6 +7,31 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+### Added
+- **What a detect unit's engine loses is counted.**
+  `vejas_detect_losses_total{unit, kind}` on `/metrics` and `losses` under
+  each detect in `/topology`: sequences never opened at the cap
+  (`runs_dropped`), sequences evicted (`runs_evicted`), and events a
+  `.where()` could not judge (`filters_without_value`). They never go back
+  across a restart or a reload. A loss of runs is also said, the first then
+  at most one a minute, as a log line and a `losses` event on
+  `<root>.flow.events`. `e2e/detect-losses.sh` checks it.
+- **`VEJAS_DETECT_MAX_RUNS`**: how many sequences a detect pattern keeps
+  open at once (10 000 by default, per partition).
+
+### Changed
+- **The Varpulis engine moves from 1cb201b to 6d40466.** It refuses at load,
+  with codes E100 to E104, what it used to ignore with a warning or in
+  silence: `import`, `context`, a `timer()` source, `.enrich()` and
+  `.alert(webhook: ...)`. A detect unit that used one stops at load and says
+  why. It also carries the dependency security updates of that range, and
+  a predicate index: once a pattern has 8 sequences waiting or more, an
+  event looks up the sequences it can advance instead of visiting each one,
+  so a correlation with many open sequences no longer slows down with their
+  number. It applies without `.partition_by`, without a negation spanning
+  the pattern, and to equality, order and range conditions. The matches one
+  event completes are now emitted in the order their sequences opened.
+
 ## [0.8.0] — 2026-11-27
 
 ### Added

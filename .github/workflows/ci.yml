@@ -142,6 +142,8 @@ jobs:
         run: e2e/public-mode.sh
       - name: A flow holds its source while a system is down (ADR-0040)
         run: e2e/flow-holds.sh
+      - name: A detect unit's engine losses are counted and said
+        run: e2e/detect-losses.sh
       - name: Docs book builds (broken includes fail here, not on deploy)
         run: |
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz

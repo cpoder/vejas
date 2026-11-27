@@ -58,6 +58,13 @@ struct Unit {
     held_on: Option<String>,
     held: bool,
     probes: u64,
+    /// Detect units: what the engine lost without failing, by `LOSS_KINDS`,
+    /// summed over every program the unit ran since the process started.
+    /// When runs were last said lost, and whether a later loss waits to be.
+    detect: bool,
+    loss: [u64; 3],
+    loss_said: Option<Instant>,
+    loss_pending: bool,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -128,6 +135,78 @@ pub fn observe_restore(unit: &str, seq: u64) {
     let u = map.entry(unit.to_string()).or_default();
     u.restores += 1;
     u.restore_seq = seq;
+}
+
+/// What a detect unit's engine can lose without an error, in the order of
+/// `vejas_detect_losses_total{kind=...}` and `/topology`.
+pub const LOSS_KINDS: [&str; 3] = ["runs_dropped", "runs_evicted", "filters_without_value"];
+
+/// How often a unit that keeps losing is reported again.
+const LOSS_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// The unit is a detect unit: it shows its losses, zero or not.
+pub fn declare_detect(unit: &str) {
+    units().lock().unwrap().entry(unit.to_string()).or_default().detect = true;
+}
+
+/// What a report of losses asks of the caller.
+#[derive(Debug, PartialEq)]
+pub enum LossNews {
+    /// Nothing to say.
+    Quiet,
+    /// Say these totals now, on the log and the bus.
+    Say([u64; 3]),
+    /// Runs were lost but were said less than `LOSS_WARN_EVERY` ago: ask
+    /// again with `flush_losses` from this instant.
+    Later(Instant),
+}
+
+fn loss_news(u: &mut Unit) -> LossNews {
+    match u.loss_said {
+        Some(t) if t.elapsed() < LOSS_WARN_EVERY => {
+            u.loss_pending = true;
+            LossNews::Later(t + LOSS_WARN_EVERY)
+        }
+        _ => {
+            u.loss_said = Some(Instant::now());
+            u.loss_pending = false;
+            LossNews::Say(u.loss)
+        }
+    }
+}
+
+/// Add what one program lost since its last report. Several programs of a
+/// unit may report at once (a reload overlaps the old and the new): each
+/// adds its own delta, so the total only grows. A loss of runs is news; a
+/// filter that could not judge an event is counted, not said, since mixed
+/// traffic does that in the normal course.
+pub fn add_losses(unit: &str, delta: [u64; 3]) -> LossNews {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.detect = true;
+    for i in 0..3 {
+        u.loss[i] += delta[i];
+    }
+    if delta[0] == 0 && delta[1] == 0 {
+        return LossNews::Quiet;
+    }
+    loss_news(u)
+}
+
+/// A loss held back by the rate limit, said once the minute has passed.
+pub fn flush_losses(unit: &str) -> LossNews {
+    let mut map = units().lock().unwrap();
+    let Some(u) = map.get_mut(unit).filter(|u| u.loss_pending) else {
+        return LossNews::Quiet;
+    };
+    loss_news(u)
+}
+
+/// A detect unit's loss totals since the process started, if it is one.
+pub fn losses(unit: &str) -> Option<[u64; 3]> {
+    let map = units().lock().unwrap();
+    let u = map.get(unit).filter(|u| u.detect)?;
+    Some(u.loss)
 }
 
 /// A message that was dead-lettered (ADR-0015). Kept separate from `observe`
@@ -266,6 +345,17 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
     out.push_str("# TYPE vejas_restore_seq gauge\n");
     for (unit, u) in map.iter() {
         out.push_str(&format!("vejas_restore_seq{{unit=\"{}\"}} {}\n", esc(unit), u.restore_seq));
+    }
+    out.push_str("# HELP vejas_detect_losses_total What a detect unit's engine lost without an error: runs never opened at the max_runs cap, runs evicted, events a filter discarded for want of a true/false value.\n");
+    out.push_str("# TYPE vejas_detect_losses_total counter\n");
+    for (unit, u) in map.iter().filter(|(_, u)| u.detect) {
+        for (i, kind) in LOSS_KINDS.iter().enumerate() {
+            out.push_str(&format!(
+                "vejas_detect_losses_total{{unit=\"{}\",kind=\"{kind}\"}} {}\n",
+                esc(unit),
+                u.loss[i]
+            ));
+        }
     }
 
     out.push_str("# HELP vejas_round_seconds_sum Wall time of the consumer loop by phase: fetch (wait for the first message of a round), process, barrier (flush + acks).\n");
@@ -889,6 +979,31 @@ pub(crate) fn json_string(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_losses_add_up_and_are_said_once_a_minute() {
+        let unit = "detect:losses_t";
+        assert_eq!(losses(unit), None, "not a detect unit before it says so");
+        declare_detect(unit);
+        assert_eq!(losses(unit), Some([0, 0, 0]));
+        assert_eq!(add_losses(unit, [0, 0, 2]), LossNews::Quiet, "a filter that could not judge is not news");
+        assert_eq!(add_losses(unit, [3, 0, 0]), LossNews::Say([3, 0, 2]), "the first lost run is said");
+        assert!(matches!(add_losses(unit, [2, 0, 0]), LossNews::Later(_)), "then held back");
+        assert!(matches!(flush_losses(unit), LossNews::Later(_)), "still within the minute");
+        // two programs of the unit report deltas at once, as across a reload:
+        // the total is their sum and never goes back
+        add_losses(unit, [1, 0, 0]);
+        add_losses(unit, [1, 0, 1]);
+        assert_eq!(losses(unit), Some([7, 0, 3]));
+        units().lock().unwrap().get_mut(unit).unwrap().loss_said =
+            Some(Instant::now() - LOSS_WARN_EVERY);
+        assert_eq!(flush_losses(unit), LossNews::Say([7, 0, 3]), "the held-back loss is said after the minute");
+        assert_eq!(flush_losses(unit), LossNews::Quiet, "and only once");
+        let text = render(&[]);
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"runs_dropped\"} 7"));
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 3"));
+        assert!(!text.contains("vejas_detect_losses_total{unit=\"flow:"), "only detect units carry it");
+    }
 
     #[test]
     fn render_emits_prometheus_shape() {
