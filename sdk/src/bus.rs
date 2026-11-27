@@ -22,7 +22,7 @@
 // standalone connectors (IBM MQ, AMQP) depend on, and it names no other module
 // of it: no `crate::` import.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -338,16 +338,7 @@ impl Bus {
         &self,
         messages: impl IntoIterator<Item = &'a Message>,
     ) -> Result<(), String> {
-        let mut replies = Vec::new();
-        for message in messages {
-            match &message.reply {
-                // one whose ack waits for the server (see `Puller::confirm_acks`)
-                Some(_) if message.confirm => message.ack()?,
-                Some(reply) => replies.push(reply.clone()),
-                None => {}
-            }
-        }
-        self.ack_replies(replies)
+        self.ack_replies(messages.into_iter().filter_map(|m| m.reply.clone()).collect())
     }
 
     fn ack_replies(&self, replies: Vec<Subject>) -> Result<(), String> {
@@ -531,12 +522,7 @@ pub struct Message {
     reply: Option<Subject>,
     headers: Option<HeaderMap>,
     link: Arc<Link>,
-    /// Its ack, nak or answer waits until the server has taken it.
-    confirm: bool,
 }
-
-/// How long an ack that waits for the server waits.
-const ACK_CONFIRM_WAIT: Duration = Duration::from_secs(5);
 
 /// What the bus says about a delivery: JetStream's count and sequence, read
 /// from its reply subject, and the dead letter it replays, from its header.
@@ -577,7 +563,6 @@ impl Message {
             reply: message.reply,
             headers: message.headers,
             link,
-            confirm: false,
         }
     }
 
@@ -629,11 +614,6 @@ impl Message {
         let Some(reply) = &self.reply else {
             return Ok(());
         };
-        if self.confirm {
-            // JetStream answers an ack that has a reply once it has taken it
-            let request = Request::new().payload(payload).timeout(Some(ACK_CONFIRM_WAIT));
-            return wait(self.link.client.send_request(reply.clone(), request)).map(drop).map_err(|e| e.to_string());
-        }
         wait(sent(self.link.client.publish(reply.clone(), payload)))
     }
 }
@@ -759,22 +739,9 @@ pub struct Puller {
     /// The stream and name of an ephemeral consumer, deleted with this handle.
     owned: Option<(String, String)>,
     js: JetStream,
-    /// Whether the acks of its messages wait for the server.
-    confirm: Cell<bool>,
 }
 
 impl Puller {
-    /// Whether the acks, naks and dead-letter acks of the messages this puller
-    /// gives from now on wait until the server has taken them. A loop that asks
-    /// for its next message only once it is done with this one turns it on.
-    /// The server takes acks and pull requests on queues of their own: an ack
-    /// that is not waited for may be taken after the pull that follows it, and
-    /// a message whose `ack_wait` ran out meanwhile is delivered again, into
-    /// that pull.
-    pub fn confirm_acks(&self, on: bool) {
-        self.confirm.set(on);
-    }
-
     /// Send one pull request and return its round. The request leaves now, and
     /// the messages come back one by one as they arrive.
     ///
@@ -787,9 +754,11 @@ impl Puller {
 
     /// A round of at most `batch` messages (1 to [`PULL_BATCH`]), as
     /// [`Puller::round`]. A loop whose messages each take long asks for one at
-    /// a time: a message waits in no queue of the client while its `ack_wait`
-    /// runs, and with no request outstanding, one that outlives it is not
-    /// delivered here a second time before its ack.
+    /// a time, so that a message does not wait in the client while its
+    /// `ack_wait` runs out. The server takes acks and pull requests on queues
+    /// of their own, so an ack may still be taken after the pull that follows
+    /// it, and a message whose `ack_wait` ran out comes back into that pull:
+    /// the caller knows it by its sequence.
     pub fn round_of(&self, batch: usize) -> Result<Round<'_>, String> {
         if let Some(fault) = self.fault.borrow_mut().take() {
             return Err(fault);
@@ -848,9 +817,7 @@ impl Iterator for Round<'_> {
             match classify(&message) {
                 Pulled::Message => {
                     self.taken += 1;
-                    let mut message = Message::new(message, self.puller.link.clone());
-                    message.confirm = self.puller.confirm.get();
-                    return Some(message);
+                    return Some(Message::new(message, self.puller.link.clone()));
                 }
                 Pulled::Nothing => {}
                 Pulled::Over => return None,
@@ -1296,7 +1263,6 @@ impl JetStream {
             link: shared.link.clone(),
             owned,
             js: self.clone(),
-            confirm: Cell::new(false),
         })
     }
 

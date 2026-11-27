@@ -174,29 +174,46 @@ pub fn fits(template: &str, args: &[&str], settings: &[&str]) -> Result<(), Stri
 }
 
 /// The URL with each `{name}` filled: an argument, percent-encoded, or one of
-/// the declaration's settings, as written. An argument may not be null, and
-/// one in the path may not be empty, `.` or `..`, which would move the call to
+/// the declaration's settings, as written. An argument may not be null, nor
+/// make a segment of the path empty, `.` or `..`, which would move the call to
 /// another resource of the system.
 fn filled(template: &str, args: &Map<String, Value>, config: &Config) -> Result<String, String> {
     let given: Vec<&str> = args.keys().map(String::as_str).collect();
     let settings: Vec<&str> = config.0.keys().map(String::as_str).collect();
     fits(template, &given, &settings)?;
     let mut url = String::with_capacity(template.len() + 16);
+    // where each argument went in the URL
+    let mut spans: Vec<(&str, usize, usize)> = Vec::new();
     for piece in pieces(template)? {
         match piece {
             Piece::Text(text) => url.push_str(text),
             Piece::Name(name) => match args.get(name) {
                 Some(Value::Null) => return Err(format!("the argument {name} is null")),
                 Some(value) => {
-                    let value = text(value);
-                    if !url.contains(['?', '#']) && matches!(value.as_str(), "" | "." | "..") {
-                        return Err(format!("the argument {name} is {value:?}, which would move the call to another path"));
-                    }
-                    url.push_str(&urlencode(&value));
+                    let start = url.len();
+                    url.push_str(&urlencode(&text(value)));
+                    spans.push((name, start, url.len()));
                 }
                 None => url.push_str(&config.0.get(name).map(text).unwrap_or_default()),
             },
         }
+    }
+    // An argument is percent-encoded: no `/`, `?` or `#` comes from one, so the
+    // template and the settings say where the path's segments are.
+    let path = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    let mut start = 0;
+    for segment in path.split('/') {
+        let end = start + segment.len();
+        if matches!(segment, "" | "." | "..") {
+            // the argument that fills most of this segment, empty ones included
+            let within = spans.iter().filter(|(_, s, e)| *s <= end && *e >= start);
+            if let Some((name, ..)) = within.max_by_key(|(_, s, e)| e - s) {
+                return Err(format!(
+                    "the argument {name} makes the path segment {segment:?}, which would move the call to another path"
+                ));
+            }
+        }
+        start = end + 1;
     }
     Ok(url)
 }
@@ -277,6 +294,16 @@ mod tests {
             assert!(e.contains("would move the call to another path"), "{bad:?}: {e}");
         }
         assert_eq!(filled("{BASE_URL}/c/{cid}", &args(json!({"cid": "..x"})), &c).unwrap(), "http://orders.example/c/..x");
+        // the segment counts, not each value
+        let two = |a: &str, b: &str| filled("{BASE_URL}/files/{a}{b}", &args(json!({"a": a, "b": b})), &c);
+        assert_eq!(two("x", ".").unwrap(), "http://orders.example/files/x.");
+        assert_eq!(two("", "x").unwrap(), "http://orders.example/files/x");
+        for (a, b) in [(".", "."), ("", ".."), ("", "")] {
+            assert!(two(a, b).unwrap_err().contains("makes the path segment"), "{a:?} {b:?}");
+        }
+        assert!(two("", "..").unwrap_err().starts_with("the argument b makes the path segment \"..\""));
+        // the host and the empty segments of the template are not the flow's
+        assert_eq!(filled("{BASE_URL}//c/{cid}", &args(json!({"cid": "1"})), &c).unwrap(), "http://orders.example//c/1");
         // in the query, an empty value or a dot is a value
         assert_eq!(filled("{BASE_URL}/search?q={q}", &args(json!({"q": ""})), &c).unwrap(), "http://orders.example/search?q=");
         // a setting is the service's own, whatever the flow passes

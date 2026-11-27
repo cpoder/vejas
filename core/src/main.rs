@@ -557,13 +557,18 @@ fn shadow_emits(prog: &vjs::Program, ev: &Value, root: &Path, pkg: &str) -> Valu
     out
 }
 
-/// Whether one event's two outputs differ. None when either run made a call
-/// whose answer is not recorded (ADR-0032, point 4): that event is left out of
-/// the comparison, and counted apart, so that two refusals do not read as
-/// "unchanged".
+/// Whether one event's two outputs differ. None when both runs reached the
+/// same call, whose answer is not recorded (ADR-0032, point 4): what follows
+/// depends on that answer, so the event is left out of the comparison and
+/// counted apart, and two refusals do not read as "unchanged". A run that
+/// calls with other arguments, calls another service, or fails before its
+/// call does something else with the event: that is a change.
 fn compared(before: &Value, after: &Value) -> Option<bool> {
-    let unrecorded = |v: &Value| v.get("not_recorded").is_some();
-    (!unrecorded(before) && !unrecorded(after)).then(|| before != after)
+    match (before.get("not_recorded"), after.get("not_recorded")) {
+        (None, None) => Some(before != after),
+        (Some(b), Some(a)) if b == a => None,
+        _ => Some(true),
+    }
 }
 
 /// Start (or replace) a canary for a flow: shadow-follow the live source and diff
@@ -1443,15 +1448,16 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // for the next one once it is done with this one (ADR-0032). Rounds
             // of 64, and the next asked for ahead, would hold up to 128 messages
             // in the client while each one's calls run, and ack a round only at
-            // its end: past `ack_wait`, the server delivers them again, into the
-            // request ahead, and each one runs twice. With no request
-            // outstanding, a message whose run outlives `ack_wait` is not
-            // delivered here a second time, as long as its late ack is taken
-            // before the next pull: so its acks wait for the server. A service
-            // edited live to call a system turns this on from the round after
-            // its first call.
+            // its end: past `ack_wait`, the server delivers them again, here or
+            // to another instance. A service edited live to call a system turns
+            // this on from the round after its first call.
+            //
+            // A message whose run outlived `ack_wait` can still come back here,
+            // when the server takes the next pull before the late ack: it takes
+            // acks and pull requests on queues of their own. The loop knows the
+            // messages it settled, and acks such a copy without running it.
             let mut one_by_one = engine.reaches_system(&prog);
-            sub.confirm_acks(one_by_one);
+            let mut settled = Settled::default();
             let mut round = sub.round_of(if one_by_one { 1 } else { bus::PULL_BATCH })?;
             let mut batch = nc.batch();
             loop {
@@ -1486,6 +1492,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         let _ = msg.ack();
                         continue;
                     }
+                    // a message this loop settled, delivered again (`Settled`)
+                    if msg.delivery().is_some_and(|d| settled.holds(d.stream_seq)) {
+                        let _ = msg.ack();
+                        continue;
+                    }
                     // The hop continues the trace the message carries, or starts
                     // one; its emits and its dead letter carry it on (ADR-0034).
                     let hop = trace::Hop::begin(trace::of(&msg));
@@ -1515,6 +1526,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     record_trace(&handle.spec.name, &msg.subject, false,
                                         Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.ack();
+                                    settled.add(&msg);
                                 }
                                 Err(de) => {
                                     record_trace(&handle.spec.name, &msg.subject, false,
@@ -1616,6 +1628,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
                                             vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.ack();
+                                        settled.add(&msg);
                                     }
                                     Err(de) => {
                                         record_trace(&handle.spec.name, &msg.subject, false,
@@ -1651,6 +1664,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 let confirmed = batch.confirm();
                 match &confirmed {
                     Ok(()) => {
+                        // done, whether or not the acks get through
+                        for msg in &to_ack {
+                            settled.add(msg);
+                        }
                         if let Err(e) = nc.ack_all(&to_ack) {
                             eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                         }
@@ -1663,7 +1680,6 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 end_confirmed(done, &confirmed);
                 if !one_by_one && engine.made_a_call() {
                     one_by_one = true;
-                    sub.confirm_acks(true);
                 }
                 round = match next {
                     Some(next) => next,
@@ -1695,6 +1711,39 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     set_state(&handle, |st| {
         st.status = "stopped".into();
     });
+}
+
+/// The messages a flow loop settled last, acked after a run or a dead letter,
+/// by stream sequence. A message whose `ack_wait` ran out before its ack was
+/// taken is delivered again although its run is done; the loop acks that copy
+/// instead of running it a second time. The copy comes in the next round or
+/// the one after: the last [`Settled::KEPT`] are remembered.
+#[derive(Default)]
+struct Settled {
+    seqs: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl Settled {
+    const KEPT: usize = 4 * bus::PULL_BATCH;
+
+    fn add(&mut self, msg: &bus::Message) {
+        let Some(seq) = msg.delivery().map(|d| d.stream_seq) else {
+            return;
+        };
+        if self.seqs.insert(seq) {
+            self.order.push_back(seq);
+        }
+        if self.order.len() > Self::KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seqs.remove(&oldest);
+            }
+        }
+    }
+
+    fn holds(&self, seq: u64) -> bool {
+        self.seqs.contains(&seq)
+    }
 }
 
 /// End the successful hops of a batch once its barrier has answered: a hop
@@ -5818,6 +5867,22 @@ mod tests {
         // two refusals of the same call do not read as "unchanged"
         assert_eq!((&diff["events"], &diff["changed"], &diff["not_recorded"]), (&json!(2), &json!(0), &json!(2)), "{diff}");
         assert_eq!(diff["results"][0]["before"]["not_recorded"], "get_limit(id: \"B\")");
+        // a candidate that calls with other arguments changes what the event does
+        std::fs::write(
+            root.join("flows").join("replay_args.vjs"),
+            "source \"vx.ra.test\"\nPREFIX = \"\"\no = invoke get_limit(id: f\"{PREFIX}{event.id}\")\nemit \"vx.out\", {n: o.body.n}\n",
+        )
+        .unwrap();
+        record_trace("flow:replay_args", "vx.ra.test", true, None, vec![], "{}".into(), Some(json!({"id": "A"})), None, None);
+        let diff = replay_literal(&root, "flows/replay_args.vjs", "PREFIX", "-", &json!("X-"), 20).unwrap();
+        assert_eq!((&diff["events"], &diff["changed"], &diff["not_recorded"]), (&json!(1), &json!(1), &json!(0)), "{diff}");
+        // and one that fails before its call, or calls another service
+        let call = |c: &str| json!({"emits": [], "error": "e", "not_recorded": c});
+        let failed = json!({"emits": [], "error": "get_limit: the argument idd appears nowhere in its URL"});
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &call("get_limit(id: \"A\")")), None);
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &failed), Some(true));
+        assert_eq!(compared(&failed, &call("get_limit(id: \"A\")")), Some(true));
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &call("get_cap(id: \"A\")")), Some(true));
         // runs that call nothing are compared as before
         assert_eq!(compared(&json!({"emits": []}), &json!({"emits": [1]})), Some(true));
         assert_eq!(compared(&json!({"emits": []}), &json!({"emits": []})), Some(false));

@@ -164,6 +164,10 @@ system and never holds a real secret (ADR-0034).
   that calls a system also takes its messages from the bus one at a time,
   asking for none ahead: otherwise the messages held in the client would
   outlive their `ack_wait` while the calls of others ran, and run twice.
+  One whose own run outlives `ack_wait` can still come back, when the server
+  takes the next pull before the late ack: the loop remembers the messages
+  it settled and acks such a copy without running it. Another instance runs
+  the copy it gets, so a run's calls stay under `ack_wait`.
 - A flow's run time and failures now depend on the systems it calls. A
   slow API slows the flows that invoke it, within `TIMEOUT_MS`.
 - A replay reruns a flow against recordings. A candidate that changes what

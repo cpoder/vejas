@@ -49,9 +49,9 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
   setting `name` as written. Every argument must appear in the URL, except
   `body`, which is sent as the JSON body. `METHOD` is `GET` unless set.
 - The settings are the service's own. An argument may not have the name of
-  one, so a flow cannot choose the host its credentials go to. In the path,
-  an argument may not be empty, `.` or `..`, which would reach another
-  resource; in the query, any value goes. A setting goes in as written, so
+  one, so a flow cannot choose the host its credentials go to. An argument
+  may not make a segment of the path empty, `.` or `..`, which would reach
+  another resource; in the query, any value goes. A setting goes in as written, so
   a secret placed in the query must hold only characters a URL takes as
   they are.
 - `vejas-runtime vjs-check` reports an argument the service does not take,
@@ -80,7 +80,9 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
 - A flow that calls a system takes its messages one by one: it asks for the
   next once it has acked the last. Its messages then wait in no queue while
   calls run. Keep a run's calls, `TIMEOUT_MS` each, under the consumer's
-  `ack_wait` (30 s). A flow that only computes takes them 64 at a time.
+  `ack_wait` (30 s): a message whose run outlives it is delivered again. Its
+  own loop acks that copy without running it; another instance runs it. A
+  flow that only computes takes them 64 at a time.
 - A flow on the bus reads the declaration again at most once a second: an
   edit of it, or a rotated secret, is picked up within that time. An `api`
   flow reads it at each request.
@@ -95,8 +97,10 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
   be idempotent, with a key the flow passes, such as the event's id.
 - A run that is shown (a preview, `vejas_run_flow`, a replay, time travel,
   the canary, a golden capture) calls no system: such an invoke fails there
-  and says why. A replay, time travel and the canary leave that event out of
-  their comparison and count it as `not_recorded`. Reading the answers
+  and says why. A replay, time travel and the canary leave out an event whose
+  two runs reach the same call, and count it as `not_recorded`. A candidate
+  that calls with other arguments, calls another service or fails before
+  its call has changed what the event does, and counts as changed. Reading the answers
   recorded with the event instead is the next step of ADR-0032.
 - The credentials stay in the declaration, through `secret()`; the flow
   never sees them.

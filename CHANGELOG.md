@@ -19,15 +19,18 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   otherwise it is a dead letter at once. An `api` flow answers 502, or 504
   after a timeout. The call carries the message's `traceparent`. A run that
   is shown (preview, replay, time travel, canary, golden) calls no system and
-  says so; replay, time travel and the canary count such an event as
-  `not_recorded` instead of comparing it, and the panel says which events it
-  could not check. Replaying recorded answers comes next. An argument fills a
-  `{name}` of the URL, may not take a setting's name, and may not be empty,
-  `.` or `..` in the path; `vjs-check` and a preview report one the service
-  does not take. A call follows no redirect. Its error names no URL and no
+  says so; replay, time travel and the canary count an event whose two runs
+  reach the same call as `not_recorded` instead of comparing it, and the
+  panel says which events it could not check. A candidate that calls with
+  other arguments, calls another service or fails before its call counts as
+  changed. Replaying recorded answers comes next. An argument fills a
+  `{name}` of the URL, may not take a setting's name, and may not make a
+  segment of the path empty, `.` or `..`; `vjs-check` and a preview report
+  one the service does not take. A call follows no redirect. Its error names no URL and no
   header and is masked as the record masks one. A flow that calls a system
   takes its messages one by one, so none waits in the client past
-  `ack_wait` and runs twice. A declaration holds settings only (an `invoke`
+  `ack_wait` and runs twice. A message whose run outlived `ack_wait` and
+  comes back to its loop is acked without running again. A declaration holds settings only (an `invoke`
   there is refused), is read again at most once a second, and a secret store
   that does not answer while reading it is a failure a later delivery may
   get past. No new crate: the call uses the runtime's HTTP client. e2e
