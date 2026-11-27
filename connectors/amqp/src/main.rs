@@ -1,4 +1,4 @@
-//! Vejas AMQP 0-9-1 (RabbitMQ) connector — spike prototype (ADR-0026).
+//! Vejas AMQP 0-9-1 (RabbitMQ) connector (ADR-0026).
 //!
 //! A first-class bus citizen owning its own NATS client, like the IBM MQ connector
 //! (ADR-0023) — but simpler, because AMQP has no two-phase syncpoint: `basic.ack`
@@ -10,10 +10,11 @@
 //!                      Crash between confirm and ack → dup publish; carry an
 //!                      idempotency key in message properties for downstream dedup.
 //!
-//! amiquip is sync/no-tokio; TLS is plaintext for the spike (default-features off,
-//! no openssl-sys) — the rustls-over-IoStream adapter (ADR-0026) is the production
-//! path. The transactional ordering is exercised against a fake below with fault
-//! injection; real-RabbitMQ certification is the declared CI exception (ADR-0017).
+//! amiquip is sync/no-tokio, with its default features off (no openssl-sys):
+//! amqps:// runs TLS through rustls over amiquip's mio stream (`tls.rs`). The
+//! transactional ordering is exercised against a fake below with fault
+//! injection, and CI certifies the connector against a real RabbitMQ (the
+//! amqp_source and amqp_sink recipes, ADR-0017).
 
 // The bus, from the connector crate (ADR-0038): one sync API over `async-nats`
 // on one small tokio runtime, and no NATS type anywhere else (ADR-0035).

@@ -1,6 +1,6 @@
 # The certified catalog
 
-**Twenty recipes**, every one *admitted* by CI — not "documented", proven:
+**Twenty-one recipes**, every one *admitted* by CI — not "documented", proven:
 credential lint (no literal secrets, single-sourced pattern), parse, then a
 real data-flow check. The recipes live in
 [`docs/examples/connectors/`](https://github.com/cpoder/vejas/tree/master/docs/examples/connectors)
@@ -10,7 +10,7 @@ wire a flow.
 | Family | Recipes | Certified against |
 |---|---|---|
 | SaaS (http-poll / oauth-poll / http-out) | ServiceNow ×2, Jira ×2, Slack, Workday RaaS, Stripe, SendGrid, GitHub, PagerDuty, Discord | A mock through the product's own write path — data must flow |
-| Webhook in | Shopify orders | Its own ingest: POST the fixture, see it on the bus |
+| Webhook in | Shopify orders, scoped ingest (`ALLOW`) | Its own ingest: POST the fixture, see it on the bus |
 | MQTT | source + sink | **A real mosquitto on every CI run** (incl. a 50-message QoS-1 burst) |
 | AMQP/RabbitMQ | source + sink | **A real RabbitMQ on every CI run** (through the broker and back) |
 | Kafka | source + sink (kcat bridge) | Stated exception + the offset-resume kill -9 test in CI |

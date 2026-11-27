@@ -160,7 +160,7 @@ impl Driver for MqttOut {
         "sink:mqtt"
     }
     fn about(&self) -> &'static str {
-        "Consumes SUBJECT and PUBLISHes each message to an MQTT topic (hand-rolled sync client, 3.1.1, QoS 0/1). QoS 1: PUBLISH → await the broker's PUBACK → THEN ack the bus message (side-effect-before-ack); a crash between them redelivers → duplicate PUBLISH (standard at-least-once). Competing-safe (durable pull). Config: BROKER, TOPIC, SUBJECT, QOS (default 1), CLIENT_ID, USERNAME/PASSWORD (secret()), KEEPALIVE_SECS. TLS + QoS2/MQTT5 → mosquitto exec-bridge."
+        "Consumes SUBJECT and PUBLISHes each message to an MQTT topic (hand-rolled sync client, 3.1.1, QoS 0/1). QoS 1: PUBLISH → await the broker's PUBACK → THEN ack the bus message (side-effect-before-ack); a crash between them redelivers → duplicate PUBLISH (standard at-least-once). Competing-safe (durable pull). Config: BROKER, TOPIC, SUBJECT, QOS (default 1), CLIENT_ID, USERNAME/PASSWORD (secret()), KEEPALIVE_SECS, TLS (bool, default false → rustls). QoS2/MQTT5 → mosquitto exec-bridge."
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
         let broker = ctx.config.str("BROKER").ok_or("BROKER required")?;

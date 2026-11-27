@@ -32,9 +32,9 @@ Three things to notice:
   restarts itself (ADR-0005). Adding a *new* row — `"bloquante" → "P1"` — is
   the same gesture: the panel inserts it span-exact, no agent needed
   (changing the flow's *logic* is the one that's a sentence to the agent).
-- **The language is pure.** No I/O, no clock, no network in a flow — input
-  event in, emits out. That is what makes replay, time-travel and canary
-  structurally safe later.
+- **The language is pure.** No I/O, no clock, no network in the
+  language — input event in, emits out. That is what makes replay,
+  time-travel and canary structurally safe later.
 - **Delivery is at-least-once, persisted.** The event was on JetStream
   before the flow saw it; the emit is acknowledged before the input is.
 
