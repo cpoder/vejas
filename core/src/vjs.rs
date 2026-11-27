@@ -402,6 +402,12 @@ pub enum Stmt {
     /// bus; `respond` is what the caller gets back.
     Respond(Expr, Expr),
     InvokeMerge(String, Vec<(String, Expr)>),
+    /// `try:` … `catch e:` … `end` (ADR-0039, point 3): the statements, the
+    /// name the catch gives the failure, and the catch's statements.
+    Try(Block, Option<String>, Block),
+    /// `remember <key> for <window>` (ADR-0039, point 4): the key, and the
+    /// window, a duration the flow writes (`"7d"`) or a constant that holds one.
+    Remember(Expr, Expr),
 }
 
 /// Statements in order, with the source line each one starts on: the trace
@@ -571,9 +577,9 @@ fn render_action(body: &[Stmt], surface: &[SurfaceEntry]) -> Option<Vec<String>>
                 _ => "respond".to_string(),
             }),
             // assignments are internal plumbing — allowed, not shown
-            Stmt::Assign(_, _) | Stmt::InvokeMerge(_, _) => {}
+            Stmt::Assign(_, _) | Stmt::InvokeMerge(_, _) | Stmt::Remember(..) => {}
             // nested control flow makes the arm advanced → RAW
-            Stmt::If(..) | Stmt::For(..) => return None,
+            Stmt::If(..) | Stmt::For(..) | Stmt::Try(..) => return None,
         }
     }
     if acts.is_empty() {
@@ -758,7 +764,67 @@ fn collect_own(stmts: &[Stmt], out: &mut Vec<String>) {
                     collect_own(body, out);
                 }
             }
-            Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+            Stmt::Try(body, name, handler) => {
+                collect_own(body, out);
+                if let Some(name) = name {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+                collect_own(handler, out);
+            }
+            Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) | Stmt::Remember(..) => {}
+        }
+    }
+}
+
+/// How many statements give `name` a value, at any depth: an assignment, a
+/// loop's variable, a catch's name.
+fn assignments(block: &Block, name: &str) -> usize {
+    block
+        .stmts
+        .iter()
+        .map(|st| match st {
+            Stmt::Assign(path, _) => usize::from(path.first().is_some_and(|first| first == name)),
+            Stmt::For(var, _, body) => usize::from(var == name) + assignments(body, name),
+            Stmt::If(arms, otherwise) => {
+                arms.iter().map(|(_, _, body)| assignments(body, name)).sum::<usize>()
+                    + otherwise.as_ref().map_or(0, |body| assignments(body, name))
+            }
+            Stmt::Try(body, caught, handler) => {
+                assignments(body, name) + usize::from(caught.as_deref() == Some(name)) + assignments(handler, name)
+            }
+            Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) | Stmt::Remember(..) => 0,
+        })
+        .sum()
+}
+
+/// Each `remember` whose window names a constant gets the constant's literal
+/// (ADR-0039): the parser checked it holds a duration.
+fn windows_from_constants(block: &mut Block, constants: &HashMap<&str, &Value>) {
+    for st in block.stmts.iter_mut() {
+        match st {
+            Stmt::Remember(_, window) => {
+                if let Expr::Var(name) = window {
+                    if let Some(value) = constants.get(name.as_str()) {
+                        *window = Expr::Lit((*value).clone());
+                    }
+                }
+            }
+            Stmt::If(arms, otherwise) => {
+                for (_, _, body) in arms.iter_mut() {
+                    windows_from_constants(body, constants);
+                }
+                if let Some(body) = otherwise {
+                    windows_from_constants(body, constants);
+                }
+            }
+            Stmt::For(_, _, body) => windows_from_constants(body, constants),
+            Stmt::Try(body, _, handler) => {
+                windows_from_constants(body, constants);
+                windows_from_constants(handler, constants);
+            }
+            Stmt::Assign(..) | Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
         }
     }
 }
@@ -805,8 +871,9 @@ fn stmts_read_whole_event(stmts: &[Stmt]) -> bool {
             arms.iter().any(|(cond, _, body)| reads_whole_event(cond) || stmts_read_whole_event(body))
                 || otherwise.as_ref().is_some_and(|body| stmts_read_whole_event(body))
         }
-        Stmt::Emit(a, b) | Stmt::Respond(a, b) => reads_whole_event(a) || reads_whole_event(b),
+        Stmt::Emit(a, b) | Stmt::Respond(a, b) | Stmt::Remember(a, b) => reads_whole_event(a) || reads_whole_event(b),
         Stmt::InvokeMerge(_, args) => args.iter().any(|(_, v)| reads_whole_event(v)),
+        Stmt::Try(body, _, handler) => stmts_read_whole_event(body) || stmts_read_whole_event(handler),
     })
 }
 
@@ -862,9 +929,23 @@ fn reads_in_order(stmts: &[Stmt], set: &mut Vec<String>, makes: &[(String, Vec<S
                     walk(body, out);
                 }
             }
-            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) | Stmt::Remember(a, b) => {
                 collect_reads(a, set, out);
                 collect_reads(b, set, out);
+            }
+            // the catch starts from what was set before the try, and its
+            // failure; what either sets counts after it
+            Stmt::Try(body, name, handler) => {
+                let before = set.clone();
+                let mut inner = before.clone();
+                reads_in_order(body, &mut inner, makes, out);
+                inner.iter().for_each(|n| add(set, n));
+                let mut inner = before;
+                if let Some(name) = name {
+                    add(&mut inner, name);
+                }
+                reads_in_order(handler, &mut inner, makes, out);
+                inner.iter().for_each(|n| add(set, n));
             }
             Stmt::InvokeMerge(service, args) => {
                 args.iter().for_each(|(_, v)| collect_reads(v, set, out));
@@ -894,11 +975,17 @@ fn reads_of_stmts(stmts: &[Stmt], own: &[String], out: &mut Vec<String>) {
                     reads_of_stmts(body, own, out);
                 }
             }
-            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) | Stmt::Remember(a, b) => {
                 collect_reads(a, own, out);
                 collect_reads(b, own, out);
             }
             Stmt::InvokeMerge(_, args) => args.iter().for_each(|(_, v)| collect_reads(v, own, out)),
+            Stmt::Try(body, name, handler) => {
+                reads_of_stmts(body, own, out);
+                let mut own = own.to_vec();
+                own.extend(name.iter().cloned());
+                reads_of_stmts(handler, &own, out);
+            }
         }
     }
 }
@@ -934,7 +1021,12 @@ fn collect_sends(stmts: &[Stmt], surface: &[SurfaceEntry], inside: Option<&str>,
                 }
             }
             Stmt::For(_, _, body) => collect_sends(body, surface, Some("each"), out),
-            Stmt::Assign(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+            // what a catch sends goes out on a failure: a condition too
+            Stmt::Try(body, _, handler) => {
+                collect_sends(body, surface, inside, out);
+                collect_sends(handler, surface, Some("when"), out);
+            }
+            Stmt::Assign(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) | Stmt::Remember(..) => {}
         }
     }
 }
@@ -1043,7 +1135,15 @@ pub fn flow_shape(prog: &Program, src: &str, services: &[(String, Vec<String>)])
                 steps.push(json!({"kind": "each", "line": line, "var": var, "over": render_atom(iter),
                                   "builds": builds, "code": text, "uses": used, "literals": literals}));
             }
-            Stmt::If(..) => steps.push(json!({"kind": "when", "line": line, "code": text})),
+            // a try runs its catch on a failure: a condition, as the page shows one
+            Stmt::If(..) | Stmt::Try(..) => steps.push(json!({"kind": "when", "line": line, "code": text})),
+            Stmt::Remember(key, window) => {
+                let (mut used, mut literals) = uses(key);
+                let (more, more_literals) = uses(window);
+                used.extend(more.into_iter().filter(|n| !used.contains(n)).collect::<Vec<_>>());
+                literals.extend(more_literals.into_iter().filter(|n| !literals.contains(n)).collect::<Vec<_>>());
+                steps.push(json!({"kind": "remember", "line": line, "code": text, "uses": used, "literals": literals}));
+            }
             Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
                 let kind = if matches!(s, Stmt::Emit(..)) { "emit" } else { "respond" };
                 let (mut used, mut literals) = uses(a);
@@ -1086,6 +1186,9 @@ struct Parser<'a> {
     src: &'a str,
     /// Where each line ends in `src`, to give a statement its line.
     newlines: &'a [usize],
+    /// Each `remember` window a constant holds, with where it is named: the
+    /// constant is checked once the file is read, wherever it is written.
+    windows: Vec<(String, usize)>,
 }
 
 impl<'a> Parser<'a> {
@@ -1170,6 +1273,17 @@ impl<'a> Parser<'a> {
     fn at_end(&self) -> bool {
         self.i >= self.toks.len() - 1
     }
+    /// Whether a `catch` starts here: `catch:` or `catch e:`. `try`, `catch`
+    /// and `remember` are words of the language only where they start their
+    /// statement, so that a variable or a field of an event keeps such a name.
+    fn at_catch(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(w) if w == "catch")
+            && match self.peek2() {
+                Some(Tok::Colon) => true,
+                Some(Tok::Ident(_)) => matches!(self.toks.get(self.i + 2).map(|s| &s.tok), Some(Tok::Colon)),
+                _ => false,
+            }
+    }
 
     fn program(&mut self) -> Result<Program, String> {
         let mut source = None;
@@ -1236,6 +1350,33 @@ impl<'a> Parser<'a> {
             let line = self.line();
             let stmt = self.stmt()?;
             stmts.push(line, stmt);
+        }
+        for (name, at) in &self.windows {
+            let held = surface.iter().find(|e| &e.name == name).map(|e| &e.value);
+            match held {
+                Some(Value::String(text)) => {
+                    window_of(text).map_err(|e| err_at(*at, self.src, &format!("{name}: {e}")))?;
+                    // the window is the constant's literal: another value
+                    // the flow gives it would not be the window
+                    if assignments(&stmts, name) > 1 {
+                        return Err(err_at(*at, self.src, &format!("the window of `remember` is the literal of {name}, and the flow sets {name} elsewhere too: give that window a constant of its own")));
+                    }
+                }
+                _ => {
+                    return Err(err_at(*at, self.src, &format!("the window of `remember` is a duration: {name} is no constant of the flow that holds one, as {name} = \"7d\" does")))
+                }
+            }
+        }
+        // A window a constant holds is the constant's literal: read at run
+        // time, the variable could be an event's field of the same name,
+        // since the constant is assigned where it is written.
+        let windows: HashMap<&str, &Value> = self
+            .windows
+            .iter()
+            .filter_map(|(name, _)| surface.iter().find(|e| &e.name == name).map(|e| (name.as_str(), &e.value)))
+            .collect();
+        if !windows.is_empty() {
+            windows_from_constants(&mut stmts, &windows);
         }
         let mut prog = Program {
             source,
@@ -1337,6 +1478,14 @@ impl<'a> Parser<'a> {
                         walk_expr(it, "for", out);
                         walk_stmts(b, out);
                     }
+                    Stmt::Try(body, _, handler) => {
+                        walk_stmts(body, out);
+                        walk_stmts(handler, out);
+                    }
+                    Stmt::Remember(key, window) => {
+                        walk_expr(key, "remember", out);
+                        walk_expr(window, "remember", out);
+                    }
                 }
             }
         }
@@ -1432,6 +1581,7 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             match self.peek() {
                 Tok::End | Tok::Elif | Tok::Else => break,
+                _ if self.at_catch() => break,
                 _ => {}
             }
             if self.at_end() {
@@ -1539,6 +1689,44 @@ impl<'a> Parser<'a> {
                 self.eat(Tok::End, "end")?;
                 Ok(Stmt::For(var, iter, body))
             }
+            Tok::Ident(w) if w == "try" && self.peek2() == Some(&Tok::Colon) => {
+                self.next();
+                self.next();
+                let body = self.block()?;
+                if !self.at_catch() {
+                    return Err(self.err("expected `catch:` or `catch e:` after the statements of `try`"));
+                }
+                self.next();
+                let name = match self.peek().clone() {
+                    Tok::Ident(name) => {
+                        self.next();
+                        Some(name)
+                    }
+                    _ => None,
+                };
+                self.eat(Tok::Colon, ":")?;
+                let handler = self.block()?;
+                self.eat(Tok::End, "end")?;
+                Ok(Stmt::Try(body, name, handler))
+            }
+            Tok::Ident(_) if self.at_catch() => Err(self.err("`catch` without `try`")),
+            Tok::Ident(w) if w == "remember" && !matches!(self.peek2(), Some(Tok::Eq | Tok::Dot)) => {
+                self.next();
+                let key = self.expr(0)?;
+                self.eat(Tok::For, "for and a window, as in `remember key for \"7d\"`")?;
+                let at = self.pos();
+                let window = self.expr(0)?;
+                match &window {
+                    Expr::Lit(Value::String(text)) => {
+                        window_of(text).map_err(|e| err_at(at, self.src, &e))?;
+                    }
+                    Expr::Var(name) if is_upper_name(name) => self.windows.push((name.clone(), at)),
+                    _ => {
+                        return Err(err_at(at, self.src, "the window of `remember` is a duration the flow writes, \"7d\", or a constant that holds one"))
+                    }
+                }
+                Ok(Stmt::Remember(key, window))
+            }
             Tok::Ident(first) => {
                 self.next();
                 let mut path = vec![first];
@@ -1572,7 +1760,7 @@ impl<'a> Parser<'a> {
                     match p {
                         FPart::Lit(s) => out.push(FStringPart::Lit(s)),
                         FPart::Expr(toks) => {
-                            let mut sub = Parser { toks: &toks, i: 0, src: self.src, newlines: self.newlines };
+                            let mut sub = Parser { toks: &toks, i: 0, src: self.src, newlines: self.newlines, windows: Vec::new() };
                             out.push(FStringPart::Expr(sub.expr(0)?));
                         }
                     }
@@ -1755,6 +1943,10 @@ fn collect_static(
                 }
             }
             Stmt::For(_, _, b) => collect_static(b, consts, emits, invokes),
+            Stmt::Try(body, _, handler) => {
+                collect_static(body, consts, emits, invokes);
+                collect_static(handler, consts, emits, invokes);
+            }
             _ => {}
         }
     }
@@ -1795,8 +1987,9 @@ fn stmts_read_var(stmts: &[Stmt], name: &str) -> bool {
             arms.iter().any(|(cond, _, body)| expr_reads_var(cond, name) || stmts_read_var(body, name))
                 || otherwise.as_deref().is_some_and(|body| stmts_read_var(body, name))
         }
-        Stmt::Emit(a, b) | Stmt::Respond(a, b) => expr_reads_var(a, name) || expr_reads_var(b, name),
+        Stmt::Emit(a, b) | Stmt::Respond(a, b) | Stmt::Remember(a, b) => expr_reads_var(a, name) || expr_reads_var(b, name),
         Stmt::InvokeMerge(_, args) => args.iter().any(|(_, v)| expr_reads_var(v, name)),
+        Stmt::Try(body, _, handler) => stmts_read_var(body, name) || stmts_read_var(handler, name),
     })
 }
 
@@ -1824,6 +2017,9 @@ fn stmts_write_bus(stmts: &[Stmt]) -> bool {
                 || otherwise.as_deref().map(stmts_write_bus).unwrap_or(false)
         }
         Stmt::For(_, iter, body) => expr_writes_bus(iter) || stmts_write_bus(body),
+        Stmt::Try(body, _, handler) => stmts_write_bus(body) || stmts_write_bus(handler),
+        // a mark that later runs read: a write (ADR-0039, point 4)
+        Stmt::Remember(_, _) => true,
     })
 }
 
@@ -1852,7 +2048,7 @@ fn expr_writes_bus(e: &Expr) -> bool {
 pub fn parse(src: &str) -> Result<Program, String> {
     let toks = lex(src)?;
     let newlines: Vec<usize> = src.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i).collect();
-    let mut p = Parser { toks: &toks, i: 0, src, newlines: &newlines };
+    let mut p = Parser { toks: &toks, i: 0, src, newlines: &newlines, windows: Vec::new() };
     p.program()
 }
 
@@ -1927,6 +2123,56 @@ pub struct Engine {
     unrecorded: Option<String>,
     /// Whether a run of this engine has called a system.
     called: bool,
+    /// The delivery of the message the run takes, when a later one may
+    /// follow: a message on the bus. None for a request, which has none.
+    delivery: Option<i64>,
+    /// What `seen` reads: the keys the flow's runs remembered (ADR-0039).
+    memory: Option<Arc<dyn Memory>>,
+}
+
+/// The keys a flow's runs remembered (ADR-0039, point 4), which `seen` reads.
+/// The runtime writes a run's marks once its emits are stored.
+pub trait Memory: Send + Sync {
+    /// Whether a run remembered `key` and the window it gave has not passed.
+    fn seen(&self, key: &str) -> Result<bool, String>;
+}
+
+/// The longest window `remember` takes.
+pub const WINDOW_MAX: std::time::Duration = std::time::Duration::from_secs(3650 * 86_400);
+
+/// The window `remember` gives a key: a whole number and its unit, seconds,
+/// minutes, hours or days (`90s`, `30m`, `24h`, `7d`).
+pub fn window_of(text: &str) -> Result<std::time::Duration, String> {
+    let text = text.trim();
+    let digits = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let unit_secs: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("{text:?} is no window: a whole number and s, m, h or d, as \"7d\"")),
+    };
+    let secs = number
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .and_then(|n| n.checked_mul(unit_secs))
+        .ok_or_else(|| format!("{text:?} is no window: a whole number above 0 and its unit, as \"7d\""))?;
+    let window = std::time::Duration::from_secs(secs);
+    if window > WINDOW_MAX {
+        return Err(format!("{text:?} is longer than the longest window, 3650d"));
+    }
+    Ok(window)
+}
+
+/// The text of a key `seen` and `remember` take: a string as it is, another
+/// value as JSON writes it. Null is no key.
+fn key_of(value: &Value, what: &str) -> Result<String, String> {
+    match value {
+        Value::Null => Err(format!("{what} takes a key, and this one is null")),
+        other => Ok(to_display(other)),
+    }
 }
 
 /// Whether a run's calls reach a system (ADR-0032).
@@ -2023,6 +2269,14 @@ fn invoke_sites(stmts: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
                 expr(iter, out);
                 invoke_sites(body, out);
             }
+            Stmt::Try(body, _, handler) => {
+                invoke_sites(body, out);
+                invoke_sites(handler, out);
+            }
+            Stmt::Remember(key, window) => {
+                expr(key, out);
+                expr(window, out);
+            }
         }
     }
 }
@@ -2094,6 +2348,8 @@ pub enum What {
     Respond(u32, u16),
     /// An invoked service started, at this version of its source.
     Enter(Arc<str>),
+    /// The statement on this line failed, and a `catch` took the failure.
+    Caught(u32),
 }
 
 impl Steps {
@@ -2180,6 +2436,36 @@ impl Steps {
     pub(crate) fn set_failed(&mut self) {
         self.failed = true;
     }
+
+    /// The statements from the `first`th step on sent and answered nothing:
+    /// a `catch` dropped what its `try` emitted or responded before the
+    /// failure.
+    fn dropped_since(&mut self, first: u64) {
+        let first_in_tail = self.count - self.tail.len() as u64;
+        let head = self.head.iter_mut().skip(first as usize);
+        let tail = self.tail.iter_mut().skip(first.saturating_sub(first_in_tail) as usize);
+        for step in head.chain(tail) {
+            if let What::Emit(line, _) | What::Respond(line, _) = step.what {
+                step.what = What::Line(line);
+            }
+        }
+    }
+
+    /// A `catch` took the failure the last step said: the run goes on.
+    fn caught(&mut self) {
+        if !std::mem::replace(&mut self.failed, false) {
+            return;
+        }
+        let last = match self.tail.back_mut() {
+            Some(step) => Some(step),
+            None => self.head.last_mut(),
+        };
+        if let Some(step) = last {
+            if let What::Line(line) = step.what {
+                step.what = What::Caught(line);
+            }
+        }
+    }
 }
 
 struct InvokeTrace {
@@ -2238,6 +2524,8 @@ impl Engine {
             loaded_at: std::time::Instant::now(),
             unrecorded: None,
             called: false,
+            delivery: None,
+            memory: None,
         }
     }
     /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
@@ -2286,6 +2574,58 @@ impl Engine {
     /// Whether a run of this engine has called a system.
     pub fn made_a_call(&self) -> bool {
         self.called
+    }
+    /// The delivery of the message the runs that follow take, on the bus;
+    /// None for a run no later delivery follows. A `catch` takes a failure
+    /// that a later delivery may change only on the message's last one.
+    pub fn delivered(&mut self, delivery: Option<i64>) {
+        self.delivery = delivery;
+    }
+    /// What `seen` reads in the runs that follow.
+    pub fn remember_in(&mut self, memory: Option<Arc<dyn Memory>>) {
+        self.memory = memory;
+    }
+    /// Whether the flow's runs remembered `key`. A run that is shown reads no
+    /// state: a key is new to it.
+    fn seen(&mut self, key: &str) -> Result<bool, String> {
+        if self.calls == Calls::Shown {
+            return Ok(false);
+        }
+        let memory = self.memory.as_ref().ok_or("seen() reads what a flow on the bus or an api flow remembered: this run has no memory")?;
+        memory.seen(key).map_err(|e| {
+            // a bucket that did not answer may answer the next delivery
+            let failure = crate::connectors::answer::Failure::unanswered(format!("seen(): {e}"));
+            let error = failure.error.clone();
+            self.failure = Some(failure);
+            error
+        })
+    }
+    /// The failure a `catch` takes, as its name holds it, or None when it
+    /// takes none (ADR-0039, point 3). It takes any failure no later delivery
+    /// may change: an error in the code, a call the service does not try
+    /// again, or one on the delivery that spends its attempts. A call a later
+    /// delivery may answer fails the run, so that the message comes back,
+    /// and so does a call a run that is shown could not make.
+    fn caught(&mut self, error: &str) -> Option<Value> {
+        if self.unrecorded.is_some() {
+            return None;
+        }
+        let attempt = self.delivery.unwrap_or(1);
+        if let Some(f) = &self.failure {
+            if f.retry && attempt < f.attempts.min(vejas_connector::MAX_DELIVERIES) && self.delivery.is_some() {
+                return None;
+            }
+        }
+        let failure = self.failure.take();
+        if let Some(steps) = self.steps.as_mut() {
+            steps.caught();
+        }
+        Some(json!({
+            "error": error,
+            "service": failure.as_ref().map(|f| f.service.as_str()).filter(|s| !s.is_empty()),
+            "status": failure.as_ref().and_then(|f| f.status),
+            "attempts": attempt,
+        }))
     }
     /// Whether a run of `prog` may call a system: a service it invokes, or one
     /// those invoke, declares a driver (ADR-0032). Read from the files as they
@@ -2516,9 +2856,12 @@ impl Engine {
                             Engine::with_secrets(self.project_root.clone(), pkg.to_string(), self.secrets.clone());
                         match run(&prog, &Value::Object(Map::new()), &mut resolving) {
                             Ok(ctx) => ctx.vars.into_iter().filter(|(k, _)| is_upper_name(k)).collect(),
-                            // a store that did not answer may answer the next delivery
+                            // a store that did not answer may answer a later
+                            // delivery; a secret it does not have will not
                             Err(e) => {
-                                let failure = crate::connectors::answer::Failure::unresolved(format!("service {key}: {e}"));
+                                let later = resolving.failure.is_some();
+                                let failure =
+                                    crate::connectors::answer::Failure::unresolved(&key, format!("service {key}: {e}"), later);
                                 let error = failure.error.clone();
                                 self.failure = Some(failure);
                                 return Err(error);
@@ -2557,6 +2900,9 @@ pub struct Ctx {
     pub emits: Vec<(String, Value)>,
     /// Set by `respond <status>, <body>` in an `api` flow: the HTTP response.
     pub response: Option<(Value, Value)>,
+    /// What the run remembers, each key with its window: the runtime marks
+    /// them once the run's emits are stored (ADR-0039, point 4).
+    pub marks: Vec<(String, std::time::Duration)>,
 }
 
 pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, String> {
@@ -2575,17 +2921,12 @@ pub fn run_with(prog: &Program, event: &Value, given: Map<String, Value>, engine
     }
     vars.extend(given);
     vars.insert("event".into(), event.clone());
-    let mut ctx = Ctx { vars, emits: Vec::new(), response: None };
+    let mut ctx = Ctx { vars, emits: Vec::new(), response: None, marks: Vec::new() };
     exec_block(&prog.stmts, &mut ctx, engine)?;
     Ok(ctx)
 }
 
-fn run_service(
-    name: &str,
-    args: Map<String, Value>,
-    engine: &mut Engine,
-    emits: &mut Vec<(String, Value)>,
-) -> Result<Value, String> {
+fn run_service(name: &str, args: Map<String, Value>, engine: &mut Engine, caller: &mut Ctx) -> Result<Value, String> {
     if engine.depth >= 32 {
         return Err(format!("invoke depth exceeded at {name}"));
     }
@@ -2595,6 +2936,10 @@ fn run_service(
         Ok(s) => s,
         Err(e) => {
             engine.depth -= 1;
+            // a failure names the service as the flow does, as a call's does
+            if let Some(failure) = engine.failure.as_mut() {
+                failure.service = name.to_string();
+            }
             return Err(e);
         }
     };
@@ -2616,7 +2961,7 @@ fn run_service(
     });
     // The invoked service's own invokes resolve within ITS package.
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
-    let mut ctx = Ctx { vars: Map::new(), emits: Vec::new(), response: None };
+    let mut ctx = Ctx { vars: Map::new(), emits: Vec::new(), response: None, marks: Vec::new() };
     let result = match &service.answers {
         Some(declared) => {
             let hop = span.as_ref().map(|(hop, _)| hop);
@@ -2652,7 +2997,8 @@ fn run_service(
         });
     }
     result?;
-    emits.append(&mut ctx.emits);
+    caller.emits.append(&mut ctx.emits);
+    caller.marks.append(&mut ctx.marks);
     ctx.vars.remove("event");
     Ok(Value::Object(ctx.vars))
 }
@@ -2688,9 +3034,7 @@ fn exec_stmt(stmt: &Stmt, step: Option<u64>, ctx: &mut Ctx, engine: &mut Engine)
             for (k, e) in args {
                 arg_map.insert(k.clone(), eval(e, ctx, engine)?);
             }
-            let mut emits = Vec::new();
-            let out = run_service(name, arg_map, engine, &mut emits)?;
-            ctx.emits.append(&mut emits);
+            let out = run_service(name, arg_map, engine, ctx)?;
             if let Value::Object(o) = out {
                 for (k, v) in o {
                     ctx.vars.insert(k, v);
@@ -2732,6 +3076,33 @@ fn exec_stmt(stmt: &Stmt, step: Option<u64>, ctx: &mut Ctx, engine: &mut Engine)
             let p = eval(payload, ctx, engine)?;
             engine.mark(step, |line| What::Emit(line, s.clone()));
             ctx.emits.push((s, p));
+        }
+        Stmt::Try(body, name, handler) => {
+            // what the statements of the try sent, remembered and answered
+            // is dropped with their failure: a run's effects stay all or none
+            let (emits, marks, response) = (ctx.emits.len(), ctx.marks.len(), ctx.response.clone());
+            let first = engine.steps.as_ref().map(|steps| steps.count);
+            if let Err(error) = exec_block(body, ctx, engine) {
+                let failure = engine.caught(&error).ok_or(error)?;
+                ctx.emits.truncate(emits);
+                ctx.marks.truncate(marks);
+                ctx.response = response;
+                if let (Some(first), Some(steps)) = (first, engine.steps.as_mut()) {
+                    steps.dropped_since(first);
+                }
+                if let Some(name) = name {
+                    ctx.vars.insert(name.clone(), failure);
+                }
+                exec_block(handler, ctx, engine)?;
+            }
+        }
+        Stmt::Remember(key, window) => {
+            let key = key_of(&eval(key, ctx, engine)?, "remember")?;
+            let window = match eval(window, ctx, engine)? {
+                Value::String(text) => window_of(&text)?,
+                other => return Err(format!("the window of remember is a duration, as \"7d\": got {other}")),
+            };
+            ctx.marks.push((key, window));
         }
         Stmt::Respond(status, body) => {
             let st = eval(status, ctx, engine)?;
@@ -2809,10 +3180,7 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
             for (k, e) in args {
                 arg_map.insert(k.clone(), eval(e, ctx, engine)?);
             }
-            let mut emits = Vec::new();
-            let out = run_service(name, arg_map, engine, &mut emits)?;
-            ctx.emits.append(&mut emits);
-            out
+            run_service(name, arg_map, engine, ctx)?
         }
         Expr::Field(base, f, safe) => {
             let b = eval(base, ctx, engine)?;
@@ -2865,14 +3233,16 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                 } else {
                     vec![]
                 };
-                let keep = truthy(&eval(cond, ctx, engine)?);
+                let keep = eval(cond, ctx, engine);
+                // the flow's own variables come back, also when the condition
+                // failed: a catch runs with them
                 for (k, old) in saved {
                     match old {
                         Some(v) => ctx.vars.insert(k, v),
                         None => ctx.vars.remove(&k),
                     };
                 }
-                if keep {
+                if truthy(&keep?) {
                     out.push(item);
                 }
             }
@@ -2883,14 +3253,28 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                 .iter()
                 .map(|a| eval(a, ctx, engine))
                 .collect::<Result<Vec<_>, _>>()?;
-            if name == "secret" {
+            if name == "seen" {
+                let key = key_of(vals.first().unwrap_or(&Value::Null), "seen()")?;
+                Value::Bool(engine.seen(&key)?)
+            } else if name == "secret" {
                 // resolve a secret at run time; never a literal, never exposed.
                 // fail closed: a missing secret aborts the run.
                 let reference = vals
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or("secret() needs a string reference, e.g. secret(\"slack/webhook\")")?;
-                Value::String(engine.secrets.get(reference)?)
+                let value = engine.secrets.read(reference).map_err(|missing| {
+                    if !missing.later {
+                        return missing.error;
+                    }
+                    // a store that did not answer may answer the next
+                    // delivery: a catch waits for the last (ADR-0039)
+                    let failure = crate::connectors::answer::Failure::unanswered(missing.error);
+                    let error = failure.error.clone();
+                    engine.failure = Some(failure);
+                    error
+                })?;
+                Value::String(value)
             } else {
                 builtin(name, &vals)?
             }
@@ -3047,6 +3431,18 @@ fn builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             _ => Value::Null,
         },
         "abs" => arg(0).as_f64().map(|f| num(f.abs())).unwrap_or(Value::Null),
+        // The base64 of a text's UTF-8 bytes (ADR-0039): a value that is not
+        // a string is read as `str` gives it, and null stays null.
+        "base64" => match arg(0) {
+            Value::Null => Value::Null,
+            v => {
+                let text = to_display(&v);
+                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &text);
+                // a credential in it is masked in its base64 as in the clear
+                crate::secrets::derived(&text, &encoded);
+                Value::String(encoded)
+            }
+        },
         _ => return Err(format!("unknown function {name}()")),
     })
 }
@@ -3526,6 +3922,20 @@ end\n";
     }
 
     #[test]
+    fn base64_gives_the_utf8_bytes_of_a_text() {
+        let p = one_emit(
+            r#"emit "vx.t", {a: base64("a"), e: base64(word), n: base64(nothing), d: base64(doc), raw: unreadable.base64 ?? base64(unreadable.text)}"#,
+            json!({"word": "é", "nothing": null, "doc": {"k": 1}, "unreadable": {"error": "x", "text": "id=42;bad", "base64": null}}),
+        );
+        assert_eq!(p["a"], "YQ==");
+        assert_eq!(p["e"], "w6k=");
+        assert_eq!(p["n"], Value::Null);
+        assert_eq!(p["d"], "eyJrIjoxfQ==");
+        // a message that is not JSON, in base64 whatever its bytes are
+        assert_eq!(p["raw"], "aWQ9NDI7YmFk");
+    }
+
+    #[test]
     fn unknown_function_and_parse_errors() {
         assert!(eval_flow("x = nope(1)\nemit \"vx.t\", {x: x}", json!({}))
             .unwrap_err()
@@ -3807,7 +4217,7 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
     }
 
     #[test]
-    fn a_declaration_holds_settings_and_its_secrets_may_resolve_later() {
+    fn a_declaration_holds_settings_and_a_secret_its_store_lacks_is_not_tried_again() {
         let (url, seen) = system(|_| (200, "{}", 0));
         let root = declared("settings", &url, "");
         let services = root.join("services");
@@ -3821,11 +4231,12 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
         let mut engine = live(root.clone());
         let e = failed(run(&parse("o = invoke loops(id: 1)\n").unwrap(), &json!({}), &mut engine));
         assert!(e.contains("its file holds settings, and invokes and emits nothing"), "{e}");
-        // a secret the store does not give: a later delivery may get it
+        // a secret the store says it does not have: no delivery gives it (a
+        // store that does not answer: what_the_runtime_did_not_give_...)
         let e = failed(run(&parse("o = invoke locked(id: 1)\n").unwrap(), &json!({}), &mut engine));
         assert!(e.contains("missing/key") && e.contains("not found"), "{e}");
         let f = engine.take_failure().unwrap();
-        assert!(f.retry && !f.timed_out && f.attempts == 3, "{f:?}");
+        assert!(!f.retry && !f.timed_out && f.service == "locked", "{f:?}");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -3989,8 +4400,8 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
     }
 
     /// A run's steps, written short: `3` a line, `3>vx.s` an emit, `3<201` a
-    /// respond, `enter p:s` a service starting, `p:s:2` a line in it, `...n`
-    /// the steps left out.
+    /// respond, `3 caught` a failure a catch took, `enter p:s` a service
+    /// starting, `p:s:2` a line in it, `...n` the steps left out.
     fn steps_of(engine: &mut Engine) -> Vec<String> {
         let steps = engine.take_steps().expect("the engine records steps");
         let one = |st: &Step| {
@@ -4000,6 +4411,7 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
                 What::Emit(l, subject) => format!("{at}{l}>{subject}"),
                 What::Respond(l, status) => format!("{at}{l}<{status}"),
                 What::Enter(_) => format!("enter {}", st.service.as_deref().unwrap_or("?")),
+                What::Caught(l) => format!("{at}{l} caught"),
             }
         };
         let mut out: Vec<String> = steps.head().iter().map(one).collect();
@@ -4223,5 +4635,363 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
         assert_eq!(line(&mut steps, n - 1), Some(n - 1));
         assert_eq!(line(&mut steps, n), None);
         assert_eq!((steps.len(), steps.skipped()), (STEPS_HEAD + STEPS_TAIL, STEPS_TAIL as u64));
+    }
+
+    #[test]
+    fn try_catch_and_remember_parse_and_leave_their_names_free() {
+        let prog = parse("try:\n    o = invoke get_order(id: 1)\ncatch e:\n    emit \"vx.r\", {why: e.error}\nend\n").unwrap();
+        assert!(matches!(&prog.stmts[0], Stmt::Try(body, Some(name), handler) if body.len() == 1 && name == "e" && handler.len() == 1));
+        assert!(matches!(&parse("try:\n    x = 1\ncatch:\n    x = 2\nend\n").unwrap().stmts[0], Stmt::Try(_, None, _)));
+        parse("WINDOW = \"7d\"\nremember event.id for WINDOW\nremember event.id for \"36h\"\n").unwrap();
+        // a constant may be written after the statement that names it
+        parse("remember event.id for WINDOW\nWINDOW = \"90s\"\n").unwrap();
+        let error = |src: &str| parse(src).err().unwrap_or_else(|| panic!("{src:?} parsed"));
+        let e = error("try:\n    x = 1\nend\n");
+        assert!(e.contains("expected `catch:` or `catch e:`"), "{e}");
+        let e = error("x = 1\ncatch e:\n    y = 2\nend\n");
+        assert!(e.contains("`catch` without `try`"), "{e}");
+        let e = error("try:\n    if x:\n        y = 1\n    catch e:\n        y = 2\nend\n");
+        assert!(e.contains("expected elif/else/end"), "{e}");
+        let e = error("remember event.id\n");
+        assert!(e.contains("expected for and a window"), "{e}");
+        let e = error("remember event.id for \"7 days\"\n");
+        assert!(e.contains("\"7 days\" is no window"), "{e}");
+        let e = error("remember event.id for window\n");
+        assert!(e.contains("a duration the flow writes"), "{e}");
+        let e = error("remember event.id for WINDOW\n");
+        assert!(e.contains("WINDOW is no constant of the flow"), "{e}");
+        let e = error("WINDOW = 7\nremember event.id for WINDOW\n");
+        assert!(e.contains("WINDOW is no constant of the flow"), "{e}");
+        let e = error("WINDOW = \"0d\"\nremember event.id for WINDOW\n");
+        assert!(e.contains("WINDOW: \"0d\" is no window"), "{e}");
+        let e = error("remember event.id for \"3651d\"\n");
+        assert!(e.contains("longer than the longest window"), "{e}");
+        assert_eq!(window_of("90s"), Ok(std::time::Duration::from_secs(90)));
+        assert_eq!(window_of(" 24h "), Ok(std::time::Duration::from_secs(86_400)));
+        assert!(window_of("7").is_err() && window_of("d").is_err() && window_of("-1d").is_err() && window_of("1.5h").is_err());
+        // a variable, a field or a key keeps such a name
+        let prog = parse("try = event.try\nremember = catch + 1\nemit \"vx.t\", {try: try, catch: remember}\n").unwrap();
+        let ctx = run(&prog, &json!({"try": 1, "catch": 2}), &mut Engine::live(std::env::temp_dir(), "default".into())).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"try": 1, "catch": 3}));
+    }
+
+    #[test]
+    fn a_catch_takes_a_failure_and_drops_what_its_try_did() {
+        let prog = parse(
+            r#"emit "vx.before", {n: 1}
+try:
+    emit "vx.inside", {n: 2}
+    remember "k1" for "1d"
+    respond 201, {ok: true}
+    x = event.n.deep
+catch e:
+    emit "vx.caught", {error: e.error, service: e.service, status: e.status, attempts: e.attempts}
+end
+emit "vx.after", {x: x}
+"#,
+        )
+        .unwrap();
+        let subjects = |ctx: &Ctx| ctx.emits.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        let ctx = run(&prog, &json!({"n": 5}), &mut engine).unwrap();
+        assert_eq!(subjects(&ctx), ["vx.before", "vx.caught", "vx.after"]);
+        assert_eq!(
+            ctx.emits[1].1,
+            json!({"error": "cannot read field \"deep\" of 5", "service": null, "status": null, "attempts": 1})
+        );
+        assert!(ctx.marks.is_empty() && ctx.response.is_none(), "what the try did before its failure is dropped");
+        // a try that succeeds keeps what it did, and its catch does not run
+        let ctx = run(&prog, &json!({"n": {"deep": 7}}), &mut engine).unwrap();
+        assert_eq!(subjects(&ctx), ["vx.before", "vx.inside", "vx.after"]);
+        assert_eq!(ctx.marks, [("k1".to_string(), std::time::Duration::from_secs(86_400))]);
+        assert_eq!(ctx.response.as_ref().map(|(s, _)| s.clone()), Some(json!(201)));
+        assert_eq!(ctx.emits[2].1, json!({"x": 7}));
+        // a failure in a catch goes to the try around it, with what the inner catch sent
+        let nested = parse(
+            r#"try:
+    try:
+        a = event.n.deep
+    catch inner:
+        emit "vx.inner", {e: inner.error}
+        b = event.n.deeper
+    end
+catch outer:
+    emit "vx.outer", {e: outer.error}
+end
+"#,
+        )
+        .unwrap();
+        let ctx = run(&nested, &json!({"n": 5}), &mut engine).unwrap();
+        assert_eq!(subjects(&ctx), ["vx.outer"]);
+        assert_eq!(ctx.emits[0].1["e"], "cannot read field \"deeper\" of 5");
+        // and one in a catch no try holds fails the run
+        let bare = parse("try:\n    a = event.n.deep\ncatch e:\n    b = e.error.x\nend\n").unwrap();
+        let e = failed(run(&bare, &json!({"n": 5}), &mut engine));
+        assert!(e.starts_with("cannot read field \"x\""), "{e}");
+        // the name of the failure is the flow's, not a field it reads from its event
+        let reads = event_reads(&parse("try:\n    o = invoke get_order(id: id)\ncatch e:\n    emit \"vx.r\", {why: e.error}\nend\n").unwrap());
+        assert_eq!(reads, ["id"]);
+    }
+
+    #[test]
+    fn a_catch_waits_for_the_delivery_that_spends_a_calls_attempts() {
+        let (url, calls) = system(|path| match path {
+            p if p.ends_with("/down") => (503, r#"{"error":"down"}"#, 0),
+            p if p.ends_with("/gone") => (404, "", 0),
+            _ => (200, "{}", 0),
+        });
+        let prog = parse(
+            r#"try:
+    o = invoke get_order(id: event.id)
+    emit "vx.ok", {s: o.status}
+catch e:
+    code = e.status ?? "NETWORK"
+    emit "vx.rejected", {code: f"API_HTTP_{code}", service: e.service, attempts: e.attempts}
+end
+"#,
+        )
+        .unwrap();
+        let root = declared("catch", &url, "ATTEMPTS = 3\n");
+        let mut engine = live(root.clone());
+        // a call a later delivery may answer fails the run: the message comes back
+        for delivery in [1, 2] {
+            engine.delivered(Some(delivery));
+            let e = failed(run(&prog, &json!({"id": "down"}), &mut engine));
+            assert!(e.starts_with("get_order: HTTP 503"), "{e}");
+            assert!(engine.take_failure().is_some_and(|f| f.retry && f.status == Some(503)));
+        }
+        // on the delivery that spends its attempts, the catch takes it
+        engine.delivered(Some(3));
+        let ctx = run(&prog, &json!({"id": "down"}), &mut engine).unwrap();
+        assert_eq!(
+            ctx.emits,
+            [("vx.rejected".to_string(), json!({"code": "API_HTTP_503", "service": "get_order", "attempts": 3}))]
+        );
+        assert!(engine.take_failure().is_none(), "a failure a catch took fails no run");
+        // one the service does not try again, at once
+        engine.delivered(Some(1));
+        let ctx = run(&prog, &json!({"id": "gone"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1["code"], "API_HTTP_404");
+        // a request has no later delivery: at once
+        engine.delivered(None);
+        let ctx = run(&prog, &json!({"id": "down"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"code": "API_HTTP_503", "service": "get_order", "attempts": 1}));
+        // on the last delivery the runtime makes, whatever ATTEMPTS says
+        let mut many = live(declared("catch-many", &url, "ATTEMPTS = 50\n"));
+        many.delivered(Some(vejas_connector::MAX_DELIVERIES - 1));
+        assert!(failed(run(&prog, &json!({"id": "down"}), &mut many)).starts_with("get_order: HTTP 503"));
+        many.delivered(Some(vejas_connector::MAX_DELIVERIES));
+        assert_eq!(run(&prog, &json!({"id": "down"}), &mut many).unwrap().emits[0].0, "vx.rejected");
+        // a network error has no status
+        let mut nowhere = live(declared("catch-network", "http://127.0.0.1:9", "ATTEMPTS = 1\n"));
+        nowhere.delivered(Some(1));
+        let ctx = run(&prog, &json!({"id": "x"}), &mut nowhere).unwrap();
+        assert_eq!(ctx.emits[0].1["code"], "API_HTTP_NETWORK");
+        // a run that is shown makes no call, and its catch takes none it could not make
+        let made = calls.lock().unwrap().len();
+        let mut shown = Engine::shadow(root, "default".into());
+        let e = failed(run(&prog, &json!({"id": "down"}), &mut shown));
+        assert!(e.contains("calls none"), "{e}");
+        assert!(shown.take_unrecorded().is_some());
+        assert_eq!(calls.lock().unwrap().len(), made, "a shown run called the system");
+    }
+
+    #[test]
+    fn a_caught_failure_is_a_step_and_the_run_goes_on() {
+        let prog = parse("try:\n    x = event.n.deep\ncatch e:\n    emit \"vx.r\", {}\nend\nemit \"vx.after\", {}\n").unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        run(&prog, &json!({"n": 5}), &mut engine).unwrap();
+        assert_eq!(steps_of(&mut engine), ["1", "2 caught", "4>vx.r", "6>vx.after"]);
+        // a catch that fails ends the run on its own statement
+        let prog = parse("try:\n    x = event.n.deep\ncatch e:\n    y = e.error.x\nend\n").unwrap();
+        engine.record_steps(true);
+        failed(run(&prog, &json!({"n": 5}), &mut engine));
+        assert_eq!(steps_of(&mut engine), ["1", "2 caught", "4!"]);
+    }
+
+    /// A memory that remembers what the test gives it.
+    struct Remembered(std::sync::Mutex<Vec<String>>);
+
+    impl Memory for Remembered {
+        fn seen(&self, key: &str) -> Result<bool, String> {
+            if key == "broken" {
+                return Err("down".into());
+            }
+            Ok(self.0.lock().unwrap().iter().any(|k| k == key))
+        }
+    }
+
+    #[test]
+    fn seen_reads_the_memory_and_remember_leaves_its_marks_to_the_runtime() {
+        let prog = parse(
+            r#"KEEP = "7d"
+if seen(event.key):
+    emit "vx.dup", {key: event.key}
+else:
+    o = invoke mark_it(key: event.key)
+    emit "vx.new", {key: event.key}
+    remember event.key for KEEP
+end
+"#,
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!("vejas-memory-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::write(root.join("services").join("mark_it.vjs"), "remember f\"svc:{key}\" for \"1h\"\n").unwrap();
+        let memory = Arc::new(Remembered(std::sync::Mutex::new(vec!["A".into()])));
+        let mut engine = Engine::live(root.clone(), "default".into());
+        engine.remember_in(Some(memory.clone()));
+        let ctx = run(&prog, &json!({"key": "A"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].0, "vx.dup");
+        assert!(ctx.marks.is_empty());
+        let ctx = run(&prog, &json!({"key": "B"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].0, "vx.new");
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(ctx.marks, [("svc:B".to_string(), hour), ("B".to_string(), 168 * hour)]);
+        // a key is any value but null: a number reads as its text
+        assert_eq!(failed(run(&prog, &json!({}), &mut engine)), "seen() takes a key, and this one is null");
+        assert_eq!(run(&prog, &json!({"key": 42}), &mut engine).unwrap().marks[1].0, "42");
+        let e = failed(run(&parse("remember event.k for \"1d\"\n").unwrap(), &json!({}), &mut engine));
+        assert_eq!(e, "remember takes a key, and this one is null");
+        // a memory that does not answer fails the run, and a later delivery may read it
+        assert_eq!(failed(run(&prog, &json!({"key": "broken"}), &mut engine)), "seen(): down");
+        assert!(engine.take_failure().is_some_and(|f| f.retry && f.attempts == vejas_connector::MAX_DELIVERIES));
+        // a run with no memory says so
+        let e = failed(run(&prog, &json!({"key": "B"}), &mut Engine::live(root.clone(), "default".into())));
+        assert!(e.contains("this run has no memory"), "{e}");
+        // a run that is shown reads no state: every key is new to it
+        let mut shown = Engine::shadow(root, "default".into());
+        shown.remember_in(Some(memory));
+        assert_eq!(run(&prog, &json!({"key": "A"}), &mut shown).unwrap().emits[0].0, "vx.new");
+        // remember is a write for the write gate, seen a read
+        assert!(parse("remember event.k for \"1d\"\n").unwrap().writes_bus());
+        assert!(!parse("x = seen(event.k)\nrespond 200, {seen: x}\n").unwrap().writes_bus());
+        assert!(parse("try:\n    x = 1\ncatch e:\n    remember event.k for \"1d\"\nend\n").unwrap().writes_bus());
+    }
+
+    #[test]
+    fn what_the_runtime_did_not_give_waits_for_the_last_delivery() {
+        // a secret store that does not answer may answer a later delivery
+        let prog = parse(
+            r#"try:
+    k = secret("absent/key")
+    emit "vx.ok", {}
+catch e:
+    emit "vx.r", {service: e.service, status: e.status, attempts: e.attempts}
+end
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(Unreachable));
+        engine.delivered(Some(1));
+        failed(run(&prog, &json!({}), &mut engine));
+        let failure = engine.take_failure().expect("a failure a later delivery may change");
+        assert!(failure.retry && failure.attempts == vejas_connector::MAX_DELIVERIES);
+        assert!(!failure.delay.is_zero(), "a nak with no delay spends the deliveries at once");
+        engine.delivered(Some(vejas_connector::MAX_DELIVERIES));
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(
+            ctx.emits,
+            [("vx.r".to_string(), json!({"service": null, "status": null, "attempts": vejas_connector::MAX_DELIVERIES}))]
+        );
+        // a store that answers there is no such secret: no delivery changes it
+        let mut none = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(MapStore(Default::default())));
+        none.delivered(Some(1));
+        assert_eq!(run(&prog, &json!({}), &mut none).unwrap().emits[0].0, "vx.r");
+        // a declaration whose secret does not resolve names the service as
+        // the flow does, as a call's failure does
+        let (url, _) = system(|_| (200, "{}", 0));
+        let call = parse(
+            r#"try:
+    o = invoke get_order(id: event.id)
+catch e:
+    emit "vx.r", {service: e.service, attempts: e.attempts}
+end
+"#,
+        )
+        .unwrap();
+        let root = declared("unresolved", &url, "");
+        // a secret the store says it does not have: no delivery changes it
+        let mut bare = Engine::with_secrets(root.clone(), "default".into(), Arc::new(MapStore(Default::default())));
+        bare.delivered(Some(1));
+        let ctx = run(&call, &json!({"id": "x"}), &mut bare).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": 1}));
+        // a store that does not answer: the catch waits for the last delivery
+        let mut down = Engine::with_secrets(root, "default".into(), Arc::new(Unreachable));
+        down.delivered(Some(1));
+        failed(run(&call, &json!({"id": "x"}), &mut down));
+        let failure = down.take_failure().expect("a failure a later delivery may change");
+        assert_eq!((failure.service.as_str(), failure.attempts), ("get_order", vejas_connector::MAX_DELIVERIES));
+        assert!(!failure.delay.is_zero());
+        down.delivered(Some(vejas_connector::MAX_DELIVERIES));
+        let ctx = run(&call, &json!({"id": "x"}), &mut down).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": vejas_connector::MAX_DELIVERIES}));
+    }
+
+    /// A secret store that does not answer.
+    struct Unreachable;
+    impl crate::secrets::SecretStore for Unreachable {
+        fn kind(&self) -> &'static str {
+            "unreachable"
+        }
+        fn get(&self, _reference: &str) -> Result<String, String> {
+            Err("vault: connection refused".into())
+        }
+        fn read(&self, reference: &str) -> Result<String, crate::secrets::Missing> {
+            self.get(reference).map_err(|error| crate::secrets::Missing { error, later: true })
+        }
+    }
+
+    #[test]
+    fn a_filter_whose_condition_fails_gives_the_flow_its_variables_back() {
+        let p = one_emit(
+            r#"id = event.id
+try:
+    open = event.lines[qty.n > 0]
+catch e:
+    emit "vx.rejected", {order: id}
+end"#,
+            json!({"id": "O-1", "lines": [{"id": "L-9", "qty": 3}]}),
+        );
+        assert_eq!(p["order"], "O-1");
+    }
+
+    #[test]
+    fn what_a_try_sent_before_its_failure_is_no_step_that_sent() {
+        let prog = parse(
+            r#"try:
+    emit "vx.inside", {}
+    respond 201, {}
+    x = event.n.deep
+catch e:
+    emit "vx.r", {}
+end
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        run(&prog, &json!({"n": 5}), &mut engine).unwrap();
+        assert_eq!(steps_of(&mut engine), ["1", "2", "3", "4 caught", "6>vx.r"]);
+    }
+
+    #[test]
+    fn a_window_a_constant_holds_is_its_literal_whatever_the_event_says() {
+        // the constant is assigned where it is written, after the remember:
+        // its literal holds all the same, and an event's field of its name
+        // does not
+        let prog = parse("remember event.id for KEEP\nKEEP = \"1h\"\n").unwrap();
+        let ctx = run(&prog, &json!({"id": "a", "KEEP": "3650d"}), &mut Engine::live(std::env::temp_dir(), "default".into())).unwrap();
+        assert_eq!(ctx.marks, [("a".to_string(), std::time::Duration::from_secs(3600))]);
+        // a constant the flow sets elsewhere too would not be the window
+        for src in [
+            "KEEP = \"1h\"\nif event.vip:\n    KEEP = \"30d\"\nend\nremember event.id for KEEP\n",
+            "KEEP = \"1h\"\nfor KEEP in event.all:\n    x = 1\nend\nremember event.id for KEEP\n",
+            "KEEP = \"1h\"\ntry:\n    x = 1\ncatch KEEP:\n    x = 2\nend\nremember event.id for KEEP\n",
+        ] {
+            let e = parse(src).err().unwrap_or_else(|| panic!("{src:?} parsed"));
+            assert!(e.contains("sets KEEP elsewhere too"), "{e}");
+        }
     }
 }

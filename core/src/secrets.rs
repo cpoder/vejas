@@ -14,7 +14,7 @@
 // value is read from `{mount}/data/{path}` and the `{key}` field. For env it is
 // the whole reference uppercased with separators turned into underscores.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -76,9 +76,22 @@ pub fn key_as_read(key: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(read)
 }
 
+/// A secret a store did not give: why, and whether a later read may give it.
+/// A store that did not answer may; one that answered that there is none
+/// will not, until someone sets it.
+pub struct Missing {
+    pub error: String,
+    pub later: bool,
+}
+
 pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
     fn get(&self, reference: &str) -> Result<String, String>;
+    /// The same, saying whether a later read may give it (ADR-0039): a store
+    /// that can tell a read that failed from an answer says so.
+    fn read(&self, reference: &str) -> Result<String, Missing> {
+        self.get(reference).map_err(|error| Missing { error, later: false })
+    }
     /// Write a secret (rotation included). Write-only: a value that enters
     /// here is never rendered back by any surface. Backends that cannot
     /// write stay read-only and say so.
@@ -210,6 +223,47 @@ fn remember(value: &str) {
     }
 }
 
+/// The values made from one handed out or held, as `base64()` makes one,
+/// the last ones only: apart from the values handed out, so that however
+/// many come, none pushes a store's value out of the masks.
+static DERIVED: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+const DERIVED_MAX: usize = 64;
+/// Longer than this, a text is a message, not a credential pair: the masks
+/// read its base64 under a key that says it is base64.
+const DERIVED_FROM_MAX: usize = 256;
+
+/// A value made from `from`, as `base64()` makes one: when `from` is short
+/// and holds a value handed out or held, `value` is masked as that value
+/// is, since no mask reads through the encoding (ADR-0039).
+pub(crate) fn derived(from: &str, value: &str) {
+    if from.len() > DERIVED_FROM_MAX {
+        return;
+    }
+    let holds = |held: &String| !held.is_empty() && held.len() <= from.len() && from.contains(held.as_str());
+    let handed = HANDED_OUT
+        .get()
+        .is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.keys().any(holds));
+    let held = handed
+        || HELD.get().is_some_and(|held| held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().any(holds));
+    if !held {
+        return;
+    }
+    let mut derived = DERIVED.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(at) = derived.iter().position(|known| known == value) {
+        // masked already: the last one made again
+        if let Some(known) = derived.remove(at) {
+            derived.push_back(known);
+        }
+        return;
+    }
+    if derived.len() >= DERIVED_MAX {
+        derived.pop_front();
+    }
+    derived.push_back(value.to_string());
+    drop(derived);
+    HANDED_OUT_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Every value handed out and still remembered, and every value held
 /// (`hold`), longest first.
 pub fn handed_out() -> Vec<String> {
@@ -219,6 +273,9 @@ pub fn handed_out() -> Vec<String> {
         .unwrap_or_default();
     if let Some(held) = HELD.get() {
         values.extend(held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned());
+    }
+    if let Some(derived) = DERIVED.get() {
+        values.extend(derived.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned());
     }
     values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     values.dedup();
@@ -305,6 +362,11 @@ impl SecretStore for Remembered {
         remember(&value);
         Ok(value)
     }
+    fn read(&self, reference: &str) -> Result<String, Missing> {
+        let value = self.0.read(reference)?;
+        remember(&value);
+        Ok(value)
+    }
     fn set(&self, reference: &str, value: &str) -> Result<(), String> {
         self.0.set(reference, value)?;
         remember(value);
@@ -344,11 +406,20 @@ impl SecretStore for FileStore {
         "file"
     }
     fn get(&self, reference: &str) -> Result<String, String> {
-        self.load()?
+        self.read(reference).map_err(|missing| missing.error)
+    }
+    fn read(&self, reference: &str) -> Result<String, Missing> {
+        // a file that could not be read may be read later; one without the
+        // secret will not give it until someone sets it
+        self.load()
+            .map_err(|error| Missing { error, later: true })?
             .get(reference)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("secret {reference:?} not set (panel Secrets card, or {})", self.path.display()))
+            .ok_or_else(|| Missing {
+                error: format!("secret {reference:?} not set (panel Secrets card, or {})", self.path.display()),
+                later: false,
+            })
     }
     fn set(&self, reference: &str, value: &str) -> Result<(), String> {
         use std::io::Write as _;
@@ -435,23 +506,29 @@ impl SecretStore for VaultStore {
         "vault"
     }
     fn get(&self, reference: &str) -> Result<String, String> {
+        self.read(reference).map_err(|missing| missing.error)
+    }
+    fn read(&self, reference: &str) -> Result<String, Missing> {
+        let answered = |error: String| Missing { error, later: false };
         let (path, key) = reference
             .rsplit_once('/')
-            .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
+            .ok_or_else(|| answered(format!("secret ref {reference:?} must be path/key")))?;
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
         // argv-safe: the token rides in an in-memory ureq header, never on argv
         let headers = [("X-Vault-Token".to_string(), self.token.clone())];
         let (code, body) = crate::connectors::http_request("GET", &url, &headers, None)
-            .map_err(|e| format!("vault: {e}"))?;
+            .map_err(|e| Missing { error: format!("vault: {e}"), later: true })?;
         if !(200..300).contains(&code) {
-            return Err(vault_refused(code, "reading", path));
+            // a Vault that is sealed, busy or down may answer later; a
+            // refusal or a path it has not will not
+            return Err(Missing { error: vault_refused(code, "reading", path), later: code == 429 || code >= 500 });
         }
-        let v: Value =
-            serde_json::from_slice(&body).map_err(|e| format!("vault: bad response: {e}"))?;
+        let v: Value = serde_json::from_slice(&body)
+            .map_err(|e| Missing { error: format!("vault: bad response: {e}"), later: true })?;
         v["data"]["data"][key]
             .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| format!("secret key {key:?} not found at {path:?}"))
+            .ok_or_else(|| answered(format!("secret key {key:?} not found at {path:?}")))
     }
     fn set(&self, reference: &str, value: &str) -> Result<(), String> {
         let (path, key) = reference
@@ -642,6 +719,42 @@ mod tests {
         fn set(&self, _reference: &str, _value: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_value_made_from_one_handed_out_is_masked_as_it_is() {
+        let store = Remembered(Arc::new(Fixed("derived-secret-value-1")));
+        store.get("crm/pw").unwrap();
+        derived("user:derived-secret-value-1", "dXNlcjpkZXJpdmVkLXNlY3JldC12YWx1ZS0x");
+        derived("nothing handed out in it", "bm90aGluZyBoYW5kZWQgb3V0IGluIGl0");
+        let values = handed_out();
+        assert!(values.iter().any(|v| v == "dXNlcjpkZXJpdmVkLXNlY3JldC12YWx1ZS0x"));
+        assert!(!values.iter().any(|v| v == "bm90aGluZyBoYW5kZWQgb3V0IGluIGl0"));
+        // a message that holds it is no credential pair: its base64 is not kept
+        let message = format!("{}derived-secret-value-1", "x".repeat(DERIVED_FROM_MAX));
+        derived(&message, "a-long-message-in-base64");
+        assert!(!handed_out().iter().any(|v| v == "a-long-message-in-base64"));
+        // however many are made, the store's value stays among the masks
+        for n in 0..DERIVED_MAX * 2 {
+            derived(&format!("{n}:derived-secret-value-1"), &format!("derived-in-base64-{n}"));
+        }
+        let values = handed_out();
+        assert!(values.iter().any(|v| v == "derived-secret-value-1"));
+        assert!(values.iter().any(|v| *v == format!("derived-in-base64-{}", DERIVED_MAX * 2 - 1)));
+        assert!(!values.iter().any(|v| v == "derived-in-base64-0"));
+    }
+
+    #[test]
+    fn a_vault_that_does_not_answer_may_later_and_one_that_refuses_will_not() {
+        for (status, later) in [("503 Service Unavailable", true), ("429 Too Many Requests", true), ("404 Not Found", false), ("403 Forbidden", false)] {
+            let (vault, served) = fake_vault(vec![answer(status, "{}")]);
+            let missing = vault.read("kv/app/token").err().expect("no secret");
+            assert_eq!(missing.later, later, "{status}: {}", missing.error);
+            served.join().unwrap();
+        }
+        let vault = VaultStore { addr: "http://127.0.0.1:9".into(), token: "t".into(), mount: "secret".into() };
+        assert!(vault.read("kv/app/token").err().is_some_and(|missing| missing.later));
+        assert!(vault.read("no-slash").err().is_some_and(|missing| !missing.later));
     }
 
     #[test]

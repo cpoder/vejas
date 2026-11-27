@@ -48,7 +48,7 @@ the old one.
 | [0036](0036-integration-agent-separate-binary.md) | The integration agent is a separate binary, a client of `/mcp` | Accepted, not built |
 | [0037](0037-how-the-connector-catalog-grows.md) | How the connector catalog grows: vendors as certified recipes on protocol drivers | Accepted (partial) |
 | [0038](0038-one-connector-contract-two-packagings.md) | One connector contract, two packagings: a crate, in the runtime or standalone | Accepted (partial): the split and the crate built; standalone packaging not |
-| [0039](0039-a-flow-sees-its-message-and-owns-its-failures.md) | A flow sees its message as it came, and owns its failures | Accepted (partial): the request as sent and messages that are not JSON built; `try`/`catch` and `seen`/`remember` proposed |
+| [0039](0039-a-flow-sees-its-message-and-owns-its-failures.md) | A flow sees its message as it came, and owns its failures | Accepted: the request as sent, messages that are not JSON, `try`/`catch` and `seen`/`remember` built |
 
 ## Template
 

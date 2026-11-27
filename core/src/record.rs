@@ -2593,7 +2593,8 @@ fn render(span: &Span, extras: &Extras, scrub: &Scrub) -> String {
 /// sent to, the status a flow's `respond` set, and an invoked service's version
 /// where it starts. `{"skipped":n}` stands for the statements that ran
 /// between the first ones kept and the last. The statement a failed run
-/// ended on, the last step, says `"failed":true`.
+/// ended on, the last step, says `"failed":true`; one that failed and a
+/// `catch` took, `"caught":true`.
 fn write_steps<'a>(out: &mut String, steps: &'a Steps, scrub: &Scrub, subjects: &mut Subjects<'a>) {
     let failed_at = if steps.failed() { steps.len().checked_sub(1) } else { None };
     let mut one = |out: &mut String, step: &'a Step, at: usize| {
@@ -2625,6 +2626,11 @@ fn write_steps<'a>(out: &mut String, steps: &'a Steps, scrub: &Scrub, subjects: 
                 // a hash of the service's source, computed here
                 out.push_str(r#""version":"#);
                 json_string(out, version);
+            }
+            What::Caught(line) => {
+                out.push_str(r#""line":"#);
+                push_u64(out, u64::from(*line));
+                out.push_str(r#","caught":true"#);
             }
         }
         if failed_at == Some(at) && !matches!(step.what, What::Enter(_)) {

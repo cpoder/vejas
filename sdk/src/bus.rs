@@ -1257,6 +1257,19 @@ pub struct StreamState {
     pub first_seq: u64,
     pub last_seq: u64,
     pub messages: u64,
+    /// The longest the stream keeps a message: zero for no limit.
+    pub max_age: Duration,
+}
+
+/// A stream's state, as STREAM.INFO answers it.
+fn state_of(info: &Value) -> StreamState {
+    let seq = |field: &str| info["state"][field].as_u64().unwrap_or(0);
+    StreamState {
+        first_seq: seq("first_seq"),
+        last_seq: seq("last_seq"),
+        messages: seq("messages"),
+        max_age: Duration::from_nanos(info["config"]["max_age"].as_u64().unwrap_or(0)),
+    }
 }
 
 pub struct StoredMessage {
@@ -1443,12 +1456,19 @@ impl JetStream {
 
     pub fn stream_state(&self, stream: &str) -> Result<StreamState, String> {
         let info = self.api(format!("STREAM.INFO.{stream}"), Bytes::new())?;
-        let seq = |field: &str| info["state"][field].as_u64().unwrap_or(0);
-        Ok(StreamState {
-            first_seq: seq("first_seq"),
-            last_seq: seq("last_seq"),
-            messages: seq("messages"),
-        })
+        Ok(state_of(&info))
+    }
+
+    /// The same, or None when the server has no stream of that name: any
+    /// other error is the bus's, and is one.
+    pub fn stream_state_if_any(&self, stream: &str) -> Result<Option<StreamState>, String> {
+        /// JSStreamNotFoundErr
+        const NOT_FOUND: u64 = 10059;
+        match self.api_coded(format!("STREAM.INFO.{stream}"), Bytes::new()) {
+            Ok(info) => Ok(Some(state_of(&info))),
+            Err((Some(NOT_FOUND), _)) => Ok(None),
+            Err((_, what)) => Err(what),
+        }
     }
 
     /// The message at a stream sequence.
