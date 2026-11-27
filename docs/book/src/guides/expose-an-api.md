@@ -111,7 +111,28 @@ respond 200, {id: id, status: "shipped"}
 ```
 
 - One flow per verb: a REST resource is several small flows.
-- `{path params}`, the JSON body and `query` all arrive as event variables.
+- `event` is the JSON body as sent: an object, whose fields are also
+  variables, an array, or null when there is none. A body that is not JSON
+  answers 400, unless the flow reads `unreadable` (see the
+  [language reference](../reference/vejascript.md)).
+- `{path params}` are variables (`id` above), over a body field of the same
+  name; `event.id` stays the body's.
+- `request` holds the rest: `request.method`, `request.path`,
+  `request.params`, `request.query` (the query string's values) and
+  `request.headers`, names in lower case: `accept`, `content-type`,
+  `idempotency-key`, `user-agent`, `x-correlation-id`, `x-request-id`, and
+  those the flow names in a list, `API_HEADERS = ["x-github-event"]`. A
+  header whose name reads as a credential (`authorization`, `cookie`,
+  `x-api-key`, a token, a key, a session, a signature, a PIN) is never given,
+  even when the list names it, in any spelling. The trace record is open to
+  read: it masks the value of each header the list names, and lists those
+  it named and the flow was not given in `request.withheld_headers`. A value
+  the flow passes on, in its answer or an emit, shows there as the flow
+  wrote it, masked by its key as any value is: name a header for what the
+  flow reads in it, not to forward it.
+- A path parameter named `event` or `request` is read as
+  `request.params.event`, and a body field named `request` as
+  `event.request`: those two names are the runtime's.
 - `respond` is the HTTP answer; `emit` still fires bus side-effects
   (best-effort — if the side effect must be guaranteed, emit to a subject
   and let an async flow own it).

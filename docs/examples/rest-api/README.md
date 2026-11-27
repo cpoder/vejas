@@ -2,8 +2,9 @@
 
 A flow can be exposed as a **synchronous HTTP endpoint** by declaring the verb and
 path it serves; a **REST resource is a set of flows, one per verb**. The runtime
-routes `(method, path)` to the flow, binds `{path params}` into the event, runs
-it, and returns its `respond`. The OpenAPI document is generated automatically.
+routes `(method, path)` to the flow, runs it on the body as sent with its
+`{path params}` as variables, and returns its `respond`. The OpenAPI document
+is generated automatically.
 
 ## The resource (`/orders`)
 
@@ -14,8 +15,11 @@ it, and returns its `respond`. The OpenAPI document is generated automatically.
 | `orders_update.vjs` | `api "PUT /orders/{id}"`   | update |
 | `orders_delete.vjs` | `api "DELETE /orders/{id}"`| delete |
 
-Each flow gets an event built from the request: the JSON **body** fields, the
-`{path params}` (e.g. `id`), and `query` (the query string). It answers with:
+Each flow gets the request: its JSON **body** as the event (an object's fields
+are variables), the `{path params}` as variables (e.g. `id`), and `request`
+with the method, path, query string (`request.query.page`) and the headers
+that say what the request is, plus those an `API_HEADERS` list names (see
+[Expose an API](../../book/src/guides/expose-an-api.md)). It answers with:
 
 ```
 respond <status>, { ...json body... }

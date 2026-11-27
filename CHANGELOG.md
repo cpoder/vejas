@@ -8,6 +8,18 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **A flow can take a message that is not JSON** (ADR-0039). A flow that reads
+  the variable `unreadable` runs such a message instead of leaving it to the
+  dead letter queue: its event is `{unreadable: {error, text, base64}}`, why
+  it is not JSON, and the message once: its text when its bytes are UTF-8
+  text, its bytes in base64 when they are not, the other null. The flow can
+  then publish its own reject with the original value, under a key that ends
+  in `base64` (`raw_base64`) for the bytes, since the masks read base64 there
+  only. An `api` flow that reads it
+  takes such a body instead of answering 400. A flow that does not read it is
+  unchanged. Time travel, the canary and a literal's replay run such messages
+  in the versions that read `unreadable`; a version that does not leaves
+  them to the dead letters, and the two count as changed.
 - **`invoke` calls a service that answers from a system** (ADR-0032). A file in
   `services/` may declare `driver "http-rpc"` instead of holding code: `URL`
   with `{arg}` placeholders, `METHOD`, `HEADERS` (with `secret()`),
@@ -82,6 +94,30 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   URLs apart by their query reads the subject instead: each connector has
   its own. Two `oauth-poll` endpoints on the same path now carry the same
   `endpoint`.
+- **An `api` flow sees the request as it came** (ADR-0039). Breaking. Its
+  `event` is the JSON body as sent: an object, an array, or null when there is
+  none. Before, a body that was not an object was dropped, and the path
+  parameters and the query string were written into the event, over the
+  body's fields of the same name: a body field named `query` was lost. A path
+  parameter is now a variable of its own, over a body field of the same name,
+  and `event.id` is the body's; one named `event` or `request` is read as
+  `request.params.event`. `request` holds `{method, path, params, query,
+  headers}`. `headers` holds `accept`, `content-type`, `idempotency-key`,
+  `user-agent`, `x-correlation-id` and `x-request-id`, and those an
+  `API_HEADERS` list of the flow names, in lower case; a header whose name
+  reads as a credential, as written or with camelCase read as snake_case, is
+  never given, even when the list names it. The trace record masks the value
+  of each header the list names, and says which it named and did not get. `query`
+  and a body field named `request` are no longer variables: read
+  `request.query` and `event.request`. A body that is not JSON answers 400
+  instead of running the flow on an empty event; it is the caller's error and
+  fails no hop. A field read on a body that is no object (`event.id` on `42`)
+  fails the run: 500. The OpenAPI document describes the body as any JSON,
+  not required, any bytes for a flow that reads `unreadable` and a 400 for
+  the others, the headers `API_HEADERS` names as parameters, and an
+  `API_REQUEST` list as an array. The trace record keeps what the flow was
+  given, the event and the request. e2e `message-as-sent.sh` checks it in
+  CI.
 - **The panel is redesigned around two people.** A menu on the left; a page
   per flow for the domain expert, read top to bottom (receives, computes,
   calls, checks, sends), with the business values in yellow where the flow
@@ -276,6 +312,22 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   percent-encoded as one segment of it, so that a `/` or `../` of the id no
   longer moves the call, and an id that is empty, `.` or `..` leaves its
   item's detail null.
+- **The masks read bytes in base64** (ADR-0017). A value under a key that
+  ends or starts with `base64` (`data_base64`, `contentBase64`, a message that
+  is not JSON) or `contentBytes`, or an array of them, is decoded: bytes that
+  read as a text are read as one, and the value is masked whole when a mask
+  finds a credential or a value the stores handed out in it, or, cut short in
+  a preview, ends in the start of one; bytes that read as no text (UTF-16
+  or UTF-32, four characters of it behind an ASCII envelope too, EBCDIC
+  however many spaces pad it, compressed) are masked whole.
+  Whitespace and padding are read past, as producers fold and join base64.
+  Under another key, or in another form (base64 of base64), no mask reads
+  them. A message that is not JSON and reads as no text is masked whole
+  where the record, the events and the dead letters showed it as text, NULs
+  between its letters.
+- **The events ring writes no more of an event than its preview shows.** A
+  large string, a 600 KB base64, was read whole under the ring's lock for
+  each preview: `/events` took 40 ms for 50 such messages.
 - **A request of `http-out`, `http-poll` or `oauth-poll` that does not get
   through names its host in its error, not its URL.** The HTTP client's text
   starts with the whole URL, its query and user info included, and quotes a

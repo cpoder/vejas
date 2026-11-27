@@ -44,6 +44,18 @@ pub fn hydrate_recent(
     subject: &str,
     n: usize,
 ) -> Result<Vec<(u64, String, serde_json::Value)>, String> {
+    hydrate_recent_with(js, stream, subject, n, |data| serde_json::from_slice(data).ok())
+}
+
+/// [`hydrate_recent`], each message read by `read`: one it gives nothing for
+/// is left out, as a message that is not JSON is there.
+pub fn hydrate_recent_with<T>(
+    js: &bus::JetStream,
+    stream: &str,
+    subject: &str,
+    n: usize,
+    read: impl Fn(&[u8]) -> Option<T>,
+) -> Result<Vec<(u64, String, T)>, String> {
     let n = n.clamp(1, 5000);
     let last = js.stream_state(stream).map(|state| state.last_seq).unwrap_or(0);
     if last == 0 {
@@ -62,8 +74,7 @@ pub fn hydrate_recent(
         inactive_threshold: Duration::from_secs(30),
     };
     let sub = js.pull_ephemeral(stream, &cfg)?;
-    let mut ring: std::collections::VecDeque<(u64, String, serde_json::Value)> =
-        std::collections::VecDeque::with_capacity(n);
+    let mut ring: std::collections::VecDeque<(u64, String, T)> = std::collections::VecDeque::with_capacity(n);
     let mut scanned = 0u64;
     loop {
         let batch = fetch_round(&sub)?;
@@ -76,7 +87,7 @@ pub fn hydrate_recent(
             if m.replay_for().is_some() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data) {
+            if let Some(v) = read(&m.data) {
                 // the stream sequence is the intrinsic join key for time-travel /
                 // canary diffs (ADR-0021) — no per-flow key to invent.
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
