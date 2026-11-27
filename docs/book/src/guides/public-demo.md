@@ -6,7 +6,7 @@ runtime, and the public sees them run.
 
 ## What it serves
 
-GET and HEAD on the reads the console makes, and nothing else:
+GET on the reads the console makes, and nothing else:
 
 | Read | For |
 |---|---|
