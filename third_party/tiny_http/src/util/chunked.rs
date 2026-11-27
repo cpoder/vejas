@@ -129,8 +129,14 @@ impl<R: Read> ChunkedReader<R> {
             None => &line[..],
         };
         let size = trim(size);
-        if size.is_empty() || size.len() > 16 || !size.iter().all(|b| b.is_ascii_hexdigit()) {
+        if size.is_empty() || !size.iter().all(|b| b.is_ascii_hexdigit()) {
             return Err(bad("chunk size is not a hex number"));
+        }
+        // leading zeros are allowed (the line is bounded); the rest fits a u64
+        let first = size.iter().position(|&b| b != b'0').unwrap_or(size.len() - 1);
+        let size = &size[first..];
+        if size.len() > 16 {
+            return Err(bad("chunk size too large"));
         }
         let text = std::str::from_utf8(size).map_err(|_| bad("chunk size"))?;
         u64::from_str_radix(text, 16).map_err(|_| bad("chunk size"))
@@ -224,6 +230,8 @@ mod tests {
         // stops right after the body: the next request starts there
         assert_eq!(&wire[cur.position() as usize..], b"NEXT");
         assert_eq!(decode(b"A\r\n0123456789\r\n0\r\n\r\n", 100).unwrap(), b"0123456789");
+        // leading zeros past 16 digits
+        assert_eq!(decode(b"000000000000000000005\r\nhello\r\n00000000000000000000\r\n\r\n", 100).unwrap(), b"hello");
     }
 
     #[test]

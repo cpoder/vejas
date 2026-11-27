@@ -487,6 +487,13 @@ impl Request {
         res
     }
 
+    /// Vejas patch: answers a request in a version the server does not speak,
+    /// as HTTP/1.1, then closes the connection without reading its body.
+    pub(crate) fn respond_unsupported_version<R: Read>(mut self, response: Response<R>) {
+        self.http_version = HTTPVersion(1, 1);
+        self.respond_and_close(response).ok();
+    }
+
     /// Vejas patch: drops the request without answering it, and closes the
     /// connection without reading what is left of its body. For a caller that
     /// must not write, not even the 500 a dropped request sends.

@@ -209,8 +209,28 @@ C=$(strict 'GET /healthz HTTP/1.1\nHost: x\n\n'); [ "$C" = "400" ] && ok "bare L
 
 kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
 
-# Four handler slots from here: what one client holds shows.
-start_runtime VEJAS_HTTP_MAX_INFLIGHT=4
+# Four handler slots and eight connections from here: what one client holds shows.
+start_runtime VEJAS_HTTP_MAX_INFLIGHT=4 VEJAS_HTTP_MAX_CONNECTIONS=8
+
+echo "── HTTP/2.0 request lines on every connection slot: each 505, the slots come back"
+OUT=$(python3 - "$PORT" <<'PY'
+import socket, sys
+held, codes = [], []
+for _ in range(8):
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+    s.settimeout(5)
+    s.sendall(b"GET /healthz HTTP/2.0\r\nHost: x\r\n\r\n")
+    held.append(s)  # the client keeps each open
+for s in held:
+    try:
+        codes.append(s.makefile("rb").readline().split(b" ")[1].decode())
+    except Exception:
+        codes.append("none")
+print(" ".join(sorted(set(codes))))
+PY
+)
+[ "$OUT" = "505" ] && ok "8 of 8 answered 505" || ko "HTTP/2.0 request lines: $OUT"
+[ "$(healthz)" = "200" ] && ok "/healthz answers after them" || ko "/healthz after HTTP/2.0 lines: the slots leaked"
 
 echo "── a chunk extension sent a byte at a time is cut at the timeout"
 OUT=$(python3 - "$PORT" <<'PY'

@@ -6,6 +6,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use std::mem;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 pub struct SequentialReaderBuilder<R>
 where
@@ -45,6 +47,8 @@ where
 {
     writer: Arc<Mutex<W>>,
     next_trigger: Option<Receiver<()>>,
+    // Vejas patch: how long a writer waits for the one before it
+    wait: Option<Duration>,
 }
 
 pub struct SequentialWriter<W>
@@ -56,6 +60,7 @@ where
     on_finish: Sender<()>,
     // Vejas patch: told when this writer is done (see `next_watched`)
     watcher: Option<Sender<()>>,
+    wait: Option<Duration>,
 }
 
 impl<R: Read + Send> SequentialReaderBuilder<R> {
@@ -71,7 +76,17 @@ impl<W: Write + Send> SequentialWriterBuilder<W> {
         SequentialWriterBuilder {
             writer: Arc::new(Mutex::new(writer)),
             next_trigger: None,
+            wait: None,
         }
+    }
+
+    /// Vejas patch: a writer waits at most `wait` for the one before it to be
+    /// done, then fails its write with `TimedOut` rather than wait for good.
+    /// A backstop: the connection reads no head before the last response is
+    /// written, so a writer has no one to wait for in the normal course.
+    pub fn with_wait(mut self, wait: Option<Duration>) -> Self {
+        self.wait = wait;
+        self
     }
 }
 
@@ -109,6 +124,7 @@ impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
             writer: self.writer.clone(),
             on_finish: tx,
             watcher: None,
+            wait: self.wait,
         })
     }
 }
@@ -149,22 +165,38 @@ impl<R: Read + Send> Read for SequentialReader<R> {
     }
 }
 
-impl<W: Write + Send> Write for SequentialWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+impl<W: Write + Send> SequentialWriter<W> {
+    /// Vejas patch: waits for the writer before this one, at most `wait`.
+    fn wait_turn(&mut self) -> IoResult<()> {
         if let Some(v) = self.trigger.as_mut() {
-            v.recv().unwrap()
+            let waited = match self.wait {
+                Some(wait) => v.recv_timeout(wait),
+                None => v.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match waited {
+                // the writer before is done (or gone): this one's turn
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the response before this one was never written",
+                    ));
+                }
+            }
         }
         self.trigger = None;
+        Ok(())
+    }
+}
 
+impl<W: Write + Send> Write for SequentialWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        self.wait_turn()?;
         self.writer.lock().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        if let Some(v) = self.trigger.as_mut() {
-            v.recv().unwrap()
-        }
-        self.trigger = None;
-
+        self.wait_turn()?;
         self.writer.lock().unwrap().flush()
     }
 }
@@ -198,5 +230,24 @@ where
         if let Some(watcher) = self.watcher.take() {
             watcher.send(()).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SequentialWriterBuilder;
+    use std::io::{ErrorKind, Write};
+    use std::time::Duration;
+
+    #[test]
+    fn a_writer_waits_for_the_one_before_at_most_its_wait() {
+        let mut b = SequentialWriterBuilder::new(Vec::new()).with_wait(Some(Duration::from_millis(50)));
+        let first = b.next().unwrap();
+        let mut second = b.next().unwrap();
+        assert_eq!(second.write(b"x").unwrap_err().kind(), ErrorKind::TimedOut);
+        drop(first);
+        let mut third = b.next().unwrap();
+        drop(second);
+        assert!(third.write(b"y").is_ok(), "the turn passes on");
     }
 }

@@ -95,7 +95,8 @@ impl ClientConnection {
 
         ClientConnection {
             source,
-            sink: SequentialWriterBuilder::new(BufWriter::with_capacity(1024, write_socket)),
+            sink: SequentialWriterBuilder::new(BufWriter::with_capacity(1024, write_socket))
+                .with_wait(limits.timeout),
             remote_addr,
             next_header_source: first_header,
             no_more_requests: false,
@@ -413,15 +414,17 @@ impl Iterator for ClientConnection {
 
             // checking HTTP version
             if *rq.http_version() > (1, 1) {
-                let writer = self.sink.next().unwrap();
+                // Vejas patch: answered through the request itself, whose
+                // writer is next in line. Upstream took the writer after it and
+                // wrote while `rq` lived: that write waited on `rq`'s writer
+                // for good, and the connection's thread and slot with it. The
+                // connection then closes: it does not speak HTTP/1.
                 let response = Response::from_string(
                     "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
                 )
                 .with_status_code(StatusCode(505));
-                response
-                    .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                    .ok();
-                continue;
+                rq.respond_unsupported_version(response);
+                return None;
             }
 
             // updating the status of the connection

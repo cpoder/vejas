@@ -8441,6 +8441,25 @@ mod http_limits_tests {
     }
 
     #[test]
+    fn an_http2_request_line_is_505_and_frees_its_connection() {
+        let mut l = limits(1024, 2000);
+        l.max_connections = 4;
+        let addr = serve(l, ok);
+        let start = Instant::now();
+        // as many as the server serves, each held open by the client
+        let held: Vec<(String, bool)> = (0..4)
+            .map(|_| exchange(addr, b"GET /healthz HTTP/2.0\r\nHost: x\r\n\r\n", Duration::from_secs(5)))
+            .collect();
+        for (out, closed) in &held {
+            assert!(out.starts_with("HTTP/1.1 505"), "{out}");
+            assert!(closed, "closed by the server");
+        }
+        assert!(start.elapsed() < Duration::from_secs(4), "{:?}", start.elapsed());
+        thread::sleep(Duration::from_millis(200));
+        assert!(healthz(addr).contains("200 OK"), "the slots came back");
+    }
+
+    #[test]
     fn past_max_connections_a_connection_is_closed_at_once() {
         let mut l = limits(1024, 3000);
         l.max_connections = 4;

@@ -59,7 +59,7 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
   written: a connection has at most one request in flight.
 - A chunked body is read by `ChunkedReader` (`src/util/chunked.rs`), in place of
   chunked_transfer's decoder: each line (size and extensions, each trailer) at
-  most 4 KiB, the trailers 8 KiB, CRLF only, the deadline checked before every
+  most 4 KiB (a size of at most 16 hex digits past its leading zeros), the trailers 8 KiB, CRLF only, the deadline checked before every
   read, and every wire byte (sizes, extensions, CRLFs, data, trailers) counted
   against the bound plus the drain's 64 KiB grace; the data alone is held to the
   bound.
@@ -82,7 +82,14 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
   OS refuses a thread; the accept loop logs an `accept()` error and goes on.
 
 A request holds a handler for at most the timeout to read its body, and its
-response for the timeout plus its write allowance.
+response for the timeout plus its write allowance. The timeout bounds the whole
+request, head and body: at 30 s, a body of 8 MiB needs about 280 KB/s.
+
+A request line in HTTP/2.0 or 3.0 is answered 505 through the request itself,
+and the connection closes. Upstream wrote the 505 with the writer after the
+request's own, while the request lived, so that write waited for good and held
+the connection's thread and slot. As a backstop, a response's writer now waits
+at most the timeout for the one before it, then fails with `TimedOut`.
 
 ## Upgrading
 
