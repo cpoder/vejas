@@ -150,8 +150,15 @@ const HANDED_OUT_MIN: usize = 4;
 struct Handed {
     last_use: HashMap<String, u64>,
     clock: u64,
-    /// Those that are URLs: a URL built on one is a stored URL too.
-    urls: Vec<String>,
+    /// Those that are URLs, each as the `url` crate writes it: a URL built on
+    /// one (`{BASE_URL}/items`) is a stored URL too.
+    urls: Vec<(String, String)>,
+}
+
+/// A URL as the `url` crate writes it: its host in lower case, no default
+/// port, a path that is empty written `/`, as it encodes it.
+fn written(url: &str) -> Option<String> {
+    url::Url::parse(url).ok().filter(|parsed| parsed.has_host()).map(String::from)
 }
 
 impl Handed {
@@ -171,20 +178,21 @@ impl Handed {
                 .map(|(v, _)| v.clone());
             if let Some(oldest) = oldest {
                 self.last_use.remove(&oldest);
-                self.urls.retain(|url| *url != oldest);
+                self.urls.retain(|(url, _)| *url != oldest);
             }
         }
-        if value.contains("://") {
-            self.urls.push(value.to_string());
+        if let Some(written) = written(value).filter(|_| value.contains("://")) {
+            self.urls.push((value.to_string(), written));
         }
         self.last_use.insert(value.to_string(), now);
         true
     }
 
-    /// Whether `url` is a value handed out, or starts with a URL handed out
-    /// (`{BASE_URL}/items`).
+    /// Whether `url` is a value handed out, or starts with a URL handed out,
+    /// both as the `url` crate writes them. Read only when a URL was.
     fn holds_url(&self, url: &str) -> bool {
-        self.last_use.contains_key(url) || self.urls.iter().any(|base| url.starts_with(base.as_str()))
+        self.last_use.contains_key(url)
+            || !self.urls.is_empty() && written(url).is_some_and(|url| self.urls.iter().any(|(_, base)| url.starts_with(base.as_str())))
     }
 }
 
@@ -696,14 +704,27 @@ mod tests {
     #[test]
     fn a_url_built_on_one_handed_out_is_stored_too() {
         let mut handed = Handed::default();
-        handed.note("https://hooks.example/base", 2);
+        handed.note("https://hooks.example/v1/acct-7f3k9", 2);
         handed.note("a-plain-value", 2);
-        assert!(handed.holds_url("https://hooks.example/base") && handed.holds_url("https://hooks.example/base/items?page=2"));
+        assert!(handed.holds_url("https://hooks.example/v1/acct-7f3k9"));
+        assert!(handed.holds_url("https://hooks.example/v1/acct-7f3k9/items?page=2"));
+        // its host in capitals, its default port spelled out
+        assert!(handed.holds_url("https://HOOKS.example:443/v1/acct-7f3k9/items"));
         assert!(handed.holds_url("a-plain-value") && !handed.holds_url("a-plain-value-and-more"));
-        assert!(!handed.holds_url("https://hooks.example/other"));
+        // another host, scheme or port; a link that leaves the stored path is
+        // not taken for stored either, since a host many connectors share
+        // would hide all of theirs
+        assert!(!handed.holds_url("https://hooks.example.org/v1/acct-7f3k9") && !handed.holds_url("http://hooks.example/v1/acct-7f3k9"));
+        assert!(!handed.holds_url("https://hooks.example:8443/v1/acct-7f3k9"));
+        assert!(!handed.holds_url("https://hooks.example/v1/items?cursor=c2"));
+        // a host alone ends where the host does
+        handed.note("https://bare.example", 3);
+        assert!(handed.holds_url("https://bare.example/x") && !handed.holds_url("https://bare.example.org/x"));
         // a URL let go past the cap is no longer one
-        handed.note("third", 2);
-        assert!(!handed.holds_url("https://hooks.example/base/items") && handed.urls.is_empty());
+        for value in ["third", "fourth", "fifth"] {
+            handed.note(value, 3);
+        }
+        assert!(!handed.holds_url("https://hooks.example/v1/acct-7f3k9/items") && handed.urls.is_empty());
     }
 
     #[test]

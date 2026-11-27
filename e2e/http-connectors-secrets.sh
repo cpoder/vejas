@@ -296,6 +296,9 @@ for line in open(sys.argv[1]):
 ' "$S/stored" > "$S/errors"
 sleep 2   # a few polls more
 curl -s -m 5 "$H/events?limit=500" > "$S/events"
+# the sink's own ring: the newest hundred of all units are the pollers' on a
+# slow machine
+curl -s -m 5 "$H/events?flow=connector%3Aout_ok" > "$S/events_ok"
 curl -s -m 5 "$H/topology" > "$S/topology"
 # what the trace record keeps at rest, every hop
 n=$(nats -s $URL stream info VEJAS_TRACES --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"]["messages"])' 2>/dev/null)
@@ -332,8 +335,8 @@ grep -q 'poll: HTTP 400: no route for GET /echo?key=<masked>&page=1' "$S/rt.log"
 grep -q "polling 127.0.0.1:$API_PORT every" "$S/rt.log" && ok "the poll logs its host" || ko "start line: $(grep polling "$S/rt.log" | head -1)"
 
 echo "── a 2xx answer that echoes the URL"
-grep -qF 'okecho?key=<masked>' "$S/events" && ok "/events keeps the sink's answer with the key masked" \
-  || ko "events: $(grep -o '.\{0,60\}okecho.\{0,40\}' "$S/events" | head -1)"
+grep -qF 'okecho?key=<masked>' "$S/events_ok" && ok "/events keeps the sink's answer with the key masked" \
+  || ko "events: $(grep -o '.\{0,60\}okecho.\{0,40\}' "$S/events_ok" | head -1)"
 grep -qF 'okecho?key=<masked>' "$S/traces" && ok "so does the trace record" \
   || ko "traces: $(grep -o '.\{0,60\}okecho.\{0,40\}' "$S/traces" | head -1)"
 
@@ -375,7 +378,7 @@ echo "$M" | grep -q '^vejas_spans_exported_total 0$' && echo "$M" | grep -q '^ve
 [ ! -s "$S/far" ] && ok "the far host got no request, so no header and no token" || ko "the far host was reached: $(head -2 "$S/far" | tr '\n' ' ')"
 
 echo "── nothing written holds a key"
-for f in stored rt.log events topology oauth env traces; do
+for f in stored rt.log events events_ok topology oauth env traces; do
   grep -q "$NEVER" "$S/$f" && ko "a key is in $f: $(grep -o ".\{0,40\}\($NEVER\).\{0,20\}" "$S/$f" | head -1)" || ok "no key in $f ($(wc -c < "$S/$f") bytes)"
 done
 

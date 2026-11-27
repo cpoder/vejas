@@ -37,10 +37,14 @@ struct TokenCache {
     /// The token in use, and when it is fetched again, before the token
     /// endpoint said it runs out.
     cached: Option<(String, Instant)>,
-    /// The routes, an endpoint, an EXPAND's list or its details, that
-    /// answered 401 to a token fetched for their 401: the client may not
-    /// read them (a scope, a consent), which another token does not change.
+    /// The routes, an endpoint or an EXPAND's list, that answered 401 to a
+    /// token fetched for their 401: the client may not read them (a scope, a
+    /// consent), which another token does not change.
     refused: HashSet<String>,
+    /// The same for an EXPAND's details, by their template, while the token
+    /// in use lives: they answer by item, so an item read says nothing of the
+    /// next one, and only another token is taken for a change.
+    items_refused: HashSet<String>,
 }
 
 impl TokenCache {
@@ -50,7 +54,12 @@ impl TokenCache {
         }
         let (token, life) = OAuthPoll::token(&self.holder, &self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
         self.cached = Some((token.clone(), Instant::now() + life));
+        self.items_refused.clear();
         Ok(token)
+    }
+
+    fn refusals(&mut self, item: bool) -> &mut HashSet<String> {
+        if item { &mut self.items_refused } else { &mut self.refused }
     }
 }
 
@@ -58,21 +67,25 @@ impl TokenCache {
 /// revoked one must be replaced, unless `route` refused one fetched for it
 /// already: one token per route and per tick would hammer the token
 /// endpoint, each one more value for the masks. A route that answers
-/// otherwise is taken for refused no more.
-fn authed_get(tc: &mut TokenCache, url: &str, route: &str) -> Result<(u16, Vec<u8>), String> {
+/// otherwise is taken for refused no more. An `item`'s detail answers for
+/// its item alone: its route stays refused while the token lives, and a
+/// token revoked meanwhile is replaced at the next list.
+fn authed_get(tc: &mut TokenCache, url: &str, route: &str, item: bool) -> Result<(u16, Vec<u8>), String> {
     let get = |tok: &str| http_request("GET", url, &[("Authorization".to_string(), format!("Bearer {tok}"))], None);
     let answer = get(&tc.bearer()?)?;
     if answer.0 != 401 {
-        tc.refused.remove(route);
+        if !item {
+            tc.refused.remove(route);
+        }
         return Ok(answer);
     }
-    if tc.refused.contains(route) {
+    if tc.refusals(item).contains(route) {
         return Ok(answer);
     }
     tc.cached = None;
     let answer = get(&tc.bearer()?)?;
     if answer.0 == 401 {
-        tc.refused.insert(route.to_string());
+        tc.refusals(item).insert(route.to_string());
     }
     Ok(answer)
 }
@@ -256,6 +269,7 @@ impl Driver for OAuthPoll {
             scope,
             cached: None,
             refused: HashSet::new(),
+            items_refused: HashSet::new(),
         };
         let mut waited = interval * 1000; // fire immediately on start
         loop {
@@ -294,7 +308,7 @@ impl Driver for OAuthPoll {
                     if !ctx.alive() {
                         return Ok(());
                     }
-                    match authed_get(&mut tc, &url, ep) {
+                    match authed_get(&mut tc, &url, ep, false) {
                         Ok((code, body)) if (200..300).contains(&code) => {
                             let parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
@@ -342,7 +356,7 @@ impl Driver for OAuthPoll {
                     if !ctx.alive() {
                         return Ok(());
                     }
-                    match authed_get(&mut tc, &url, &spec.list) {
+                    match authed_get(&mut tc, &url, &spec.list, false) {
                         Ok((code, body)) if (200..300).contains(&code) => {
                             let mut parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
@@ -386,7 +400,7 @@ impl Driver for OAuthPoll {
                                     };
                                     // a failing detail leaves null on THAT item;
                                     // the page still ships (per-item resilience)
-                                    let detail = match durl.and_then(|durl| authed_get(&mut tc, &durl, &spec.detail)) {
+                                    let detail = match durl.and_then(|durl| authed_get(&mut tc, &durl, &spec.detail, true)) {
                                         Ok((c, b)) if (200..300).contains(&c) => {
                                             serde_json::from_slice::<Value>(&b)
                                                 .unwrap_or(Value::Null)
@@ -455,9 +469,9 @@ mod tests {
     use std::sync::Arc;
 
     /// A token endpoint that numbers its tokens, `prefix` first, and an API
-    /// at `/api` that answers what `api` says to each token: the base URL,
-    /// and how many tokens were fetched.
-    fn token_server(prefix: &'static str, api: fn(&str) -> u16) -> (String, Arc<AtomicU32>) {
+    /// that answers what `api` says to each path and token: the base URL, and
+    /// how many tokens were fetched.
+    fn token_server(prefix: &'static str, api: fn(&str, &str) -> u16) -> (String, Arc<AtomicU32>) {
         use std::io::{BufRead as _, BufReader, Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -488,7 +502,7 @@ mod tests {
                     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
                     (200, format!(r#"{{"access_token":"{prefix}{n:04}","expires_in":3600}}"#))
                 } else {
-                    (api(&bearer), "{}".to_string())
+                    (api(first.split(' ').nth(1).unwrap_or_default(), &bearer), "{}".to_string())
                 };
                 let head = format!("HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", answer.len());
                 let _ = stream.write_all(format!("{head}{answer}").as_bytes());
@@ -507,25 +521,26 @@ mod tests {
             scope: String::new(),
             cached: None,
             refused: HashSet::new(),
+            items_refused: HashSet::new(),
         };
         // a route the client may not read: one more token, not one a call
-        let (base, fetched) = token_server("Rt7-oauth-loop-", |_| 401);
+        let (base, fetched) = token_server("Rt7-oauth-loop-", |_, _| 401);
         let mut tc = cache("test:oauth-401-loop", &base);
         for _ in 0..5 {
-            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api").unwrap().0, 401);
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api", false).unwrap().0, 401);
         }
         assert_eq!(fetched.load(Ordering::SeqCst), 2);
         // a token revoked, or past its life: replaced at once
-        let (base, fetched) = token_server("Rt7-oauth-revoked-", |token| if token.ends_with("-0001") { 401 } else { 200 });
+        let (base, fetched) = token_server("Rt7-oauth-revoked-", |_, token| if token.ends_with("-0001") { 401 } else { 200 });
         let mut tc = cache("test:oauth-401-revoked", &base);
         for _ in 0..3 {
-            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api").unwrap().0, 200);
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api", false).unwrap().0, 200);
         }
         assert_eq!(fetched.load(Ordering::SeqCst), 2);
         // a route refused does not keep another from drawing a new token
-        let (base, fetched) = token_server("Rt7-oauth-mixed-", |token| if token.ends_with("-0002") { 401 } else { 200 });
+        let (base, fetched) = token_server("Rt7-oauth-mixed-", |_, token| if token.ends_with("-0002") { 401 } else { 200 });
         let mut tc = cache("test:oauth-401-mixed", &base);
-        let refused = |tc: &mut TokenCache| authed_get(tc, &format!("{base}/api"), "/never").map(|answer| answer.0);
+        let refused = |tc: &mut TokenCache| authed_get(tc, &format!("{base}/api"), "/never", false).map(|answer| answer.0);
         tc.refused.insert("/never".into());
         assert_eq!(refused(&mut tc).unwrap(), 200, "token 1 is good");
         assert_eq!(fetched.load(Ordering::SeqCst), 1);
@@ -534,8 +549,24 @@ mod tests {
         tc.refused.insert("/never".into());
         // token 2 is revoked: /never keeps it, /other replaces it
         assert_eq!(refused(&mut tc).unwrap(), 401);
-        assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/other").unwrap().0, 200);
+        assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/other", false).unwrap().0, 200);
         assert_eq!(fetched.load(Ordering::SeqCst), 3);
+        // details answer by item: an item read clears no refusal, and while
+        // the token lives no 401 of theirs draws another
+        let (base, fetched) = token_server("Rt7-oauth-items-", |path, _| if path.ends_with("/2") || path.ends_with("/4") { 401 } else { 200 });
+        let mut tc = cache("test:oauth-401-items", &base);
+        for _ in 0..3 {
+            for n in 1..=4 {
+                let want = if n % 2 == 0 { 401 } else { 200 };
+                assert_eq!(authed_get(&mut tc, &format!("{base}/det/{n}"), "/det/{id}", true).unwrap().0, want);
+            }
+        }
+        assert_eq!(fetched.load(Ordering::SeqCst), 2, "the token, and one more for the first 401");
+        // another token, as one runs out: their 401 draws one more
+        tc.cached = None;
+        assert_eq!(authed_get(&mut tc, &format!("{base}/det/2"), "/det/{id}", true).unwrap().0, 401);
+        assert_eq!(authed_get(&mut tc, &format!("{base}/det/4"), "/det/{id}", true).unwrap().0, 401);
+        assert_eq!(fetched.load(Ordering::SeqCst), 4);
     }
 
     #[test]

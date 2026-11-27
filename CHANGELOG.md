@@ -246,8 +246,9 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   out are: each connector's last two, apart from those values, so that
   however many tokens come, none pushes a store's value out of the masks. On
   a 401, another token is fetched, unless the endpoint refused one fetched
-  for its 401 already, until it answers otherwise: a client the endpoint
-  refuses got a new token per endpoint and per tick. A token is used no
+  for its 401 already, until it answers otherwise, or for an `EXPAND`'s
+  details, which answer by item, while the token lives: a client the
+  endpoint refuses got a new token per endpoint and per tick. A token is used no
   longer than the token endpoint says it lives, less a tenth of that and a
   minute at most, 5 s at least; it was used 30 s at least. `http-out`, `http-poll` and `oauth-poll` read 64 KiB at most of
   an answer outside 2xx. `http-poll` logs its host instead of its URL,
