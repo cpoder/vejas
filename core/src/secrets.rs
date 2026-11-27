@@ -212,6 +212,12 @@ pub(crate) fn hand_out(value: &str) {
     remember(value);
 }
 
+/// A credential the runtime holds that no store handed out, a token a
+/// connector fetched: masked wherever the values handed out are.
+pub(crate) fn hold(value: &str) {
+    remember(value);
+}
+
 /// Changes when a value joins `handed_out()`: the trace record rebuilds its
 /// index of them only then.
 pub fn handed_out_generation() -> u64 {
@@ -369,7 +375,7 @@ impl SecretStore for VaultStore {
         let (code, body) = crate::connectors::http_request("GET", &url, &headers, None)
             .map_err(|e| format!("vault: {e}"))?;
         if !(200..300).contains(&code) {
-            return Err(format!("vault: HTTP {code} reading {path:?}"));
+            return Err(vault_refused(code, "reading", path));
         }
         let v: Value =
             serde_json::from_slice(&body).map_err(|e| format!("vault: bad response: {e}"))?;
@@ -384,31 +390,152 @@ impl SecretStore for VaultStore {
             .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
         let headers = [("X-Vault-Token".to_string(), self.token.clone())];
-        // KV v2 writes replace the whole path: merge with the existing keys
-        let mut data = match crate::connectors::http_request("GET", &url, &headers, None) {
+        // KV v2 writes replace the whole path: merge with the existing keys,
+        // and write over the version read only (check-and-set), so that a
+        // write in between is not dropped. A read that fails stops the write,
+        // which would drop them.
+        let (mut data, version) = match crate::connectors::http_request("GET", &url, &headers, None) {
             Ok((code, body)) if (200..300).contains(&code) => {
-                serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["data"]["data"].as_object().cloned())
-                    .unwrap_or_default()
+                let read = serde_json::from_slice::<Value>(&body).ok();
+                let data = read.as_ref().and_then(|v| v["data"]["data"].as_object().cloned());
+                match (data, read.as_ref().and_then(|v| v["data"]["metadata"]["version"].as_u64())) {
+                    (Some(data), Some(version)) => (data, version),
+                    _ => return Err(format!("vault: bad response reading {path:?}, so nothing was written")),
+                }
             }
-            _ => Default::default(),
+            // nothing at the path yet, or its last version deleted, as Vault
+            // says it: another server's 404, a proxy's, says nothing of the path
+            Ok((404, body)) => match serde_json::from_slice::<Value>(&body) {
+                Ok(v) if v.get("errors").is_some_and(Value::is_array) || v["data"]["metadata"].is_object() => {
+                    (Default::default(), v["data"]["metadata"]["version"].as_u64().unwrap_or(0))
+                }
+                _ => {
+                    return Err(format!(
+                        "vault: HTTP 404 reading {path:?} that is no answer of Vault's, so nothing was written"
+                    ))
+                }
+            },
+            Ok((code, _)) => return Err(format!("{}, so nothing was written", vault_refused(code, "reading", path))),
+            Err(e) => return Err(format!("vault: {e}, so nothing was written")),
         };
         data.insert(key.to_string(), Value::String(value.to_string()));
-        let body = serde_json::json!({ "data": data }).to_string();
+        let body = serde_json::json!({ "data": data, "options": { "cas": version } }).to_string();
         let mut headers = headers.to_vec();
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         match crate::connectors::http_request("POST", &url, &headers, Some(body.as_bytes())) {
             Ok((code, _)) if (200..300).contains(&code) => Ok(()),
-            Ok((code, _)) => Err(format!("vault: HTTP {code} writing {path:?}")),
+            Ok((400, answer)) if String::from_utf8_lossy(&answer).contains("check-and-set") => Err(format!(
+                "vault: {path:?} changed between its read and the write, so nothing was written: write it again"
+            )),
+            Ok((code, _)) => Err(vault_refused(code, "writing", path)),
             Err(e) => Err(format!("vault: {e}")),
         }
+    }
+}
+
+/// What a Vault answer outside 2xx says. A standby node answers with a
+/// redirect to the active one, which is not followed: the token would go along.
+fn vault_refused(code: u16, doing: &str, path: &str) -> String {
+    match code {
+        301 | 302 | 303 | 307 | 308 => format!(
+            "vault: HTTP {code} {doing} {path:?}: a redirect, not followed, since the token would go along: set VAULT_ADDR to the active node"
+        ),
+        _ => format!("vault: HTTP {code} {doing} {path:?}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Vault that answers each request in turn with the next of `answers`,
+    /// and hands back the requests it got, each whole.
+    fn fake_vault(answers: Vec<String>) -> (VaultStore, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read as _, Write as _};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let serving = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for answer in answers {
+                let (mut conn, _) = server.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // the head, then as much body as it announces
+                loop {
+                    let n = conn.read(&mut chunk).unwrap_or(0);
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        if n == 0 { break } else { continue }
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if body.len() >= length || n == 0 {
+                        break;
+                    }
+                }
+                got.push(String::from_utf8_lossy(&request).into_owned());
+                conn.write_all(answer.as_bytes()).unwrap();
+            }
+            got
+        });
+        let store = VaultStore { addr: format!("http://127.0.0.1:{port}"), token: "t0k3n-vault".into(), mount: "secret".into() };
+        (store, serving)
+    }
+
+    fn answer(status: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    #[test]
+    fn a_standby_vault_is_named_and_not_followed() {
+        let standby = "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/v1/secret/data/app\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (store, serving) = fake_vault(vec![standby.to_string()]);
+        let e = store.get("app/key").unwrap_err();
+        assert!(e.starts_with("vault: HTTP 307 reading \"app\": a redirect, not followed") && e.contains("VAULT_ADDR"), "{e}");
+        assert_eq!(serving.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_vault_write_never_drops_the_keys_it_could_not_read() {
+        // the read fails: nothing is written
+        let (store, serving) = fake_vault(vec![answer("500 Internal Server Error", r#"{"errors":["local node not active"]}"#)]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert_eq!(e, "vault: HTTP 500 reading \"app\", so nothing was written");
+        assert_eq!(serving.join().unwrap().len(), 1, "a write followed the failed read");
+        // nothing at the path yet: the write goes on, for a path still empty
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", r#"{"errors":[]}"#), answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        let got = serving.join().unwrap();
+        let lines: Vec<&str> = got.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert_eq!(lines, ["GET /v1/secret/data/app HTTP/1.1", "POST /v1/secret/data/app HTTP/1.1"]);
+        assert!(got[1].ends_with(r#"{"data":{"new":"v"},"options":{"cas":0}}"#), "{}", got[1]);
+        // its last version deleted: written over that version
+        let deleted = r#"{"data":{"data":null,"metadata":{"deletion_time":"2026-11-27T00:00:00Z","version":4}}}"#;
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", deleted), answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        assert!(serving.join().unwrap()[1].ends_with(r#""options":{"cas":4}}"#));
+        // a 404 that is not Vault's, a proxy with no server behind it: nothing is written
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", "404 page not found")]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert!(e.contains("no answer of Vault's, so nothing was written"), "{e}");
+        assert_eq!(serving.join().unwrap().len(), 1, "a write followed a proxy's 404");
+        // the keys read are written back with the new one, over the version read
+        let read = answer("200 OK", r#"{"data":{"data":{"old":"kept"},"metadata":{"version":7}}}"#);
+        let (store, serving) = fake_vault(vec![read, answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        let got = serving.join().unwrap();
+        assert!(got[1].ends_with(r#"{"data":{"new":"v","old":"kept"},"options":{"cas":7}}"#), "{}", got[1]);
+        // a write in between: Vault refuses ours, which says so
+        let read = answer("200 OK", r#"{"data":{"data":{"old":"kept"},"metadata":{"version":7}}}"#);
+        let refused = answer("400 Bad Request", r#"{"errors":["check-and-set parameter did not match the current version"]}"#);
+        let (store, serving) = fake_vault(vec![read, refused]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert!(e.contains("changed between its read and the write"), "{e}");
+        serving.join().unwrap();
+    }
 
     #[test]
     fn camel_case_reads_as_snake_case() {

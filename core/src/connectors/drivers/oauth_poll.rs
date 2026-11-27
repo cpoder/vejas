@@ -7,7 +7,9 @@ use serde_json::Value;
 use vejas_connector::clock::iso8601_utc;
 
 use crate::bus;
-use crate::connectors::http_client::{host_of, http_request, join_url, next_url, refused, urlencode};
+use crate::connectors::http_client::{
+    host_of, http_request, join_url, link_url, next_url, path_segment, path_shown, refused, urlencode,
+};
 use crate::connectors::{Config, Ctx, Driver, humanize};
 use crate::metrics::Kind;
 
@@ -130,11 +132,7 @@ impl OAuthPoll {
         let (code, body) = http_request("POST", token_url, &headers, Some(form.as_bytes()))?;
         if !(200..300).contains(&code) {
             // an endpoint may echo the form, the client secret in it
-            let mut refusal = refused(code, token_url, &body, 300);
-            if !client_secret.is_empty() {
-                refusal = refusal.replace(&urlencode(client_secret), "<masked>").replace(client_secret, "<masked>");
-            }
-            return Err(format!("token endpoint {refusal}"));
+            return Err(format!("token endpoint {}", refused(code, token_url, &body, 300, &[client_secret])));
         }
         let v: Value =
             serde_json::from_slice(&body).map_err(|e| format!("token endpoint: bad JSON: {e}"))?;
@@ -142,6 +140,9 @@ impl OAuthPoll {
             .as_str()
             .ok_or("token endpoint: no access_token in response")?
             .to_string();
+        // a credential no store handed out: masked wherever theirs are, in an
+        // answer that quotes it as in the record (ADR-0017)
+        crate::secrets::hold(&tok);
         // refresh a minute early; floor for endpoints that answer tiny lifetimes
         let ttl = v["expires_in"].as_u64().unwrap_or(300).saturating_sub(60).max(30);
         Ok((tok, Duration::from_secs(ttl)))
@@ -153,7 +154,7 @@ impl Driver for OAuthPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS. EXPAND = [{name, list, detail, key, as, list_field?}] does a client-side $expand: each item of the list response's array (list_field, default \"value\"; use \"resources\"/\"data\" for other APIs; a bare-string item becomes {key: id}) is enriched with its per-item detail call ({key} substituted in the detail path) and the page ships as ONE envelope under endpoint=name — sized for list APIs without a server-side expand (sequential detail calls, keep pages small). Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE (optional — omitted when empty, e.g. CrowdStrike), BASE_URL, ENDPOINTS and/or EXPAND, SUBJECT, INTERVAL_SECS, MAX_PAGES."
+        "OAuth2 client-credentials REST poller: takes a token from TOKEN_URL, GETs each of ENDPOINTS with the Bearer (pagination via NEXT_LINK_FIELD, default \"@odata.nextLink\", capped by MAX_PAGES; a next page on another scheme, host or port than its page is not followed, since the token would go along), publishes one {endpoint, fetched_at, body} message per page on SUBJECT every INTERVAL_SECS (endpoint: as ENDPOINTS names it, without its query). EXPAND = [{name, list, detail, key, as, list_field?}] does a client-side $expand: each item of the list response's array (list_field, default \"value\"; use \"resources\"/\"data\" for other APIs; a bare-string item becomes {key: id}) is enriched with its per-item detail call ({key} substituted in the detail path, percent-encoded as one segment of it; a detail that is \"{key}\" alone is the item's link, followed on the list page's origin only) and the page ships as ONE envelope under endpoint=name — sized for list APIs without a server-side expand (sequential detail calls, keep pages small). Config: TOKEN_URL, CLIENT_ID, CLIENT_SECRET (use secret()), SCOPE (optional — omitted when empty, e.g. CrowdStrike), BASE_URL, ENDPOINTS and/or EXPAND, SUBJECT, INTERVAL_SECS, MAX_PAGES."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let token_url = ctx.config.str("TOKEN_URL").ok_or("TOKEN_URL required")?;
@@ -179,14 +180,15 @@ impl Driver for OAuthPoll {
                     .ok()
                     .and_then(|v| v["value"].as_array().map(|a| a.len()));
                 Ok(match items {
-                    Some(n) => format!("token OK · GET {ep} OK ({n} items)"),
-                    None => format!("token OK · GET {ep} OK ({} bytes)", body.len()),
+                    Some(n) => format!("token OK · GET {} OK ({n} items)", path_shown(&ep)),
+                    None => format!("token OK · GET {} OK ({} bytes)", path_shown(&ep), body.len()),
                 })
             }
             Ok((code, _)) => Err(humanize(&format!(
-                "token OK, but GET {ep} answered HTTP {code} (missing permission / admin consent?)"
+                "token OK, but GET {} answered HTTP {code} (missing permission / admin consent?)",
+                path_shown(&ep)
             ))),
-            Err(e) => Err(humanize(&format!("GET {ep}: {e}"))),
+            Err(e) => Err(humanize(&format!("GET {}: {e}", path_shown(&ep)))),
         }
     }
     fn run(&self, ctx: &Ctx) -> Result<(), String> {
@@ -271,26 +273,35 @@ impl Driver for OAuthPoll {
                             let parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    eprintln!("[{}] {ep}: non-JSON page skipped: {e}", ctx.name);
+                                    eprintln!("[{}] {}: non-JSON page skipped: {e}", ctx.name, path_shown(ep));
                                     break;
                                 }
                             };
-                            publish_page(&parsed, ep, &js)?;
+                            // the endpoint names the page without its query, where a
+                            // credential may ride (an Azure Functions `code`)
+                            publish_page(&parsed, &path_shown(ep), &js)?;
                             pages += 1;
-                            match next_url(&base, &parsed, &next_field) {
-                                Some(next) => url = next,
-                                None => break,
+                            match next_url(&base, &url, &parsed, &next_field) {
+                                Ok(Some(next)) => url = next,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let msg = format!("{}: {e}", path_shown(ep));
+                                    eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
+                                    ctx.failed(&subject, msg);
+                                    break;
+                                }
                             }
                         }
                         Ok((code, body)) => {
-                            let msg = format!("{ep}: {}", refused(code, &url, &body, 200));
+                            let msg = format!("{}: {}", path_shown(ep), refused(code, &url, &body, 200, &[]));
                             eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
                             ctx.failed(&subject, msg);
                             break;
                         }
                         Err(e) => {
-                            eprintln!("[{}] {ep}: {e} — endpoint skipped this tick", ctx.name);
-                            ctx.failed(&subject, format!("{ep}: {e}"));
+                            let msg = format!("{}: {e}", path_shown(ep));
+                            eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
+                            ctx.failed(&subject, msg);
                             break;
                         }
                     }
@@ -337,13 +348,19 @@ impl Driver for OAuthPoll {
                                     else {
                                         continue;
                                     };
-                                    let durl = join_url(
-                                        &base,
-                                        &fill_template(&spec.detail, &spec.key, &id),
-                                    );
+                                    // a detail that is the item's field alone is its
+                                    // link, followed on the list page's origin only;
+                                    // an id in a path is one segment of it
+                                    let durl = if spec.detail == format!("{{{}}}", spec.key) {
+                                        link_url(&base, &url, &id, "its detail")
+                                    } else {
+                                        path_segment(&id)
+                                            .map(|segment| join_url(&base, &fill_template(&spec.detail, &spec.key, &segment)))
+                                            .ok_or_else(|| "an id that names no segment of a path".to_string())
+                                    };
                                     // a failing detail leaves null on THAT item;
                                     // the page still ships (per-item resilience)
-                                    let detail = match authed_get(&mut tc, &durl) {
+                                    let detail = match durl.and_then(|durl| authed_get(&mut tc, &durl)) {
                                         Ok((c, b)) if (200..300).contains(&c) => {
                                             serde_json::from_slice::<Value>(&b)
                                                 .unwrap_or(Value::Null)
@@ -370,13 +387,19 @@ impl Driver for OAuthPoll {
                             }
                             publish_page(&parsed, &spec.name, &js)?;
                             pages += 1;
-                            match next_url(&base, &parsed, &next_field) {
-                                Some(next) => url = next,
-                                None => break,
+                            match next_url(&base, &url, &parsed, &next_field) {
+                                Ok(Some(next)) => url = next,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let msg = format!("{}: {e}", spec.name);
+                                    eprintln!("[{}] {msg} — expand skipped this tick", ctx.name);
+                                    ctx.failed(&subject, msg);
+                                    break;
+                                }
                             }
                         }
                         Ok((code, body)) => {
-                            let msg = format!("{}: {}", spec.name, refused(code, &url, &body, 200));
+                            let msg = format!("{}: {}", spec.name, refused(code, &url, &body, 200, &[]));
                             eprintln!("[{}] {msg} — expand skipped this tick", ctx.name);
                             ctx.failed(&subject, msg);
                             break;

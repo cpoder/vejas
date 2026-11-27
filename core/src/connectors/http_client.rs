@@ -27,68 +27,207 @@ fn http_agent() -> &'static ureq::Agent {
 }
 
 /// The host a URL names, `host[:port]`, for a log line or an error: never its
-/// user info, its path or its query, where credentials ride.
-pub(crate) fn host_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+/// user info, its path or its query, where credentials ride. A URL that does
+/// not parse is not guessed at.
+pub(crate) fn host_of(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => "a URL with no host".into(),
+        },
+        Err(_) => "a URL that does not parse".into(),
+    }
 }
 
 /// A URL as an event names it: its scheme, host and path, without its user
 /// info and its query, and with any value a secret store handed out masked.
 pub(crate) fn url_shown(url: &str) -> String {
-    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let path_at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let path = &rest[path_at..];
-    let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
-    let shown = match scheme {
-        Some(scheme) => format!("{scheme}://{}{path}", host_of(url)),
-        None => format!("{}{path}", host_of(url)),
-    };
-    crate::record::shown().error(&shown)
+    match url::Url::parse(url) {
+        Ok(parsed) => crate::record::shown().error(&format!("{}://{}{}", parsed.scheme(), host_of(url), parsed.path())),
+        Err(_) => "a URL that does not parse".into(),
+    }
 }
 
-/// The start of what a system answered, for an error: a system may echo the
-/// request, so the URL's query and user info are taken out, and the record's
-/// mask applies (ADR-0017): the values the secret stores handed out, and
-/// credential-named pairs. The error reaches the log, the unit's last error
-/// and the dead letter at rest.
-fn excerpt(url: &str, body: &[u8], most: usize) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let mut echoed: Vec<&str> = Vec::new();
-    if let Some((user_info, _)) = authority.rsplit_once('@') {
-        echoed.push(user_info);
+/// An endpoint the configuration names, `/data?code=…` or a whole URL, as an
+/// error or a page names it: without its query, and a whole URL as
+/// [`url_shown`] shows one, without its user info.
+pub(crate) fn path_shown(endpoint: &str) -> std::borrow::Cow<'_, str> {
+    if endpoint.contains("://") {
+        return std::borrow::Cow::Owned(url_shown(endpoint));
     }
-    if let Some((_, query)) = url.split_once('?') {
-        echoed.push(&query[..query.find('#').unwrap_or(query.len())]);
+    std::borrow::Cow::Borrowed(&endpoint[..endpoint.find(['?', '#']).unwrap_or(endpoint.len())])
+}
+
+/// The shortest user info or query value taken for a credential: shorter
+/// ones, `page=1`, would mask the answer's text everywhere they occur.
+const SHORTEST_SECRET: usize = 6;
+/// The shortest path segment taken for a token, which has a digit in it: a
+/// webhook's address carries its credential in the path, where a resource is
+/// named shorter, or in words (`deviceManagement`).
+const SHORTEST_TOKEN: usize = 16;
+/// The shortest reading of a value looked for in an answer.
+const SHORTEST_READING: usize = 4;
+/// What an escape takes, at most, for each byte it stands for (`\u002B`).
+const ESCAPED_MOST: usize = 6;
+/// What is kept of a 2xx answer for the trace record and the events, once
+/// the URL's values are masked in it: what the record keeps of one.
+const ANSWER_KEPT: usize = 16 * 1024;
+
+/// What of `url` could carry a credential, and the values in `also`: the user
+/// info, each value of the query, a segment of the path long enough to be a
+/// token, each as it is and decoded. An echo in any other form reads as one
+/// of them once its escapes are read (`record::Values::found_in`).
+fn credentials(url: &str, also: &[&str]) -> crate::record::Values {
+    let mut values: Vec<String> = also.iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
+    // a date, a time, a version or a number is no credential:
+    // `api-version=2024-02-01` would mask each such date in the answer
+    let data = |value: &str| percent_decoded(value).bytes().all(|b| b.is_ascii_digit() || b"-.:_/+ TZ".contains(&b));
+    if let Ok(parsed) = url::Url::parse(url) {
+        let mut secret = |value: &str, shortest: usize| {
+            if value.len() >= shortest {
+                values.push(value.to_string());
+            }
+        };
+        secret(parsed.username(), SHORTEST_SECRET);
+        secret(parsed.password().unwrap_or_default(), SHORTEST_SECRET);
+        for pair in parsed.query().unwrap_or_default().split('&') {
+            // a pair with no `=` is a value alone, `?<token>`
+            let value = pair.split_once('=').map_or(pair, |(_, value)| value);
+            if !data(value) {
+                secret(value, SHORTEST_SECRET);
+            }
+        }
+        for segment in parsed.path_segments().into_iter().flatten() {
+            if segment.bytes().any(|b| b.is_ascii_digit()) && !data(segment) {
+                secret(segment, SHORTEST_TOKEN);
+            }
+        }
     }
-    echoed.retain(|v| !v.is_empty());
-    // read past `most` by the longest of them, so that one the cut would
-    // split is still found whole
-    let longest = echoed.iter().map(|v| v.len()).max().unwrap_or(0);
-    let mut text = String::from_utf8_lossy(&body[..body.len().min(most + longest)]).into_owned();
-    for value in echoed {
-        text = text.replace(value, "<masked>");
+    let mut readings = Vec::with_capacity(values.len() * 3);
+    for value in values {
+        // a `+` of a query is a space to a form, itself to RFC 3986
+        readings.push(percent_decoded(&value.replace('+', " ")));
+        readings.push(percent_decoded(&value));
+        readings.push(value);
     }
-    if text.len() > most {
-        let cut = (0..=most).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-        text.truncate(cut);
+    // a value that decodes to a few characters, `%3D%3D`, would mask them
+    // everywhere in the answer
+    readings.retain(|r| r.len() >= SHORTEST_READING);
+    crate::record::Values::of(&readings)
+}
+
+/// The start of `text`, `most` bytes of it at most, with `values` masked
+/// wherever they are found. The cut never splits a masked value: one that
+/// starts before it is masked whole. True when the text was cut.
+fn masked_start(text: &str, values: &crate::record::Values, most: usize) -> (String, bool) {
+    let window = &text[..floor_char(text, most.saturating_add(values.longest().saturating_mul(ESCAPED_MOST)))];
+    let cut = floor_char(window, most);
+    let mut shown = String::with_capacity(cut + 16);
+    let mut at = 0;
+    for (start, end) in values.found_in(window) {
+        if start >= cut {
+            break;
+        }
+        if start < at {
+            // overlaps the value masked before it
+            at = at.max(end);
+            continue;
+        }
+        shown.push_str(&window[at..start]);
+        shown.push_str("<masked>");
+        at = end;
     }
-    crate::record::shown().error(text.trim())
+    if at < cut {
+        shown.push_str(&window[at..cut]);
+    }
+    (shown, cut < text.len())
+}
+
+/// `at`, or the character boundary of `text` before it.
+fn floor_char(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The start of what a system answered, at most `most` bytes, for an error.
+/// The record's mask first (ADR-0017): credential-named pairs and the values
+/// the secret stores handed out. Then a system may echo the request in any
+/// form, so what of the URL could carry a credential (see [`credentials`]) and
+/// the values in `also` are masked wherever they appear, as they are or
+/// through the escapes of JSON, a URL or HTML. The error reaches the log, the
+/// unit's last error and the dead letter at rest.
+pub(crate) fn excerpt(url: &str, body: &[u8], most: usize, also: &[&str]) -> String {
+    let values = credentials(url, also);
+    let window = most.saturating_add(values.longest().saturating_mul(ESCAPED_MOST));
+    let text = crate::record::shown().error(&String::from_utf8_lossy(&body[..body.len().min(window)]));
+    masked_start(&text, &values, most).0.trim().to_string()
+}
+
+/// What of a sink's URL could carry a credential, to mask in what its system
+/// answers: an answer may echo the request, as a 2xx does as well as an error.
+pub(crate) struct Echoes(crate::record::Values);
+
+impl Echoes {
+    pub(crate) fn of(url: &str) -> Echoes {
+        Echoes(credentials(url, &[]))
+    }
+
+    /// A 2xx answer as the trace record and the events keep it: the record's
+    /// mask, then the URL's values masked wherever they are found, and of an
+    /// answer longer than the record keeps, only its start.
+    pub(crate) fn masked(&self, text: String) -> String {
+        if self.0.is_empty() {
+            return text;
+        }
+        let read = &text[..floor_char(&text, ANSWER_KEPT.saturating_add(self.0.longest().saturating_mul(ESCAPED_MOST)))];
+        let shown = crate::record::shown().text(read, read.len() < text.len());
+        let (mut kept, cut) = masked_start(&shown, &self.0, ANSWER_KEPT);
+        if cut || read.len() < text.len() {
+            kept.push('…');
+        }
+        kept
+    }
+}
+
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The statuses of a redirect, whose `Location` the answer points to.
+fn redirects(code: u16) -> bool {
+    matches!(code, 301 | 302 | 303 | 307 | 308)
 }
 
 /// The error of an answer outside 2xx: a redirect, which is not followed, or
-/// the status and the start of the answer.
-pub(super) fn refused(code: u16, url: &str, body: &[u8], most: usize) -> String {
-    if (300..400).contains(&code) {
+/// the status and the start of the answer (see [`excerpt`]).
+pub(super) fn refused(code: u16, url: &str, body: &[u8], most: usize, also: &[&str]) -> String {
+    if redirects(code) {
         return format!(
             "HTTP {code} from {}: a redirect, not followed, since the request's headers would go along: set the URL to the address it points to",
             host_of(url)
         );
     }
-    format!("HTTP {code}: {}", excerpt(url, body, most))
+    format!("HTTP {code}: {}", excerpt(url, body, most, also))
 }
 
 /// The agent of the calls a flow makes (ADR-0032). It follows no redirect: a
@@ -147,8 +286,11 @@ pub fn http_request(
     };
     let code = response.status();
     let mut buf = Vec::new();
+    // of an answer outside 2xx, only its start is ever shown
+    let most = if (200..300).contains(&code) { u64::MAX } else { ERROR_BODY_MOST };
     response
         .into_reader()
+        .take(most)
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
     Ok((code, buf))
@@ -157,9 +299,12 @@ pub fn http_request(
 pub(super) fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
     match http_request("GET", url, headers, None)? {
         (code, body) if (200..300).contains(&code) => Ok(body),
-        (code, body) => Err(refused(code, url, &body, 300)),
+        (code, body) => Err(refused(code, url, &body, 300, &[])),
     }
 }
+
+/// How much of an answer outside 2xx is read: its start is all an error shows.
+const ERROR_BODY_MOST: u64 = 64 * 1024;
 
 /// The headers a request sends: with a trace, it carries it as `traceparent`
 /// (and `tracestate`), replacing any the manifest set (ADR-0034).
@@ -263,7 +408,7 @@ pub(super) fn http_post(
 ) -> Result<Vec<u8>, String> {
     match http_request("POST", url, &traced(headers, trace), Some(body))? {
         (code, out) if (200..300).contains(&code) => Ok(out),
-        (code, out) => Err(refused(code, url, &out, 300)),
+        (code, out) => Err(refused(code, url, &out, 300, &[])),
     }
 }
 
@@ -290,12 +435,54 @@ pub(super) fn join_url(base: &str, endpoint: &str) -> String {
     }
 }
 
-/// The next page URL out of a response body, if any (absolute or relative).
-pub(super) fn next_url(base: &str, body: &serde_json::Value, field: &str) -> Option<String> {
-    body.get(field)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| join_url(base, s))
+/// The URL a link in the answer of the page at `page` points to: absolute;
+/// a query alone or a link without its scheme, read against the page; else
+/// relative to `base`, or to the page's origin when the page is elsewhere (an
+/// absolute endpoint). One elsewhere than `page`, another scheme, host or
+/// port, is an error that calls the link `what`: the request's token would go
+/// along, as it would with a redirect.
+pub(super) fn link_url(base: &str, page: &str, link: &str, what: &str) -> Result<String, String> {
+    let origin = |url: &str| url::Url::parse(url).map(|url| url.origin());
+    let shown = |url: &str| match url::Url::parse(url) {
+        Ok(parsed) => format!("{}://{}", parsed.scheme(), host_of(url)),
+        Err(_) => "a URL that does not parse".into(),
+    };
+    let next = if link.starts_with("http://") || link.starts_with("https://") {
+        link.to_string()
+    } else if link.starts_with("//") || link.starts_with('?') {
+        url::Url::parse(page).and_then(|page| page.join(link)).map_or_else(|_| link.to_string(), String::from)
+    } else {
+        match (origin(base), origin(page)) {
+            (Ok(base_origin), Ok(page_origin)) if base_origin != page_origin => {
+                join_url(&page_origin.ascii_serialization(), link)
+            }
+            _ => join_url(base, link),
+        }
+    };
+    match (origin(&next), origin(page)) {
+        (Ok(there), Ok(here)) if there == here => Ok(next),
+        _ => Err(format!(
+            "{what} is at {}, not {}: not followed, since the token would go along",
+            shown(&next),
+            shown(page)
+        )),
+    }
+}
+
+/// The next page URL out of the body of the page at `page`, if any (see
+/// [`link_url`]).
+pub(super) fn next_url(base: &str, page: &str, body: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    let Some(next) = body.get(field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    link_url(base, page, next, "the next page").map(Some)
+}
+
+/// An id as one segment of a path, percent-encoded, so that a `/` or a `?` of
+/// its own does not move the call (`../y?z`). None for an id that is no
+/// segment, empty, `.` or `..`, which a URL reads as a move.
+pub(super) fn path_segment(id: &str) -> Option<String> {
+    (!matches!(id, "" | "." | "..")).then(|| urlencode(id))
 }
 
 #[cfg(test)]
@@ -309,16 +496,49 @@ mod tests {
         assert_eq!(join_url("https://api.x/v1", "users"), "https://api.x/v1/users");
         assert_eq!(join_url("https://api.x/v1", "https://other/abs"), "https://other/abs");
         let body = json!({"value": [], "@odata.nextLink": "https://api.x/v1/users?$skip=2"});
+        let page = "https://api.x/v1/users";
         assert_eq!(
-            next_url("https://api.x/v1", &body, "@odata.nextLink").as_deref(),
+            next_url("https://api.x/v1", page, &body, "@odata.nextLink").unwrap().as_deref(),
             Some("https://api.x/v1/users?$skip=2")
         );
         let rel = json!({"next": "/users?page=2"});
         assert_eq!(
-            next_url("https://api.x/v1", &rel, "next").as_deref(),
+            next_url("https://api.x/v1", page, &rel, "next").unwrap().as_deref(),
             Some("https://api.x/v1/users?page=2")
         );
-        assert_eq!(next_url("https://api.x/v1", &json!({"value": []}), "next"), None);
+        // the page of an absolute endpoint elsewhere than the base: its links
+        // read against its own origin
+        let pages = json!({"next": "/pages?p=2"});
+        assert_eq!(
+            next_url("https://api.x/v1", "http://localhost:4494/pages", &pages, "next").unwrap().as_deref(),
+            Some("http://localhost:4494/pages?p=2")
+        );
+        // a query alone reads against the page, a link without its scheme too
+        let query = json!({"next": "?p=2"});
+        assert_eq!(
+            next_url("https://api.x/v1", "https://api.x/v1/users?p=1", &query, "next").unwrap().as_deref(),
+            Some("https://api.x/v1/users?p=2")
+        );
+        let far = json!({"next": "//evil.x/steal"});
+        assert!(next_url("https://api.x/v1", page, &far, "next").unwrap_err().starts_with("the next page is at https://evil.x"));
+        // a detail that is an item's link, elsewhere: not followed
+        let e = link_url("https://api.x/v1", "https://api.x/v1/items", "http://127.0.0.1:4492/steal", "its detail").unwrap_err();
+        assert!(e.starts_with("its detail is at http://127.0.0.1:4492, not https://api.x"), "{e}");
+        // an id is one segment of a path
+        assert_eq!(path_segment("../y?z").as_deref(), Some("..%2Fy%3Fz"));
+        assert_eq!(path_segment("u-42").as_deref(), Some("u-42"));
+        assert_eq!(path_segment(".."), None);
+        assert_eq!(path_segment(""), None);
+        assert_eq!(next_url("https://api.x/v1", page, &json!({"value": []}), "next"), Ok(None));
+        // elsewhere, the token would go along: another host, the same in clear, another port
+        for elsewhere in ["https://evil.example/steal?$skip=2", "http://api.x/v1/users?$skip=2", "https://api.x:8443/v1"] {
+            let e = next_url("https://api.x/v1", page, &json!({"next": elsewhere}), "next").unwrap_err();
+            assert!(e.starts_with("the next page is at ") && e.ends_with("not https://api.x: not followed, since the token would go along"), "{e}");
+        }
+        // an endpoint the configuration puts on another host pages there
+        let other = "https://other.example/items";
+        let next = json!({"next": "https://other.example/items?page=2"});
+        assert_eq!(next_url("https://api.x/v1", other, &next, "next").unwrap().as_deref(), Some("https://other.example/items?page=2"));
     }
 
     #[test]
@@ -352,26 +572,130 @@ mod tests {
         let url = "https://svc:pw-SECRET-1@api.x:8443/v1/orders?api_key=SECRET-2#top";
         assert_eq!(host_of(url), "api.x:8443");
         assert_eq!(url_shown(url), "https://api.x:8443/v1/orders");
-        assert_eq!((host_of("http://h"), url_shown("http://h").as_str()), ("h", "http://h"));
-        assert_eq!((host_of("https://h?x=1"), url_shown("https://h?x=1").as_str()), ("h", "https://h"));
-        assert_eq!((host_of("h/p?q=1"), url_shown("h/p?q=1").as_str()), ("h", "h/p"));
+        assert_eq!((host_of("http://h"), url_shown("http://h").as_str()), ("h".into(), "http://h/"));
+        assert_eq!((host_of("https://h?x=1"), url_shown("https://h?x=1").as_str()), ("h".into(), "https://h/"));
+        assert_eq!(host_of("http://[::1]:8080/x"), "[::1]:8080");
+        // a password with a raw `/` is not taken for the host
+        assert_eq!(host_of("http://u:pa/ss@h/"), "a URL that does not parse");
+        assert_eq!((host_of("h/p?q=1"), url_shown("h/p?q=1")), ("a URL that does not parse".into(), "a URL that does not parse".into()));
+        assert_eq!(path_shown("/data?code=K3Y#x"), "/data");
     }
 
     #[test]
     fn an_answer_that_echoes_the_request_keeps_its_credentials_out() {
         let url = "http://svc:pw-SECRET-1@h:1/orders?api_key=SECRET-2&page=1";
-        let e = refused(400, url, b"no route for GET /orders?api_key=SECRET-2&page=1 (svc:pw-SECRET-1)", 300);
-        assert_eq!(e, "HTTP 400: no route for GET /orders?<masked> (<masked>)");
-        // where the excerpt's cut would split the echo, it is still found whole
-        let body = format!("{}/orders?api_key=SECRET-2&page=1", "x".repeat(290));
-        let e = refused(400, url, body.as_bytes(), 300);
-        assert!(!e.contains("SECRET") && !e.contains("api_key") && e.contains("/orders?<m"), "{e}");
+        let e = refused(400, url, b"no route for GET /orders?api_key=SECRET-2&page=1 (svc:pw-SECRET-1)", 300, &[]);
+        assert_eq!(e, "HTTP 400: no route for GET /orders?api_key=<masked>&page=1 (svc:<masked>)");
         // a credential-named pair, under the record's mask (ADR-0017)
-        let e = refused(401, "http://h/x", br#"{"error":"bad","client_secret":"K3Y"}"#, 300);
+        let e = refused(401, "http://h/x", br#"{"error":"bad","client_secret":"K3Y"}"#, 300, &[]);
         assert!(!e.contains("K3Y"), "{e}");
         // a redirect is not followed, and says where to look
-        let e = refused(302, url, b"<a href=/elsewhere?api_key=SECRET-2>", 300);
+        let e = refused(302, url, b"<a href=/elsewhere?api_key=SECRET-2>", 300, &[]);
         assert!(e.starts_with("HTTP 302 from h:1: a redirect, not followed") && !e.contains("SECRET"), "{e}");
+        // 304 is no redirect
+        assert!(refused(304, url, b"", 300, &[]).starts_with("HTTP 304: "));
+    }
+
+    #[test]
+    fn an_echo_is_masked_in_every_form_it_takes() {
+        // names the pair mask does not know, a value with characters to escape
+        let url = "https://alice@h/hook/T0001/B0001/SECRETPATHTOKEN99?key=LIT-K3Y-0001&sig=ab/cd+ef&owner=alice&page=1";
+        for body in [
+            // HTML, Go's JSON, decoded, the value alone, the path
+            "<p>bad request: /hook?key=LIT-K3Y-0001&amp;sig=ab%2Fcd%2Bef&amp;page=1</p>",
+            r#"{"url":"/x?key=LIT-K3Y-0001\u0026sig=ab/cd ef"}"#,
+            "the signature ab/cd ef is not valid for LIT-K3Y-0001",
+            "sig=ab%2fcd%20ef",
+            "\"LIT-K3Y-0001\" is not a valid key",
+            "no webhook /hook/T0001/B0001/SECRETPATHTOKEN99",
+        ] {
+            let e = excerpt(url, body.as_bytes(), 300, &[]);
+            let shown = e.to_ascii_lowercase();
+            assert!(!e.contains("LIT-K3Y") && !e.contains("SECRETPATH") && !shown.contains("ab/cd") && !shown.contains("ab%2fcd"), "{body} → {e}");
+        }
+        // a user name that is also a query value does not stop the query's mask
+        let e = excerpt(url, b"owner alice, key LIT-K3Y-0001", 300, &[]);
+        assert!(!e.contains("LIT-K3Y"), "{e}");
+        // what the caller names, as a client secret, is masked the same way,
+        // in a text that names it as nothing the record's mask reads
+        let e = excerpt("http://h/token", b"no client holds s3cr%2Ft-value", 300, &["s3cr/t-value"]);
+        assert_eq!(e, "no client holds <masked>");
+    }
+
+    #[test]
+    fn an_echo_is_found_through_any_escape() {
+        let url = "http://h/x?php=AB%2FCD%2BEF-PHP01&net=AB%2BCD-NET01&pyq=AB%2FCD%2BEF-PYQ01&htm=AB%2FCD%2BEF-HTM01&til=AB~CD-TIL01";
+        for body in [
+            // PHP's json_encode, .NET's System.Text.Json, Python's quote(),
+            // HTML's numeric entities, a `~` percent-encoded
+            r#"{"message":"Invalid signature: AB\/CD+EF-PHP01"}"#,
+            r#"{"message":"AB\u002BCD-NET01 is not valid"}"#,
+            "bad pyq=AB/CD%2BEF-PYQ01",
+            "<p>AB&#x2F;CD&#43;EF-HTM01</p>",
+            "til=AB%7ECD-TIL01",
+        ] {
+            let e = excerpt(url, body.as_bytes(), 300, &[]);
+            assert!(!["PHP01", "NET01", "PYQ01", "HTM01", "TIL01"].iter().any(|tail| e.contains(tail)), "{body} → {e}");
+            assert!(e.contains("<masked>"), "{body} → {e}");
+        }
+    }
+
+    #[test]
+    fn a_value_that_names_a_credential_leaves_the_record_its_pair() {
+        // the record's mask goes first: the pair's value is masked by its name
+        let e = excerpt("http://h/x?include=password", br#"{"password":"hunter2-PAIR01"}"#, 300, &[]);
+        assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    #[test]
+    fn a_date_or_a_version_in_the_url_is_no_credential() {
+        let url = "http://h/v1/reports/2024-02-01T00:00:00?api-version=2024-02-01&key=K3Y-DATE-01";
+        let e = excerpt(url, b"created 2024-02-01 for 2024-02-01T00:00:00 with K3Y-DATE-01", 300, &[]);
+        assert_eq!(e, "created 2024-02-01 for 2024-02-01T00:00:00 with <masked>");
+    }
+
+    #[test]
+    fn a_resource_named_in_words_is_no_token() {
+        let url = "http://h/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartnerX";
+        let e = excerpt(url, b"Resource not found for segment 'A_BusinessPartnerX'", 300, &[]);
+        assert_eq!(e, "Resource not found for segment 'A_BusinessPartnerX'");
+        let e = excerpt("https://graph.x/v1.0/deviceManagement/managedDevices", b"no deviceManagement here", 300, &[]);
+        assert_eq!(e, "no deviceManagement here");
+    }
+
+    #[test]
+    fn a_2xx_answer_keeps_the_values_of_its_url_out() {
+        let echoes = Echoes::of("http://h/okecho?key=OKECHO-K3Y-01");
+        let kept = echoes.masked(r#"{"ok":true,"url":"/okecho?key=OKECHO-K3Y-01"}"#.to_string());
+        assert!(!kept.contains("OKECHO-K3Y") && kept.contains("<masked>"), "{kept}");
+        // past what the record keeps, the start only
+        let long = format!("{}OKECHO-K3Y-01", "x".repeat(ANSWER_KEPT + 100));
+        let kept = echoes.masked(long);
+        assert!(kept.ends_with('…') && !kept.contains("OKECHO") && kept.len() < ANSWER_KEPT + 16, "{}", kept.len());
+        // a URL with nothing to mask leaves the answer as it came
+        assert_eq!(Echoes::of("http://h/plain").masked("as it came".to_string()), "as it came");
+    }
+
+    #[test]
+    fn an_absolute_endpoint_is_shown_without_its_user_info() {
+        assert_eq!(path_shown("http://svc:pw-USERINFO-01@h:1/missing?x=1"), "http://h:1/missing");
+        assert_eq!(path_shown("/data?code=K3Y"), "/data");
+    }
+
+    #[test]
+    fn the_cut_never_splits_a_masked_value() {
+        let url = "http://h/x?key=LIT-K3Y-SPLIT";
+        // an echo across the cut is masked whole
+        let body = format!("{}LIT-K3Y-SPLIT and more", "x".repeat(295));
+        let e = excerpt(url, body.as_bytes(), 300, &[]);
+        assert!(e.ends_with("<masked>") && !e.contains("LIT"), "{e}");
+        // and one after the cut is not shown at all
+        let body = format!("key=LIT-K3Y-SPLIT {} LIT-K3Y-SPLIT&units=metric", "y".repeat(300));
+        let e = excerpt(url, body.as_bytes(), 300, &[]);
+        assert!(!e.contains("LIT") && !e.contains("metri"), "{e}");
+        // a cut inside a character backs off to its start
+        let e = excerpt(url, "ééé".as_bytes(), 3, &[]);
+        assert_eq!(e, "é");
     }
 
     #[test]

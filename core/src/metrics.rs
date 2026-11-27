@@ -531,7 +531,9 @@ pub fn otlp_init() {
         let (tx, rx) = sync_channel::<Span>(config.queue);
         eprintln!("[vejas] OTLP traces -> {}", shown(&config.url));
         let spawned = std::thread::Builder::new().name("otlp-export".into()).spawn(move || {
-            let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
+            // no redirect: ureq would take OTEL_EXPORTER_OTLP_HEADERS, an API
+            // key among them, to wherever the collector's answer points
+            let agent = ureq::AgentBuilder::new().timeout(config.timeout).redirects(0).build();
             let mut batch: Vec<Span> = Vec::with_capacity(config.batch);
             let mut oldest: Option<Instant> = None;
             let mut last_report: Option<Instant> = None;
@@ -649,7 +651,22 @@ fn export(agent: &ureq::Agent, config: &ExportConfig, body: &str) -> Result<u64,
             request = request.set(k, v);
         }
         let wait = match request.send_string(body) {
-            Ok(response) => return Ok(rejected_spans(&response.into_string().unwrap_or_default())),
+            Ok(response) if (200..300).contains(&response.status()) => {
+                return Ok(rejected_spans(&response.into_string().unwrap_or_default()))
+            }
+            // with no redirect followed, a 3xx comes back as an answer: the
+            // spans were not taken
+            Ok(response) => {
+                let code = response.status();
+                return Err(match code {
+                    301 | 302 | 303 | 307 | 308 => format!(
+                        "HTTP {code} from {}: a redirect, not followed, since the headers would go along: \
+                         set OTEL_EXPORTER_OTLP_ENDPOINT to the address it points to",
+                        crate::connectors::host_of(&config.url)
+                    ),
+                    _ => format!("HTTP {code}"),
+                });
+            }
             Err(ureq::Error::Status(code, response)) if matches!(code, 429 | 502 | 503 | 504) => {
                 if attempt == ATTEMPTS {
                     return Err(format!("HTTP {code} after {ATTEMPTS} attempts"));

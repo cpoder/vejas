@@ -625,6 +625,78 @@ impl Vault {
             }
         }
     }
+
+    /// Where its values are in `text`, as it is and in each of `views`, its
+    /// readings: a cut from the first byte each was read from to the last
+    /// (see `Scrub::vault_cuts`).
+    fn cuts(&self, text: &str, views: &[View], with: With, cuts: &mut Vec<Cut>) {
+        let Vault::Values { finder, .. } = self else { return };
+        let whole = Cut { start: 0, end: text.len(), with };
+        let before = cuts.len();
+        let read = std::iter::once((text.as_bytes(), None)).chain(views.iter().map(|v| (&v.bytes[..], Some(&v.spans[..]))));
+        for (bytes, spans) in read {
+            let Ok(found) = finder.try_find_overlapping_iter(bytes) else {
+                cuts.truncate(before);
+                cuts.push(whole);
+                return;
+            };
+            let (mark, most) = (cuts.len(), 4 * bytes.len() + 64);
+            for m in found {
+                if cuts.len() - mark >= most {
+                    cuts.truncate(before);
+                    cuts.push(whole);
+                    return;
+                }
+                let (start, end) = match spans {
+                    None => (m.start(), m.end()),
+                    Some(s) => (s[m.start()].0, s[m.end() - 1].1),
+                };
+                cuts.push(Cut { start, end, with });
+            }
+        }
+    }
+}
+
+/// Values a text is searched for as the record searches it for the values the
+/// secret stores handed out: the credentials a request carries in its URL,
+/// which the system it calls may echo in its answer, in any form.
+pub struct Values(Vault);
+
+impl Values {
+    pub fn of(values: &[String]) -> Values {
+        Values(Vault::of(values))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self.0, Vault::Empty)
+    }
+
+    /// The length of the longest of them.
+    pub fn longest(&self) -> usize {
+        match &self.0 {
+            Vault::Values { longest, .. } => *longest,
+            _ => 0,
+        }
+    }
+
+    /// Where they are in `text`: as they are, and once its escapes are read,
+    /// one level after the other (JSON's, a URL's `%XX`, the entities of HTML
+    /// and XML), so that `AB\/CD`, `AB%2FCD` and `AB&#x2F;CD` are all found
+    /// as `AB/CD`. One read from escapes spans them whole. Byte ranges of
+    /// `text` on its character boundaries, sorted; values that could not be
+    /// indexed find the whole text.
+    pub fn found_in(&self, text: &str) -> Vec<(usize, usize)> {
+        let mut cuts = Vec::new();
+        match &self.0 {
+            Vault::Empty => {}
+            Vault::Unusable => cuts.push(Cut { start: 0, end: text.len(), with: With::Masked }),
+            vault @ Vault::Values { .. } => vault.cuts(text, &readings(text.as_bytes()), With::Masked, &mut cuts),
+        }
+        let mut found: Vec<(usize, usize)> =
+            cuts.iter().map(|c| (floor_boundary(text, c.start), ceil_boundary(text, c.end))).collect();
+        found.sort_unstable();
+        found
+    }
 }
 
 /// A text as it reads once one level of its escapes is read.
@@ -981,30 +1053,7 @@ impl Scrub {
     /// at every position many times: past four matches a byte, the whole text
     /// goes, which is about what they cover anyway.
     fn vault_cuts(&self, text: &str, views: &[View], cuts: &mut Vec<Cut>) {
-        let Vault::Values { finder, .. } = &self.vault else { return };
-        let whole = Cut { start: 0, end: text.len(), with: With::Secret };
-        let before = cuts.len();
-        let read = std::iter::once((text.as_bytes(), None)).chain(views.iter().map(|v| (&v.bytes[..], Some(&v.spans[..]))));
-        for (bytes, spans) in read {
-            let Ok(found) = finder.try_find_overlapping_iter(bytes) else {
-                cuts.truncate(before);
-                cuts.push(whole);
-                return;
-            };
-            let (mark, most) = (cuts.len(), 4 * bytes.len() + 64);
-            for m in found {
-                if cuts.len() - mark >= most {
-                    cuts.truncate(before);
-                    cuts.push(whole);
-                    return;
-                }
-                let (start, end) = match spans {
-                    None => (m.start(), m.end()),
-                    Some(s) => (s[m.start()].0, s[m.end() - 1].1),
-                };
-                cuts.push(Cut { start, end, with: With::Secret });
-            }
-        }
+        self.vault.cuts(text, views, With::Secret, cuts);
     }
 
     /// Where a text that ends in the start of a value handed out, `PREFIX_MIN`

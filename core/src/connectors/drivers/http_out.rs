@@ -2,7 +2,7 @@
 
 use vejas_connector::{answer_text, summarize};
 
-use crate::connectors::http_client::{host_of, http_post, http_request, refused};
+use crate::connectors::http_client::{host_of, http_post, http_request, refused, Echoes};
 use crate::connectors::{Ctx, Driver, humanize};
 
 pub(super) struct HttpOut;
@@ -26,15 +26,15 @@ impl Driver for HttpOut {
         match http_request("POST", &url, &headers, Some(&bytes)) {
             Ok((code, resp)) if (200..300).contains(&code) => Ok(crate::record::shown().error(&format!(
                 "POST OK · answered: {}",
-                summarize(&resp).unwrap_or_else(|| "(empty)".into())
+                summarize(&resp).map_or_else(|| "(empty)".into(), |answer| Echoes::of(&url).masked(answer))
             ))),
             Ok((401 | 403, _)) => Err(humanize(&format!("HTTP 401: authentication rejected by {}", host_of(&url)))),
-            Ok((code, resp)) if (300..400).contains(&code) => Err(refused(code, &url, &resp, 300)),
+            Ok((code, resp)) if (300..400).contains(&code) => Err(refused(code, &url, &resp, 300, &[])),
             // any other answer past auth still proves network + credentials;
             // only the probe payload was refused
             Ok((code, resp)) => Ok(format!(
                 "reachable and authenticated · but TEST_BODY was refused ({})",
-                refused(code, &url, &resp, 300)
+                refused(code, &url, &resp, 300, &[])
             )),
             Err(e) => Err(humanize(&e)),
         }
@@ -46,8 +46,11 @@ impl Driver for HttpOut {
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
+        // an answer may echo the URL, a 2xx as well as an error, and the
+        // record and the events keep it
+        let echoes = Echoes::of(&url);
         ctx.consume(&subject, move |data, trace| {
-            http_post(&url, &headers, data, Some(trace)).map(answer_text)
+            http_post(&url, &headers, data, Some(trace)).map(|body| answer_text(body).map(|text| echoes.masked(text)))
         })
     }
 }

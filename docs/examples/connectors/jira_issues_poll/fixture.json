@@ -1,5 +1,5 @@
 {
-  "endpoint": "http://127.0.0.1:9200/rest/api/3/search?jql=updated%3E%3D-1d&maxResults=100",
+  "endpoint": "http://127.0.0.1:9200/rest/api/3/search",
   "fetched_at": "2026-08-22T10:00:01Z",
   "body": {
     "issues": [
