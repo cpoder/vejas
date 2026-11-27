@@ -150,6 +150,8 @@ const HANDED_OUT_MIN: usize = 4;
 struct Handed {
     last_use: HashMap<String, u64>,
     clock: u64,
+    /// Those that are URLs: a URL built on one is a stored URL too.
+    urls: Vec<String>,
 }
 
 impl Handed {
@@ -169,10 +171,20 @@ impl Handed {
                 .map(|(v, _)| v.clone());
             if let Some(oldest) = oldest {
                 self.last_use.remove(&oldest);
+                self.urls.retain(|url| *url != oldest);
             }
+        }
+        if value.contains("://") {
+            self.urls.push(value.to_string());
         }
         self.last_use.insert(value.to_string(), now);
         true
+    }
+
+    /// Whether `url` is a value handed out, or starts with a URL handed out
+    /// (`{BASE_URL}/items`).
+    fn holds_url(&self, url: &str) -> bool {
+        self.last_use.contains_key(url) || self.urls.iter().any(|base| url.starts_with(base.as_str()))
     }
 }
 
@@ -205,12 +217,10 @@ pub fn handed_out() -> Vec<String> {
     values
 }
 
-/// Whether a store handed this value out: a URL a store holds is a
-/// credential whole.
-pub(crate) fn is_handed_out(value: &str) -> bool {
-    HANDED_OUT
-        .get()
-        .is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.contains_key(value))
+/// Whether a store handed this URL out, or one it starts with (a `BASE_URL`):
+/// such a URL is a credential whole, and nothing of it is named.
+pub(crate) fn is_stored_url(url: &str) -> bool {
+    HANDED_OUT.get().is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).holds_url(url))
 }
 
 /// A value as if a store had handed it out, for the tests of what reads them.
@@ -680,7 +690,20 @@ mod tests {
         let all = handed_out();
         assert!(all.iter().any(|v| v == "Hv7-stored-once-0001"));
         assert_eq!(all.iter().filter(|v| v.starts_with("Tk9-many-")).count(), 2);
-        assert!(is_handed_out("Hv7-stored-once-0001") && !is_handed_out("Tk9-many-00000"));
+        assert!(is_stored_url("Hv7-stored-once-0001") && !is_stored_url("Tk9-many-00000"));
+    }
+
+    #[test]
+    fn a_url_built_on_one_handed_out_is_stored_too() {
+        let mut handed = Handed::default();
+        handed.note("https://hooks.example/base", 2);
+        handed.note("a-plain-value", 2);
+        assert!(handed.holds_url("https://hooks.example/base") && handed.holds_url("https://hooks.example/base/items?page=2"));
+        assert!(handed.holds_url("a-plain-value") && !handed.holds_url("a-plain-value-and-more"));
+        assert!(!handed.holds_url("https://hooks.example/other"));
+        // a URL let go past the cap is no longer one
+        handed.note("third", 2);
+        assert!(!handed.holds_url("https://hooks.example/base/items") && handed.urls.is_empty());
     }
 
     #[test]

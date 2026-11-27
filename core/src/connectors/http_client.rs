@@ -34,7 +34,7 @@ const STORED_URL: &str = "a URL a secret store holds";
 /// user info, its path or its query, where credentials ride, and nothing of a
 /// URL a store handed out. A URL that does not parse is not guessed at.
 pub(crate) fn host_of(url: &str) -> String {
-    if crate::secrets::is_handed_out(url) {
+    if crate::secrets::is_stored_url(url) {
         return STORED_URL.into();
     }
     match url::Url::parse(url) {
@@ -51,7 +51,7 @@ pub(crate) fn host_of(url: &str) -> String {
 /// info and its query, and with any value a secret store handed out masked;
 /// nothing of a URL a store handed out.
 pub(crate) fn url_shown(url: &str) -> String {
-    if crate::secrets::is_handed_out(url) {
+    if crate::secrets::is_stored_url(url) {
         return STORED_URL.into();
     }
     match url::Url::parse(url) {
@@ -92,12 +92,11 @@ const ANSWER_KEPT: usize = 16 * 1024;
 /// of them once its escapes are read (`record::Values::found_in`).
 fn credentials(url: &str, also: &[&str]) -> crate::record::Values {
     // a URL a secret store handed out is a credential whole, each of its parts
-    credentials_in(url, also, crate::secrets::is_handed_out(url))
+    credentials_in(url, also, crate::secrets::is_stored_url(url))
 }
 
 fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Values {
     let mut values: Vec<String> = also.iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
-    let given = values.len();
     if let Ok(parsed) = url::Url::parse(url) {
         let mut secret = |value: &str, shortest: usize| {
             if value.len() >= shortest {
@@ -120,22 +119,16 @@ fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Valu
                 secret(value, SHORTEST_SECRET);
             }
         }
-        let mut uuids = Vec::new();
         for segment in parsed.path_segments().into_iter().flatten() {
+            // a UUID is one too: a webhook's credential (`/webhook/6f7b288e-…`)
+            // reads as a resource's name
             if stored {
                 secret(segment, SHORTEST_SECRET);
-            } else if is_uuid(segment) {
-                uuids.push(segment);
             } else if (segment.bytes().any(|b| b.is_ascii_digit()) && !is_date_or_version(&percent_decoded(segment)))
                 || reads_as_random(segment)
             {
                 secret(segment, SHORTEST_TOKEN);
             }
-        }
-        // a UUID names a resource, unless nothing else of the URL can be its
-        // credential: then it is one, as a webhook's (`/webhook/6f7b288e-…`)
-        if values.len() == given {
-            values.extend(uuids.into_iter().map(str::to_string));
         }
     }
     let mut readings = Vec::with_capacity(values.len() * 3);
@@ -236,13 +229,6 @@ fn reads_as_random(segment: &str) -> bool {
         && changes * 4 >= bytes.len()
 }
 
-/// A UUID, which in a path names a resource (`/devices/3f2b8c1e-…`).
-fn is_uuid(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { *b == b'-' } else { b.is_ascii_hexdigit() })
-}
-
 /// What of a sink's URL could carry a credential, to mask in what its system
 /// answers: an answer may echo the request, as a 2xx does as well as an error.
 pub(crate) struct Echoes(crate::record::Values);
@@ -323,7 +309,7 @@ fn call_agent() -> &'static ureq::Agent {
 /// URL a store handed out.
 fn transport_error(t: &ureq::Transport, url: &str) -> String {
     let mut text = String::new();
-    if crate::secrets::is_handed_out(url) {
+    if crate::secrets::is_stored_url(url) {
         text.push_str(STORED_URL);
         text.push_str(": ");
     } else if let Some(host) = t.url().and_then(|url| Some((url.host_str()?, url.port_or_known_default()))) {
@@ -524,7 +510,7 @@ pub(super) fn join_url(base: &str, endpoint: &str) -> String {
 pub(super) fn link_url(base: &str, page: &str, link: &str, what: &str) -> Result<String, String> {
     let origin = |url: &str| url::Url::parse(url).map(|url| url.origin());
     let shown = |url: &str| match url::Url::parse(url) {
-        _ if crate::secrets::is_handed_out(url) => STORED_URL.to_string(),
+        _ if crate::secrets::is_stored_url(url) => STORED_URL.to_string(),
         Ok(parsed) => format!("{}://{}", parsed.scheme(), host_of(url)),
         Err(_) => "a URL that does not parse".into(),
     };
@@ -742,12 +728,8 @@ mod tests {
         let url = "http://h/x?a=2.0.0-rc.1&b=1.4.2-beta2&c=1.0-SNAPSHOT&key=1.0-AbCdEf0123456789XyZ";
         let e = excerpt(url, b"2.0.0-rc.1 1.4.2-beta2 1.0-SNAPSHOT 1.0-AbCdEf0123456789XyZ", 300, &[]);
         assert_eq!(e, "2.0.0-rc.1 1.4.2-beta2 1.0-SNAPSHOT <masked>");
-        // a UUID in a path names a resource, when the URL has a credential
-        let url = "http://h/sap/devices/3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f?sap-client=100&code=K3Y-UUID-01";
-        let e = excerpt(url, b"Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'", 300, &[]);
-        assert_eq!(e, "Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'");
-        // and is the credential when nothing else can be, as a webhook's
-        let url = "http://h/webhook/6f7b288e-1efe-4504-a6fd-660931327269";
+        // a UUID may be a webhook's credential, whatever else the URL holds
+        let url = "http://h/webhook/6f7b288e-1efe-4504-a6fd-660931327269?source=vejas-prod";
         let e = excerpt(url, br#"The requested webhook "POST 6f7b288e-1efe-4504-a6fd-660931327269" is not registered."#, 300, &[]);
         assert_eq!(e, r#"The requested webhook "POST <masked>" is not registered."#);
     }
@@ -821,6 +803,9 @@ mod tests {
         assert_eq!(path_shown(url), STORED_URL);
         let refused = refused(302, url, b"", 300, &[]);
         assert!(refused.contains(STORED_URL) && !refused.contains("Nm4"), "{refused}");
+        // and a URL built on it, as a BASE_URL is
+        let built = "zqnamed://Nm4-stored-host.invalid:8443/x/y?k=v&page=2";
+        assert_eq!((host_of(built), url_shown(built)), (STORED_URL.to_string(), STORED_URL.to_string()));
     }
 
     #[test]

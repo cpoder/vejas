@@ -230,11 +230,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   16 bytes or more with a digit in it, as a webhook's address carries its
   token, or of letters that read as random, base64url's `-` and `_` among
   them. A date, a time or a version is no credential
-  (`api-version=2024-02-01`, `2.0.0-rc.1`), nor is a UUID in the path, which
-  names a resource, unless nothing else of the URL can be one
-  (`/webhook/6f7b288e-…`); a number is one, since a PIN or a key may be. Each
-  part of a URL a secret store handed out is one, its host and each segment
-  of 6 bytes or more, and the errors and the log name none of them. A shorter
+  (`api-version=2024-02-01`, `2.0.0-rc.1`); a number is one, since a PIN or
+  a key may be, and so is a UUID in the path, as a webhook's is
+  (`/webhook/6f7b288e-…`). Each part of a URL a secret store handed out, or
+  of one built on it (a `BASE_URL`), is one, its host and each segment of 6
+  bytes or more, and the errors and the log name none of them. A shorter
   token in the path, or one in words, is not found. Each is found as it is, decoded, and through
   the escapes the answer wraps it in, JSON's, a URL's or HTML's, the named
   signs of HTML5 among them (`&sol;`), as the record finds the values the
@@ -245,11 +245,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   token `oauth-poll` fetches is masked wherever the values the stores handed
   out are: each connector's last two, apart from those values, so that
   however many tokens come, none pushes a store's value out of the masks. On
-  a 401, another token is fetched once: one fetched for a refused token that
-  draws a 401 too is kept until it runs out, where a client the endpoint
+  a 401, another token is fetched, unless the endpoint refused one fetched
+  for its 401 already, until it answers otherwise: a client the endpoint
   refuses got a new token per endpoint and per tick. A token is used no
   longer than the token endpoint says it lives, less a tenth of that and a
-  minute at most; it was used 30 s at least. `http-out`, `http-poll` and `oauth-poll` read 64 KiB at most of
+  minute at most, 5 s at least; it was used 30 s at least. `http-out`, `http-poll` and `oauth-poll` read 64 KiB at most of
   an answer outside 2xx. `http-poll` logs its host instead of its URL,
   `oauth-poll` names its endpoints and an item's link without their query
   and their user info in its errors and its test, and the `http-out` test

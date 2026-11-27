@@ -1,5 +1,6 @@
 //! oauth-poll: the OAuth2 client-credentials REST poller.
 
+use std::collections::HashSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,8 +25,8 @@ use crate::metrics::Kind;
 
 pub(super) struct OAuthPoll;
 
-/// Client-credentials token cache: refreshed before it runs out, and once on
-/// a 401.
+/// Client-credentials token cache: refreshed before it runs out, and on a 401
+/// of a route that has not refused a token fetched for it (`authed_get`).
 struct TokenCache {
     /// The connector: its tokens are masked as its own (`secrets::hold`).
     holder: String,
@@ -33,70 +34,58 @@ struct TokenCache {
     client_id: String,
     client_secret: String,
     scope: String,
-    cached: Option<Cached>,
-}
-
-/// The token in use.
-struct Cached {
-    token: String,
-    /// When it is fetched again, before the token endpoint said it runs out.
-    deadline: Instant,
-    /// It drew a 401: the client may not read that endpoint (a scope, a
-    /// consent), which another token does not change.
-    refused: bool,
+    /// The token in use, and when it is fetched again, before the token
+    /// endpoint said it runs out.
+    cached: Option<(String, Instant)>,
+    /// The routes, an endpoint, an EXPAND's list or its details, that
+    /// answered 401 to a token fetched for their 401: the client may not
+    /// read them (a scope, a consent), which another token does not change.
+    refused: HashSet<String>,
 }
 
 impl TokenCache {
     fn bearer(&mut self) -> Result<String, String> {
-        if let Some(cached) = self.cached.as_ref().filter(|cached| Instant::now() < cached.deadline) {
-            return Ok(cached.token.clone());
+        if let Some((token, _)) = self.cached.as_ref().filter(|(_, deadline)| Instant::now() < *deadline) {
+            return Ok(token.clone());
         }
         let (token, life) = OAuthPoll::token(&self.holder, &self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
-        self.cached = Some(Cached { token: token.clone(), deadline: Instant::now() + life, refused: false });
+        self.cached = Some((token.clone(), Instant::now() + life));
         Ok(token)
-    }
-    /// A 401 to the token in use: whether to try another one. A token is
-    /// replaced at once, as a revoked one must be, unless it was fetched for
-    /// one refused and drew a 401 too: the client may not read that endpoint
-    /// (a scope, a consent), which another token does not change, and one
-    /// token per endpoint and per tick would hammer the token endpoint, each
-    /// one more value for the masks.
-    fn try_another(&mut self) -> bool {
-        let another = self.cached.as_ref().is_some_and(|cached| !cached.refused);
-        if another {
-            self.cached = None;
-        }
-        another
-    }
-    /// The token fetched for one refused drew a 401 too: kept till it runs out.
-    fn refuse(&mut self) {
-        if let Some(cached) = &mut self.cached {
-            cached.refused = true;
-        }
     }
 }
 
-/// GET with the cached bearer; on a 401, one retry with another token, unless
-/// the one in use is refused already (`TokenCache::try_another`).
-fn authed_get(tc: &mut TokenCache, url: &str) -> Result<(u16, Vec<u8>), String> {
+/// GET with the cached bearer. On a 401, one retry with another token, as a
+/// revoked one must be replaced, unless `route` refused one fetched for it
+/// already: one token per route and per tick would hammer the token
+/// endpoint, each one more value for the masks. A route that answers
+/// otherwise is taken for refused no more.
+fn authed_get(tc: &mut TokenCache, url: &str, route: &str) -> Result<(u16, Vec<u8>), String> {
     let get = |tok: &str| http_request("GET", url, &[("Authorization".to_string(), format!("Bearer {tok}"))], None);
     let answer = get(&tc.bearer()?)?;
-    if answer.0 != 401 || !tc.try_another() {
+    if answer.0 != 401 {
+        tc.refused.remove(route);
         return Ok(answer);
     }
+    if tc.refused.contains(route) {
+        return Ok(answer);
+    }
+    tc.cached = None;
     let answer = get(&tc.bearer()?)?;
     if answer.0 == 401 {
-        tc.refuse();
+        tc.refused.insert(route.to_string());
     }
     Ok(answer)
 }
 
 /// How long a token is used: its lifetime less a tenth of it, a minute at
 /// most, so that it is fetched again before it runs out; 5 minutes when the
-/// token endpoint does not say.
+/// token endpoint does not say. 5 s at least, so that a lifetime of 0 does
+/// not fetch a token a request, a 401 past it drawing another; a day at most.
 fn token_life(expires_in: Option<u64>) -> Duration {
-    let life = expires_in.unwrap_or(300);
-    Duration::from_secs(life - (life / 10).min(60))
+    const LEAST: u64 = 5;
+    const MOST: u64 = 86_400;
+    let life = expires_in.unwrap_or(300).min(MOST);
+    Duration::from_secs((life - (life / 10).min(60)).max(LEAST))
 }
 
 /// `{key}` placeholder substitution for EXPAND detail templates.
@@ -266,6 +255,7 @@ impl Driver for OAuthPoll {
             client_secret,
             scope,
             cached: None,
+            refused: HashSet::new(),
         };
         let mut waited = interval * 1000; // fire immediately on start
         loop {
@@ -304,7 +294,7 @@ impl Driver for OAuthPoll {
                     if !ctx.alive() {
                         return Ok(());
                     }
-                    match authed_get(&mut tc, &url) {
+                    match authed_get(&mut tc, &url, ep) {
                         Ok((code, body)) if (200..300).contains(&code) => {
                             let parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
@@ -352,7 +342,7 @@ impl Driver for OAuthPoll {
                     if !ctx.alive() {
                         return Ok(());
                     }
-                    match authed_get(&mut tc, &url) {
+                    match authed_get(&mut tc, &url, &spec.list) {
                         Ok((code, body)) if (200..300).contains(&code) => {
                             let mut parsed: Value = match serde_json::from_slice(&body) {
                                 Ok(v) => v,
@@ -396,7 +386,7 @@ impl Driver for OAuthPoll {
                                     };
                                     // a failing detail leaves null on THAT item;
                                     // the page still ships (per-item resilience)
-                                    let detail = match durl.and_then(|durl| authed_get(&mut tc, &durl)) {
+                                    let detail = match durl.and_then(|durl| authed_get(&mut tc, &durl, &spec.detail)) {
                                         Ok((c, b)) if (200..300).contains(&c) => {
                                             serde_json::from_slice::<Value>(&b)
                                                 .unwrap_or(Value::Null)
@@ -516,21 +506,36 @@ mod tests {
             client_secret: "s".into(),
             scope: String::new(),
             cached: None,
+            refused: HashSet::new(),
         };
-        // an endpoint the client may not read: one more token, not one a call
+        // a route the client may not read: one more token, not one a call
         let (base, fetched) = token_server("Rt7-oauth-loop-", |_| 401);
         let mut tc = cache("test:oauth-401-loop", &base);
         for _ in 0..5 {
-            assert_eq!(authed_get(&mut tc, &format!("{base}/api")).unwrap().0, 401);
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api").unwrap().0, 401);
         }
         assert_eq!(fetched.load(Ordering::SeqCst), 2);
         // a token revoked, or past its life: replaced at once
         let (base, fetched) = token_server("Rt7-oauth-revoked-", |token| if token.ends_with("-0001") { 401 } else { 200 });
         let mut tc = cache("test:oauth-401-revoked", &base);
         for _ in 0..3 {
-            assert_eq!(authed_get(&mut tc, &format!("{base}/api")).unwrap().0, 200);
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/api").unwrap().0, 200);
         }
         assert_eq!(fetched.load(Ordering::SeqCst), 2);
+        // a route refused does not keep another from drawing a new token
+        let (base, fetched) = token_server("Rt7-oauth-mixed-", |token| if token.ends_with("-0002") { 401 } else { 200 });
+        let mut tc = cache("test:oauth-401-mixed", &base);
+        let refused = |tc: &mut TokenCache| authed_get(tc, &format!("{base}/api"), "/never").map(|answer| answer.0);
+        tc.refused.insert("/never".into());
+        assert_eq!(refused(&mut tc).unwrap(), 200, "token 1 is good");
+        assert_eq!(fetched.load(Ordering::SeqCst), 1);
+        assert!(tc.refused.is_empty(), "a route that answers otherwise is refused no more");
+        tc.cached = None;
+        tc.refused.insert("/never".into());
+        // token 2 is revoked: /never keeps it, /other replaces it
+        assert_eq!(refused(&mut tc).unwrap(), 401);
+        assert_eq!(authed_get(&mut tc, &format!("{base}/api"), "/other").unwrap().0, 200);
+        assert_eq!(fetched.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -538,7 +543,9 @@ mod tests {
         assert_eq!(token_life(Some(3600)), Duration::from_secs(3540));
         assert_eq!(token_life(Some(20)), Duration::from_secs(18));
         assert_eq!(token_life(Some(5)), Duration::from_secs(5));
-        assert_eq!(token_life(Some(0)), Duration::ZERO);
+        // a lifetime of 0, or past a day
+        assert_eq!(token_life(Some(0)), Duration::from_secs(5));
+        assert_eq!(token_life(Some(u64::MAX)), Duration::from_secs(86_340));
         assert_eq!(token_life(None), Duration::from_secs(270));
     }
 
