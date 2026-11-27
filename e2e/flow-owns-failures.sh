@@ -55,11 +55,13 @@ python3 "$S/system.py" $SP "$S/calls" & SYS=$!
 calls(){ grep -cx "$1" "$S/calls"; }
 
 mkdir -p "$R/flows" "$R/services"
+# today's path, not the hold (ADR-0040): e2e/flow-holds.sh tries the hold
 cat > "$R/services/get_quote.vjs" <<V
 driver "http-rpc"
 URL = "http://127.0.0.1:$SP/quotes/{id}"
 ATTEMPTS = 3
 DELAY_MS = 200
+WHEN_DOWN = "dead-letter"
 V
 # the same system, a second apart: a message it fails dies on its second delivery
 cat > "$R/services/slow_quote.vjs" <<V
@@ -67,6 +69,7 @@ driver "http-rpc"
 URL = "http://127.0.0.1:$SP/quotes/{id}"
 ATTEMPTS = 2
 DELAY_MS = 1000
+WHEN_DOWN = "dead-letter"
 V
 cat > "$R/flows/ordered.vjs" <<'V'
 # flow: ordered
