@@ -75,12 +75,50 @@ struct ProcState {
     restarts: u64,
     started_at: Option<u64>,
     last_error: Option<String>,
+    /// While the flow holds its message because a system is down (ADR-0040):
+    /// the service, since when, the last error, the probes, the next one.
+    hold: Option<Value>,
 }
 
 struct Handle {
     spec: Spec,
     state: Mutex<ProcState>,
     stop: AtomicBool,
+    /// A person asked to release the held message, or to probe now
+    /// (ADR-0040, point 5). The flow's loop takes them.
+    release: Ask,
+    probe_now: Ask,
+    /// The holds this flow went into: each has its number, its generation.
+    holds: AtomicU64,
+}
+
+/// A person's act on a held message (ADR-0040, point 5). What is asked is one
+/// word: the generation of the hold it targets, then a number of the act's
+/// own. Only that hold takes it, and the act that asked is confirmed only by
+/// the hold taking that very word: a hold that ended, a new one, or a second
+/// act asked at the same time confirm nothing.
+#[derive(Default)]
+struct Ask {
+    asked: AtomicU64,
+    taken: AtomicU64,
+}
+
+/// The acts asked of held flows, numbered.
+static ACTS: AtomicU64 = AtomicU64::new(0);
+
+impl Ask {
+    /// The hold of generation `generation` takes what was asked of it.
+    fn take(&self, generation: u64) -> bool {
+        let asked = self.asked.load(Ordering::SeqCst);
+        if asked == 0 || asked >> 32 != generation {
+            return false;
+        }
+        if self.asked.compare_exchange(asked, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return false;
+        }
+        self.taken.store(asked, Ordering::SeqCst);
+        true
+    }
 }
 
 type Registry = Arc<Mutex<HashMap<String, Arc<Handle>>>>;
@@ -865,7 +903,7 @@ fn approval_authorized(request: &tiny_http::Request) -> bool {
 /// set, the documented production posture, leaves the human unable to approve
 /// from the panel.
 fn is_human_route(path: &str) -> bool {
-    matches!(path, "/dlq/replay" | "/dlq/purge")
+    matches!(path, "/dlq/replay" | "/dlq/purge" | "/hold/release" | "/hold/probe")
         || (path.starts_with("/proposals/")
             && (path.ends_with("/approve") || path.ends_with("/reject")))
 }
@@ -1067,6 +1105,72 @@ fn dlq_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
         return Err((401, "unauthorized: X-Approval-Token required".into()));
     }
     Err((409, DLQ_HUMAN_ACT.into()))
+}
+
+const HOLD_HUMAN_ACT: &str = "approval required: releasing a held message or probing its system \
+    is a human action in governed mode: the panel, or X-Approval-Token (ADR-0024, ADR-0040)";
+
+/// Releasing a held message, or probing now (ADR-0040, point 5): human acts in
+/// governed mode, as a DLQ replay is.
+fn hold_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
+    if !require_approval() || approval_authorized(request) {
+        return Ok(());
+    }
+    if request.headers().iter().any(|h| h.field.equiv("x-approval-token")) {
+        return Err((401, "unauthorized: X-Approval-Token required".into()));
+    }
+    Err((409, HOLD_HUMAN_ACT.into()))
+}
+
+/// Release the message a flow holds, or have it probe now (ADR-0040, point 5),
+/// recorded in the audit with who asked. The act is answered once the flow
+/// took it: a hold that ended meanwhile, or a flow that holds nothing here,
+/// answers 409 (in a cluster another instance may hold it), and nothing is
+/// recorded. An act the audit could not record is answered 500, as taken.
+fn hold_act(registry: &Registry, flow: Option<&str>, release: bool, actor: &str) -> Result<Value, (u16, String)> {
+    let flow = flow.ok_or((400, "give the flow: {\"flow\": \"name\"}".to_string()))?;
+    let handle = registry.lock().unwrap().get(flow).cloned().ok_or((404, format!("no flow {flow}")))?;
+    let holds_nothing = || (409, format!("{flow} holds no message on this instance"));
+    let generation_now = || handle.state.lock().unwrap().hold.as_ref().and_then(|h| h["generation"].as_u64());
+    let Some(hold) = handle.state.lock().unwrap().hold.clone() else {
+        return Err(holds_nothing());
+    };
+    let generation = hold["generation"].as_u64().unwrap_or(0);
+    let kind = if release { "hold-release" } else { "hold-probe" };
+    let ask = if release { &handle.release } else { &handle.probe_now };
+    let word = (generation << 32) | ((ACTS.fetch_add(1, Ordering::SeqCst) + 1) & 0xffff_ffff);
+    if ask.asked.compare_exchange(0, word, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err((409, format!("a {kind} of {flow} is asked already, and not taken yet")));
+    }
+    // The flow takes it between two probes: a run or a probe under way
+    // finishes first, a call each within its TIMEOUT_MS.
+    let until = Instant::now() + Duration::from_secs(60);
+    while ask.taken.load(Ordering::SeqCst) != word {
+        let ended = generation_now() != Some(generation);
+        if ended || Instant::now() >= until {
+            if ask.asked.compare_exchange(word, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Err(if ended {
+                    holds_nothing()
+                } else {
+                    (503, format!("{flow} did not take the {kind} within a minute; ask again"))
+                });
+            }
+            // taken as we gave up: `taken` says so next
+            continue;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let record = json!({
+        "ts": now_secs(), "actor": actor, "kind": kind, "unit": flow,
+        "service": hold["service"], "subject": hold["subject"],
+    });
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let audited = bus::connect(&url).and_then(|nc| connectors::to_audit(&nc.jetstream(), flow, &record));
+    if let Err(e) = audited {
+        eprintln!("[vejas] {kind}: audit not written: {e}");
+        return Err((500, format!("{kind} of {flow} taken, but the audit did not record it: {e}")));
+    }
+    Ok(json!({"ok": true, "flow": flow, "action": if release { "release" } else { "probe" }, "hold": hold}))
 }
 
 /// Governed-change mode (ADR-0024): when `VEJAS_REQUIRE_APPROVAL=1`, a direct
@@ -1476,13 +1580,20 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             let js = nc.jetstream();
             let _ = js.add_stream(&bus::StreamConfig::bus(&stream, &subj_root));
             let durable = handle.spec.name.replace([':', '.'], "_");
+            let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
+            // A flow that calls a service that holds its source takes one
+            // message at a time across instances: while one instance holds a
+            // message, the others wait (ADR-0040, point 3). Any other flow
+            // gives the server's default back to a durable that had it.
+            let mut one_at_a_time = engine.holds_its_source(&prog);
             // create the durable pull consumer (idempotent-ish), then bind
-            let _ = js.create_pull_consumer(
+            let _ = js.create_pull_consumer_with(
                 &stream,
                 &durable,
                 std::slice::from_ref(&source),
                 connectors::ack_wait(),
                 None,
+                one_at_a_time.then_some(1),
             );
             let sub = js.pull_durable(&stream, &durable, Some(&source))?;
             set_state(&handle, |st| {
@@ -1494,7 +1605,6 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 "[vejas] {} (vjs, native) consuming {source}",
                 handle.spec.name
             );
-            let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
             // What `seen` reads and `remember` marks (ADR-0039, point 4).
             let memory = memory::Bucket::of(&js, &handle.spec.name);
             engine.remember_in(Some(memory.clone()));
@@ -1536,7 +1646,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 }
                 engine.refresh(SERVICES_FRESH); // pick up live service edits
                 let round_t0 = Instant::now();
-                let next = if one_by_one { None } else { Some(sub.round()?) };
+                let mut next = if one_by_one { None } else { Some(sub.round()?) };
                 // Messages are processed as they arrive, not once the whole batch
                 // has landed, so reading and working overlap instead of taking
                 // turns.
@@ -1549,7 +1659,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 // then: acked and recorded, or failed if the stream refused one
                 // of its emits.
                 let mut ran: Vec<Ran> = Vec::new();
-                for msg in fetch {
+                // A held message is kept in progress until it is settled (ADR-0040).
+                let mut in_hand: Option<InHand> = None;
+                while let Some(msg) = fetch.next() {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -1629,26 +1741,121 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     // a failed run, capped by MAX_DELIVERIES and dead-lettered, and
                     // the emits it held before the refusal go back out of the batch:
                     // a run's emits leave all together or not at all (ADR-0032).
-                    let held = batch.held();
-                    let outcome = vjs::run(&prog, &event, &mut engine).and_then(|ctx| {
-                        for (subj, payload) in &ctx.emits {
-                            let bytes = serde_json::to_vec(payload).unwrap_or_default();
-                            // held; sent and confirmed once per batch below
-                            batch
-                                .publish_traced(subj, bytes, &carried)
-                                .map_err(|e| format!("publish {subj}: {e}"))?;
-                        }
-                        Ok(ctx)
-                    });
-                    if outcome.is_err() {
-                        batch.rollback(held);
-                    }
+                    let mut held = batch.held();
+                    let mut outcome = run_into(&prog, &event, &mut engine, &mut batch, &carried);
                     if traced {
                         for invoked in engine.take_spans() {
                             metrics::span(invoke_span(&handle.spec.name, invoked));
                         }
                     }
-                    let steps = engine.take_steps();
+                    let mut steps = engine.take_steps();
+                    let mut failure = if outcome.is_err() { engine.take_failure() } else { None };
+                    // A call whose system is down, on a service that holds its
+                    // source: the flow keeps the message in hand and tries it
+                    // again until the system answers (ADR-0040). The hold ends
+                    // with a run that passes, or with a failure that takes the
+                    // path below as spent.
+                    let mut hold_ended = false;
+                    let mut held_note = None;
+                    if let (Err(error), Some(first)) = (&outcome, failure.as_ref().filter(|f| f.holds())) {
+                        in_hand = Some(InHand::keep(&msg));
+                        // One at a time from now on, across instances. Should the
+                        // update fail, the messages given back below come back
+                        // after an ack wait, not at once into a pull.
+                        let mut give_back_after = None;
+                        if !one_at_a_time {
+                            match js.create_pull_consumer_with(
+                                &stream,
+                                &durable,
+                                std::slice::from_ref(&source),
+                                connectors::ack_wait(),
+                                None,
+                                Some(1),
+                            ) {
+                                Ok(_) => one_at_a_time = true,
+                                Err(e) => {
+                                    eprintln!("[vejas] {}: one message at a time not set on {durable}: {e}", handle.spec.name);
+                                    give_back_after = Some(connectors::ack_wait().max(Duration::from_secs(1)));
+                                }
+                            }
+                        }
+                        let give_back = |rest: bus::Message| {
+                            let _ = match give_back_after {
+                                Some(delay) => rest.nak_after(delay),
+                                None => rest.nak(),
+                            };
+                        };
+                        // A flow that took its messages in rounds (a service
+                        // edited to call a system): the messages after this one
+                        // go back, those of the round asked for ahead too, and
+                        // what already ran in the round is settled now, so that
+                        // none waits on the hold unkept (ADR-0040).
+                        if !one_by_one {
+                            one_by_one = true;
+                            // the round asked for ahead first: drained, it asks
+                            // for nothing more, and none given back comes into it
+                            if let Some(ahead) = next.take() {
+                                for rest in ahead {
+                                    give_back(rest);
+                                }
+                            }
+                            for rest in fetch.by_ref() {
+                                give_back(rest);
+                            }
+                            let confirmed = batch.confirm_each();
+                            if let Err(e) = &confirmed {
+                                eprintln!("[vejas] {}: flush before ack failed: {e} (batch redelivers)", handle.spec.name);
+                            }
+                            let unit = Unit {
+                                handle: &handle,
+                                file: &code_file,
+                                version: &flow_version,
+                                overlay_of: overlay_of.as_ref(),
+                                js: &js,
+                                durable: &durable,
+                                memory: &memory,
+                            };
+                            let acked = settle(std::mem::take(&mut ran), &confirmed, &unit);
+                            for done in &acked {
+                                settled.add(done);
+                            }
+                            if let Err(e) = nc.ack_all(&acked) {
+                                eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
+                            }
+                            held = batch.held();
+                        }
+                        let (first, error) = (first.clone(), error.clone());
+                        let mut holding = Holding {
+                            handle: &handle,
+                            prog: &prog,
+                            event: &event,
+                            engine: &mut engine,
+                            batch: &mut batch,
+                            carried: &carried,
+                            msg: &msg,
+                            js: &js,
+                            stream: &stream,
+                            durable: &durable,
+                            subj_root: &subj_root,
+                            traced,
+                            generation: 0,
+                        };
+                        match hold(&mut holding, first, error) {
+                            Held::Ran { outcome: o, steps: s, failure: f, ended, note } => {
+                                outcome = o;
+                                steps = s;
+                                failure = f;
+                                hold_ended = ended;
+                                held_note = Some(note);
+                            }
+                            Held::Stopped => {
+                                // first in line for the next holder (ADR-0040)
+                                drop(in_hand.take());
+                                let _ = msg.nak();
+                                return Ok(());
+                            }
+                        }
+                    }
                     match outcome {
                         Ok(ctx) => ran.push(Ran {
                             emits: held..batch.held(),
@@ -1664,9 +1871,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             start_nanos,
                             secs: t0.elapsed().as_secs_f64(),
                             observing,
+                            held: held_note,
                             msg,
                         }),
                         Err(e) => {
+                            // settled here: no longer kept in progress
+                            drop(in_hand.take());
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
                             metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
                             // poison guard: past MAX_DELIVERIES the message is
@@ -1678,8 +1888,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             // again at its next delivery, after the service's delay,
                             // while the service allows it; a call no later try can
                             // change, or whose attempts are spent, is a dead letter now.
-                            let failure = engine.take_failure();
-                            let spent = failure.as_ref().is_some_and(|f| !f.retry || delivered >= f.attempts);
+                            // A hold that ended on a failure no later try changes
+                            // leaves it to the catch, which has run, or the DLQ now.
+                            let spent = hold_ended
+                                || failure.as_ref().is_some_and(|f| !f.retry || delivered >= f.attempts);
                             let mut dead_lettered = false;
                             if delivered >= MAX_DELIVERIES || spent {
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
@@ -1711,6 +1923,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             if observing {
                                 let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos);
                                 let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
+                                let span = match &held_note {
+                                    Some(note) => note.on(span),
+                                    None => span,
+                                };
                                 record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data).steps(steps));
                             }
                             set_state(&handle, |st| st.last_error = Some(e));
@@ -1742,6 +1958,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 for msg in &acked {
                     settled.add(msg);
                 }
+                // no in-progress after the ack
+                drop(in_hand);
                 if let Err(e) = nc.ack_all(&acked) {
                     eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                 }
@@ -1881,6 +2099,359 @@ struct Ran {
     start_nanos: u128,
     secs: f64,
     observing: bool,
+    /// The hold the run ended, when the flow held its message (ADR-0040).
+    held: Option<HoldNote>,
+}
+
+/// Run a flow over one event, holding its emits in `batch` for the round's
+/// confirmation: a run's emits leave all together or not at all (ADR-0032).
+/// Holding an emit is local, so a refusal is final for this message: it can
+/// never leave, however often it redelivers. That makes it a failed run, and
+/// the emits it held before the refusal go back out of the batch.
+fn run_into(
+    prog: &vjs::Program,
+    event: &Value,
+    engine: &mut vjs::Engine,
+    batch: &mut bus::Batch,
+    carried: &trace::Context,
+) -> Result<vjs::Ctx, String> {
+    let held = batch.held();
+    let outcome = vjs::run(prog, event, engine).and_then(|ctx| {
+        for (subj, payload) in &ctx.emits {
+            let bytes = serde_json::to_vec(payload).unwrap_or_default();
+            // held; sent and confirmed once per batch
+            batch
+                .publish_traced(subj, bytes, carried)
+                .map_err(|e| format!("publish {subj}: {e}"))?;
+        }
+        Ok(ctx)
+    });
+    if outcome.is_err() {
+        batch.rollback(held);
+    }
+    outcome
+}
+
+/// What a flow needs to hold a message and run it again (ADR-0040).
+struct Holding<'a> {
+    handle: &'a Handle,
+    prog: &'a vjs::Program,
+    event: &'a Value,
+    engine: &'a mut vjs::Engine,
+    batch: &'a mut bus::Batch,
+    carried: &'a trace::Context,
+    msg: &'a bus::Message,
+    js: &'a bus::JetStream,
+    stream: &'a str,
+    durable: &'a str,
+    subj_root: &'a str,
+    traced: bool,
+    /// The hold's generation once the flow is held, 0 while it tries in hand.
+    generation: u64,
+}
+
+/// What became of a message a flow held (ADR-0040).
+enum Held {
+    /// The run that ended the hold: it passed, or it failed. `ended`: no later
+    /// try changes its failure, so its catch has run or it is a dead letter
+    /// now. Otherwise the failure takes today's path (a secret store that did
+    /// not answer keeps the pace of deliveries).
+    Ran {
+        outcome: Result<vjs::Ctx, String>,
+        steps: Option<vjs::Steps>,
+        failure: Option<connectors::answer::Failure>,
+        ended: bool,
+        note: HoldNote,
+    },
+    /// The runtime or the flow stops: the message goes back to the bus now.
+    Stopped,
+}
+
+/// What the trace record says of a hold: the service, how long the message
+/// was in hand, its runs and the probes.
+struct HoldNote {
+    service: String,
+    millis: u64,
+    tries: i64,
+    probes: u64,
+}
+
+impl HoldNote {
+    fn on(&self, span: metrics::Span) -> metrics::Span {
+        span.attr("vejas.hold.service", self.service.clone())
+            .attr("vejas.hold.ms", self.millis)
+            .attr("vejas.hold.tries", self.tries)
+            .attr("vejas.hold.probes", self.probes)
+    }
+}
+
+/// Why a held flow's wait ended.
+enum Woken {
+    Due,
+    Stop,
+    Release,
+    ProbeNow,
+}
+
+/// Keeps a message in progress for as long as the flow holds it in hand
+/// (ADR-0040): from its first failure until it is settled, through its runs,
+/// its probes and their calls, each up to `TIMEOUT_MS`. A thread of its own
+/// tells the bus every third of the `ack_wait`, so that no other instance is
+/// given the message meanwhile. Dropped, it stops, before the message is
+/// acked or given back.
+struct InHand {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl InHand {
+    fn keep(msg: &bus::Message) -> InHand {
+        let keeper = msg.keeper();
+        let wait = connectors::ack_wait();
+        let wait = if wait.is_zero() { Duration::from_secs(30) } else { wait };
+        let every = (wait / 3).max(Duration::from_millis(200));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut last: Option<Instant> = None;
+            while !stopped.load(Ordering::SeqCst) {
+                if last.is_none_or(|at| at.elapsed() >= every) {
+                    let _ = keeper.in_progress();
+                    last = Some(Instant::now());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        InHand { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for InHand {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Wait `pause` with the message in hand (`InHand` keeps it in progress). A
+/// stop ends the wait at once; once the flow is held, so do a release and a
+/// probe a person asked for.
+fn hold_wait(h: &Holding, pause: Duration) -> Woken {
+    let held = h.generation != 0;
+    let until = Instant::now() + pause;
+    loop {
+        if !RUNNING.load(Ordering::SeqCst) || h.handle.stop.load(Ordering::SeqCst) {
+            return Woken::Stop;
+        }
+        if held && h.handle.release.take(h.generation) {
+            return Woken::Release;
+        }
+        if held && h.handle.probe_now.take(h.generation) {
+            return Woken::ProbeNow;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return Woken::Due;
+        }
+        thread::sleep((until - now).min(Duration::from_millis(100)));
+    }
+}
+
+/// Run the held message again: its outcome, its steps, and the failure it
+/// took, if it failed. A rerun is no delivery: a failure the hold does not
+/// take (a service that says dead-letter, a secret store that did not
+/// answer) counts the message's real deliveries for its catch.
+fn run_again(
+    h: &mut Holding,
+) -> (Result<vjs::Ctx, String>, Option<vjs::Steps>, Option<connectors::answer::Failure>) {
+    h.engine.record_steps(record::on());
+    h.engine.delivered(Some(h.msg.delivery().map(|d| d.delivered).unwrap_or(1)));
+    let outcome = run_into(h.prog, h.event, h.engine, h.batch, h.carried);
+    if h.traced {
+        for invoked in h.engine.take_spans() {
+            metrics::span(invoke_span(&h.handle.spec.name, invoked));
+        }
+    }
+    let steps = h.engine.take_steps();
+    let failure = if outcome.is_err() { h.engine.take_failure() } else { None };
+    (outcome, steps, failure)
+}
+
+/// Announce a hold's transition on `<root>.flow.events`, as dead letters are
+/// on `<root>.dlq.events`: an ordinary subject a flow or a sink can page
+/// someone from. It holds what the runtime wrote itself, never the payload.
+fn hold_event(h: &Holding, transition: &str, service: &str, since: u64, probes: u64, status: Option<u16>) {
+    let now = now_secs();
+    let event = json!({
+        "transition": transition, "ts": now, "unit": h.handle.spec.name,
+        "service": service, "subject": h.msg.subject, "since": since,
+        "held_secs": now.saturating_sub(since), "probes": probes, "status": status,
+        "trace_id": format!("{:032x}", h.carried.trace_id),
+    });
+    let subject = format!("{}.flow.events", h.subj_root);
+    let body = serde_json::to_vec(&event).unwrap_or_default();
+    if let Err(e) = h.js.publish_traced(&subject, body, h.carried) {
+        eprintln!("[vejas] {}: {transition} event not published: {e}", h.handle.spec.name);
+    }
+}
+
+/// The flow's state while it holds: what `/topology` and `vejas_topology` say.
+#[allow(clippy::too_many_arguments)]
+fn hold_state(h: &Holding, service: &str, since: u64, error: &str, status: Option<u16>, tries: i64, probes: u64, next: Duration) {
+    let behind = h
+        .js
+        .consumer_info(h.stream, h.durable)
+        .ok()
+        .and_then(|info| info["num_pending"].as_u64());
+    let hold = json!({
+        "service": service, "since": since, "last_error": error, "status": status,
+        "tries": tries, "probes": probes, "next_probe_at": now_secs() + next.as_secs(),
+        "behind": behind, "subject": h.msg.subject, "generation": h.generation,
+    });
+    set_state(h.handle, |st| {
+        st.status = "held".into();
+        st.hold = Some(hold);
+        st.last_error = Some(error.to_string());
+    });
+}
+
+/// The hold is over: the flow runs again.
+fn hold_over(h: &Holding, service: &str) {
+    metrics::set_held(&h.handle.spec.name, service, false);
+    set_state(h.handle, |st| {
+        st.status = "running".into();
+        st.hold = None;
+    });
+}
+
+/// Hold the message a run failed on because the system of `first.service`
+/// did not answer (ADR-0040, point 2). The run is tried again in hand,
+/// `DELAY_MS` apart, up to `ATTEMPTS` runs, with nothing announced. Then the
+/// flow is held: it says so, and probes, after `DELAY_MS` and twice as long
+/// each time up to `PROBE_MAX_MS`, the service that failed last: its
+/// `HEALTH_URL` when it has one, the run itself otherwise. Probes are not
+/// deliveries. The hold ends with the run that passes, a failure no later try
+/// changes, a release, or a stop.
+fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> Held {
+    let connectors::answer::WhenDown::Hold(mut probe) = first.down.clone() else {
+        // only a holding service's failure comes here
+        return Held::Ran { outcome: Err(error), steps: None, failure: Some(first), ended: false, note: HoldNote { service: String::new(), millis: 0, tries: 1, probes: 0 } };
+    };
+    let mut service = first.service.clone();
+    let delay = first.delay.max(Duration::from_millis(1));
+    let attempts = first.attempts.max(1);
+    let started = Instant::now();
+    let since = now_secs();
+    let mut tries: i64 = 1;
+    let mut probes: u64 = 0;
+    let mut last = (error, first);
+    let note = |service: &str, tries: i64, probes: u64| HoldNote {
+        service: service.to_string(),
+        millis: started.elapsed().as_millis() as u64,
+        tries,
+        probes,
+    };
+    // 1. In hand: a blip costs a delay and nothing else.
+    while tries < attempts {
+        if let Woken::Stop = hold_wait(h, delay) {
+            return Held::Stopped;
+        }
+        tries += 1;
+        let (outcome, steps, failure) = run_again(h);
+        match failure {
+            Some(f) if outcome.is_err() && f.holds() => {
+                service = f.service.clone();
+                last = (outcome.err().unwrap_or_default(), f);
+            }
+            failure => {
+                let ended = failure.as_ref().is_none_or(|f| !f.retry);
+                return Held::Ran { outcome, steps, failure, ended, note: note(&service, tries, probes) };
+            }
+        }
+    }
+    // 2. Held: said, and probed until the system answers.
+    if let connectors::answer::WhenDown::Hold(p) = &last.1.down {
+        probe = p.clone();
+    }
+    h.generation = (h.handle.holds.fetch_add(1, Ordering::SeqCst) + 1) & 0xffff_ffff;
+    eprintln!("[vejas] {}: held while {service} is down: {}", h.handle.spec.name, last.0);
+    metrics::set_held(&h.handle.spec.name, &service, true);
+    hold_event(h, "held", &service, since, probes, last.1.status);
+    record_trace(&h.handle.spec.name, &h.msg.subject, false,
+        Some(format!("{}, held while {service} is down", last.0)),
+        vec![], String::new(), Some(h.event.clone()), None, h.msg.delivery());
+    let mut pause = delay.min(probe.max);
+    loop {
+        hold_state(h, &service, since, &last.0, last.1.status, tries, probes, pause);
+        match hold_wait(h, pause) {
+            Woken::Stop => {
+                hold_event(h, "stopped", &service, since, probes, last.1.status);
+                hold_over(h, &service);
+                return Held::Stopped;
+            }
+            Woken::Release => {
+                // The held service answers with the failure it gave, and no
+                // call is made to it: the catch takes it now, or the message
+                // is a dead letter. Calls before it in the flow are made again.
+                h.engine.releasing(Some(last.1.clone()));
+                tries += 1;
+                let (outcome, steps, failure) = run_again(h);
+                h.engine.releasing(None);
+                hold_event(h, "released", &service, since, probes, last.1.status);
+                hold_over(h, &service);
+                return Held::Ran { outcome, steps, failure, ended: true, note: note(&service, tries, probes) };
+            }
+            Woken::Due | Woken::ProbeNow => {}
+        }
+        probes += 1;
+        metrics::inc_probe(&h.handle.spec.name);
+        if probe.has_health() {
+            if let Err(e) = probe.ask() {
+                last.0 = format!("{service}: {e}");
+                pause = (pause * 2).min(probe.max);
+                continue;
+            }
+        }
+        tries += 1;
+        let (outcome, steps, failure) = run_again(h);
+        match failure {
+            Some(f) if outcome.is_err() && f.holds() => {
+                if f.service != service {
+                    // another system it calls is down now: probe that one
+                    metrics::set_held(&h.handle.spec.name, &service, false);
+                    service = f.service.clone();
+                    metrics::set_held(&h.handle.spec.name, &service, true);
+                }
+                let moved = f.service != last.1.service;
+                if let connectors::answer::WhenDown::Hold(p) = &f.down {
+                    probe = p.clone();
+                }
+                pause = if moved {
+                    // a new system down: its probes start again from its delay
+                    f.delay.max(Duration::from_millis(1)).min(probe.max)
+                } else {
+                    (pause * 2).min(probe.max)
+                };
+                last = (outcome.err().unwrap_or_default(), f);
+            }
+            failure => {
+                let ended = failure.as_ref().is_none_or(|f| !f.retry);
+                // A failure no later try changes ends the hold too: its catch
+                // has run, or the message is a dead letter, not resumed.
+                let (transition, status) = if ended && outcome.is_err() {
+                    ("failed", failure.as_ref().and_then(|f| f.status))
+                } else {
+                    ("resumed", None)
+                };
+                hold_event(h, transition, &service, since, probes, status);
+                hold_over(h, &service);
+                eprintln!("[vejas] {}: {service} answers again, {transition}", h.handle.spec.name);
+                return Held::Ran { outcome, steps, failure, ended, note: note(&service, tries, probes) };
+            }
+        }
+    }
 }
 
 /// What settling a run needs of the flow it ran in.
@@ -2027,6 +2598,10 @@ fn settle(ran: Vec<Ran>, confirmed: &Result<Vec<bus::Refused>, String>, unit: &U
             if run.observing && (run.hop.sampled || remembered.is_err()) {
                 let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos)
                     .attr("vejas.emits", emits);
+                let span = match &run.held {
+                    Some(note) => note.on(span),
+                    None => span,
+                };
                 let span = match &remembered {
                     Ok(()) if run.marks.is_empty() => span,
                     Ok(()) => span.attr("vejas.remembered", run.marks.len() as i64),
@@ -2791,8 +3366,12 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
             restarts: 0,
             started_at: None,
             last_error: None,
+            hold: None,
         }),
         stop: AtomicBool::new(false),
+        release: Ask::default(),
+        probe_now: Ask::default(),
+        holds: AtomicU64::new(0),
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();
@@ -3114,6 +3693,7 @@ fn topology_json(registry: &Registry) -> Value {
             "restarts": st.restarts,
             "started_at": st.started_at,
             "last_error": st.last_error,
+            "hold": st.hold,
         });
         match handle.spec.kind {
             Kind::Flow => flows.push(entry),
@@ -3552,8 +4132,8 @@ Rules:
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
-- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
-- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. A `secret()` or a `seen()` whose store does not answer is a failure a later delivery may change: the catch takes it on the fifth delivery. A secret the store says it does not have is an error in the code. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
+- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. A flow on the bus holds its message while the system is down (`WHEN_DOWN = "hold"`, the default; `HEALTH_URL`, `PROBE_MAX_MS`), or sends it back until it is a dead letter (`WHEN_DOWN = "dead-letter"`) (ADR-0040). Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
+- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or, for a service that says `WHEN_DOWN = "dead-letter"`, a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. A service that holds (the default) keeps the message in hand while its system is down, and the catch takes the failure when a person releases it (ADR-0040): the run is made again, the held service answers with the failure it gave and is not called, and the calls before it in the flow are made again. A `secret()` or a `seen()` whose store does not answer is a failure a later delivery may change: the catch takes it on the fifth delivery. A secret the store says it does not have is an error in the code. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
 - `seen(key)` is true when a run of this flow said `remember key for "<window>"` and the window has not passed. The mark is written once the run's emits are stored: a run that fails marks nothing, so a message that comes back is processed again, and a catch marks only what it remembers. The window is a number and s, m, h or d, up to 3650d, written in the statement or in an UPPERCASE constant that the flow sets once. A key is any value but null; a number or a document is read as its JSON text. A copy of a message finds the mark of a run before it, also in the same batch, but two copies that run at the same instant, on two instances or as two requests, can both pass. Where a run is SHOWN, `seen` is false for every key. `remember` is a write: a read-method `api` flow that remembers needs the token, as one that emits. A flow whose memory does not answer fails its run, as a call that may answer later does (an `api` flow answers 503).
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
@@ -5080,7 +5660,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"type": "object", "properties": props, "required": req})
     };
     let mut tools = vec![
-        json!({"name": "vejas_topology", "description": "List running flows and connectors with their status.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_topology", "description": "List running flows and connectors with their status, and for a flow that holds its message while a system is down its `hold`: the service, since when, the last error, the probes, the next one, the messages behind (ADR-0040).", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_graph", "description": "The pipeline graph: sources, flows, composed services, destinations, connectors.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_surface", "description": "The business surface of every flow: mappings, transcoding tables, constants.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_language", "description": "The VejasScript reference: grammar, builtins, and the rules for flow files and connector manifests. Read this before writing any .vjs.", "inputSchema": obj(json!({}), vec![])}),
@@ -5830,6 +6410,17 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/hold/release") | (tiny_http::Method::Post, "/hold/probe") => {
+            if let Err((code, e)) = hold_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
+            let body = read_body(&mut request);
+            let release = path_only == "/hold/release";
+            match hold_act(&registry, body.get("flow").and_then(|v| v.as_str()), release, &actor) {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err((code, e)) => respond(request, code, e, "text/plain"),
             }
         }
         (tiny_http::Method::Post, "/dlq/purge") => {

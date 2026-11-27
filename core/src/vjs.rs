@@ -2128,6 +2128,10 @@ pub struct Engine {
     delivery: Option<i64>,
     /// What `seen` reads: the keys the flow's runs remembered (ADR-0039).
     memory: Option<Arc<dyn Memory>>,
+    /// A person released the held message (ADR-0040): the failure its
+    /// service gave, which a call to it answers with, and which its catch
+    /// takes now, whatever its deliveries.
+    releasing: Option<crate::connectors::answer::Failure>,
 }
 
 /// The keys a flow's runs remembered (ADR-0039, point 4), which `seen` reads.
@@ -2526,6 +2530,7 @@ impl Engine {
             called: false,
             delivery: None,
             memory: None,
+            releasing: None,
         }
     }
     /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
@@ -2556,6 +2561,13 @@ impl Engine {
             self.unrecorded.get_or_insert(call);
             return Err(error);
         }
+        if let Some(held) = self.releasing.as_ref().filter(|held| held.service == name) {
+            // released: the system is not called again (ADR-0040)
+            let failure = held.clone();
+            let error = failure.error.clone();
+            self.failure = Some(failure);
+            return Err(error);
+        }
         self.called = true;
         let trace = hop.map(|hop| hop.context()).or_else(|| self.carried.clone());
         let config = &declared.config;
@@ -2580,6 +2592,13 @@ impl Engine {
     /// that a later delivery may change only on the message's last one.
     pub fn delivered(&mut self, delivery: Option<i64>) {
         self.delivery = delivery;
+    }
+    /// The runs that follow are the release of a held message (ADR-0040),
+    /// whose service gave `held`: a call to that service answers with that
+    /// failure and is not made, and a catch takes any failure, as on a last
+    /// delivery. None ends the release.
+    pub fn releasing(&mut self, held: Option<crate::connectors::answer::Failure>) {
+        self.releasing = held;
     }
     /// What `seen` reads in the runs that follow.
     pub fn remember_in(&mut self, memory: Option<Arc<dyn Memory>>) {
@@ -2611,8 +2630,13 @@ impl Engine {
             return None;
         }
         let attempt = self.delivery.unwrap_or(1);
-        if let Some(f) = &self.failure {
-            if f.retry && attempt < f.attempts.min(vejas_connector::MAX_DELIVERIES) && self.delivery.is_some() {
+        if let Some(f) = self.failure.as_ref().filter(|_| self.releasing.is_none() && self.delivery.is_some()) {
+            // A flow on the bus holds its message while the system is down
+            // (ADR-0040): no delivery is its last, until a person releases it.
+            if f.holds() {
+                return None;
+            }
+            if f.retry && attempt < f.attempts.min(vejas_connector::MAX_DELIVERIES) {
                 return None;
             }
         }
@@ -2631,10 +2655,23 @@ impl Engine {
     /// those invoke, declares a driver (ADR-0032). Read from the files as they
     /// are now. A service that cannot be read fails its run without calling.
     pub fn reaches_system(&mut self, prog: &Program) -> bool {
+        self.systems(prog).0
+    }
+    /// Whether a run of `prog` may call a service that holds its source while
+    /// its system is down (ADR-0040): every declared service, unless it says
+    /// `WHEN_DOWN = "dead-letter"`. Its flow then takes one message at a time
+    /// across instances.
+    pub fn holds_its_source(&mut self, prog: &Program) -> bool {
+        self.systems(prog).1
+    }
+    /// Whether a run of `prog` may call a system, and whether one of those
+    /// holds its source.
+    fn systems(&mut self, prog: &Program) -> (bool, bool) {
         let caller = self.caller_pkg.clone();
         let mut seen: Vec<String> = Vec::new();
         let mut todo: Vec<(String, String)> = prog.invokes.iter().map(|n| (caller.clone(), n.clone())).collect();
         let mut reaches = false;
+        let mut holds = false;
         while let Some((pkg, name)) = todo.pop() {
             self.caller_pkg = pkg;
             let Ok((pkg, svc)) = self.resolve(&name) else { continue };
@@ -2649,12 +2686,17 @@ impl Engine {
             };
             if service.driver.is_some() {
                 reaches = true;
-                break;
+                let down = service.surface.iter().find(|e| e.name == "WHEN_DOWN").and_then(|e| e.value.as_str());
+                if down != Some("dead-letter") {
+                    holds = true;
+                    break;
+                }
+                continue;
             }
             todo.extend(service.invokes.iter().map(|n| (pkg.clone(), n.clone())));
         }
         self.caller_pkg = caller;
-        reaches
+        (reaches, holds)
     }
     /// What a check of a flow tells of its invokes without running it: the
     /// arguments a service that answers does not take (ADR-0032, point 1). A
@@ -2672,6 +2714,11 @@ impl Engine {
             };
             if service.driver.is_none() {
                 continue;
+            }
+            if let Some(down) = service.surface.iter().find(|e| e.name == "WHEN_DOWN").map(|e| &e.value) {
+                if !down.as_str().is_some_and(|d| crate::connectors::answer::WHEN_DOWN.contains(&d)) {
+                    problems.push(format!("invoke {name}: its WHEN_DOWN is {down}, not \"hold\" or \"dead-letter\""));
+                }
             }
             let (settings, url) = declared_shape(&service);
             let Some(url) = url else { continue };
@@ -4751,7 +4798,7 @@ end
 "#,
         )
         .unwrap();
-        let root = declared("catch", &url, "ATTEMPTS = 3\n");
+        let root = declared("catch", &url, "ATTEMPTS = 3\nWHEN_DOWN = \"dead-letter\"\n");
         let mut engine = live(root.clone());
         // a call a later delivery may answer fails the run: the message comes back
         for delivery in [1, 2] {
@@ -4777,13 +4824,13 @@ end
         let ctx = run(&prog, &json!({"id": "down"}), &mut engine).unwrap();
         assert_eq!(ctx.emits[0].1, json!({"code": "API_HTTP_503", "service": "get_order", "attempts": 1}));
         // on the last delivery the runtime makes, whatever ATTEMPTS says
-        let mut many = live(declared("catch-many", &url, "ATTEMPTS = 50\n"));
+        let mut many = live(declared("catch-many", &url, "ATTEMPTS = 50\nWHEN_DOWN = \"dead-letter\"\n"));
         many.delivered(Some(vejas_connector::MAX_DELIVERIES - 1));
         assert!(failed(run(&prog, &json!({"id": "down"}), &mut many)).starts_with("get_order: HTTP 503"));
         many.delivered(Some(vejas_connector::MAX_DELIVERIES));
         assert_eq!(run(&prog, &json!({"id": "down"}), &mut many).unwrap().emits[0].0, "vx.rejected");
         // a network error has no status
-        let mut nowhere = live(declared("catch-network", "http://127.0.0.1:9", "ATTEMPTS = 1\n"));
+        let mut nowhere = live(declared("catch-network", "http://127.0.0.1:9", "ATTEMPTS = 1\nWHEN_DOWN = \"dead-letter\"\n"));
         nowhere.delivered(Some(1));
         let ctx = run(&prog, &json!({"id": "x"}), &mut nowhere).unwrap();
         assert_eq!(ctx.emits[0].1["code"], "API_HTTP_NETWORK");
@@ -4794,6 +4841,63 @@ end
         assert!(e.contains("calls none"), "{e}");
         assert!(shown.take_unrecorded().is_some());
         assert_eq!(calls.lock().unwrap().len(), made, "a shown run called the system");
+    }
+
+    #[test]
+    fn a_catch_waits_while_its_flow_holds_the_message_until_a_release() {
+        let (url, calls) = system(|path| match path {
+            p if p.ends_with("/down") => (503, r#"{"error":"down"}"#, 0),
+            p if p.ends_with("/gone") => (404, "", 0),
+            _ => (200, "{}", 0),
+        });
+        let prog = parse(
+            r#"try:
+    o = invoke get_order(id: event.id)
+    emit "vx.ok", {s: o.status}
+catch e:
+    emit "vx.rejected", {status: e.status}
+end
+"#,
+        )
+        .unwrap();
+        // a declared service holds by default (ADR-0040)
+        let root = declared("hold", &url, "ATTEMPTS = 2\n");
+        let mut engine = live(root);
+        assert!(engine.holds_its_source(&prog));
+        for delivery in [1, 2, 9] {
+            engine.delivered(Some(delivery));
+            let e = failed(run(&prog, &json!({"id": "down"}), &mut engine));
+            assert!(e.starts_with("get_order: HTTP 503"), "{e}");
+            let f = engine.take_failure().expect("the failure the hold reads");
+            assert!(f.holds(), "{f:?}");
+        }
+        // released, its catch takes it now, and the system is not called again
+        let made = calls.lock().unwrap().len();
+        engine.delivered(Some(1));
+        failed(run(&prog, &json!({"id": "down"}), &mut engine));
+        let held = engine.take_failure().unwrap();
+        engine.releasing(Some(held));
+        let ctx = run(&prog, &json!({"id": "down"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0], ("vx.rejected".to_string(), json!({"status": 503})));
+        assert_eq!(calls.lock().unwrap().len(), made + 1, "the release made no call");
+        engine.releasing(None);
+        // a failure no later try changes is caught at once
+        engine.delivered(Some(1));
+        let ctx = run(&prog, &json!({"id": "gone"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"status": 404}));
+        // a request is never held: its catch takes it at once
+        engine.delivered(None);
+        assert_eq!(run(&prog, &json!({"id": "down"}), &mut engine).unwrap().emits[0].0, "vx.rejected");
+        // a service that says dead-letter keeps today's path
+        let mut dl = live(declared("hold-dl", &url, "WHEN_DOWN = \"dead-letter\"\n"));
+        assert!(dl.reaches_system(&prog) && !dl.holds_its_source(&prog));
+        dl.delivered(Some(1));
+        failed(run(&prog, &json!({"id": "down"}), &mut dl));
+        assert!(dl.take_failure().is_some_and(|f| f.retry && !f.holds()));
+        // a WHEN_DOWN it does not know is told by the check
+        let mut odd = live(declared("hold-odd", &url, "WHEN_DOWN = \"pause\"\n"));
+        let problems = odd.check_invokes(&prog);
+        assert!(problems.iter().any(|p| p.contains("WHEN_DOWN")), "{problems:?}");
     }
 
     #[test]

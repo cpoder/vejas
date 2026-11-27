@@ -874,6 +874,30 @@ pub struct Message {
     link: Arc<Link>,
 }
 
+/// The answer that says a message is still being worked on. JetStream spells
+/// it `+WPI`, as async-nats sends it; `+WIP` is no answer it knows, and the
+/// message is delivered again once its `ack_wait` runs out.
+const IN_PROGRESS: &[u8] = b"+WPI";
+
+/// Keeps a message in progress (`+WPI`) from any thread: see
+/// [`Message::keeper`].
+#[derive(Clone)]
+pub struct Keeper {
+    reply: Option<Subject>,
+    link: Arc<Link>,
+}
+
+impl Keeper {
+    /// Tell the server the message is still being worked on, as
+    /// [`Message::in_progress`].
+    pub fn in_progress(&self) -> Result<(), String> {
+        let Some(reply) = &self.reply else {
+            return Ok(());
+        };
+        wait(sent(self.link.client.publish(reply.clone(), Bytes::from_static(IN_PROGRESS))))
+    }
+}
+
 /// What the bus says about a delivery: JetStream's count and sequence, read
 /// from its reply subject, and the dead letter it replays, from its header.
 #[derive(Debug, PartialEq, Eq)]
@@ -947,6 +971,22 @@ impl Message {
 
     pub fn nak(&self) -> Result<(), String> {
         self.answer(Bytes::from_static(b"-NAK"))
+    }
+
+    /// Tell the server the message is still being worked on, so that its
+    /// `ack_wait` starts again and it is not delivered elsewhere meanwhile: a
+    /// flow that holds its message while a system is down (ADR-0040).
+    pub fn in_progress(&self) -> Result<(), String> {
+        self.answer(Bytes::from_static(IN_PROGRESS))
+    }
+
+    /// What keeps this message in progress from another thread, for as long
+    /// as it is in hand: during the calls of its runs too (ADR-0040).
+    pub fn keeper(&self) -> Keeper {
+        Keeper {
+            reply: self.reply.clone(),
+            link: self.link.clone(),
+        }
     }
 
     /// Ask for this message again after `delay`, not at once: a call that got
@@ -1581,6 +1621,23 @@ impl JetStream {
         ack_wait: Duration,
         start_seq: Option<u64>,
     ) -> Result<(), String> {
+        self.create_pull_consumer_with(stream, durable, filters, ack_wait, start_seq, None)
+    }
+
+    /// The same, with at most `max_ack_pending` messages delivered and not yet
+    /// acked across every instance that reads the durable: 1 for a flow that
+    /// holds its message while a system is down, so that the others wait
+    /// (ADR-0040). None leaves the server's default. The server updates an
+    /// existing durable to it.
+    pub fn create_pull_consumer_with(
+        &self,
+        stream: &str,
+        durable: &str,
+        filters: &[String],
+        ack_wait: Duration,
+        start_seq: Option<u64>,
+        max_ack_pending: Option<i64>,
+    ) -> Result<(), String> {
         let mut config = json!({
             "durable_name": durable,
             "ack_policy": "explicit",
@@ -1594,6 +1651,9 @@ impl JetStream {
         if let Some(seq) = start_seq {
             config["deliver_policy"] = Value::from("by_start_sequence");
             config["opt_start_seq"] = Value::from(seq);
+        }
+        if let Some(max) = max_ack_pending {
+            config["max_ack_pending"] = Value::from(max);
         }
         match filters {
             [one] => config["filter_subject"] = Value::String(one.clone()),
@@ -1617,6 +1677,12 @@ impl JetStream {
             ));
         }
         Ok(())
+    }
+
+    /// What the server says of a consumer: its config, the messages it has
+    /// delivered and not had acked, those still to deliver (`num_pending`).
+    pub fn consumer_info(&self, stream: &str, consumer: &str) -> Result<Value, String> {
+        self.api(format!("CONSUMER.INFO.{stream}.{consumer}"), Bytes::new())
     }
 
     pub fn delete_consumer(&self, stream: &str, consumer: &str) -> Result<(), String> {
@@ -2450,6 +2516,88 @@ mod live {
         assert_eq!(waiting.count(), 0);
         let error = puller.round().err().expect("the consumer is gone");
         assert!(error.contains("consumer gone"), "{error}");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_durable_takes_its_max_ack_pending_and_gives_it_back() {
+        let server = Server::start();
+        let js = connect(&server.url()).unwrap().jetstream();
+        js.add_stream(&StreamConfig {
+            name: "T".into(),
+            subjects: vec!["t.>".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = ["t.in".to_string()];
+        let pending = |js: &JetStream| {
+            let info = js.api("CONSUMER.INFO.T.d".into(), Bytes::new()).unwrap();
+            info["config"]["max_ack_pending"].as_i64().unwrap_or(-1)
+        };
+        js.create_pull_consumer_with("T", "d", &filter, Duration::from_secs(30), None, Some(1))
+            .unwrap();
+        assert_eq!(pending(&js), 1);
+        // The same durable created again without it is updated to the default.
+        js.create_pull_consumer("T", "d", &filter, Duration::from_secs(30), None)
+            .unwrap();
+        assert_ne!(pending(&js), 1);
+        js.create_pull_consumer_with("T", "d", &filter, Duration::from_secs(30), None, Some(1))
+            .unwrap();
+        assert_eq!(pending(&js), 1);
+        // In progress is an answer like an ack: it leaves the message pending.
+        let puller = js.pull_durable("T", "d", Some("t.in")).unwrap();
+        js.publish("t.in", "one").unwrap();
+        let message = puller.round_of(1).unwrap().next().expect("delivered");
+        message.in_progress().unwrap();
+        let info = js.api("CONSUMER.INFO.T.d".into(), Bytes::new()).unwrap();
+        assert_eq!(info["num_ack_pending"], 1);
+        message.ack().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn a_message_kept_in_progress_is_not_delivered_again() {
+        let server = Server::start();
+        let js = connect(&server.url()).unwrap().jetstream();
+        js.add_stream(&StreamConfig {
+            name: "W".into(),
+            subjects: vec!["w.>".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = ["w.in".to_string()];
+        js.create_pull_consumer("W", "d", &filter, Duration::from_secs(1), None).unwrap();
+        let holder = js.pull_durable("W", "d", Some("w.in")).unwrap();
+        let other = js.pull_durable("W", "d", Some("w.in")).unwrap();
+        js.publish("w.in", "one").unwrap();
+        let message = holder.round_of(1).unwrap().next().expect("delivered");
+        let keeper = message.keeper();
+        // four ack waits, in progress every 300 ms from another thread, while
+        // another reader of the durable asks for the next
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticking = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    keeper.in_progress().unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(4);
+        let mut again = Vec::new();
+        while Instant::now() < until {
+            again.extend(other.round_of(1).unwrap().map(|m| m.delivery().map(|d| d.delivered)));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        ticking.join().unwrap();
+        assert!(again.is_empty(), "kept in progress, not delivered again: {again:?}");
+        // left alone, it comes back once its ack wait runs out
+        let until = Instant::now() + Duration::from_secs(3);
+        while again.is_empty() && Instant::now() < until {
+            again.extend(other.round_of(1).unwrap().map(|m| m.delivery().map(|d| d.delivered)));
+        }
+        assert_eq!(again, vec![Some(2)]);
     }
 
     #[test]

@@ -53,6 +53,11 @@ struct Unit {
     snapshot_secs: f64,
     restores: u64,
     restore_seq: u64,
+    /// A flow that holds its message while a system is down (ADR-0040): the
+    /// service it waits on, whether it holds now, and the probes it made.
+    held_on: Option<String>,
+    held: bool,
+    probes: u64,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -131,6 +136,20 @@ pub fn observe_restore(unit: &str, seq: u64) {
 pub fn inc_dead_letter(unit: &str) {
     let mut map = units().lock().unwrap();
     map.entry(unit.to_string()).or_default().dead += 1;
+}
+
+/// A flow holds its message while `service` is down, or no longer (ADR-0040).
+pub fn set_held(unit: &str, service: &str, held: bool) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.held_on = Some(service.to_string());
+    u.held = held;
+}
+
+/// A held flow asked whether its system is back (ADR-0040).
+pub fn inc_probe(unit: &str) {
+    let mut map = units().lock().unwrap();
+    map.entry(unit.to_string()).or_default().probes += 1;
 }
 
 /// A connection or request refused because a bound was reached, or because the
@@ -306,6 +325,24 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
             esc(unit),
             u.dead
         ));
+    }
+
+    out.push_str("# HELP vejas_flow_held Whether a flow holds its message while the system of a service is down (ADR-0040).\n");
+    out.push_str("# TYPE vejas_flow_held gauge\n");
+    for (unit, u) in map.iter() {
+        if let Some(service) = &u.held_on {
+            out.push_str(&format!(
+                "vejas_flow_held{{unit=\"{}\",service=\"{}\"}} {}\n",
+                esc(unit),
+                esc(service),
+                u8::from(u.held)
+            ));
+        }
+    }
+    out.push_str("# HELP vejas_hold_probes_total Probes a held flow made to learn whether its system is back (ADR-0040).\n");
+    out.push_str("# TYPE vejas_hold_probes_total counter\n");
+    for (unit, u) in map.iter().filter(|(_, u)| u.held_on.is_some()) {
+        out.push_str(&format!("vejas_hold_probes_total{{unit=\"{}\"}} {}\n", esc(unit), u.probes));
     }
 
     out.push_str("# HELP vejas_spans_exported_total Spans the OTLP exporter delivered to the collector.\n");

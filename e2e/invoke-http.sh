@@ -20,7 +20,8 @@ ko(){ echo "  ✗ $1"; fail=1; }
 URL=nats://127.0.0.1:4292; H="http://127.0.0.1:8763"; IN=18796; API_PORT=18797
 mkdir -p "$R/flows" "$R/connectors" "$R/services"
 printf '# connector: http_in\ndriver "http-in"\nPORT = %s\n' $IN > "$R/connectors/http_in.vjs"
-printf 'driver "http-rpc"\nBASE_URL = "http://127.0.0.1:%s"\nURL = "{BASE_URL}/orders/{id}"\nTIMEOUT_MS = 500\nATTEMPTS = 3\nDELAY_MS = 300\n' \
+# today's path, not the hold (ADR-0040): e2e/flow-holds.sh tries the hold
+printf 'driver "http-rpc"\nBASE_URL = "http://127.0.0.1:%s"\nURL = "{BASE_URL}/orders/{id}"\nTIMEOUT_MS = 500\nATTEMPTS = 3\nDELAY_MS = 300\nWHEN_DOWN = "dead-letter"\n' \
   $API_PORT > "$R/services/get_order.vjs"
 printf '# flow: enrich\nsource "vx.orders.raw"\no = invoke get_order(id: id)\nemit "vx.orders.ready", {id: id, state: o.body.status}\n' \
   > "$R/flows/enrich.vjs"
