@@ -1,6 +1,15 @@
 # 0040 — A flow holds its source while a system it calls is down
 
-- Status: Proposed. Point 6, the default, is for the founder to settle.
+- Status: Accepted (partial). Point 6: the founder chose hold as the default,
+  2026-11-27. Built: `WHEN_DOWN`, `HEALTH_URL` and `PROBE_MAX_MS` on a
+  declared service; the runs in hand with the in-progress ack; the hold with
+  doubling probes; the held message first on resume; release and probe-now
+  (`POST /hold/release`, `POST /hold/probe`, write-gated, human acts in
+  governed mode, audited); one message at a time on the consumer of a flow
+  that holds; the state in `/topology` and `vejas_topology`; `held`,
+  `resumed` and `released` on `vx.flow.events`; the trace record and the
+  metrics; e2e/flow-holds.sh. Not built: the panel's badge and buttons, MCP
+  tools for the two acts.
 - Date: 2026-11-27
 
 ## Context
@@ -113,7 +122,7 @@ On a held flow a person can:
 Both are recorded in `VEJAS_AUDIT` with the actor. In governed mode
 (ADR-0024) they are human acts, like a DLQ replay.
 
-### 6. The default (open)
+### 6. The default: hold (decided 2026-11-27)
 
 Two possible defaults for a declared service that does not say:
 
@@ -124,7 +133,8 @@ Two possible defaults for a declared service that does not say:
   service says `WHEN_DOWN = "dead-letter"`.
 - **`dead-letter`**, which keeps today's behaviour, and `hold` is opted in.
 
-The recommendation is `hold`.
+The recommendation was `hold`, and the founder chose hold as the default,
+2026-11-27. A service that wants today's path says `WHEN_DOWN = "dead-letter"`.
 
 ### What does not change
 

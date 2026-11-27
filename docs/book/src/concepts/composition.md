@@ -67,18 +67,24 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
 - Any other status, a timeout (`TIMEOUT_MS`, 10 s by default) or a network
   error fails the run, with an error that names the service and the cause:
   `get_order: HTTP 503`. A failure that may change later (429, a 5xx, a
-  timeout, the network; `RETRY_ON` lists other statuses) brings the message
-  back after `DELAY_MS` (1 s, at most an hour), until it has been delivered
-  `ATTEMPTS` times (3), and never past the five deliveries of any message. A
-  secret store that does not answer when the declaration is read is such a
-  failure too. Any other failure, or the last attempt, is a
+  timeout, the network; `RETRY_ON` lists other statuses) means the system is
+  down: a flow on the bus **holds** its message until it answers (below). A
+  failure no later try changes (another 4xx) is a
   [dead letter](../guides/dlq-replay.md) at once, replayed once the cause is
   fixed. A run's emits leave only when it succeeds, so a message tried again
   emits once.
+- `WHEN_DOWN = "dead-letter"` keeps the path a call took before the hold:
+  the message comes back after `DELAY_MS` (1 s, at most an hour), until it
+  has been delivered `ATTEMPTS` times (3), and never past the five
+  deliveries of any message; then it is a dead letter. A secret store that
+  does not answer when the declaration is read takes that path whatever the
+  service says.
 - A flow that knows what such a failure means writes the call in a `try`:
-  its `catch` runs instead of the dead letter, on the delivery that spends
-  the attempts, or at once when the service does not try again (ADR-0039).
-  `e.status` holds the status the system answered, null when it gave none.
+  its `catch` runs instead of the dead letter (ADR-0039): at once when the
+  service does not try again; for a service that says `"dead-letter"`, on
+  the delivery that spends the attempts; for one that holds, when a person
+  releases the held message. `e.status` holds the status the system
+  answered, null when it gave none.
 - The error names no URL and no header, and is masked as the trace record
   masks one, so a credential reaches no log, span, answer or dead letter.
 - A flow that calls a system takes its messages one by one: it asks for the
@@ -109,6 +115,60 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
 - The credentials stay in the declaration, through `secret()`; the flow
   never sees them.
 
+
+## While a system is down: the hold
+
+A declared service holds by default (`WHEN_DOWN = "hold"`, ADR-0040). When a
+run fails on a call a later try may change, the flow keeps the message in
+hand instead of sending it back:
+
+```
+driver "http-rpc"
+BASE_URL = "https://payments.example"
+URL = "{BASE_URL}/payments/{id}"
+HEALTH_URL = "{BASE_URL}/health"
+ATTEMPTS = 3
+DELAY_MS = 1000
+PROBE_MAX_MS = 60000
+```
+
+- The run is tried again in hand, `DELAY_MS` apart, up to `ATTEMPTS` runs.
+  Nothing is announced: a blip costs a delay.
+- Then the flow is **held**. It probes after `DELAY_MS`, then twice as long
+  each time, up to `PROBE_MAX_MS` (60 s by default). With `HEALTH_URL`, a
+  probe is a GET that answers 2xx when the system is up, with the service's
+  headers; without it, the probe is the held message's run itself, which
+  calls again what the run called before the failing call.
+- When the system answers, the held message runs first, then the ones
+  behind it, in the order they came. No message behind it was called during
+  the outage, and none became a dead letter.
+- A failure no later try changes ends the hold for that message: its catch
+  runs, or it is a dead letter, and the flow goes on.
+- Probes are not deliveries: neither the five-delivery cap nor a catch's last
+  delivery fires during a hold. The message is told to the bus as still in
+  progress while it waits.
+- A flow that calls a service that holds takes one message at a time across
+  all instances (`max_ack_pending = 1` on its consumer): while one holds a
+  message, the others wait. A flow that calls such a system for only some of
+  its messages holds the others too: that is the price of order. Such a
+  service says `WHEN_DOWN = "dead-letter"`.
+- A stop gives the held message back to the bus at once, first in line for
+  the next instance.
+- What is seen: the flow's `status` is `held` and its `hold` in
+  `GET /topology` and `vejas_topology` gives the service, since when, the
+  last error, the runs, the probes, the next probe and the messages behind.
+  `held`, `resumed` and `released` are published on `vx.flow.events`, an
+  ordinary subject, as dead letters are on `vx.dlq.events`. `/metrics` has
+  `vejas_flow_held{unit,service}` and `vejas_hold_probes_total{unit}`. The
+  trace record of the run that ends the hold carries `vejas.hold.ms`, its
+  runs and its probes.
+- A person can `POST /hold/release` with `{"flow": "flow:pay"}`: the held
+  message's catch runs now, or it is a dead letter. `POST /hold/probe` has
+  the flow probe now. Both take the write token, are human acts in governed
+  mode (the approval token, as a DLQ replay), and are written to the audit
+  with who asked. A flow that holds nothing on this instance answers 409.
+- An `api` flow is never held: it answers at once, 502 or 504, or its catch
+  runs. A run that is shown makes no call.
 ## `invoke` — merge, or capture
 
 A flow calls a service with named arguments, two ways:
