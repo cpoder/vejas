@@ -362,6 +362,18 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   its body. An `api` flow no longer receives a body cut short: one too large,
   too slow or broken is answered 413, 408 or 400. An `accept()` error no
   longer stops the server, nor a refused thread its accept loop.
+  A review then found three more paths, also closed: a chunked body is read
+  by a bounded parser (chunked_transfer's decoder grew memory on an endless
+  chunk-size line), every byte on the wire counted; a request's head and
+  body share one deadline, the timeout from its first byte, which every
+  socket read honours (a chunk extension sent a byte at a time no longer
+  holds a drain); and a connection has one request in flight at most, a
+  response gets the timeout plus a second per 16 KiB written, and the
+  dispatch loop never writes (a client that pipelined and never read
+  stalled every slot). A `Transfer-Encoding` other than `chunked` is 501,
+  one with a `Content-Length` 400, a bare LF 400, an idle head 408, and an
+  early refusal reads a little of what the client still sends so it is not
+  lost to a reset. The three variables are capped (1 GiB, a day, 65536).
   `e2e/http-limits.sh` holds it.
 - **`http-out`, `http-poll`, `oauth-poll` and `invoke` keep a credential that
   rides in a URL, or that a system echoes, out of the log, the events and the

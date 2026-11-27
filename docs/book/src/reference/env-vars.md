@@ -21,9 +21,9 @@ directory is a complete system.
 | `VEJAS_AGENT_CMD` | *(unset)* | Command the panel uses for its agent-assist box. |
 | `VEJAS_DLQ_EVENT_SECS` | `60` | At most one dead-letter event per unit per this many seconds on `vx.dlq.events`. `0` announces every letter. |
 | `VEJAS_HTTP_MAX_INFLIGHT` | `256` | Requests handled at once on the panel/MCP port, one thread each. Past it: 503, and the connection closes. |
-| `VEJAS_HTTP_MAX_BODY_BYTES` | `8388608` | Largest request body on the panel/MCP/`api` port, declared or chunked. Past it: 413. |
-| `VEJAS_HTTP_TIMEOUT_SECS` | `30` | On that port, how long a socket read or write, a request head (idle keep-alive included) and a request body may take. Past it: 408, or the connection closes. |
-| `VEJAS_HTTP_MAX_CONNECTIONS` | `512` | Connections served at once on that port, one thread each. Past it a new connection closes as it is accepted. |
+| `VEJAS_HTTP_MAX_BODY_BYTES` | `8388608` | Largest request body on the panel/MCP/`api` port, declared or chunked (a chunked body's framing counts, up to 64 KiB more). Past it: 413. At most 1 GiB. |
+| `VEJAS_HTTP_TIMEOUT_SECS` | `30` | On that port: how long a connection may idle before a request, and how long a request's head and body together may take from its first byte (past it: 408, or the connection closes); a response gets it plus one second per 16 KiB written. At most a day. |
+| `VEJAS_HTTP_MAX_CONNECTIONS` | `512` | Connections served at once on that port, one thread each, one request in flight each. Past it a new connection closes as it is accepted. At most 65536. |
 | `VEJAS_PUBLIC` | *(unset)* | `1`: the public mode (ADR-0041). The console's reads only, 404 for every write, `/mcp`, the `api` flows and the secrets, whatever the credential; no agent, no control channel; capped reads. See [A public demo](../guides/public-demo.md). |
 | `VEJAS_STREAM_MAX_AGE_SECS` | *(unset)* | How long the stream keeps a message, in seconds. Unset or `0`: for ever. Applied to an existing stream at start. |
 

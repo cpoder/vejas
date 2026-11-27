@@ -159,16 +159,130 @@ read -r LEFT SECS < "$S/loris.out"
 [ "$LEFT" = "0" ] && ok "all 40 cut off by the server (within ${SECS}s)" || ko "$LEFT of 40 still open after ${SECS}s"
 alive && ok "the runtime is still running" || ko "the runtime died"
 
-kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
-
-echo "── the in-flight 503 does not wait on a body"
-# One slot. A slow body holds it; the next requests are shed by the accept
-# loop, which must not read what their bodies would be.
-start_runtime VEJAS_HTTP_MAX_INFLIGHT=1
-python3 - "$PORT" <<'PY' &
+echo "── an endless chunk-size line is cut at its bound, memory flat"
+rss(){ awk '/^VmRSS:/{print $2}' "/proc/$RT/status"; }
+BEFORE=$(rss)
+OUT=$(python3 - "$PORT" <<'PY'
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
-s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n")
+s.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+t0, sent, how = time.time(), 0, "still open after 10s"
+s.settimeout(0.2)
+while time.time() - t0 < 10:
+    try:
+        sent += s.send(b"1" * 4096)
+    except socket.timeout:
+        pass
+    except OSError:
+        how = "cut"; break
+    try:
+        if s.recv(65536) == b"":
+            how = "cut"; break
+    except socket.timeout:
+        pass
+    except OSError:
+        how = "cut"; break
+print(f"{how} {time.time() - t0:.1f} {sent}")
+PY
+)
+read -r HOW SECS SENT <<< "$OUT"
+GROWTH=$(( ($(rss) - BEFORE) / 1024 ))
+[ "$HOW" = "cut" ] && ok "cut after ${SECS}s, $SENT bytes sent" || ko "endless size line: $OUT"
+[ "$GROWTH" -lt 16 ] && ok "memory grew ${GROWTH} MB" || ko "memory grew ${GROWTH} MB"
+
+echo "── framing is strict: an idle head is 408, an unknown coding 501, a bare LF 400"
+strict(){ python3 - "$PORT" "$1" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.settimeout(10)
+s.sendall(sys.argv[2].encode().decode("unicode_escape").encode())
+try:
+    print(s.makefile("rb").readline().split(b" ")[1].decode())
+except Exception:
+    print("none")
+PY
+}
+C=$(strict 'GET /healthz HTTP/1.1\r\n'); [ "$C" = "408" ] && ok "idle head: $C" || ko "idle head: $C"
+C=$(strict 'POST /api/echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n'); [ "$C" = "501" ] && ok "Transfer-Encoding gzip: $C" || ko "Transfer-Encoding gzip: $C"
+C=$(strict 'POST /api/echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n'); [ "$C" = "400" ] && ok "chunked with a Content-Length: $C" || ko "chunked with a Content-Length: $C"
+C=$(strict 'GET /healthz HTTP/1.1\nHost: x\n\n'); [ "$C" = "400" ] && ok "bare LF: $C" || ko "bare LF: $C"
+
+kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
+
+# Four handler slots from here: what one client holds shows.
+start_runtime VEJAS_HTTP_MAX_INFLIGHT=4
+
+echo "── a chunk extension sent a byte at a time is cut at the timeout"
+OUT=$(python3 - "$PORT" <<'PY'
+import socket, sys, threading, time
+port = int(sys.argv[1]); res = []
+def one():
+    s = socket.create_connection(("127.0.0.1", port))
+    t0 = time.time()
+    s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1;")
+    s.settimeout(1)
+    while time.time() - t0 < 20:
+        try:
+            s.sendall(b"a")
+            if s.recv(4096) == b"":
+                break
+            break  # an answer: the server gave up on the body
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+    res.append(time.time() - t0)
+ts = [threading.Thread(target=one) for _ in range(4)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(f"{max(res):.1f}")
+PY
+)
+python3 -c "import sys; sys.exit(0 if float('$OUT') <= $TIMEOUT + 1.5 else 1)" \
+  && ok "4 connections, all cut within ${OUT}s (timeout ${TIMEOUT}s)" || ko "slow extensions lasted ${OUT}s"
+[ "$(healthz)" = "200" ] && ok "/healthz answers once they are cut" || ko "/healthz after slow extensions"
+
+echo "── clients that pipeline and never read do not stall the server"
+python3 - "$PORT" <<'PY' &
+import socket, sys, time
+port = int(sys.argv[1]); socks = []
+for _ in range(3):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.connect(("127.0.0.1", port))
+    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n" * 30)  # the panel, 30 times, never read
+    socks.append(s)
+time.sleep(14)
+PY
+PIPE=$!
+sleep 1
+SLOWEST=0; CODES=""
+for _ in 1 2 3 4 5 6; do
+  OUT=$(curl -s -m 5 -o /dev/null -w '%{http_code} %{time_total}' "$H/healthz")
+  CODES="$CODES ${OUT%% *}"
+  SLOWEST=$(python3 -c "print(max($SLOWEST, ${OUT##* }))")
+  sleep 0.5
+done
+# each holds one request at most: three of the four slots, the fourth is free
+python3 -c "import sys; sys.exit(0 if $SLOWEST < 1 else 1)" && [ "${CODES# }" = "200 200 200 200 200 200" ] \
+  && ok "/healthz answered 200 every time under 3 such clients, the slowest in ${SLOWEST}s" \
+  || ko "/healthz under pipelining clients: ${CODES# }, slowest ${SLOWEST}s"
+sleep 6  # 10 s from the start: past the write timeout twice, and its linger
+LEFT=$(ss -Htn state established "( sport = :$PORT )" | wc -l)
+[ "$LEFT" = "0" ] && ok "the server closed all 3 pipelining connections within 10s" \
+  || ko "$LEFT server sockets still established after 10s"
+wait $PIPE
+[ "$(healthz)" = "200" ] && ok "/healthz is 200 again" || ko "/healthz after pipelining"
+
+echo "── the in-flight 503 does not wait on a body"
+# Four slow bodies hold the four slots; the next requests are shed by the
+# dispatch loop, which must not read what their bodies would be.
+python3 - "$PORT" <<'PY' &
+import socket, sys, time
+held = []
+for _ in range(4):
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+    s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n")
+    held.append(s)
 time.sleep(6)
 PY
 HOLD=$!
