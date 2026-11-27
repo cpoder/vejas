@@ -209,8 +209,8 @@ C=$(strict 'GET /healthz HTTP/1.1\nHost: x\n\n'); [ "$C" = "400" ] && ok "bare L
 
 kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
 
-# Four handler slots and eight connections from here: what one client holds shows.
-start_runtime VEJAS_HTTP_MAX_INFLIGHT=4 VEJAS_HTTP_MAX_CONNECTIONS=8
+# Eight connection slots: an HTTP/2.0 line on each must give its slot back.
+start_runtime VEJAS_HTTP_MAX_CONNECTIONS=8
 
 echo "── HTTP/2.0 request lines on every connection slot: each 505, the slots come back"
 OUT=$(python3 - "$PORT" <<'PY'
@@ -231,6 +231,11 @@ PY
 )
 [ "$OUT" = "505" ] && ok "8 of 8 answered 505" || ko "HTTP/2.0 request lines: $OUT"
 [ "$(healthz)" = "200" ] && ok "/healthz answers after them" || ko "/healthz after HTTP/2.0 lines: the slots leaked"
+
+kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
+
+# Four handler slots from here: what one client holds shows.
+start_runtime VEJAS_HTTP_MAX_INFLIGHT=4
 
 echo "── a chunk extension sent a byte at a time is cut at the timeout"
 OUT=$(python3 - "$PORT" <<'PY'
@@ -292,6 +297,10 @@ LEFT=$(ss -Htn state established "( sport = :$PORT )" | wc -l)
   || ko "$LEFT server sockets still established after 10s"
 wait $PIPE
 [ "$(healthz)" = "200" ] && ok "/healthz is 200 again" || ko "/healthz after pipelining"
+
+# A fresh runtime: the slots above may still be closing their connections.
+kill $RT 2>/dev/null; wait $RT 2>/dev/null; RT=""
+start_runtime VEJAS_HTTP_MAX_INFLIGHT=4
 
 echo "── the in-flight 503 does not wait on a body"
 # Four slow bodies hold the four slots; the next requests are shed by the
