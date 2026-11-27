@@ -874,6 +874,30 @@ pub struct Message {
     link: Arc<Link>,
 }
 
+/// The answer that says a message is still being worked on. JetStream spells
+/// it `+WPI`, as async-nats sends it; `+WIP` is no answer it knows, and the
+/// message is delivered again once its `ack_wait` runs out.
+const IN_PROGRESS: &[u8] = b"+WPI";
+
+/// Keeps a message in progress (`+WPI`) from any thread: see
+/// [`Message::keeper`].
+#[derive(Clone)]
+pub struct Keeper {
+    reply: Option<Subject>,
+    link: Arc<Link>,
+}
+
+impl Keeper {
+    /// Tell the server the message is still being worked on, as
+    /// [`Message::in_progress`].
+    pub fn in_progress(&self) -> Result<(), String> {
+        let Some(reply) = &self.reply else {
+            return Ok(());
+        };
+        wait(sent(self.link.client.publish(reply.clone(), Bytes::from_static(IN_PROGRESS))))
+    }
+}
+
 /// What the bus says about a delivery: JetStream's count and sequence, read
 /// from its reply subject, and the dead letter it replays, from its header.
 #[derive(Debug, PartialEq, Eq)]
@@ -953,7 +977,16 @@ impl Message {
     /// `ack_wait` starts again and it is not delivered elsewhere meanwhile: a
     /// flow that holds its message while a system is down (ADR-0040).
     pub fn in_progress(&self) -> Result<(), String> {
-        self.answer(Bytes::from_static(b"+WIP"))
+        self.answer(Bytes::from_static(IN_PROGRESS))
+    }
+
+    /// What keeps this message in progress from another thread, for as long
+    /// as it is in hand: during the calls of its runs too (ADR-0040).
+    pub fn keeper(&self) -> Keeper {
+        Keeper {
+            reply: self.reply.clone(),
+            link: self.link.clone(),
+        }
     }
 
     /// Ask for this message again after `delay`, not at once: a call that got
@@ -2519,6 +2552,52 @@ mod live {
         let info = js.api("CONSUMER.INFO.T.d".into(), Bytes::new()).unwrap();
         assert_eq!(info["num_ack_pending"], 1);
         message.ack().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn a_message_kept_in_progress_is_not_delivered_again() {
+        let server = Server::start();
+        let js = connect(&server.url()).unwrap().jetstream();
+        js.add_stream(&StreamConfig {
+            name: "W".into(),
+            subjects: vec!["w.>".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = ["w.in".to_string()];
+        js.create_pull_consumer("W", "d", &filter, Duration::from_secs(1), None).unwrap();
+        let holder = js.pull_durable("W", "d", Some("w.in")).unwrap();
+        let other = js.pull_durable("W", "d", Some("w.in")).unwrap();
+        js.publish("w.in", "one").unwrap();
+        let message = holder.round_of(1).unwrap().next().expect("delivered");
+        let keeper = message.keeper();
+        // four ack waits, in progress every 300 ms from another thread, while
+        // another reader of the durable asks for the next
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticking = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    keeper.in_progress().unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(4);
+        let mut again = Vec::new();
+        while Instant::now() < until {
+            again.extend(other.round_of(1).unwrap().map(|m| m.delivery().map(|d| d.delivered)));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        ticking.join().unwrap();
+        assert!(again.is_empty(), "kept in progress, not delivered again: {again:?}");
+        // left alone, it comes back once its ack wait runs out
+        let until = Instant::now() + Duration::from_secs(3);
+        while again.is_empty() && Instant::now() < until {
+            again.extend(other.round_of(1).unwrap().map(|m| m.delivery().map(|d| d.delivered)));
+        }
+        assert_eq!(again, vec![Some(2)]);
     }
 
     #[test]
