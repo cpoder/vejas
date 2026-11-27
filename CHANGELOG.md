@@ -7,6 +7,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-27
+
 ### Added
 - **A public mode** (ADR-0041). `VEJAS_PUBLIC=1` serves the console's reads
   and answers 404 to everything else, whatever the credential: every write,
