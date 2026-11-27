@@ -44,3 +44,4 @@ to "why is it built this way", and the moat a rewrite would have to re-earn.
 - [ADR-0039 — 0039 — A flow sees its message as it came, and owns its failures](https://github.com/cpoder/vejas/blob/master/docs/adr/0039-a-flow-sees-its-message-and-owns-its-failures.md)
 - [ADR-0040 — 0040 — A flow holds its source while a system it calls is down](https://github.com/cpoder/vejas/blob/master/docs/adr/0040-a-flow-holds-its-source-while-a-system-is-down.md)
 - [ADR-0041 — 0041 — The playground: the language in the browser, and a live runtime shown read-only](https://github.com/cpoder/vejas/blob/master/docs/adr/0041-the-playground.md)
+- [ADR-0042 — 0042 — An emit carries a key, headers and a time, and a flow reads those of its message](https://github.com/cpoder/vejas/blob/master/docs/adr/0042-an-emit-carries-a-key-headers-and-a-time.md)
