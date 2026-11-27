@@ -22,6 +22,36 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
+/// The agent of the calls a flow makes (ADR-0032). It follows no redirect: a
+/// redirect would take the service's headers, its credentials among them, to
+/// wherever the answer points. A service that takes a 3xx lists it in ANSWERS
+/// and reads `location` itself.
+static CALL_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn call_agent() -> &'static ureq::Agent {
+    CALL_AGENT.get_or_init(|| ureq::AgentBuilder::new().redirects(0).user_agent("vejas").build())
+}
+
+/// What a request that did not get through says: the host it went to, the kind
+/// of failure and its cause. Never the URL or a header: ureq's own text starts
+/// with the whole URL, its query and user info included, and a header it
+/// cannot send is quoted with its value. A secret in either would reach the
+/// run's error, its span, the log and the dead letter.
+fn transport_error(t: &ureq::Transport) -> String {
+    let mut text = String::new();
+    if let Some(host) = t.url().and_then(|url| Some((url.host_str()?, url.port_or_known_default()))) {
+        text.push_str(host.0);
+        if let Some(port) = host.1 {
+            text.push_str(&format!(":{port}"));
+        }
+        text.push_str(": ");
+    }
+    text.push_str(&t.kind().to_string());
+    if let Some(cause) = std::error::Error::source(t) {
+        text.push_str(&format!(": {cause}"));
+    }
+    text
+}
+
 /// One HTTP request. Returns (status, body) — the caller decides what a given
 /// status means (401 → token refresh, etc.), so 4xx/5xx are handed back, not
 /// errored.
@@ -44,7 +74,7 @@ pub fn http_request(
         Ok(r) => r,
         // A non-2xx status is not an error here — return it to the caller.
         Err(ureq::Error::Status(_code, r)) => r,
-        Err(ureq::Error::Transport(t)) => return Err(format!("http: {t}")),
+        Err(ureq::Error::Transport(t)) => return Err(format!("http: {}", transport_error(&t))),
     };
     let code = response.status();
     let mut buf = Vec::new();
@@ -117,7 +147,7 @@ pub(crate) fn http_call(
 ) -> Result<Answer, NoAnswer> {
     use std::io::Read as _;
     let timed_out = |e: &std::io::Error| e.kind() == std::io::ErrorKind::TimedOut;
-    let mut req = http_agent().request(method, url).timeout(timeout);
+    let mut req = call_agent().request(method, url).timeout(timeout);
     for (k, v) in traced(headers, trace) {
         req = req.set(&k, &v);
     }
@@ -135,8 +165,8 @@ pub(crate) fn http_call(
                 | ureq::ErrorKind::ConnectionFailed
                 | ureq::ErrorKind::Io
                 | ureq::ErrorKind::BadStatus
-                | ureq::ErrorKind::ProxyConnect => NoAnswer::Network(t.to_string()),
-                _ => NoAnswer::Broken(t.to_string()),
+                | ureq::ErrorKind::ProxyConnect => NoAnswer::Network(transport_error(&t)),
+                _ => NoAnswer::Broken(transport_error(&t)),
             });
         }
     };
@@ -232,5 +262,25 @@ mod tests {
     fn urlencode_encodes_reserved() {
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(urlencode("p@ss wörd+/="), "p%40ss%20w%C3%B6rd%2B%2F%3D");
+    }
+
+    #[test]
+    fn a_request_that_does_not_get_through_names_no_url_and_no_header() {
+        // a port nothing listens on any more: the connection is refused
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://svc:pw-SECRET-1@127.0.0.1:{port}/orders/1?api_key=SECRET-2");
+        let Err(NoAnswer::Network(e)) = http_call("GET", &url, &[], None, Duration::from_secs(2), None) else {
+            panic!("the connection was not refused")
+        };
+        assert!(e.starts_with(&format!("127.0.0.1:{port}: Connection Failed: ")), "{e}");
+        assert!(!e.contains("SECRET") && !e.contains("api_key"), "{e}");
+        let e = http_request("GET", &url, &[], None).unwrap_err();
+        assert!(e.starts_with("http: 127.0.0.1:") && !e.contains("SECRET"), "{e}");
+        // a header that cannot be sent is not quoted, value included
+        let headers = [("Authorization".to_string(), "Bearer SECRET-3\n".to_string())];
+        let Err(NoAnswer::Broken(e)) = http_call("GET", &url, &headers, None, Duration::from_secs(2), None) else {
+            panic!("the header was sent")
+        };
+        assert!(e.contains("Bad Header") && !e.contains("SECRET"), "{e}");
     }
 }

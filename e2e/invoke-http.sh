@@ -3,7 +3,8 @@
 # reaches the flow; a call that gets no answer is tried again at the message's
 # next delivery, after the service's delay and up to its attempts; one no later
 # try can change is a dead letter at once; an api flow answers 502, or 504 after
-# a timeout. The call carries the message's trace.
+# a timeout. The call carries the message's trace, and its error no URL. Calls
+# that outlive ack_wait run once per message.
 #   e2e/invoke-http.sh                       (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -25,9 +26,18 @@ printf '# flow: enrich\nsource "vx.orders.raw"\no = invoke get_order(id: id)\nem
   > "$R/flows/enrich.vjs"
 printf '# flow: lookup\napi "POST /lookup"\no = invoke get_order(id: id)\nrespond 200, {state: o.body.status}\n' \
   > "$R/flows/lookup.vjs"
+# calls of 2.5 s, against the ack_wait of 1 s the runtime is started with
+printf 'driver "http-rpc"\nBASE_URL = "http://127.0.0.1:%s"\nURL = "{BASE_URL}/orders/{id}"\nTIMEOUT_MS = 5000\n' \
+  $API_PORT > "$R/services/get_lag.vjs"
+printf '# flow: lag\nsource "vx.orders.lag"\no = invoke get_lag(id: id)\nemit "vx.orders.ready", {id: id}\n' > "$R/flows/lag.vjs"
+# a key in the query, and nothing listening
+printf 'driver "http-rpc"\nKEY = secret("orders/key")\nURL = "http://127.0.0.1:9/orders/{id}?api_key={KEY}"\nATTEMPTS = 1\n' \
+  > "$R/services/get_keyed.vjs"
+printf '# flow: keyed\napi "POST /keyed"\no = invoke get_keyed(id: id)\nrespond 200, {s: o.status}\n' > "$R/flows/keyed.vjs"
 
 # The API: flaky-* fails twice then answers, down-* always 503, gone-* 404,
-# slow-* answers after a second. It writes one line per call: id, traceparent.
+# slow-* answers after a second, lag-* after 2.5 s. It writes one line per
+# call: id, traceparent.
 python3 -c '
 import http.server, sys, time, collections
 calls = collections.Counter()
@@ -42,6 +52,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if oid.startswith("down"): status = 503
         if oid.startswith("gone"): status = 404
         if oid.startswith("slow"): time.sleep(1)
+        if oid.startswith("lag"): time.sleep(2.5)
         body = b"{\"status\":\"OK\"}" if status == 200 else b"{\"error\":\"no\"}"
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -51,10 +62,10 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4292 > /dev/null 2>&1 & NP=$!
 sleep 0.5
-NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:8763 \
-  "$BIN" > "$S/rt.log" 2>&1 & RT=$!
+NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:8763 VEJAS_ACK_WAIT_SECS=1 \
+  VEJAS_SECRET_ORDERS_KEY=K3Y-e2e-SECRET "$BIN" > "$S/rt.log" 2>&1 & RT=$!
 until curl -sf -o /dev/null "$H/healthz"; do sleep 0.1; done
-send(){ curl -s -m 5 -X POST -H 'Content-Type: application/json' -d "{\"id\":\"$1\"}" "http://127.0.0.1:$IN/ingest/orders.raw"; }
+send(){ curl -s -m 5 -X POST -H 'Content-Type: application/json' -d "{\"id\":\"$1\"}" "http://127.0.0.1:$IN/ingest/${2:-orders.raw}"; }
 for _ in $(seq 1 100); do send warmup | grep -q published && break; sleep 0.1; done
 nats -s $URL sub vx.orders.ready --raw > "$S/ready" 2>/dev/null & SUB=$!
 sleep 0.5
@@ -81,7 +92,7 @@ for _ in $(seq 1 100); do [ "$(ready flaky-1)" = "1" ] && break; sleep 0.1; done
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 [ "$(ready flaky-1)" = "1" ] && ok "emitted after $(calls flaky-1) calls, in $MS ms" || ko "no emit after $(calls flaky-1) calls"
 [ "$(calls flaky-1)" = "3" ] && ok "three calls" || ko "$(calls flaky-1) calls"
-[ "$MS" -ge 600 ] && [ "$MS" -lt 5000 ] && ok "the deliveries waited the service's delay, not ack_wait" || ko "it took $MS ms"
+[ "$MS" -ge 600 ] && [ "$MS" -lt 1800 ] && ok "the deliveries waited the service's delay, not ack_wait" || ko "it took $MS ms"
 
 echo "── never an answer: a dead letter after the service's attempts"
 send down-1 > /dev/null
@@ -103,6 +114,18 @@ api(){ curl -s -m 10 -o "$S/answer" -w '%{http_code}' -X POST -H 'Content-Type: 
 C=$(api ok-api); [ "$C" = "200" ] && grep -q '"state":"OK"' "$S/answer" && ok "answered: $C" || ko "$C: $(cat "$S/answer")"
 C=$(api down-api); [ "$C" = "502" ] && grep -q 'get_order: HTTP 503' "$S/answer" && ok "no answer: $C" || ko "$C: $(cat "$S/answer")"
 C=$(api slow-api); [ "$C" = "504" ] && grep -q 'timeout after 500 ms' "$S/answer" && ok "too slow: $C" || ko "$C: $(cat "$S/answer")"
+
+echo "── a call's error names no URL: the key in its query stays out"
+C=$(curl -s -m 10 -o "$S/keyed" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"id":"k1"}' "$H/api/keyed")
+[ "$C" = "502" ] && ! grep -q 'K3Y-e2e-SECRET\|api_key' "$S/keyed" && ok "no answer, without the key: $(cat "$S/keyed")" || ko "$C: $(cat "$S/keyed")"
+! grep -q 'K3Y-e2e-SECRET' "$S/rt.log" && ok "nor in the log" || ko "the key is in the log"
+
+echo "── calls that outlive ack_wait: each message runs once"
+for i in 1 2 3; do send "lag-$i" orders.lag > /dev/null; done
+for _ in $(seq 1 150); do [ "$(count '"id":"lag-' "$S/ready")" -ge 3 ] && break; sleep 0.1; done
+sleep 3  # time for a second run of one of them to call and emit again
+[ "$(count '^lag-' "$S/calls")" = "3" ] && ok "three calls of 2.5 s, against an ack_wait of 1 s" || ko "$(count '^lag-' "$S/calls") calls"
+[ "$(count '"id":"lag-' "$S/ready")" = "3" ] && ok "three emits" || ko "$(count '"id":"lag-' "$S/ready") emits"
 
 [ $fail -eq 0 ] && echo "INVOKE HTTP HOLDS" || echo "INVOKE HTTP REGRESSION — do not ship"
 exit $fail

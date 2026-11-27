@@ -1464,10 +1464,24 @@ function diffLine(r, hide) {
 function replayHtml(res, hide) {
   if (!res.events) return '<p><b>No recent event to check it on.</b></p>';
   const lastN = res.events === 1 ? 'the last event' : `the last ${res.events} events`;
+  // the events whose run calls a system: a check calls none
+  const skipped = res.not_recorded || 0, checked = res.events - skipped;
+  const of = skipped ? `${plural(checked, 'event')} checked` : lastN;
   const changed = (res.results || []).filter(r => r.changed);
-  const head = res.changed ? `<b>${res.changed} of ${lastN} would change.</b>` : `<b>None of ${lastN} would change.</b>`;
+  const head = !checked ? `<b>None of ${lastN} could be checked.</b>`
+    : res.changed ? `<b>${res.changed} of ${of} would change.</b>` : `<b>None of ${of} would change.</b>`;
   const list = changed.slice(0, 5).map(r => `<li><span class="time num">${esc(eventLabel(r))}</span><span>${diffLine(r, hide)}</span></li>`).join('');
-  return `<p>${head}</p>${unseen(res.results)}${list ? `<ul>${list}</ul>` : ''}${changed.length > 5 ? `<p class="muted">And ${changed.length - 5} more.</p>` : ''}`;
+  return `<p>${head}</p>${uncalled(res, skipped, checked)}${unseen(res.results)}${list ? `<ul>${list}</ul>` : ''}${changed.length > 5 ? `<p class="muted">And ${changed.length - 5} more.</p>` : ''}`;
+}
+// The events a check left out: their run calls a system, and a check calls none.
+function uncalled(res, skipped, checked) {
+  if (!skipped) return '';
+  const call = (res.results || []).map(r => (r.before || {}).not_recorded || (r.after || {}).not_recorded).find(Boolean) || '';
+  const name = call.split('(')[0];
+  const service = name ? `<code>${esc(name)}</code>` : 'a system';
+  return checked
+    ? `<p class="muted">${plural(skipped, 'other')} could not be checked: their run calls ${service}, and a check calls no system.</p>`
+    : `<p class="muted">Their run calls ${service}, and a check calls no system.</p>`;
 }
 // The fields the flow reads that the check ran without: the runtime hides
 // what may hold a credential, so a rule on one of them may decide otherwise live.

@@ -66,7 +66,9 @@ system and never holds a real secret (ADR-0034).
    `o.status` and `o.body`. In `URL`, `{name}` takes the argument `name`,
    URL-encoded, or the declaration's constant `name`. An argument `body` is
    sent as the JSON body. An argument used nowhere is an error when the
-   flow is checked. The declaration's constants are business literals
+   flow is checked. An argument may not take the name of a constant: the
+   declaration's settings are its own, so a flow does not choose where the
+   service's credentials go. The declaration's constants are business literals
    (ADR-0016), so `BASE_URL` can change live like any other.
 
 2. **What comes back.** For `http-rpc`, `{status, body, headers}`, with
@@ -139,7 +141,8 @@ system and never holds a real secret (ADR-0034).
    `invoke` as a write, so a flow that gains a connector-backed service
    needs approval in governed mode, as one that gains an `emit` does. A
    declaration holds its credentials through `secret()`. The flow never
-   sees them, and a shadow run never resolves them, since it never calls.
+   sees them, and a shadow run never resolves them, since it never calls. A
+   call follows no redirect, which would carry them to another host.
 
 7. **Measured before it grows.** Before a second driver, the cost of an
    invoke of a local `http-rpc` service and of an `exec-rpc` one, with
@@ -157,7 +160,10 @@ system and never holds a real secret (ADR-0034).
   it.
 - A flow handles its messages one at a time, so the latency of what it
   calls bounds its throughput: about 50 messages a second against a 20 ms
-  API. Competing consumers (ADR-0020) spread a flow across instances.
+  API. Competing consumers (ADR-0020) spread a flow across instances. A flow
+  that calls a system also takes its messages from the bus one at a time,
+  asking for none ahead: otherwise the messages held in the client would
+  outlive their `ack_wait` while the calls of others ran, and run twice.
 - A flow's run time and failures now depend on the systems it calls. A
   slow API slows the flows that invoke it, within `TIMEOUT_MS`.
 - A replay reruns a flow against recordings. A candidate that changes what

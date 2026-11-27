@@ -1887,6 +1887,13 @@ pub struct Engine {
     failure: Option<crate::connectors::answer::Failure>,
     /// The trace a call carries when the run's invokes have no span.
     carried: Option<crate::trace::Context>,
+    /// When the services and exports in the cache were loaded.
+    loaded_at: std::time::Instant,
+    /// The first call a run that is shown could not make, its answer not
+    /// recorded: that run's outputs say nothing of the flow's.
+    unrecorded: Option<String>,
+    /// Whether a run of this engine has called a system.
+    called: bool,
 }
 
 /// Whether a run's calls reach a system (ADR-0032).
@@ -1902,16 +1909,89 @@ enum Calls {
 /// source they came from, which the trace record joins the code with.
 struct Service {
     stmts: Block,
-    /// A service that answers from a system instead of running statements
-    /// (ADR-0032): its driver, and its declaration's settings with their
-    /// secrets resolved by the engine that loaded it.
-    answers: Option<(Arc<str>, crate::connectors::Config)>,
+    /// A service that answers from a system instead of running statements.
+    answers: Option<Declared>,
     /// `package:service`, as its steps name it.
     name: Arc<str>,
     /// Its source, hashed into its version the first time a run that records
     /// steps invokes it: a run that records none never pays for the hash.
     src: Box<str>,
     version: std::sync::OnceLock<Arc<str>>,
+}
+
+/// A service that answers from a system (ADR-0032): its driver, its settings
+/// with their secrets resolved by the engine that loaded it (none for a run
+/// that is shown), and what a check of its arguments reads.
+struct Declared {
+    driver: Arc<str>,
+    config: crate::connectors::Config,
+    /// Every setting the declaration names, resolved or not.
+    settings: Vec<String>,
+    /// Its URL, when the declaration writes it as a literal.
+    url: Option<String>,
+}
+
+/// The settings a declaration names, and its URL when written as a literal.
+fn declared_shape(prog: &Program) -> (Vec<String>, Option<String>) {
+    let settings = prog
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Assign(path, _) if path.len() == 1 && is_upper_name(&path[0]) => Some(path[0].clone()),
+            _ => None,
+        })
+        .collect();
+    let url = prog.surface.iter().find(|e| e.name == "URL").and_then(|e| e.value.as_str()).map(String::from);
+    (settings, url)
+}
+
+/// Each invoke of `stmts`, with the names of its arguments.
+fn invoke_sites(stmts: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+    fn site(name: &str, args: &[(String, Expr)], out: &mut Vec<(String, Vec<String>)>) {
+        out.push((name.to_string(), args.iter().map(|(k, _)| k.clone()).collect()));
+        args.iter().for_each(|(_, v)| expr(v, out));
+    }
+    fn expr(e: &Expr, out: &mut Vec<(String, Vec<String>)>) {
+        match e {
+            Expr::Invoke(name, args) => site(name, args, out),
+            Expr::FString(parts) => parts.iter().for_each(|part| {
+                if let FStringPart::Expr(e) = part {
+                    expr(e, out)
+                }
+            }),
+            Expr::Doc(pairs) => pairs.iter().for_each(|(_, v)| expr(v, out)),
+            Expr::Array(items) | Expr::Call(_, items) => items.iter().for_each(|v| expr(v, out)),
+            Expr::Field(b, _, _) | Expr::Projection(b) | Expr::Unary(_, b) => expr(b, out),
+            Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Expr::Lit(_) | Expr::Var(_) => {}
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign(_, e) => expr(e, out),
+            Stmt::Emit(a, b) | Stmt::Respond(a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Stmt::InvokeMerge(name, args) => site(name, args, out),
+            Stmt::If(arms, otherwise) => {
+                for (cond, _, body) in arms {
+                    expr(cond, out);
+                    invoke_sites(body, out);
+                }
+                if let Some(body) = otherwise {
+                    invoke_sites(body, out);
+                }
+            }
+            Stmt::For(_, iter, body) => {
+                expr(iter, out);
+                invoke_sites(body, out);
+            }
+        }
+    }
 }
 
 impl Service {
@@ -2122,35 +2202,113 @@ impl Engine {
             calls: Calls::Made,
             failure: None,
             carried: None,
+            loaded_at: std::time::Instant::now(),
+            unrecorded: None,
+            called: false,
         }
     }
     /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
-    /// invoke's span, or else of the run. A run that is shown calls nothing.
+    /// invoke's span, or else of the run. A run that is shown calls nothing: it
+    /// says which arguments the service does not take, if any, and otherwise
+    /// that the answer is not recorded.
     fn answer(
         &mut self,
         name: &str,
-        driver: &str,
-        config: &crate::connectors::Config,
+        declared: &Declared,
         args: &Map<String, Value>,
         hop: Option<&crate::trace::Hop>,
     ) -> Result<Map<String, Value>, String> {
         if self.calls == Calls::Shown {
-            let mut shown: String = args.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ");
-            if shown.len() > 200 {
-                let cut = (0..=200).rev().find(|&i| shown.is_char_boundary(i)).unwrap_or(0);
-                shown.truncate(cut);
-                shown.push('…');
+            if let Some(url) = &declared.url {
+                let given: Vec<&str> = args.keys().map(String::as_str).collect();
+                let settings: Vec<&str> = declared.settings.iter().map(String::as_str).collect();
+                crate::connectors::answer::fits(url, &given, &settings).map_err(|e| format!("{name}: {e}"))?;
             }
-            return Err(format!(
-                "{name}({shown}) answers from a system, and a run that is shown calls none: no answer was recorded for it"
-            ));
+            let mut call: String = args.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ");
+            if call.len() > 200 {
+                let cut = (0..=200).rev().find(|&i| call.is_char_boundary(i)).unwrap_or(0);
+                call.truncate(cut);
+                call.push('…');
+            }
+            let call = format!("{name}({call})");
+            let error = format!("{call} answers from a system, and a run that is shown calls none: no answer was recorded for it");
+            self.unrecorded.get_or_insert(call);
+            return Err(error);
         }
+        self.called = true;
         let trace = hop.map(|hop| hop.context()).or_else(|| self.carried.clone());
-        crate::connectors::answer::call(name, driver, config, args, trace.as_ref()).map_err(|failure| {
+        let config = &declared.config;
+        crate::connectors::answer::call(name, &declared.driver, config, args, trace.as_ref()).map_err(|failure| {
             let error = failure.error.clone();
             self.failure = Some(failure);
             error
         })
+    }
+    /// The first call a run that is shown could not make, its answer not
+    /// recorded (ADR-0032, point 4): what that run gave says nothing of the
+    /// flow's outputs, and a comparison leaves its event out.
+    pub fn take_unrecorded(&mut self) -> Option<String> {
+        self.unrecorded.take()
+    }
+    /// Whether a run of this engine has called a system.
+    pub fn made_a_call(&self) -> bool {
+        self.called
+    }
+    /// Whether a run of `prog` may call a system: a service it invokes, or one
+    /// those invoke, declares a driver (ADR-0032). Read from the files as they
+    /// are now. A service that cannot be read fails its run without calling.
+    pub fn reaches_system(&mut self, prog: &Program) -> bool {
+        let caller = self.caller_pkg.clone();
+        let mut seen: Vec<String> = Vec::new();
+        let mut todo: Vec<(String, String)> = prog.invokes.iter().map(|n| (caller.clone(), n.clone())).collect();
+        let mut reaches = false;
+        while let Some((pkg, name)) = todo.pop() {
+            self.caller_pkg = pkg;
+            let Ok((pkg, svc)) = self.resolve(&name) else { continue };
+            let key = format!("{pkg}:{svc}");
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let path = self.pkg_dir(&pkg).join("services").join(format!("{svc}.vjs"));
+            let Ok(service) = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|src| parse(&src)) else {
+                continue;
+            };
+            if service.driver.is_some() {
+                reaches = true;
+                break;
+            }
+            todo.extend(service.invokes.iter().map(|n| (pkg.clone(), n.clone())));
+        }
+        self.caller_pkg = caller;
+        reaches
+    }
+    /// What a check of a flow tells of its invokes without running it: the
+    /// arguments a service that answers does not take (ADR-0032, point 1). A
+    /// service that cannot be found, or whose URL is not a literal, is left to
+    /// the run.
+    pub fn check_invokes(&mut self, prog: &Program) -> Vec<String> {
+        let mut sites = Vec::new();
+        invoke_sites(&prog.stmts, &mut sites);
+        let mut problems = Vec::new();
+        for (name, args) in sites {
+            let Ok((pkg, svc)) = self.resolve(&name) else { continue };
+            let path = self.pkg_dir(&pkg).join("services").join(format!("{svc}.vjs"));
+            let Ok(service) = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|src| parse(&src)) else {
+                continue;
+            };
+            if service.driver.is_none() {
+                continue;
+            }
+            let (settings, url) = declared_shape(&service);
+            let Some(url) = url else { continue };
+            let given: Vec<&str> = args.iter().map(String::as_str).collect();
+            let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
+            if let Err(e) = crate::connectors::answer::fits(&url, &given, &settings) {
+                problems.push(format!("invoke {name}: {e}"));
+            }
+        }
+        problems
     }
     /// Why a call of the last run got no answer, if one did not (ADR-0032).
     pub fn take_failure(&mut self) -> Option<crate::connectors::answer::Failure> {
@@ -2215,9 +2373,15 @@ impl Engine {
             }
         }
     }
-    pub fn invalidate(&mut self) {
-        self.cache.clear();
-        self.exports.clear();
+    /// Forget the services and exports loaded `max_age` ago or more: an edit
+    /// of a service, or of a secret a declaration reads, is picked up within
+    /// that time, and a declaration's secrets are resolved at most once in it.
+    pub fn refresh(&mut self, max_age: std::time::Duration) {
+        if self.loaded_at.elapsed() >= max_age {
+            self.cache.clear();
+            self.exports.clear();
+            self.loaded_at = std::time::Instant::now();
+        }
     }
     fn pkg_dir(&self, pkg: &str) -> PathBuf {
         if pkg == "default" {
@@ -2301,20 +2465,40 @@ impl Engine {
         let answers = match &prog.driver {
             None => None,
             Some(driver) if crate::connectors::answer::DRIVERS.contains(&driver.as_str()) => {
+                // Its file holds settings. One that invoked a service would
+                // call it each time it loads, itself included.
+                if prog.writes_bus() {
+                    return Err(format!(
+                        "service {key} declares driver {driver:?}: its file holds settings, and invokes and emits nothing"
+                    ));
+                }
+                let (settings, url) = declared_shape(&prog);
                 // Its settings are its UPPERCASE names, evaluated as a
                 // connector's manifest is: secret() resolves here. A run that
                 // is shown calls nothing, so it resolves nothing either.
                 let config = match self.calls {
                     Calls::Shown => Map::new(),
                     Calls::Made => {
-                        let mut settings =
+                        let mut resolving =
                             Engine::with_secrets(self.project_root.clone(), pkg.to_string(), self.secrets.clone());
-                        let ctx = run(&prog, &Value::Object(Map::new()), &mut settings)
-                            .map_err(|e| format!("service {key}: {e}"))?;
-                        ctx.vars.into_iter().filter(|(k, _)| is_upper_name(k)).collect()
+                        match run(&prog, &Value::Object(Map::new()), &mut resolving) {
+                            Ok(ctx) => ctx.vars.into_iter().filter(|(k, _)| is_upper_name(k)).collect(),
+                            // a store that did not answer may answer the next delivery
+                            Err(e) => {
+                                let failure = crate::connectors::answer::Failure::unresolved(format!("service {key}: {e}"));
+                                let error = failure.error.clone();
+                                self.failure = Some(failure);
+                                return Err(error);
+                            }
+                        }
                     }
                 };
-                Some((Arc::from(driver.as_str()), crate::connectors::Config(config)))
+                Some(Declared {
+                    driver: Arc::from(driver.as_str()),
+                    config: crate::connectors::Config(config),
+                    settings,
+                    url,
+                })
             }
             Some(driver) => {
                 return Err(format!(
@@ -2394,9 +2578,14 @@ fn run_service(
     let saved_pkg = std::mem::replace(&mut engine.caller_pkg, pkg);
     let mut ctx = Ctx { vars: Map::new(), emits: Vec::new(), response: None };
     let result = match &service.answers {
-        Some((driver, config)) => {
+        Some(declared) => {
             let hop = span.as_ref().map(|(hop, _)| hop);
-            engine.answer(name, driver, config, &args, hop).map(|answer| ctx.vars = answer)
+            // What the flow passed comes back with the answer, as it does from
+            // a service of code: a merge gives the flow its arguments too.
+            engine.answer(name, declared, &args, hop).map(|answer| {
+                ctx.vars = args;
+                ctx.vars.extend(answer);
+            })
         }
         None => {
             ctx.vars = args.clone();
@@ -3501,9 +3690,117 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
         let e = failed(run(&prog, &json!({"id": "A1"}), &mut engine));
         assert!(e.starts_with("get_order(id: \"A1\") answers from a system") && e.contains("calls none"), "{e}");
         assert!(seen.lock().unwrap().is_empty(), "the system was called");
+        // the run names the call it could not make, so a comparison leaves it out
+        assert_eq!(engine.take_unrecorded().as_deref(), Some("get_order(id: \"A1\")"));
+        assert!(!engine.made_a_call());
+        // an argument the service does not take is what a shown run reports
+        let typo = parse("o = invoke get_order(idd: event.id)\n").unwrap();
+        let e = failed(run(&typo, &json!({"id": "A1"}), &mut engine));
+        assert_eq!(e, "get_order: the argument idd appears nowhere in its URL");
+        assert!(engine.take_unrecorded().is_none());
         // Only a driver that answers can stand behind a service.
         let e = failed(run(&parse("o = invoke post_it(a: 1)\n").unwrap(), &json!({}), &mut live(root)));
         assert!(e.contains("declares driver \"http-out\", which answers no call"), "{e}");
+    }
+
+    #[test]
+    fn what_a_flow_passes_comes_back_with_the_answer() {
+        let (url, _) = system(|_| (200, r#"{"total": 42}"#, 0));
+        let mut engine = live(declared("merge", &url, ""));
+        let prog = parse("invoke get_order(id: event.ref)\nemit \"vx.t\", {id: id, s: status, total: body.total}\n").unwrap();
+        let ctx = run(&prog, &json!({"ref": "X1"}), &mut engine).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"id": "X1", "s": 200, "total": 42}));
+        assert!(engine.made_a_call());
+    }
+
+    #[test]
+    fn a_call_follows_no_redirect() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        let elsewhere = format!("Location: {url}/elsewhere").parse::<tiny_http::Header>().unwrap();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                kept.lock().unwrap().push(request.url().to_string());
+                let _ = request.respond(tiny_http::Response::empty(302).with_header(elsewhere.clone()));
+            }
+        });
+        let prog = parse("o = invoke get_order(id: event.id)\n").unwrap();
+        let mut engine = live(declared("redirect", &url, ""));
+        assert_eq!(failed(run(&prog, &json!({"id": "A1"}), &mut engine)), "get_order: HTTP 302");
+        assert!(!engine.take_failure().unwrap().retry);
+        assert_eq!(*seen.lock().unwrap(), ["/orders/A1"]);
+    }
+
+    #[test]
+    fn a_call_error_shows_no_secret_its_system_echoes() {
+        crate::secrets::hand_out("s3cr3t-token");
+        let (url, _) = system(|_| (401, r#"{"error": "bad token s3cr3t-token"}"#, 0));
+        let prog = parse("o = invoke get_order(id: event.id)\n").unwrap();
+        let e = failed(run(&prog, &json!({"id": "A1"}), &mut live(declared("echo", &url, ""))));
+        assert!(e.starts_with("get_order: HTTP 401") && !e.contains("s3cr3t-token"), "{e}");
+    }
+
+    #[test]
+    fn a_declaration_holds_settings_and_its_secrets_may_resolve_later() {
+        let (url, seen) = system(|_| (200, "{}", 0));
+        let root = declared("settings", &url, "");
+        let services = root.join("services");
+        std::fs::write(services.join("loops.vjs"), "driver \"http-rpc\"\nURL = \"http://x/{id}\"\nX = invoke loops(id: 1)\n").unwrap();
+        std::fs::write(
+            services.join("locked.vjs"),
+            format!("driver \"http-rpc\"\nURL = \"{url}/{{id}}\"\nHEADERS = {{Authorization: secret(\"missing/key\")}}\n"),
+        )
+        .unwrap();
+        // a declaration that invokes is refused, never run
+        let mut engine = live(root.clone());
+        let e = failed(run(&parse("o = invoke loops(id: 1)\n").unwrap(), &json!({}), &mut engine));
+        assert!(e.contains("its file holds settings, and invokes and emits nothing"), "{e}");
+        // a secret the store does not give: a later delivery may get it
+        let e = failed(run(&parse("o = invoke locked(id: 1)\n").unwrap(), &json!({}), &mut engine));
+        assert!(e.contains("missing/key") && e.contains("not found"), "{e}");
+        let f = engine.take_failure().unwrap();
+        assert!(f.retry && !f.timed_out && f.attempts == 3, "{f:?}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_check_reads_what_a_flow_calls_without_running_it() {
+        let (url, _) = system(|_| (200, "{}", 0));
+        let root = declared("check", &url, "");
+        let services = root.join("services");
+        std::fs::write(services.join("tag.vjs"), "t = 1\n").unwrap();
+        std::fs::write(services.join("enrich.vjs"), "o = invoke get_order(id: 1)\n").unwrap();
+        let mut engine = Engine::shadow(root.clone(), "default".into());
+        let flow = parse("o = invoke get_order(idd: 1)\np = invoke get_order(id: 1, BASE_URL: \"h\")\ninvoke tag(x: 1)\n").unwrap();
+        assert_eq!(
+            engine.check_invokes(&flow),
+            [
+                "invoke get_order: the argument idd appears nowhere in its URL",
+                "invoke get_order: the argument BASE_URL has the name of a setting of the service",
+            ]
+        );
+        assert!(engine.reaches_system(&flow));
+        assert!(!engine.reaches_system(&parse("invoke tag(x: 1)\n").unwrap()));
+        assert!(engine.reaches_system(&parse("invoke enrich(x: 1)\n").unwrap()), "through a service of code");
+        assert!(engine.check_invokes(&parse("o = invoke get_order(id: 1)\n").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_engine_picks_up_a_service_edit_once_its_cache_is_old_enough() {
+        let root = std::env::temp_dir().join(format!("vejas-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::write(root.join("services").join("tag.vjs"), "t = 1\n").unwrap();
+        let prog = parse("invoke tag(x: 1)\nemit \"vx.t\", {t: t}\n").unwrap();
+        let mut engine = Engine::live(root.clone(), "default".into());
+        let t = |engine: &mut Engine| run(&prog, &json!({}), engine).unwrap().emits[0].1["t"].clone();
+        assert_eq!(t(&mut engine), 1);
+        std::fs::write(root.join("services").join("tag.vjs"), "t = 2\n").unwrap();
+        engine.refresh(std::time::Duration::from_secs(3600));
+        assert_eq!(t(&mut engine), 1, "loaded less than an hour ago");
+        engine.refresh(std::time::Duration::ZERO);
+        assert_eq!(t(&mut engine), 2);
     }
 
     struct MapStore(std::collections::HashMap<String, String>);
