@@ -55,6 +55,23 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How long a barrier may wait for its echo (the sync client's flush timeout).
 const BARRIER_WAIT: Duration = Duration::from_secs(10);
 
+/// The answers of a stored batch awaited at a time. The JetStream context lends
+/// a permit to each publish that awaits its answer and takes it back once the
+/// answer is awaited: a batch that sent all its publishes before awaiting any
+/// held one permit per publish, and the one past the context's limit waited
+/// for a permit that only its own waiting could give back (5 000 by default).
+const ANSWERS_AT_ONCE: usize = 1024;
+
+/// The permits the JetStream context lends: more than all the batches that
+/// can await `ANSWERS_AT_ONCE` answers at once will ever ask for.
+const ACKS_IN_FLIGHT: usize = 1 << 24;
+
+/// How long what the bus read of the account's streams stands before it is
+/// read again, in the background (see [`Bus::batch_stored`]): a stream made or
+/// deleted by someone else is seen within this time. One the runtime makes is
+/// seen at once.
+pub const STREAMS_SEEN_FOR: Duration = Duration::from_secs(30);
+
 /// After a failed first connect, later callers get the same answer for this
 /// long instead of queueing on the registry lock behind a dead address.
 const CONNECT_MEMO: Duration = Duration::from_secs(1);
@@ -207,6 +224,31 @@ struct Shared {
     /// here at any flow count (ADR-0035).
     link: Arc<Link>,
     js: jetstream::Context,
+    /// The account's streams, as last read.
+    streams: Mutex<StreamsSeen>,
+}
+
+/// The streams of the account as the bus last read them.
+#[derive(Default)]
+struct StreamsSeen {
+    /// When a read last ended; None before the first.
+    read_at: Option<Instant>,
+    /// A read is under way: the others take what was read before.
+    reading: bool,
+    /// The streams this runtime made while a read was under way: it may have
+    /// begun before them, so they join what it finds.
+    made_while_reading: Vec<Stream>,
+    /// None until a read succeeds.
+    streams: Option<Arc<[Stream]>>,
+    /// The last read failed and said so: the next failures keep quiet.
+    warned: bool,
+}
+
+/// A stream of the account: its name, and the subjects it stores.
+#[derive(Clone)]
+struct Stream {
+    name: String,
+    subjects: Vec<String>,
 }
 
 #[derive(Default)]
@@ -288,8 +330,10 @@ fn open(url: &str) -> Result<Bus, String> {
     let servers = servers_of(url)?;
     wait(async move {
         let link = Link::open(servers).await?;
-        let js = jetstream::new(link.client.clone());
-        Ok(Bus(Arc::new(Shared { link, js })))
+        let js = jetstream::ContextBuilder::new()
+            .max_ack_inflight(ACKS_IN_FLIGHT)
+            .build(link.client.clone());
+        Ok(Bus(Arc::new(Shared { link, js, streams: Mutex::default() })))
     })
 }
 
@@ -333,13 +377,157 @@ impl Bus {
         }
     }
 
-    /// The same, for the emits of units: a publish under `root` is a stream's,
-    /// and its batch is confirmed once that stream has said it stored it.
+    /// The same, for the emits of units: a publish to a subject a stream
+    /// stores waits for that stream's answer, and its batch is confirmed once
+    /// the stream has said it stored it. The others keep the barrier. Until
+    /// the bus has read the account's streams, which takes a permission to list
+    /// them, the subjects under `root` are taken for the stored ones: the
+    /// runtime's stream holds them.
     pub fn batch_stored(&self, root: &str) -> Batch {
         Batch {
             bus: self.clone(),
             held: Vec::new(),
-            stored: Some(format!("{root}.")),
+            stored: Some(format!("{root}.>")),
+        }
+    }
+
+    /// Whether the account has a stream named `name`, as the bus last read the
+    /// streams. False until it could read them.
+    pub fn has_stream(&self, name: &str) -> bool {
+        self.streams_seen().is_some_and(|streams| streams.iter().any(|s| s.name == name))
+    }
+
+    /// Read the account's streams now, and wait for the answer, unless the bus
+    /// has read them before. The runtime calls it once it is connected, before
+    /// its units take a message: a unit whose batch waited for the first read,
+    /// 5 s when the permission to list is missing, saw its messages come back
+    /// meanwhile.
+    pub fn read_streams(&self) {
+        // a read another unit began is waited for, so that each unit's first
+        // batch knows the streams
+        let deadline = Instant::now() + 2 * SEND_WAIT;
+        loop {
+            let mut seen = self.streams_lock();
+            if seen.read_at.is_some() {
+                return;
+            }
+            if !seen.reading {
+                seen.reading = true;
+                drop(seen);
+                let read = wait(self.list_streams());
+                self.streams_read(read);
+                return;
+            }
+            drop(seen);
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The account's streams as last read. Past [`STREAMS_SEEN_FOR`], a call
+    /// starts a read in the background and takes what was read before: no
+    /// batch waits for one. Before the first read ends, None. A list the server
+    /// does not give keeps what was read before.
+    fn streams_seen(&self) -> Option<Arc<[Stream]>> {
+        let mut seen = self.streams_lock();
+        if seen.reading || seen.read_at.is_some_and(|at| at.elapsed() < STREAMS_SEEN_FOR) {
+            return seen.streams.clone();
+        }
+        seen.reading = true;
+        let streams = seen.streams.clone();
+        drop(seen);
+        let bus = self.clone();
+        runtime().spawn(async move {
+            let read = bus.list_streams().await;
+            bus.streams_read(read);
+        });
+        streams
+    }
+
+    fn streams_lock(&self) -> std::sync::MutexGuard<'_, StreamsSeen> {
+        self.0.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Keep what a read of the streams found, with the streams made here while
+    /// it was under way.
+    fn streams_read(&self, read: Result<Vec<Stream>, String>) {
+        let mut seen = self.streams_lock();
+        seen.reading = false;
+        seen.read_at = Some(Instant::now());
+        let made = std::mem::take(&mut seen.made_while_reading);
+        match read {
+            Ok(mut streams) => {
+                for stream in made {
+                    if !streams.iter().any(|s| s.name == stream.name) {
+                        streams.push(stream);
+                    }
+                }
+                seen.streams = Some(streams.into());
+                seen.warned = false;
+            }
+            Err(e) if !seen.warned => {
+                seen.warned = true;
+                let standing = match seen.streams {
+                    Some(_) => "what was read before stands",
+                    None => "an emit under the subject root is taken for stored",
+                };
+                eprintln!("[vejas] the streams could not be listed ({e}): {standing}");
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// This runtime made a stream, or found it made: the next batch knows of
+    /// it. One already known changes nothing.
+    fn stream_made(&self, name: &str, subjects: &[String]) {
+        let mut seen = self.streams_lock();
+        let stream = Stream { name: name.to_string(), subjects: subjects.to_vec() };
+        if seen.reading && !seen.made_while_reading.iter().any(|s| s.name == name) {
+            seen.made_while_reading.push(stream.clone());
+        }
+        if let Some(streams) = &seen.streams {
+            if !streams.iter().any(|s| s.name == name) {
+                let mut more = streams.to_vec();
+                more.push(stream);
+                seen.streams = Some(more.into());
+            }
+        }
+    }
+
+    /// The account's streams that answer a publish, every page of the server's
+    /// list. A stream that stores without answering, `no_ack`, is left out:
+    /// its subjects keep the barrier, since no answer would come.
+    async fn list_streams(&self) -> Result<Vec<Stream>, String> {
+        let client = &self.0.link.client;
+        let mut streams = Vec::new();
+        let mut offset = 0;
+        loop {
+            let ask = client.request("$JS.API.STREAM.LIST", json!({"offset": offset}).to_string().into());
+            let reply = match timeout(SEND_WAIT, ask).await {
+                Ok(reply) => reply.map_err(|e| e.to_string())?,
+                Err(_) => return Err("timed out".into()),
+            };
+            let page: Value = serde_json::from_slice(&reply.payload).map_err(|e| format!("unreadable reply: {e}"))?;
+            if let Some(error) = page.get("error") {
+                return Err(error["description"].as_str().unwrap_or("error").to_string());
+            }
+            let listed = page["streams"].as_array().map(Vec::as_slice).unwrap_or_default();
+            offset += listed.len();
+            for stream in listed {
+                if stream["config"]["no_ack"].as_bool() == Some(true) {
+                    continue;
+                }
+                let subjects = stream["config"]["subjects"].as_array().map(Vec::as_slice).unwrap_or_default();
+                streams.push(Stream {
+                    name: stream["config"]["name"].as_str().unwrap_or_default().to_string(),
+                    subjects: subjects.iter().filter_map(Value::as_str).map(String::from).collect(),
+                });
+            }
+            if listed.is_empty() || offset as u64 >= page["total"].as_u64().unwrap_or(0) {
+                return Ok(streams);
+            }
         }
     }
 
@@ -416,7 +604,8 @@ impl Bus {
 pub struct Batch {
     bus: Bus,
     held: Vec<(Subject, Option<HeaderMap>, Bytes)>,
-    /// `root.`: the subjects whose publishes wait for the stream's answer.
+    /// For the emits of units, the root's subjects (see [`Bus::batch_stored`]):
+    /// a publish to a subject a stream stores waits for its answer.
     stored: Option<String>,
 }
 
@@ -427,6 +616,12 @@ pub struct Refused {
     pub index: usize,
     pub subject: String,
     pub error: String,
+    /// No later try can change it: a message over the server's or the
+    /// stream's size limit, headers over the stream's, a sealed stream. A full
+    /// stream or account, or no leader, may clear.
+    pub lasting: bool,
+    /// What was published, for a caller that keeps it elsewhere.
+    pub payload: Bytes,
 }
 
 impl Batch {
@@ -501,9 +696,9 @@ impl Batch {
     }
 
     /// [`Batch::confirm`], saying which publishes the stream refused. A batch
-    /// made by [`Bus::batch_stored`] asks the stream for an answer to each
-    /// publish under its root, the way a JetStream publish does, and waits for
-    /// them all at once.
+    /// made by [`Bus::batch_stored`] asks for an answer to each publish whose
+    /// subject a stream stores (as the bus last read the streams), the way a
+    /// JetStream publish does, and awaits them [`ANSWERS_AT_ONCE`] at a time.
     ///
     /// The barrier proves the server read a publish, not that a stream stored
     /// it. A stream that is full and discards new messages, a disk that is
@@ -516,9 +711,9 @@ impl Batch {
     /// confirmed as a whole: the connection, or an answer that did not come
     /// within the barrier's wait.
     ///
-    /// A publish outside the root, or one answered by a service that listens
-    /// on its subject instead of by the stream, counts as read, as with the
-    /// barrier.
+    /// A publish to a subject no stream stores, or one answered by a service
+    /// that listens on its subject instead of by the stream, counts as read,
+    /// as with the barrier.
     pub fn confirm_each(&mut self) -> Result<Vec<Refused>, String> {
         if self.held.is_empty() {
             return Ok(Vec::new());
@@ -528,17 +723,41 @@ impl Batch {
             self.held.clear();
             return Err("the connection is down".into());
         }
+        // before the batch leaves: reading them may ask the server
+        let streams = self.stored.as_deref().map(|root| (root, self.bus.streams_seen()));
+        let stored_by_a_stream = |subject: &str| match &streams {
+            None => false,
+            Some((_, Some(streams))) => streams
+                .iter()
+                .any(|s| s.subjects.iter().any(|f| crate::pull::subject_matches(f, subject))),
+            // the streams could not be read: the root's are the runtime's stream's
+            Some((root, None)) => crate::pull::subject_matches(root, subject),
+        };
         let epoch = link.epoch();
         let js = &self.bus.0.js;
-        let stored = self.stored.as_deref();
         let held = &mut self.held;
         wait(async {
+            let deadline = tokio::time::Instant::now() + BARRIER_WAIT;
+            let mut refused = Vec::new();
             let mut answers = Vec::new();
+            // the subjects of this batch already looked up: a batch has few
+            let mut known: Vec<(Subject, bool)> = Vec::new();
             let mut plain = false;
             for (index, (subject, headers, payload)) in held.drain(..).enumerate() {
-                if stored.is_some_and(|root| subject.starts_with(root)) {
-                    // a count of the bytes it shares, not a copy
+                let stored = match known.iter().find(|(s, _)| *s == subject) {
+                    Some((_, stored)) => *stored,
+                    None => {
+                        let stored = stored_by_a_stream(&subject);
+                        if known.len() < 64 {
+                            known.push((subject.clone(), stored));
+                        }
+                        stored
+                    }
+                };
+                if stored {
+                    // counts of the bytes they share, not copies
                     let name = subject.clone();
+                    let kept = payload.clone();
                     let sending = match headers {
                         Some(headers) => timeout(SEND_WAIT, js.publish_with_headers(subject, headers, payload)).await,
                         None => timeout(SEND_WAIT, js.publish(subject, payload)).await,
@@ -547,7 +766,10 @@ impl Batch {
                         Ok(answer) => answer.map_err(|e| e.to_string())?,
                         Err(_) => return Err("timed out: the bus connection is not taking writes".into()),
                     };
-                    answers.push((index, name, answer));
+                    answers.push((index, name, kept, answer));
+                    if answers.len() >= ANSWERS_AT_ONCE {
+                        heard(&mut answers, &mut refused, deadline).await?;
+                    }
                 } else {
                     plain = true;
                     match headers {
@@ -559,40 +781,64 @@ impl Batch {
             if plain {
                 link.barrier_since(epoch).await?;
             }
-            let heard = timeout(BARRIER_WAIT, async {
-                let mut refused = Vec::new();
-                for (index, subject, answer) in answers {
-                    if let Some(error) = refusal(answer.await)? {
-                        refused.push(Refused { index, subject: subject.to_string(), error });
-                    }
-                }
-                Ok(refused)
-            });
-            match heard.await {
-                Ok(refused) => refused,
-                Err(_) => Err("timed out waiting for the stream to store the batch".into()),
-            }
+            heard(&mut answers, &mut refused, deadline).await?;
+            Ok(refused)
         })
     }
 }
 
+/// Await the answers of the publishes sent so far, by `deadline`, and note
+/// which ones the stream refused. Awaited, an answer gives its permit back.
+async fn heard(
+    answers: &mut Vec<(usize, Subject, Bytes, jetstream::context::PublishAckFuture)>,
+    refused: &mut Vec<Refused>,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let waiting = async {
+        for (index, subject, payload, answer) in answers.drain(..) {
+            if let Some((error, lasting)) = refusal(answer.await)? {
+                refused.push(Refused { index, subject: subject.to_string(), error, lasting, payload });
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout_at(deadline, waiting).await {
+        Ok(done) => done,
+        Err(_) => Err("timed out waiting for the stream to store the batch".into()),
+    }
+}
+
 /// What the stream's answer to one publish says: None when it stored it, the
-/// reason when it refused it, Err when the answer did not come.
-fn refusal(answer: Result<jetstream::publish::PublishAck, jetstream::context::PublishError>) -> Result<Option<String>, String> {
+/// reason when it refused it and whether that lasts (see [`Refused::lasting`]),
+/// Err when the answer did not come.
+fn refusal(
+    answer: Result<jetstream::publish::PublishAck, jetstream::context::PublishError>,
+) -> Result<Option<(String, bool)>, String> {
     use jetstream::context::PublishErrorKind;
     let Err(error) = answer else {
         return Ok(None);
     };
     match error.kind() {
-        PublishErrorKind::StreamNotFound => Ok(Some("no stream stores this subject".into())),
+        // the stream went away since the bus read the streams: it may be back
+        PublishErrorKind::StreamNotFound => Ok(Some(("no stream stores this subject".into(), false))),
         PublishErrorKind::TimedOut | PublishErrorKind::BrokenPipe => Err(error.to_string()),
+        PublishErrorKind::MaxPayloadExceeded => Ok(Some((error.to_string(), true))),
         _ => {
             let stream = std::error::Error::source(&error).and_then(|source| source.downcast_ref::<jetstream::Error>());
             match stream {
-                Some(said) => Ok(Some(said.to_string())),
+                Some(said) => {
+                    use jetstream::ErrorCode;
+                    let lasting = [
+                        ErrorCode::STREAM_MESSAGE_EXCEEDS_MAXIMUM,
+                        ErrorCode::STREAM_HEADER_EXCEEDS_MAXIMUM,
+                        ErrorCode::STREAM_SEALED,
+                    ]
+                    .contains(&said.error_code());
+                    Ok(Some((said.to_string(), lasting)))
+                }
                 // a service on the subject answered first: read, as with the barrier
                 None if error.kind() == PublishErrorKind::Other => Ok(None),
-                None => Ok(Some(error.to_string())),
+                None => Ok(Some((error.to_string(), false))),
             }
         }
     }
@@ -1148,8 +1394,9 @@ impl JetStream {
         self.api_coded(
             format!("STREAM.CREATE.{}", config.name),
             body.to_string().into(),
-        )
-        .map(|_| ())
+        )?;
+        self.0.stream_made(&config.name, &config.subjects);
+        Ok(())
     }
 
     /// Create a stream, or bring the limits of the one that exists to those of
@@ -1811,32 +2058,77 @@ mod live {
     fn a_batch_says_which_publish_its_stream_refused() {
         let server = Server::start();
         let bus = connect(&server.url()).unwrap();
-        bus.jetstream()
-            .add_stream(&StreamConfig {
-                name: "FULL".into(),
-                subjects: vec!["t.>".into()],
-                max_msgs: 2,
-                discard: Discard::New,
-                ..Default::default()
-            })
-            .unwrap();
+        bus.read_streams();
+        let full = |name: &str, subjects: &str| StreamConfig {
+            name: name.into(),
+            subjects: vec![subjects.into()],
+            max_msgs: 2,
+            discard: Discard::New,
+            ..Default::default()
+        };
+        bus.jetstream().add_stream(&full("FULL", "t.>")).unwrap();
         let mut batch = bus.batch_stored("t");
         for n in 0..3 {
             batch.publish("t.full", n.to_string()).unwrap();
         }
-        // outside the root: the barrier alone
+        // no stream stores it: the barrier alone
         batch.publish("u.plain", "plain").unwrap();
         let refused = batch.confirm_each().unwrap();
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!((refused[0].index, refused[0].subject.as_str()), (2, "t.full"));
         assert!(refused[0].error.starts_with("maximum messages exceeded"), "{}", refused[0].error);
+        assert!(!refused[0].lasting, "a full stream may take it later");
+        assert_eq!(&refused[0].payload[..], b"2");
         assert_eq!(bus.jetstream().stream_state("FULL").unwrap().messages, 2);
 
-        // under the root, and no stream for it
-        let mut batch = bus.batch_stored("w");
-        batch.publish("w.nowhere", "x").unwrap();
+        // a stream outside the root is asked too, and one made here is known at once
+        bus.jetstream().add_stream(&full("ELSE", "w.>")).unwrap();
+        let mut batch = bus.batch_stored("t");
+        for n in 0..3 {
+            batch.publish("w.else", n.to_string()).unwrap();
+        }
+        let refused = batch.confirm_each().unwrap();
+        assert_eq!(refused.iter().map(|r| r.index).collect::<Vec<_>>(), [2], "{refused:?}");
+
+        // a message over the stream's own size limit: no later try stores it
+        let made = bus.jetstream().api(
+            "STREAM.CREATE.SMALL".into(),
+            json!({"name": "SMALL", "subjects": ["s.>"], "max_msg_size": 16, "storage": "memory"}).to_string().into(),
+        );
+        made.unwrap();
+        // a stream that stores and never answers, `no_ack`, keeps the barrier:
+        // an answer awaited would never come
+        let made = bus.jetstream().api(
+            "STREAM.CREATE.QUIET".into(),
+            json!({"name": "QUIET", "subjects": ["q.>"], "no_ack": true, "storage": "memory"}).to_string().into(),
+        );
+        made.unwrap();
+        // a sealed stream takes no message again
+        let sealed = json!({"name": "SEALED", "subjects": ["z.>"], "storage": "memory"});
+        bus.jetstream().api("STREAM.CREATE.SEALED".into(), sealed.to_string().into()).unwrap();
+        let mut seal = sealed.clone();
+        seal["sealed"] = true.into();
+        bus.jetstream().api("STREAM.UPDATE.SEALED".into(), seal.to_string().into()).unwrap();
+        // made behind this bus's back: a bus of its own reads the streams afresh
+        let fresh = connect_own(&server.url()).unwrap();
+        fresh.read_streams();
+        let mut batch = fresh.batch_stored("t");
+        batch.publish("s.big", vec![b'x'; 100]).unwrap();
+        batch.publish("q.quiet", "stored, never answered").unwrap();
+        batch.publish("z.sealed", "refused for good").unwrap();
+        let started = Instant::now();
+        let refused = batch.confirm_each().unwrap();
+        assert!(started.elapsed() < SEND_WAIT, "the batch waited for QUIET: {:?}", started.elapsed());
+        assert_eq!(refused.iter().map(|r| (r.index, r.lasting)).collect::<Vec<_>>(), [(0, true), (2, true)], "{refused:?}");
+        assert_eq!(fresh.jetstream().stream_state("QUIET").unwrap().messages, 1);
+
+        // deleted by someone else: the bus counts on it until it reads the streams again
+        fresh.jetstream().delete_stream("ELSE").unwrap();
+        let mut batch = bus.batch_stored("t");
+        batch.publish("w.else", "x").unwrap();
         let refused = batch.confirm_each().unwrap();
         assert_eq!(refused[0].error, "no stream stores this subject");
+        assert!(!refused[0].lasting, "it may be made again");
 
         // `confirm` reads a refusal as a batch that failed
         let mut batch = bus.batch_stored("t");
@@ -1848,6 +2140,27 @@ mod live {
         let mut batch = bus.batch();
         batch.publish("t.full", "read by the server, dropped by the stream").unwrap();
         batch.confirm().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn a_stored_batch_past_the_answers_a_context_lends_is_confirmed() {
+        // The JetStream context lends 5 000 permits by default, one to each
+        // publish until its answer is awaited: a batch that sent more before
+        // awaiting any waited for a permit only its own waiting could give back.
+        let server = Server::start();
+        let bus = connect(&server.url()).unwrap();
+        let many = StreamConfig { name: "MANY".into(), subjects: vec!["m.>".into()], ..Default::default() };
+        bus.jetstream().add_stream(&many).unwrap();
+        let mut batch = bus.batch_stored("m");
+        for n in 0..12_000 {
+            batch.publish("m.n", n.to_string()).unwrap();
+        }
+        let started = Instant::now();
+        let refused = batch.confirm_each().unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(started.elapsed() < SEND_WAIT, "{:?}", started.elapsed());
+        assert_eq!(bus.jetstream().stream_state("MANY").unwrap().messages, 12_000);
     }
 
     #[test]

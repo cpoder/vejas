@@ -15,6 +15,19 @@ post-mortem knows *which* logic failed, even after a promote. The envelope
 also keeps the `traceparent` of the event, and a replay continues that
 trace (see [observability](observability.md)).
 
+An emit the stream refuses to store (a stream full that discards new
+messages, a full disk, no leader in a cluster) fails its run the same way. A
+refusal no delivery changes, a message over the stream's own size limit, is a
+dead letter at the first delivery.
+
+A detect unit's engine has taken a message in once it ran: delivered again,
+it would count twice. So its message is acked, and an alert a stream refuses
+is a dead letter of its own, marked `"emit": true`, whose subject is where the
+alert was going. When an alert is too large for the server, none of that
+run's alerts leave, and each is a dead letter. A payload too large for a
+letter is cut to fit, and the letter says so (`"cut": true`): it can be read,
+not replayed.
+
 ## Seeing and replaying
 
 - Panel: the **To review** page; API: `GET /dlq`; agent: `vejas_dlq`.
@@ -28,7 +41,8 @@ trace (see [observability](observability.md)).
   message that died (`Vejas-Replay-Of`), so the panel and the trace read the
   letter and its replays as one event. A letter that no unit would take
   stays, and the answer's `errors` says why: its unit is no longer declared,
-  or no longer reads that subject.
+  or no longer reads that subject. An `emit` letter goes back on its subject
+  for every reader, since no reader has had it.
 - In [governed mode](governed-mode.md) both are human acts: `vejas_dlq_replay`
   and `vejas_dlq_purge` are refused, and the HTTP routes want the
   `X-Approval-Token` header, which the panel sends.

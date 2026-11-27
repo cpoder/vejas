@@ -226,24 +226,59 @@ for the stream drops it, and the barrier still comes back. A bench on a stream
 limited to one message showed it: two emits, one kept, no error, no dead letter,
 and the source message acked.
 
-An emit under the stream's root (`Bus::batch_stored`) is now published the way a
-JetStream publish is, with a reply, and the batch waits for every answer at once,
-within the barrier's wait. An answer that is an error, or no stream for the
-subject, refuses that emit: its run fails as a run that errs does, and the other
-runs of the batch stand (`Batch::confirm_each`). No answer in time fails the
-batch as the barrier did. Emits outside the root keep the barrier. A service
-that answers on a stream's subject before the stream does counts as read, as
-before; nothing in the repo does that.
+An emit of a unit to a subject a stream stores (`Bus::batch_stored`) is now
+published the way a JetStream publish is, with a reply, and the batch waits for
+the answers within the barrier's wait. Which subjects a stream stores, the bus
+knows from the account's list of streams (`$JS.API.STREAM.LIST`): read when a
+unit starts, before its first message, read again every 30 s in the background
+so that no batch waits for it, and told at once of a stream the runtime makes.
+A stream that stores without answering (`no_ack`) is left out: its subjects keep
+the barrier. Without the permission to list them, the subjects under the root
+are taken for the ones `VEJAS` stores, as the first version of this amendment
+did for every subject. An answer that is an error, or no stream for the subject,
+refuses that emit: its run fails as a run that errs does, and the other runs of
+the batch stand (`Batch::confirm_each`). A message over the server's or the
+stream's size limit, headers over the stream's, or a sealed stream, is a refusal
+no later try changes (`Refused::lasting`, by the server's error code): the run's
+message is a dead letter at its first delivery, and an `api` flow answers 500,
+not 503. A full stream, account or disk may clear, and is no such refusal. No
+answer in time fails the batch as the barrier did. Emits no stream stores keep the barrier. A
+service that answers on a stream's subject before the stream does counts as
+read, as before; nothing in the repo does that.
+
+The JetStream context lends a permit to each publish that waits for an answer,
+5 000 by default, and takes it back when the answer is awaited. A batch that
+sent all its publishes before awaiting any waited, past 5 000, for a permit only
+its own waiting could give back, and every unit shares the context. The batch
+now awaits its answers 1 024 at a time, and the context lends far more permits
+than all the units can hold at once.
+
+A detect unit cannot fail a run by delivering its message again: its engine has
+taken the event in, and would count it twice. Its alert that a stream refuses is
+a dead letter of its own (`dlq::emit_to_dlq`), whose replay publishes it where
+it was going, and the message is acked. A batch the bus does not confirm starts
+the unit again with a new engine: from its snapshot when it keeps one (ADR-0031),
+whose replay sends the alerts again. The alerts that time closes are confirmed
+the same way. The server also delivers a message again when its ack is lost or
+comes after `ack_wait`. A unit whose program keeps state has its consumer made
+again at each start, after what its engine holds, so a second delivery is one
+of its own engine's, and it is acked without being fed. A stateless program
+keeps its consumer, which instances may share: a message delivered again
+alerts again, at least once, as a flow runs again.
 
 Measured on the flow hop, with 20 000 events already stored when the runtime
-starts, five runs each, interleaved: 13 500 events/s before and 11 700 after
-(-13 %), 88 and 95 µs of runtime CPU per event, 224 and 228 µs of server CPU.
-With publishers in the loop (`bench/flow-only.sh`) the rate does not move,
-because they are slower than the flow. The cost is on the client side, since
-the server's CPU does not move: each emit now has a reply subject, a timer and a
-channel of its own. Two ways to take it back, not tried: a subscription per
-batch that collects its answers, or the atomic batch publish of nats-server
-2.12, one answer for a batch that is stored whole or not at all.
+starts, five runs each, interleaved: 16 051 events/s before, 15 360 after
+(medians), 4 % less. The CPU per event does not move, the runtime's (74 µs
+before, 71 after) nor the server's (192 µs, 197): a batch waits longer, until
+the stream has stored its emits rather than until the server has read them. With
+publishers in the loop (`bench/flow-only.sh`) the rate does not move, 8 905
+events/s before and 9 183 after, because they are slower than the flow. A way to
+take the 4 % back, not tried: run the next batch while the stream answers for
+the last. The atomic batch publish of nats-server 2.12, one answer for a batch
+stored whole or not at all, would keep a run's emits from being sent twice:
+today a run whose third emit is refused sends its first two again when its
+message comes back. `Nats-Msg-Id` on each emit would let the stream drop those
+copies within its duplicate window.
 
 The answers come back on `_INBOX.>`, which a runtime with a publish allow-list
 already needed.
