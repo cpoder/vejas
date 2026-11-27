@@ -73,6 +73,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   replay went through no longer shows as failed.
 
 ### Changed
+- **Breaking: the `endpoint` of an `http-poll` envelope (`ENVELOPE = true`)
+  is the URL without its user info and its query, and that of an
+  `oauth-poll` page is the endpoint without its query**, and without its
+  user info when it is a whole URL, since a credential often rides there
+  (`api_key`, an Azure Functions `code`). It is `a URL a secret store holds`
+  when the URL comes from a secret store, whose host may be the credential. A flow that told two `http-poll`
+  URLs apart by their query reads the subject instead: each connector has
+  its own. Two `oauth-poll` endpoints on the same path now carry the same
+  `endpoint`.
 - **The panel is redesigned around two people.** A menu on the left; a page
   per flow for the domain expert, read top to bottom (receives, computes,
   calls, checks, sends), with the business values in yellow where the flow
@@ -158,6 +167,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 - **A dead letter never fails for its size.** A payload that would take its
   letter past the server's limit is cut to fit, and the letter says so
   (`"cut": true`). A replay refuses it, since it holds only the start.
+- **The Vault store never writes over the keys it could not read.** A KV v2
+  write replaces the whole path, so the store reads the path's keys first and
+  writes them back with the new one. A read that failed, a 500 or no answer,
+  was taken for an empty path, and the write dropped every other key. Only
+  Vault's own 404 is taken for an empty path now, not a proxy's: any other
+  failure stops the write and says so. The write goes over the version read
+  only (check-and-set), so one made in between is no longer dropped: ours
+  fails and says to write again.
 - **An `api` flow answers 503 when the bus does not confirm its emits.** It
   answered 200, or what the flow said, without knowing whether its emits had
   left: with the bus down, the caller was told the event was taken and it was
@@ -202,6 +219,63 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   reason instead of "Replayed.".
 
 ### Security
+- **`http-out`, `http-poll`, `oauth-poll` and `invoke` keep a credential that
+  rides in a URL, or that a system echoes, out of the log, the events and the
+  dead letters.** A system that echoes the request, as a 400 page often does,
+  carried a key from the URL into the log, the unit's last error and the dead
+  letter stored in the stream. An answer outside 2xx is now quoted in the
+  error under the record's mask (ADR-0017), then with what of the URL could
+  carry a credential masked wherever the answer echoes it: the user info and
+  each value of the query, of 6 bytes or more, and a segment of the path of
+  16 bytes or more with a digit in it, as a webhook's address carries its
+  token, or of letters that read as random, base64url's `-` and `_` among
+  them. A date, a time or a version is no credential
+  (`api-version=2024-02-01`, `2.0.0-rc.1`); a number is one, since a PIN or
+  a key may be, and so is a UUID in the path, as a webhook's is
+  (`/webhook/6f7b288e-…`). Each part of a URL a secret store handed out, or
+  of one built on it (a `BASE_URL`), is one, its host and each segment of 6
+  bytes or more, and the errors and the log name none of them. A shorter
+  token in the path, or one in words, is not found. Each is found as it is, decoded, and through
+  the escapes the answer wraps it in, JSON's, a URL's or HTML's, the named
+  signs of HTML5 among them (`&sol;`), as the record finds the values the
+  stores handed out; one that starts before the excerpt's cut is masked
+  whole, however long. The same for a token endpoint that echoes the client
+  secret, and for what the system of an `http-out` sink answers with a 2xx,
+  which the trace record, the events and the sink's test keep. The access
+  token `oauth-poll` fetches is masked wherever the values the stores handed
+  out are: each connector's last two, apart from those values, so that
+  however many tokens come, none pushes a store's value out of the masks. On
+  a 401, another token is fetched, unless the endpoint refused one fetched
+  for its 401 already, until it answers otherwise, or for an `EXPAND`'s
+  details, which answer by item, while the token lives: a client the
+  endpoint refuses got a new token per endpoint and per tick. A token is used no
+  longer than the token endpoint says it lives, less a tenth of that and a
+  minute at most, 5 s at least; it was used 30 s at least. `http-out`, `http-poll` and `oauth-poll` read 64 KiB at most of
+  an answer outside 2xx. `http-poll` logs its host instead of its URL,
+  `oauth-poll` names its endpoints and an item's link without their query
+  and their user info in its errors and its test, and the `http-out` test
+  names the host it was refused by.
+- **`http-out`, `http-poll`, `oauth-poll`, the Vault store and the OTLP
+  exporter follow no redirect**, as the calls of a flow do not (ADR-0032).
+  The HTTP client dropped `Authorization` on a redirect and took the other
+  headers along, an `X-Api-Key`, `X-Vault-Token` or the headers of
+  `OTEL_EXPORTER_OTLP_HEADERS` among them, to wherever the answer pointed. A
+  301, 302, 303, 307 or 308 is now an error that names the host and says to
+  set the URL to the address it points to; the OTLP exporter counts the
+  spans it sent as dropped. A Vault standby node answers 307: `VAULT_ADDR`
+  names the active node, or a balancer that reaches it.
+- **`oauth-poll` takes its token to no other host than the page's.** It
+  followed an absolute next page link, `@odata.nextLink`, wherever it
+  pointed, with the Bearer token. A next page at another scheme, host or
+  port than the page it came from is now an error that names both, and the
+  endpoint waits for the next tick. A relative link reads against the
+  endpoint's origin when the endpoint is a whole URL elsewhere than
+  `BASE_URL`, and a query alone (`?p=2`) against the page. An `EXPAND` detail
+  that is an item's field alone (`detail = "{href}"`) is the item's link,
+  held to the list page's origin the same way; an id in a detail path is
+  percent-encoded as one segment of it, so that a `/` or `../` of the id no
+  longer moves the call, and an id that is empty, `.` or `..` leaves its
+  item's detail null.
 - **A request of `http-out`, `http-poll` or `oauth-poll` that does not get
   through names its host in its error, not its URL.** The HTTP client's text
   starts with the whole URL, its query and user info included, and quotes a

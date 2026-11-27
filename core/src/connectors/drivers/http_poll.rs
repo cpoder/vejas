@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde_json::Value;
 use vejas_connector::clock::iso8601_utc;
 
-use crate::connectors::http_client::http_get;
+use crate::connectors::http_client::{host_of, http_get, url_shown};
 use crate::connectors::{Ctx, Driver, humanize};
 use crate::metrics::Kind;
 
@@ -16,7 +16,7 @@ impl Driver for HttpPoll {
         "source:poll"
     }
     fn about(&self) -> &'static str {
-        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …}), ENVELOPE (optional bool: when true, publish {endpoint, fetched_at, body} like oauth-poll so a stateless flow gets a collected_at — the language has no clock)."
+        "GETs a URL every INTERVAL_SECS and publishes the JSON body. Config: URL, SUBJECT, INTERVAL_SECS, HEADERS (optional doc, e.g. {\"Authorization\": …}), ENVELOPE (optional bool: when true, publish {endpoint, fetched_at, body} like oauth-poll so a stateless flow gets a collected_at — the language has no clock; endpoint is the URL without its user info and its query). A redirect is not followed."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let url = ctx.config.str("URL").ok_or("URL required")?;
@@ -32,7 +32,9 @@ impl Driver for HttpPoll {
         let headers = ctx.config.headers();
         let envelope = ctx.config.0.get("ENVELOPE").and_then(|v| v.as_bool()).unwrap_or(false);
         let js = ctx.jetstream()?;
-        eprintln!("[{}] polling {url} every {interval}s -> {subject}", ctx.name);
+        // the host only: a credential may ride in the URL's query or path
+        eprintln!("[{}] polling {} every {interval}s -> {subject}", ctx.name, host_of(&url));
+        let endpoint = url_shown(&url);
         let mut waited = interval * 1000; // fire immediately on start
         loop {
             if !ctx.alive() {
@@ -49,7 +51,7 @@ impl Driver for HttpPoll {
                             // flow gets collected_at); else the raw body (compat)
                             let bytes = if envelope {
                                 serde_json::to_vec(&serde_json::json!({
-                                    "endpoint": url,
+                                    "endpoint": endpoint,
                                     "fetched_at": iso8601_utc(crate::now_secs()),
                                     "body": parsed,
                                 }))

@@ -150,6 +150,15 @@ const HANDED_OUT_MIN: usize = 4;
 struct Handed {
     last_use: HashMap<String, u64>,
     clock: u64,
+    /// Those that are URLs, each as the `url` crate writes it: a URL built on
+    /// one (`{BASE_URL}/items`) is a stored URL too.
+    urls: Vec<(String, String)>,
+}
+
+/// A URL as the `url` crate writes it: its host in lower case, no default
+/// port, a path that is empty written `/`, as it encodes it.
+fn written(url: &str) -> Option<String> {
+    url::Url::parse(url).ok().filter(|parsed| parsed.has_host()).map(String::from)
 }
 
 impl Handed {
@@ -169,10 +178,21 @@ impl Handed {
                 .map(|(v, _)| v.clone());
             if let Some(oldest) = oldest {
                 self.last_use.remove(&oldest);
+                self.urls.retain(|(url, _)| *url != oldest);
             }
+        }
+        if let Some(written) = written(value).filter(|_| value.contains("://")) {
+            self.urls.push((value.to_string(), written));
         }
         self.last_use.insert(value.to_string(), now);
         true
+    }
+
+    /// Whether `url` is a value handed out, or starts with a URL handed out,
+    /// both as the `url` crate writes them. Read only when a URL was.
+    fn holds_url(&self, url: &str) -> bool {
+        self.last_use.contains_key(url)
+            || !self.urls.is_empty() && written(url).is_some_and(|url| self.urls.iter().any(|(_, base)| url.starts_with(base.as_str())))
     }
 }
 
@@ -190,26 +210,81 @@ fn remember(value: &str) {
     }
 }
 
-/// Every value handed out and still remembered, longest first.
+/// Every value handed out and still remembered, and every value held
+/// (`hold`), longest first.
 pub fn handed_out() -> Vec<String> {
-    let Some(handed) = HANDED_OUT.get() else {
-        return Vec::new();
-    };
-    let mut values: Vec<String> = handed
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .last_use
-        .keys()
-        .cloned()
-        .collect();
+    let mut values: Vec<String> = HANDED_OUT
+        .get()
+        .map(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(held) = HELD.get() {
+        values.extend(held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned());
+    }
     values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
     values
+}
+
+/// Whether a store handed this URL out, or one it starts with (a `BASE_URL`):
+/// such a URL is a credential whole, and nothing of it is named.
+pub(crate) fn is_stored_url(url: &str) -> bool {
+    HANDED_OUT.get().is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).holds_url(url))
 }
 
 /// A value as if a store had handed it out, for the tests of what reads them.
 #[cfg(test)]
 pub(crate) fn hand_out(value: &str) {
     remember(value);
+}
+
+/// The credentials the runtime holds that no store handed out, a token a
+/// connector fetched, by their holder: its last two, the one in use and the
+/// one before, which a request under way may still carry. Apart from the
+/// values handed out, so that however many tokens come, none pushes a
+/// store's value out of the masks: there are as many holders as connectors.
+static HELD: OnceLock<Mutex<Held>> = OnceLock::new();
+
+#[derive(Default)]
+struct Held(HashMap<String, [Option<String>; 2]>);
+
+impl Held {
+    /// A holder's new value, its last but one let go; true when it is new.
+    /// The one before, given again, is the one in use again.
+    fn note(&mut self, holder: &str, value: &str) -> bool {
+        let slot = self.0.entry(holder.to_string()).or_default();
+        match slot.iter().position(|held| held.as_deref() == Some(value)) {
+            Some(0) => false,
+            Some(_) => {
+                slot.swap(0, 1);
+                false
+            }
+            None => {
+                slot[1] = slot[0].replace(value.to_string());
+                true
+            }
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &String> {
+        self.0.values().flat_map(|slot| slot.iter().flatten())
+    }
+}
+
+/// A credential the runtime holds that no store handed out, a token a
+/// connector fetched: masked wherever the values handed out are, as long as
+/// it is its holder's last or last but one.
+pub(crate) fn hold(holder: &str, value: &str) {
+    if value.len() < HANDED_OUT_MIN {
+        return;
+    }
+    let new = HELD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .note(holder, value);
+    if new {
+        HANDED_OUT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Changes when a value joins `handed_out()`: the trace record rebuilds its
@@ -369,7 +444,7 @@ impl SecretStore for VaultStore {
         let (code, body) = crate::connectors::http_request("GET", &url, &headers, None)
             .map_err(|e| format!("vault: {e}"))?;
         if !(200..300).contains(&code) {
-            return Err(format!("vault: HTTP {code} reading {path:?}"));
+            return Err(vault_refused(code, "reading", path));
         }
         let v: Value =
             serde_json::from_slice(&body).map_err(|e| format!("vault: bad response: {e}"))?;
@@ -384,31 +459,152 @@ impl SecretStore for VaultStore {
             .ok_or_else(|| format!("secret ref {reference:?} must be path/key"))?;
         let url = format!("{}/v1/{}/data/{}", self.addr, self.mount, path);
         let headers = [("X-Vault-Token".to_string(), self.token.clone())];
-        // KV v2 writes replace the whole path: merge with the existing keys
-        let mut data = match crate::connectors::http_request("GET", &url, &headers, None) {
+        // KV v2 writes replace the whole path: merge with the existing keys,
+        // and write over the version read only (check-and-set), so that a
+        // write in between is not dropped. A read that fails stops the write,
+        // which would drop them.
+        let (mut data, version) = match crate::connectors::http_request("GET", &url, &headers, None) {
             Ok((code, body)) if (200..300).contains(&code) => {
-                serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["data"]["data"].as_object().cloned())
-                    .unwrap_or_default()
+                let read = serde_json::from_slice::<Value>(&body).ok();
+                let data = read.as_ref().and_then(|v| v["data"]["data"].as_object().cloned());
+                match (data, read.as_ref().and_then(|v| v["data"]["metadata"]["version"].as_u64())) {
+                    (Some(data), Some(version)) => (data, version),
+                    _ => return Err(format!("vault: bad response reading {path:?}, so nothing was written")),
+                }
             }
-            _ => Default::default(),
+            // nothing at the path yet, or its last version deleted, as Vault
+            // says it: another server's 404, a proxy's, says nothing of the path
+            Ok((404, body)) => match serde_json::from_slice::<Value>(&body) {
+                Ok(v) if v.get("errors").is_some_and(Value::is_array) || v["data"]["metadata"].is_object() => {
+                    (Default::default(), v["data"]["metadata"]["version"].as_u64().unwrap_or(0))
+                }
+                _ => {
+                    return Err(format!(
+                        "vault: HTTP 404 reading {path:?} that is no answer of Vault's, so nothing was written"
+                    ))
+                }
+            },
+            Ok((code, _)) => return Err(format!("{}, so nothing was written", vault_refused(code, "reading", path))),
+            Err(e) => return Err(format!("vault: {e}, so nothing was written")),
         };
         data.insert(key.to_string(), Value::String(value.to_string()));
-        let body = serde_json::json!({ "data": data }).to_string();
+        let body = serde_json::json!({ "data": data, "options": { "cas": version } }).to_string();
         let mut headers = headers.to_vec();
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         match crate::connectors::http_request("POST", &url, &headers, Some(body.as_bytes())) {
             Ok((code, _)) if (200..300).contains(&code) => Ok(()),
-            Ok((code, _)) => Err(format!("vault: HTTP {code} writing {path:?}")),
+            Ok((400, answer)) if String::from_utf8_lossy(&answer).contains("check-and-set") => Err(format!(
+                "vault: {path:?} changed between its read and the write, so nothing was written: write it again"
+            )),
+            Ok((code, _)) => Err(vault_refused(code, "writing", path)),
             Err(e) => Err(format!("vault: {e}")),
         }
+    }
+}
+
+/// What a Vault answer outside 2xx says. A standby node answers with a
+/// redirect to the active one, which is not followed: the token would go along.
+fn vault_refused(code: u16, doing: &str, path: &str) -> String {
+    match code {
+        301 | 302 | 303 | 307 | 308 => format!(
+            "vault: HTTP {code} {doing} {path:?}: a redirect, not followed, since the token would go along: set VAULT_ADDR to the active node"
+        ),
+        _ => format!("vault: HTTP {code} {doing} {path:?}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Vault that answers each request in turn with the next of `answers`,
+    /// and hands back the requests it got, each whole.
+    fn fake_vault(answers: Vec<String>) -> (VaultStore, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read as _, Write as _};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let serving = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for answer in answers {
+                let (mut conn, _) = server.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // the head, then as much body as it announces
+                loop {
+                    let n = conn.read(&mut chunk).unwrap_or(0);
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        if n == 0 { break } else { continue }
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if body.len() >= length || n == 0 {
+                        break;
+                    }
+                }
+                got.push(String::from_utf8_lossy(&request).into_owned());
+                conn.write_all(answer.as_bytes()).unwrap();
+            }
+            got
+        });
+        let store = VaultStore { addr: format!("http://127.0.0.1:{port}"), token: "t0k3n-vault".into(), mount: "secret".into() };
+        (store, serving)
+    }
+
+    fn answer(status: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    #[test]
+    fn a_standby_vault_is_named_and_not_followed() {
+        let standby = "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/v1/secret/data/app\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (store, serving) = fake_vault(vec![standby.to_string()]);
+        let e = store.get("app/key").unwrap_err();
+        assert!(e.starts_with("vault: HTTP 307 reading \"app\": a redirect, not followed") && e.contains("VAULT_ADDR"), "{e}");
+        assert_eq!(serving.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_vault_write_never_drops_the_keys_it_could_not_read() {
+        // the read fails: nothing is written
+        let (store, serving) = fake_vault(vec![answer("500 Internal Server Error", r#"{"errors":["local node not active"]}"#)]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert_eq!(e, "vault: HTTP 500 reading \"app\", so nothing was written");
+        assert_eq!(serving.join().unwrap().len(), 1, "a write followed the failed read");
+        // nothing at the path yet: the write goes on, for a path still empty
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", r#"{"errors":[]}"#), answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        let got = serving.join().unwrap();
+        let lines: Vec<&str> = got.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert_eq!(lines, ["GET /v1/secret/data/app HTTP/1.1", "POST /v1/secret/data/app HTTP/1.1"]);
+        assert!(got[1].ends_with(r#"{"data":{"new":"v"},"options":{"cas":0}}"#), "{}", got[1]);
+        // its last version deleted: written over that version
+        let deleted = r#"{"data":{"data":null,"metadata":{"deletion_time":"2026-11-27T00:00:00Z","version":4}}}"#;
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", deleted), answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        assert!(serving.join().unwrap()[1].ends_with(r#""options":{"cas":4}}"#));
+        // a 404 that is not Vault's, a proxy with no server behind it: nothing is written
+        let (store, serving) = fake_vault(vec![answer("404 Not Found", "404 page not found")]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert!(e.contains("no answer of Vault's, so nothing was written"), "{e}");
+        assert_eq!(serving.join().unwrap().len(), 1, "a write followed a proxy's 404");
+        // the keys read are written back with the new one, over the version read
+        let read = answer("200 OK", r#"{"data":{"data":{"old":"kept"},"metadata":{"version":7}}}"#);
+        let (store, serving) = fake_vault(vec![read, answer("200 OK", "{}")]);
+        store.set("app/new", "v").unwrap();
+        let got = serving.join().unwrap();
+        assert!(got[1].ends_with(r#"{"data":{"new":"v","old":"kept"},"options":{"cas":7}}"#), "{}", got[1]);
+        // a write in between: Vault refuses ours, which says so
+        let read = answer("200 OK", r#"{"data":{"data":{"old":"kept"},"metadata":{"version":7}}}"#);
+        let refused = answer("400 Bad Request", r#"{"errors":["check-and-set parameter did not match the current version"]}"#);
+        let (store, serving) = fake_vault(vec![read, refused]);
+        let e = store.set("app/new", "v").unwrap_err();
+        assert!(e.contains("changed between its read and the write"), "{e}");
+        serving.join().unwrap();
+    }
 
     #[test]
     fn camel_case_reads_as_snake_case() {
@@ -475,6 +671,60 @@ mod tests {
         let mut kept: Vec<&str> = handed.last_use.keys().map(String::as_str).collect();
         kept.sort();
         assert_eq!(kept, ["read-at-start", "token-2", "token-3"]);
+    }
+
+    #[test]
+    fn a_holder_keeps_its_last_two_values_and_pushes_no_store_value_out() {
+        let mut held = Held::default();
+        assert!(held.note("connector:a", "tok-a-1"));
+        assert!(held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:b", "tok-b-1"));
+        assert!(!held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:a", "tok-a-3"));
+        let mut kept: Vec<&str> = held.values().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["tok-a-2", "tok-a-3", "tok-b-1"]);
+        // a token server that gives the one before again: it is the one in use
+        assert!(!held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:a", "tok-a-4"));
+        let mut kept: Vec<&str> = held.values().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["tok-a-2", "tok-a-4", "tok-b-1"]);
+        // however many tokens a connector fetches, a store's value stays
+        hand_out("Hv7-stored-once-0001");
+        for i in 0..HANDED_OUT_MAX + 10 {
+            hold("connector:many", &format!("Tk9-many-{i:05}"));
+        }
+        let all = handed_out();
+        assert!(all.iter().any(|v| v == "Hv7-stored-once-0001"));
+        assert_eq!(all.iter().filter(|v| v.starts_with("Tk9-many-")).count(), 2);
+        assert!(is_stored_url("Hv7-stored-once-0001") && !is_stored_url("Tk9-many-00000"));
+    }
+
+    #[test]
+    fn a_url_built_on_one_handed_out_is_stored_too() {
+        let mut handed = Handed::default();
+        handed.note("https://hooks.example/v1/acct-7f3k9", 2);
+        handed.note("a-plain-value", 2);
+        assert!(handed.holds_url("https://hooks.example/v1/acct-7f3k9"));
+        assert!(handed.holds_url("https://hooks.example/v1/acct-7f3k9/items?page=2"));
+        // its host in capitals, its default port spelled out
+        assert!(handed.holds_url("https://HOOKS.example:443/v1/acct-7f3k9/items"));
+        assert!(handed.holds_url("a-plain-value") && !handed.holds_url("a-plain-value-and-more"));
+        // another host, scheme or port; a link that leaves the stored path is
+        // not taken for stored either, since a host many connectors share
+        // would hide all of theirs
+        assert!(!handed.holds_url("https://hooks.example.org/v1/acct-7f3k9") && !handed.holds_url("http://hooks.example/v1/acct-7f3k9"));
+        assert!(!handed.holds_url("https://hooks.example:8443/v1/acct-7f3k9"));
+        assert!(!handed.holds_url("https://hooks.example/v1/items?cursor=c2"));
+        // a host alone ends where the host does
+        handed.note("https://bare.example", 3);
+        assert!(handed.holds_url("https://bare.example/x") && !handed.holds_url("https://bare.example.org/x"));
+        // a URL let go past the cap is no longer one
+        for value in ["third", "fourth", "fifth"] {
+            handed.note(value, 3);
+        }
+        assert!(!handed.holds_url("https://hooks.example/v1/acct-7f3k9/items") && handed.urls.is_empty());
     }
 
     #[test]

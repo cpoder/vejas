@@ -39,6 +39,7 @@ pub use audit::{audit_recent, to_audit};
 pub use drivers::{catalog, driver_for};
 pub use host::host;
 pub use http_client::http_request;
+pub(crate) use http_client::host_of;
 pub use process::without_runtime_credentials;
 pub use slot::Slot;
 pub use snapshots::{open_state_store, snapshot_get, snapshot_put, Snapshot};

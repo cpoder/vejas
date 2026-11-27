@@ -1604,6 +1604,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "ureq",
+ "url",
  "varpulis-engine",
  "vejas-connector",
  "webpki-roots 0.26.11",

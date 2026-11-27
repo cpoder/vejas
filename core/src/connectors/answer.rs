@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::http_client::{http_call, urlencode, NoAnswer};
+use super::http_client::{excerpt, http_call, urlencode, NoAnswer};
 use super::Config;
 use crate::trace;
 
@@ -111,7 +111,7 @@ fn http_rpc(
     let status = answer.status;
     if !listed(config, "ANSWERS", status).unwrap_or((200..300).contains(&status)) {
         return Err(Why {
-            error: format!("HTTP {status}{}", excerpt(&answer.body)),
+            error: format!("HTTP {status}{}", refusal(&url, &answer.body)),
             retry: listed(config, "RETRY_ON", status).unwrap_or(status == 429 || status >= 500),
             timed_out: false,
         });
@@ -241,10 +241,11 @@ fn read(body: &[u8]) -> Value {
     serde_json::from_slice(body).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()))
 }
 
-/// The start of a refused answer's body, for the error.
-fn excerpt(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-    match text.trim() {
+/// The start of a refused answer's body, for the error: what of the URL could
+/// carry a credential is masked wherever the answer echoes it (see
+/// [`excerpt`]).
+fn refusal(url: &str, body: &[u8]) -> String {
+    match excerpt(url, body, 200, &[]).as_str() {
         "" => String::new(),
         text => format!(": {text}"),
     }
@@ -324,7 +325,9 @@ mod tests {
         assert_eq!(listed(&config(json!({})), "ANSWERS", 200), None);
         assert_eq!(read(b"{\"a\":1}"), json!({"a": 1}));
         assert_eq!(read(b"plain"), json!("plain"));
-        assert_eq!(excerpt(b"  "), "");
-        assert_eq!(excerpt(b"{\"error\":\"gone\"}"), ": {\"error\":\"gone\"}");
+        assert_eq!(refusal("http://h/x", b"  "), "");
+        assert_eq!(refusal("http://h/x", b"{\"error\":\"gone\"}"), ": {\"error\":\"gone\"}");
+        let url = "http://h/x?key=LIT-K3Y-1234&page=1";
+        assert_eq!(refusal(url, b"no key LIT-K3Y-1234 here"), ": no key <masked> here");
     }
 }

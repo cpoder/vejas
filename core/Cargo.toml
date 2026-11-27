@@ -18,6 +18,8 @@ vejas-connector = { path = "../sdk" }
 # Pooled, blocking HTTP(S) client for the http-out/http-poll/oauth-poll drivers
 # (replaces one curl process per request). Pure-Rust TLS (rustls), self-contained.
 ureq = "2"
+# already in the tree through ureq: parses a URL to name its host and its parts
+url = "2"
 # Already in the tree via ureq (rustls 0.23 + webpki-roots 0.26) — made direct so
 # the hand-rolled MQTT client can wrap its stream in TLS. No new binary weight.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

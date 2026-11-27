@@ -8,6 +8,9 @@ The rule is absolute (ADR-0008): **a credential never appears as a literal**
 - `VEJAS_SECRET_<PATH>` environment entries (containers, CI);
 - a file store (`VEJAS_SECRETS_FILE`) for dev;
 - HashiCorp Vault (`VAULT_ADDR` / `VAULT_TOKEN` / `VEJAS_VAULT_MOUNT`).
+  The store follows no redirect, which would take the token along:
+  `VAULT_ADDR` names the active node, or a balancer that reaches it, since a
+  standby node answers 307.
 
 What keeps the rule real, rather than aspirational:
 
