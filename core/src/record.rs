@@ -798,64 +798,76 @@ fn escape_at(bytes: &[u8], i: usize) -> Escape {
     }
 }
 
-/// An entity of XML or HTML, from right after its `&`: a named one XML
-/// defines, one HTML5 names for a sign of ASCII (`&sol;`, `&plus;`, as PHP's
-/// `htmlentities` writes them), or a character's number.
+/// The entities `entity` reads by name: those XML defines, and those HTML5
+/// names for a sign of ASCII (`&sol;`, `&plus;`, as PHP's `htmlentities`
+/// writes them). In byte order, since they are searched in halves: a form or
+/// a page has an `&` every few bytes.
+const ENTITIES: [(&[u8], u8); 45] = [
+    (b"AMP", b'&'),
+    (b"DiacriticalGrave", b'`'),
+    (b"GT", b'>'),
+    (b"Hat", b'^'),
+    (b"LT", b'<'),
+    (b"NewLine", b'\n'),
+    (b"QUOT", b'"'),
+    (b"Tab", b'\t'),
+    (b"UnderBar", b'_'),
+    (b"VerticalLine", b'|'),
+    (b"amp", b'&'),
+    (b"apos", b'\''),
+    (b"ast", b'*'),
+    (b"bsol", b'\\'),
+    (b"colon", b':'),
+    (b"comma", b','),
+    (b"commat", b'@'),
+    (b"dollar", b'$'),
+    (b"equals", b'='),
+    (b"excl", b'!'),
+    (b"grave", b'`'),
+    (b"gt", b'>'),
+    (b"lbrace", b'{'),
+    (b"lbrack", b'['),
+    (b"lcub", b'{'),
+    (b"lowbar", b'_'),
+    (b"lpar", b'('),
+    (b"lsqb", b'['),
+    (b"lt", b'<'),
+    (b"midast", b'*'),
+    (b"num", b'#'),
+    (b"percnt", b'%'),
+    (b"period", b'.'),
+    (b"plus", b'+'),
+    (b"quest", b'?'),
+    (b"quot", b'"'),
+    (b"rbrace", b'}'),
+    (b"rbrack", b']'),
+    (b"rcub", b'}'),
+    (b"rpar", b')'),
+    (b"rsqb", b']'),
+    (b"semi", b';'),
+    (b"sol", b'/'),
+    (b"verbar", b'|'),
+    (b"vert", b'|'),
+];
+
+/// The longest name of [`ENTITIES`].
+const ENTITY_MOST: usize = 16;
+
+/// An entity of XML or HTML, from right after its `&`: one of [`ENTITIES`],
+/// or a character's number.
 fn entity(rest: &[u8]) -> Escape {
-    const NAMED: [(&[u8], u8); 45] = [
-        (b"amp;", b'&'),
-        (b"lt;", b'<'),
-        (b"gt;", b'>'),
-        (b"quot;", b'"'),
-        (b"apos;", b'\''),
-        (b"AMP;", b'&'),
-        (b"LT;", b'<'),
-        (b"GT;", b'>'),
-        (b"QUOT;", b'"'),
-        (b"Tab;", b'\t'),
-        (b"NewLine;", b'\n'),
-        (b"excl;", b'!'),
-        (b"num;", b'#'),
-        (b"dollar;", b'$'),
-        (b"percnt;", b'%'),
-        (b"lpar;", b'('),
-        (b"rpar;", b')'),
-        (b"ast;", b'*'),
-        (b"midast;", b'*'),
-        (b"plus;", b'+'),
-        (b"comma;", b','),
-        (b"period;", b'.'),
-        (b"sol;", b'/'),
-        (b"colon;", b':'),
-        (b"semi;", b';'),
-        (b"equals;", b'='),
-        (b"quest;", b'?'),
-        (b"commat;", b'@'),
-        (b"lsqb;", b'['),
-        (b"lbrack;", b'['),
-        (b"bsol;", b'\\'),
-        (b"rsqb;", b']'),
-        (b"rbrack;", b']'),
-        (b"Hat;", b'^'),
-        (b"lowbar;", b'_'),
-        (b"UnderBar;", b'_'),
-        (b"grave;", b'`'),
-        (b"DiacriticalGrave;", b'`'),
-        (b"lcub;", b'{'),
-        (b"lbrace;", b'{'),
-        (b"verbar;", b'|'),
-        (b"vert;", b'|'),
-        (b"VerticalLine;", b'|'),
-        (b"rcub;", b'}'),
-        (b"rbrace;", b'}'),
-    ];
-    for (name, b) in NAMED {
-        if rest.starts_with(name) {
-            return Escape::byte(1 + name.len(), b);
+    let len = rest.iter().take(ENTITY_MOST + 1).take_while(|b| b.is_ascii_alphabetic()).count();
+    match rest.get(len) {
+        Some(b';') if len > 0 => {
+            let name = &rest[..len];
+            return match ENTITIES.binary_search_by(|(entity, _)| entity.cmp(&name)) {
+                Ok(i) => Escape::byte(len + 2, ENTITIES[i].1),
+                Err(_) => Escape::Not,
+            };
         }
-        if name.starts_with(rest) {
-            return Escape::Cut;
-        }
+        // the text ends in what may be one
+        None if ENTITIES.iter().any(|(entity, _)| entity.starts_with(rest)) => return Escape::Cut,
+        _ => {}
     }
     if rest.first() != Some(&b'#') {
         return Escape::Not;
@@ -3554,6 +3566,23 @@ mod tests {
         }
         let r = rendered(&with_error("HTTP 400: abcde"), Extras::new(), &["xyzwvu-K14"]);
         assert_eq!(r["error"], "HTTP 400: abcde");
+    }
+
+    #[test]
+    fn each_entity_reads_as_its_sign_and_one_the_text_ends_in_as_cut() {
+        assert!(ENTITIES.windows(2).all(|pair| pair[0].0 < pair[1].0), "searched in halves: in byte order");
+        let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+        for (name, sign) in ENTITIES {
+            let text = [name, b";x"].concat();
+            let read = entity(&text);
+            assert!(matches!(read, Escape::Reads { len, reads: [b, ..], n: 1 } if len == name.len() + 2 && b == sign), "{}", shown(name));
+            assert!(matches!(entity(name), Escape::Cut), "{}", shown(name));
+            assert!(matches!(entity(&name[..1]), Escape::Cut), "{}", shown(name));
+        }
+        assert!(matches!(entity(b""), Escape::Cut));
+        for text in [&b"b=2&c=3"[..], b"ampx;", b"Amp;", b"nbsp;", b";", b"DiacriticalGraveX;", b"qz"] {
+            assert!(matches!(entity(text), Escape::Not), "{}", shown(text));
+        }
     }
 
     /// A shape down every path a record has: whole, cut, as an error, as an

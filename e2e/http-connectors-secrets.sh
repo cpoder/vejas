@@ -44,7 +44,8 @@ OTLPK=OTLP-K3Y-0012             # the OTLP exporter's header
 SIG=PRESIGNED-K3Y-0013          # an item's presigned link: the page carries it, the log must not
 INV=IN%2FV-K3Y-0014             # an invoked service's, echoed as PHP escapes its /
 PAD=PADECHO-K3Y-0015            # echoed by a 2xx past the 200 chars a test shows of it
-NEVER="K3Y-0001\|K3Y-0003\|K3Y-0010\|PATHT0K3N\|K3Y-0005\|K3Y-0009\|K3Y-0006\|$SEC\|$BEARER\|PHP01\|NET01\|PYQ01\|K3Y-0011\|PAIR01\|K3Y-0012\|K3Y-0014\|PADECHO\|lettersonlyhooktoken"
+CAP="http://capsecret7f3k9qzx.invalid:$API_PORT/x"   # from the store, its host the credential, which does not resolve
+NEVER="K3Y-0001\|K3Y-0003\|K3Y-0010\|PATHT0K3N\|K3Y-0005\|K3Y-0009\|K3Y-0006\|$SEC\|$BEARER\|PHP01\|NET01\|PYQ01\|K3Y-0011\|PAIR01\|K3Y-0012\|K3Y-0014\|PADECHO\|lettersonlyhooktoken\|capsecret"
 mkdir -p "$R/connectors" "$R/services" "$R/flows"
 conn(){ cat > "$R/connectors/$1.vjs"; }
 conn poll_echo <<V
@@ -88,6 +89,12 @@ conn out_hook2 <<V
 driver "http-out"
 SUBJECT = "vx.e2e.hook2"
 URL = secret("hook/url")
+V
+conn out_caphost <<V
+# connector: out_caphost
+driver "http-out"
+SUBJECT = "vx.e2e.caphost"
+URL = secret("cap/host")
 V
 conn out_okpad <<V
 # connector: out_okpad
@@ -248,14 +255,14 @@ for _ in $(seq 1 50); do curl -s -m 1 -o /dev/null "$A/ok" && break; sleep 0.1; 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4299 > /dev/null 2>&1 & NP=$!
 for _ in $(seq 1 50); do nats -s $URL server check connection > /dev/null 2>&1 && break; sleep 0.1; done
 NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:8773 VEJAS_ACK_WAIT_SECS=1 \
-  VEJAS_SECRET_API_KEY=$SEC VEJAS_SECRET_OAUTH_SECRET="$CLIENT" VEJAS_SECRET_HOOK_URL="$HOOK" \
+  VEJAS_SECRET_API_KEY=$SEC VEJAS_SECRET_OAUTH_SECRET="$CLIENT" VEJAS_SECRET_HOOK_URL="$HOOK" VEJAS_SECRET_CAP_HOST="$CAP" \
   OTEL_EXPORTER_OTLP_ENDPOINT="$A/otlp" OTEL_EXPORTER_OTLP_HEADERS="x-otlp-key=$OTLPK" \
   "$BIN" > "$S/rt.log" 2>&1 & RT=$!
 until curl -sf -o /dev/null "$H/healthz"; do sleep 0.1; done
 nats -s $URL sub vx.e2e.enveloped --raw > "$S/env" 2>/dev/null & SUB=$!
 nats -s $URL sub vx.e2e.oauth --raw > "$S/oauth" 2>/dev/null & SUB2=$!
-for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.e2e' "$S/rt.log")" -ge 13 ] && break; sleep 0.1; done
-for subject in out moved html json hook hook2 php net pyq pair hdr ok; do nats -s $URL pub "vx.e2e.$subject" '{"n":1}' > /dev/null 2>&1; done
+for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.e2e' "$S/rt.log")" -ge 14 ] && break; sleep 0.1; done
+for subject in out moved html json hook hook2 php net pyq pair hdr ok caphost; do nats -s $URL pub "vx.e2e.$subject" '{"n":1}' > /dev/null 2>&1; done
 # a flow's call, whose service answers a 400 that echoes its code, and a test
 # of the sink whose answer echoes its key past what the test shows of it
 for _ in $(seq 1 50); do
@@ -264,11 +271,11 @@ for _ in $(seq 1 50); do
 done
 curl -s -m 10 -X POST "$H/connectors/test" -H 'Content-Type: application/json' -d '{"file":"connectors/out_okpad.vjs"}' > "$S/probe"
 
-DEAD="out_echo out_moved out_html out_json out_hook out_hook2 out_php out_net out_pyq out_pair out_hdr"
+DEAD="out_echo out_moved out_html out_json out_hook out_hook2 out_php out_net out_pyq out_pair out_hdr out_caphost"
 letters(){ curl -s -m 5 "$H/dlq" | python3 -c 'import json,sys; print(" ".join(sorted(d.get("unit","?") for d in json.load(sys.stdin)["dead_letters"])))'; }
 L=""; for _ in $(seq 1 200); do
   L=$(letters); n=0; for u in $DEAD; do echo "$L" | grep -q "connector:$u\b" && n=$((n+1)); done
-  [ $n -eq 11 ] && break; sleep 0.1
+  [ $n -eq 12 ] && break; sleep 0.1
 done
 # what the dead letter stream keeps at rest, unmasked: one line per letter,
 # its unit then its last error
@@ -314,6 +321,8 @@ e=$(letter out_hook); has "$e" "HTTP 404: no webhook /hook/T0001/B0001/<masked>"
   && ok "a webhook's token, in the path" || ko "hook letter: $e"
 e=$(letter out_hook2); has "$e" "HTTP 404: no webhook /hook/T0002/B0002/<masked>" \
   && ok "a token of letters alone, in a webhook's address from the store" || ko "hook2 letter: $e"
+e=$(letter out_caphost); has "$e" "a URL a secret store holds" && ! has "$e" "capsecret" \
+  && ok "a URL from the store whose host does not resolve: the letter names none of it" || ko "caphost letter: $e"
 e=$(letter out_hdr); has "$e" "HTTP 400: bad key <secret>" \
   && ok "a header's key from the secret store" || ko "hdr letter: $e"
 e=$(letter out_pair); has "$e" "HTTP 400: {" && ! has "$e" "hunter2" \

@@ -24,7 +24,8 @@ use crate::metrics::Kind;
 
 pub(super) struct OAuthPoll;
 
-/// Client-credentials token cache: refresh a minute early, invalidate on 401.
+/// Client-credentials token cache: refreshed before it runs out, and once on
+/// a 401.
 struct TokenCache {
     /// The connector: its tokens are masked as its own (`secrets::hold`).
     holder: String,
@@ -32,49 +33,70 @@ struct TokenCache {
     client_id: String,
     client_secret: String,
     scope: String,
-    /// The token, when it runs out, and when it was fetched.
-    cached: Option<(String, Instant, Instant)>,
+    cached: Option<Cached>,
 }
 
-/// A token this young is not fetched again for a 401: the client may not read
-/// that endpoint (a scope, a consent), which a new token does not change.
-const TOKEN_FRESH: Duration = Duration::from_secs(30);
+/// The token in use.
+struct Cached {
+    token: String,
+    /// When it is fetched again, before the token endpoint said it runs out.
+    deadline: Instant,
+    /// It drew a 401: the client may not read that endpoint (a scope, a
+    /// consent), which another token does not change.
+    refused: bool,
+}
 
 impl TokenCache {
     fn bearer(&mut self) -> Result<String, String> {
-        if let Some((t, deadline, _)) = &self.cached {
-            if Instant::now() < *deadline {
-                return Ok(t.clone());
-            }
+        if let Some(cached) = self.cached.as_ref().filter(|cached| Instant::now() < cached.deadline) {
+            return Ok(cached.token.clone());
         }
-        let (t, ttl) = OAuthPoll::token(&self.holder, &self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
-        let now = Instant::now();
-        self.cached = Some((t.clone(), now + ttl, now));
-        Ok(t)
+        let (token, life) = OAuthPoll::token(&self.holder, &self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
+        self.cached = Some(Cached { token: token.clone(), deadline: Instant::now() + life, refused: false });
+        Ok(token)
     }
-    fn invalidate(&mut self) {
-        self.cached = None;
+    /// A 401 to the token in use: whether to try another one. A token is
+    /// replaced at once, as a revoked one must be, unless it was fetched for
+    /// one refused and drew a 401 too: the client may not read that endpoint
+    /// (a scope, a consent), which another token does not change, and one
+    /// token per endpoint and per tick would hammer the token endpoint, each
+    /// one more value for the masks.
+    fn try_another(&mut self) -> bool {
+        let another = self.cached.as_ref().is_some_and(|cached| !cached.refused);
+        if another {
+            self.cached = None;
+        }
+        another
     }
-    fn fresh(&self) -> bool {
-        self.cached.as_ref().is_some_and(|(_, _, fetched)| fetched.elapsed() < TOKEN_FRESH)
+    /// The token fetched for one refused drew a 401 too: kept till it runs out.
+    fn refuse(&mut self) {
+        if let Some(cached) = &mut self.cached {
+            cached.refused = true;
+        }
     }
 }
 
-/// GET with the cached bearer; on a 401, ONE retry with a new token, unless
-/// the token is fresh: one per endpoint and per tick would hammer the token
-/// endpoint, and each new token is one more value for the masks.
+/// GET with the cached bearer; on a 401, one retry with another token, unless
+/// the one in use is refused already (`TokenCache::try_another`).
 fn authed_get(tc: &mut TokenCache, url: &str) -> Result<(u16, Vec<u8>), String> {
-    let tok = tc.bearer()?;
-    let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
-    match http_request("GET", url, &headers, None)? {
-        (401, _) if !tc.fresh() => {
-            tc.invalidate();
-            let tok = tc.bearer()?;
-            let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
-            http_request("GET", url, &headers, None)
-        }
-        answer => Ok(answer),
+    let get = |tok: &str| http_request("GET", url, &[("Authorization".to_string(), format!("Bearer {tok}"))], None);
+    let answer = get(&tc.bearer()?)?;
+    if answer.0 != 401 || !tc.try_another() {
+        return Ok(answer);
     }
+    let answer = get(&tc.bearer()?)?;
+    if answer.0 == 401 {
+        tc.refuse();
+    }
+    Ok(answer)
+}
+
+/// How long a token is used: its lifetime less a tenth of it, a minute at
+/// most, so that it is fetched again before it runs out; 5 minutes when the
+/// token endpoint does not say.
+fn token_life(expires_in: Option<u64>) -> Duration {
+    let life = expires_in.unwrap_or(300);
+    Duration::from_secs(life - (life / 10).min(60))
 }
 
 /// `{key}` placeholder substitution for EXPAND detail templates.
@@ -156,9 +178,7 @@ impl OAuthPoll {
         // a credential no store handed out: masked wherever theirs are, in an
         // answer that quotes it as in the record (ADR-0017)
         crate::secrets::hold(holder, &tok);
-        // refresh a minute early; floor for endpoints that answer tiny lifetimes
-        let ttl = v["expires_in"].as_u64().unwrap_or(300).saturating_sub(60).max(30);
-        Ok((tok, Duration::from_secs(ttl)))
+        Ok((tok, token_life(v["expires_in"].as_u64())))
     }
 }
 
@@ -441,6 +461,86 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serde_json::Map;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// A token endpoint that numbers its tokens, `prefix` first, and an API
+    /// at `/api` that answers what `api` says to each token: the base URL,
+    /// and how many tokens were fetched.
+    fn token_server(prefix: &'static str, api: fn(&str) -> u16) -> (String, Arc<AtomicU32>) {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let fetched = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&fetched);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Ok(read) = stream.try_clone() else { return };
+                let mut reader = BufReader::new(read);
+                let (mut first, mut length, mut bearer) = (String::new(), 0, String::new());
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(n) = lower.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("authorization:") {
+                        bearer = line.trim_end().rsplit(' ').next().unwrap_or_default().to_string();
+                    }
+                }
+                let _ = reader.read_exact(&mut vec![0; length]);
+                let (code, answer) = if first.starts_with("POST") {
+                    let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    (200, format!(r#"{{"access_token":"{prefix}{n:04}","expires_in":3600}}"#))
+                } else {
+                    (api(&bearer), "{}".to_string())
+                };
+                let head = format!("HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", answer.len());
+                let _ = stream.write_all(format!("{head}{answer}").as_bytes());
+            }
+        });
+        (base, fetched)
+    }
+
+    #[test]
+    fn a_401_draws_another_token_once_a_token() {
+        let cache = |holder: &str, base: &str| TokenCache {
+            holder: holder.into(),
+            token_url: format!("{base}/token"),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            scope: String::new(),
+            cached: None,
+        };
+        // an endpoint the client may not read: one more token, not one a call
+        let (base, fetched) = token_server("Rt7-oauth-loop-", |_| 401);
+        let mut tc = cache("test:oauth-401-loop", &base);
+        for _ in 0..5 {
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api")).unwrap().0, 401);
+        }
+        assert_eq!(fetched.load(Ordering::SeqCst), 2);
+        // a token revoked, or past its life: replaced at once
+        let (base, fetched) = token_server("Rt7-oauth-revoked-", |token| if token.ends_with("-0001") { 401 } else { 200 });
+        let mut tc = cache("test:oauth-401-revoked", &base);
+        for _ in 0..3 {
+            assert_eq!(authed_get(&mut tc, &format!("{base}/api")).unwrap().0, 200);
+        }
+        assert_eq!(fetched.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_token_is_used_no_longer_than_it_lives() {
+        assert_eq!(token_life(Some(3600)), Duration::from_secs(3540));
+        assert_eq!(token_life(Some(20)), Duration::from_secs(18));
+        assert_eq!(token_life(Some(5)), Duration::from_secs(5));
+        assert_eq!(token_life(Some(0)), Duration::ZERO);
+        assert_eq!(token_life(None), Duration::from_secs(270));
+    }
 
     #[test]
     fn expand_template_and_config() {

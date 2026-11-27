@@ -26,10 +26,17 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
+/// What a URL a secret store handed out is named: none of its parts, since
+/// its host may be the credential (`<id>.m.pipedream.net`).
+const STORED_URL: &str = "a URL a secret store holds";
+
 /// The host a URL names, `host[:port]`, for a log line or an error: never its
-/// user info, its path or its query, where credentials ride. A URL that does
-/// not parse is not guessed at.
+/// user info, its path or its query, where credentials ride, and nothing of a
+/// URL a store handed out. A URL that does not parse is not guessed at.
 pub(crate) fn host_of(url: &str) -> String {
+    if crate::secrets::is_handed_out(url) {
+        return STORED_URL.into();
+    }
     match url::Url::parse(url) {
         Ok(url) => match (url.host_str(), url.port()) {
             (Some(host), Some(port)) => format!("{host}:{port}"),
@@ -41,8 +48,12 @@ pub(crate) fn host_of(url: &str) -> String {
 }
 
 /// A URL as an event names it: its scheme, host and path, without its user
-/// info and its query, and with any value a secret store handed out masked.
+/// info and its query, and with any value a secret store handed out masked;
+/// nothing of a URL a store handed out.
 pub(crate) fn url_shown(url: &str) -> String {
+    if crate::secrets::is_handed_out(url) {
+        return STORED_URL.into();
+    }
     match url::Url::parse(url) {
         Ok(parsed) => crate::record::shown().error(&format!("{}://{}{}", parsed.scheme(), host_of(url), parsed.path())),
         Err(_) => "a URL that does not parse".into(),
@@ -86,6 +97,7 @@ fn credentials(url: &str, also: &[&str]) -> crate::record::Values {
 
 fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Values {
     let mut values: Vec<String> = also.iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
+    let given = values.len();
     if let Ok(parsed) = url::Url::parse(url) {
         let mut secret = |value: &str, shortest: usize| {
             if value.len() >= shortest {
@@ -94,6 +106,10 @@ fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Valu
         };
         secret(parsed.username(), SHORTEST_SECRET);
         secret(parsed.password().unwrap_or_default(), SHORTEST_SECRET);
+        if stored {
+            // a capability host, `<id>.m.pipedream.net`
+            secret(parsed.host_str().unwrap_or_default(), SHORTEST_SECRET);
+        }
         for pair in parsed.query().unwrap_or_default().split('&') {
             // a pair with no `=` is a value alone, `?<token>`
             let value = pair.split_once('=').map_or(pair, |(_, value)| value);
@@ -104,14 +120,22 @@ fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Valu
                 secret(value, SHORTEST_SECRET);
             }
         }
+        let mut uuids = Vec::new();
         for segment in parsed.path_segments().into_iter().flatten() {
-            let token = (segment.bytes().any(|b| b.is_ascii_digit())
-                && !is_date_or_version(&percent_decoded(segment))
-                && !is_uuid(segment))
-                || reads_as_random(segment);
-            if stored || token {
+            if stored {
+                secret(segment, SHORTEST_SECRET);
+            } else if is_uuid(segment) {
+                uuids.push(segment);
+            } else if (segment.bytes().any(|b| b.is_ascii_digit()) && !is_date_or_version(&percent_decoded(segment)))
+                || reads_as_random(segment)
+            {
                 secret(segment, SHORTEST_TOKEN);
             }
+        }
+        // a UUID names a resource, unless nothing else of the URL can be its
+        // credential: then it is one, as a webhook's (`/webhook/6f7b288e-…`)
+        if values.len() == given {
+            values.extend(uuids.into_iter().map(str::to_string));
         }
     }
     let mut readings = Vec::with_capacity(values.len() * 3);
@@ -181,13 +205,14 @@ pub(crate) fn excerpt(url: &str, body: &[u8], most: usize, also: &[&str]) -> Str
 }
 
 /// A date, a time or a version, which no credential is: `api-version=2024-02-01`
-/// would mask each such date in the answer. A number may be one, a PIN or a
-/// key of digits.
+/// would mask each such date in the answer. Its suffix is a word, and a
+/// number (`-preview`, `-rc.1`, `-beta2`), not a token (`1.0-AbCdEf0123…`). A
+/// number may be a credential, a PIN or a key of digits.
 fn is_date_or_version(value: &str) -> bool {
     static DATA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     DATA.get_or_init(|| {
         regex::RegexBuilder::new(
-            r"^(\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?(-[a-z]+)?|v?\d+(\.\d+)+(-[a-z0-9.]+)?)$",
+            r"^(\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?(-[a-z]{1,12})?|v?\d+(\.\d+)+(-[a-z]{1,12}(\.?\d{1,4})?)?)$",
         )
         .case_insensitive(true)
         .build()
@@ -196,17 +221,19 @@ fn is_date_or_version(value: &str) -> bool {
     .is_match(value)
 }
 
-/// Letters alone that read as random, as a token without a digit does: as
-/// many capitals as small letters, give or take, and a change of case at
-/// least every third letter. A word in camel case has few capitals
-/// (`CustomerOrderItems`), an acronym few changes (`HTTPServerConfig`).
+/// Letters that read as random, as a token without a digit does, base64url's
+/// `-` and `_` among them: as many capitals as small letters, give or take,
+/// and a change of case at least every fourth byte. A word in camel case has
+/// few capitals (`CustomerOrderItems`), an acronym few changes
+/// (`HTTPServerConfig`).
 fn reads_as_random(segment: &str) -> bool {
     let bytes = segment.as_bytes();
+    let letters = bytes.iter().filter(|b| b.is_ascii_alphabetic()).count();
     let capitals = bytes.iter().filter(|b| b.is_ascii_uppercase()).count();
     let changes = bytes.windows(2).filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase()).count();
-    bytes.iter().all(u8::is_ascii_alphabetic)
-        && (bytes.len() * 3..=bytes.len() * 7).contains(&(capitals * 10))
-        && changes * 3 >= bytes.len()
+    bytes.iter().all(|b| b.is_ascii_alphabetic() || matches!(b, b'-' | b'_'))
+        && (letters * 3..=letters * 7).contains(&(capitals * 10))
+        && changes * 4 >= bytes.len()
 }
 
 /// A UUID, which in a path names a resource (`/devices/3f2b8c1e-…`).
@@ -288,14 +315,18 @@ fn call_agent() -> &'static ureq::Agent {
     CALL_AGENT.get_or_init(|| ureq::AgentBuilder::new().redirects(0).user_agent("vejas").build())
 }
 
-/// What a request that did not get through says: the host it went to, the kind
-/// of failure and its cause. Never the URL or a header: ureq's own text starts
-/// with the whole URL, its query and user info included, and a header it
-/// cannot send is quoted with its value. A secret in either would reach the
-/// run's error, its span, the log and the dead letter.
-fn transport_error(t: &ureq::Transport) -> String {
+/// What a request to `url` that did not get through says: the host it went
+/// to, the kind of failure and its cause. Never the URL or a header: ureq's
+/// own text starts with the whole URL, its query and user info included, and
+/// a header it cannot send is quoted with its value. A secret in either would
+/// reach the run's error, its span, the log and the dead letter. Nothing of a
+/// URL a store handed out.
+fn transport_error(t: &ureq::Transport, url: &str) -> String {
     let mut text = String::new();
-    if let Some(host) = t.url().and_then(|url| Some((url.host_str()?, url.port_or_known_default()))) {
+    if crate::secrets::is_handed_out(url) {
+        text.push_str(STORED_URL);
+        text.push_str(": ");
+    } else if let Some(host) = t.url().and_then(|url| Some((url.host_str()?, url.port_or_known_default()))) {
         text.push_str(host.0);
         if let Some(port) = host.1 {
             text.push_str(&format!(":{port}"));
@@ -331,7 +362,7 @@ pub fn http_request(
         Ok(r) => r,
         // A non-2xx status is not an error here — return it to the caller.
         Err(ureq::Error::Status(_code, r)) => r,
-        Err(ureq::Error::Transport(t)) => return Err(format!("http: {}", transport_error(&t))),
+        Err(ureq::Error::Transport(t)) => return Err(format!("http: {}", transport_error(&t, url))),
     };
     let code = response.status();
     let mut buf = Vec::new();
@@ -425,8 +456,8 @@ pub(crate) fn http_call(
                 | ureq::ErrorKind::ConnectionFailed
                 | ureq::ErrorKind::Io
                 | ureq::ErrorKind::BadStatus
-                | ureq::ErrorKind::ProxyConnect => NoAnswer::Network(transport_error(&t)),
-                _ => NoAnswer::Broken(transport_error(&t)),
+                | ureq::ErrorKind::ProxyConnect => NoAnswer::Network(transport_error(&t, url)),
+                _ => NoAnswer::Broken(transport_error(&t, url)),
             });
         }
     };
@@ -493,6 +524,7 @@ pub(super) fn join_url(base: &str, endpoint: &str) -> String {
 pub(super) fn link_url(base: &str, page: &str, link: &str, what: &str) -> Result<String, String> {
     let origin = |url: &str| url::Url::parse(url).map(|url| url.origin());
     let shown = |url: &str| match url::Url::parse(url) {
+        _ if crate::secrets::is_handed_out(url) => STORED_URL.to_string(),
         Ok(parsed) => format!("{}://{}", parsed.scheme(), host_of(url)),
         Err(_) => "a URL that does not parse".into(),
     };
@@ -706,16 +738,29 @@ mod tests {
         // a number may be a key, a PIN
         let e = excerpt("http://h/x?key=73950264817", b"key 73950264817 is unknown", 300, &[]);
         assert_eq!(e, "key <masked> is unknown");
-        // a UUID in a path names a resource
-        let url = "http://h/sap/devices/3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f";
+        // a version's suffix is a word and a number, not a token
+        let url = "http://h/x?a=2.0.0-rc.1&b=1.4.2-beta2&c=1.0-SNAPSHOT&key=1.0-AbCdEf0123456789XyZ";
+        let e = excerpt(url, b"2.0.0-rc.1 1.4.2-beta2 1.0-SNAPSHOT 1.0-AbCdEf0123456789XyZ", 300, &[]);
+        assert_eq!(e, "2.0.0-rc.1 1.4.2-beta2 1.0-SNAPSHOT <masked>");
+        // a UUID in a path names a resource, when the URL has a credential
+        let url = "http://h/sap/devices/3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f?sap-client=100&code=K3Y-UUID-01";
         let e = excerpt(url, b"Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'", 300, &[]);
         assert_eq!(e, "Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'");
+        // and is the credential when nothing else can be, as a webhook's
+        let url = "http://h/webhook/6f7b288e-1efe-4504-a6fd-660931327269";
+        let e = excerpt(url, br#"The requested webhook "POST 6f7b288e-1efe-4504-a6fd-660931327269" is not registered."#, 300, &[]);
+        assert_eq!(e, r#"The requested webhook "POST <masked>" is not registered."#);
     }
 
     #[test]
     fn a_token_of_letters_alone_reads_as_random() {
         assert!(reads_as_random("hTqWzKeLmPbXcVnRaYsDfGuJ"));
-        for words in ["deviceManagement", "CustomerOrderItemsCollection", "HTTPServerConfig", "abcdefghijklmnopqrstuvwx", "A_BusinessPartnerX"] {
+        // base64url's signs among them
+        assert!(reads_as_random("aBcD-eFgH_iJkLmNoPqRsTuV"));
+        for words in [
+            "deviceManagement", "CustomerOrderItemsCollection", "HTTPServerConfig", "abcdefghijklmnopqrstuvwx", "A_BusinessPartnerX",
+            "customer-orders-by-region", "Sales_Order_Header_Items",
+        ] {
             assert!(!reads_as_random(words), "{words}");
         }
         let e = excerpt("http://h/hook/T0001/B0001/hTqWzKeLmPbXcVnRaYsDfGuJ", b"no webhook hTqWzKeLmPbXcVnRaYsDfGuJ", 300, &[]);
@@ -755,10 +800,27 @@ mod tests {
         // a webhook's token with no digit, and a date, in a URL a store holds
         let url = "https://h/services/T0001/B0001/abcdefghijklmnopqrstuvwx?since=2024-02-01";
         let text = "no webhook /services/T0001/B0001/abcdefghijklmnopqrstuvwx since 2024-02-01";
+        // each segment of 6 bytes or more, a word too: the store holds it whole
         let (e, _) = masked_start(text, &credentials_in(url, &[], true), 300);
-        assert_eq!(e, "no webhook /services/T0001/B0001/<masked> since <masked>");
+        assert_eq!(e, "no webhook /<masked>/T0001/B0001/<masked> since <masked>");
         let (e, _) = masked_start(text, &credentials_in(url, &[], false), 300);
         assert_eq!(e, text);
+        // its host, and its segments from 6 bytes
+        let url = "https://capsecret7f3k9qzx.invalid/hook/catch/1234567/abcdefg/";
+        let text = "no hook catch/1234567/abcdefg at capsecret7f3k9qzx.invalid";
+        let (e, _) = masked_start(text, &credentials_in(url, &[], true), 300);
+        assert_eq!(e, "no hook catch/<masked>/<masked> at <masked>");
+    }
+
+    #[test]
+    fn a_url_a_store_handed_out_is_named_by_none_of_its_parts() {
+        // a scheme no text of another test ends in the start of
+        let url = "zqnamed://Nm4-stored-host.invalid:8443/x/y?k=v";
+        crate::secrets::hand_out(url);
+        assert_eq!((host_of(url), url_shown(url)), (STORED_URL.to_string(), STORED_URL.to_string()));
+        assert_eq!(path_shown(url), STORED_URL);
+        let refused = refused(302, url, b"", 300, &[]);
+        assert!(refused.contains(STORED_URL) && !refused.contains("Nm4"), "{refused}");
     }
 
     #[test]
