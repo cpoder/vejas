@@ -68,6 +68,12 @@ pub(crate) struct BodyGuard<R: Read> {
 /// Size of the drain buffer: fixed, whatever the declared length.
 const DRAIN_CHUNK: usize = 8 * 1024;
 
+/// How far past the bound a drain reads before it gives up and closes. A body
+/// a little over the bound is drained to its end, so the answer the handler
+/// gave (a 413) is not lost to a reset when the connection closes on unread
+/// bytes.
+const DRAIN_GRACE: usize = 64 * 1024;
+
 impl<R: Read> BodyGuard<R> {
     pub(crate) fn new(
         inner: R,
@@ -127,7 +133,7 @@ impl<R: Read> Drop for BodyGuard<R> {
         // Set already (a caller chose to close rather than drain): no read.
         if self.drain && !self.abandon.is_set() {
             let mut chunk = [0u8; DRAIN_CHUNK];
-            while self.read <= self.max && !self.late() {
+            while self.read <= self.max.saturating_add(DRAIN_GRACE) && !self.late() {
                 match self.inner.read(&mut chunk) {
                     Ok(0) => {
                         self.done = true;
@@ -163,15 +169,14 @@ mod tests {
     }
 
     #[test]
-    fn past_the_bound_is_an_error_and_abandons() {
+    fn past_the_bound_is_an_error() {
         let a = Abandon::new();
         let mut g = BodyGuard::new(Cursor::new(vec![7u8; 11]), 10, None, true, a.clone());
         let mut out = Vec::new();
         let e = g.read_to_end(&mut out).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidData);
         assert!(e.get_ref().unwrap().is::<BodyTooLarge>());
-        drop(g);
-        assert!(a.is_set());
+        assert!(g.read(&mut [0u8; 4]).is_err(), "and stays one");
     }
 
     #[test]
@@ -184,12 +189,25 @@ mod tests {
     }
 
     #[test]
-    fn drop_stops_at_the_bound_and_abandons() {
+    fn drop_stops_past_the_bound_and_abandons() {
         let a = Abandon::new();
-        let mut src = Cursor::new(vec![1u8; 100_000]);
+        let mut src = Cursor::new(vec![1u8; 200_000]);
         drop(BodyGuard::new(&mut src, 10_000, None, true, a.clone()));
-        assert!(src.position() <= 10_000 + 8 * 1024);
+        assert!(src.position() <= (10_000 + super::DRAIN_GRACE + super::DRAIN_CHUNK) as u64);
         assert!(a.is_set());
+    }
+
+    #[test]
+    fn a_body_a_little_over_the_bound_is_drained_to_its_end() {
+        let a = Abandon::new();
+        let mut src = Cursor::new(vec![1u8; 12_000]);
+        {
+            let mut g = BodyGuard::new(&mut src, 10_000, None, true, a.clone());
+            let mut out = Vec::new();
+            assert!(g.read_to_end(&mut out).is_err());
+        }
+        assert_eq!(src.position(), 12_000);
+        assert!(!a.is_set(), "the connection can serve its next request");
     }
 
     #[test]

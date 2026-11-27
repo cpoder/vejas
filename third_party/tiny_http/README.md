@@ -38,8 +38,9 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
 - Every body read from the socket goes through `BodyGuard`
   (`src/util/body_guard.rs`): at most the bound (past it, the read fails with
   `BodyTooLarge`), within the timeout (past it, `TimedOut`). On drop it drains
-  what the handler left unread into a fixed 8 KiB buffer, under the same two
-  bounds. A body it does not read to its end closes the connection: the next
+  what the handler left unread into a fixed 8 KiB buffer, within the timeout
+  and up to 64 KiB past the bound (so a 413 for a body a little over it is not
+  lost to a reset). A body it does not read to its end closes the connection: the next
   request is never read from the middle of a body. `EqualReader` no longer
   drains on its own drop.
 - `Request::respond_and_close`: answers, then closes the connection without

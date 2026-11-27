@@ -8167,8 +8167,21 @@ mod http_limits_tests {
             req.extend_from_slice(b"\r\n");
         }
         req.extend_from_slice(b"0\r\n\r\n");
-        let (out, closed) = exchange(addr, &req, Duration::from_secs(5));
+        // A body a little over the bound is drained, and the connection goes on.
+        let mut next = req.clone();
+        next.extend_from_slice(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let (out, closed) = exchange(addr, &next, Duration::from_secs(5));
         assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+        assert!(out.contains("HTTP/1.1 200") && closed, "{out}");
+        // One far over it closes the connection after the 413.
+        let mut big = b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..200 {
+            big.extend_from_slice(b"400\r\n");
+            big.extend(std::iter::repeat(b'a').take(0x400));
+            big.extend_from_slice(b"\r\n");
+        }
+        let (out, closed) = exchange(addr, &big, Duration::from_secs(5));
+        assert!(out.is_empty() || out.starts_with("HTTP/1.1 413"), "{out}");
         assert!(closed, "a body read only in part closes the connection");
         assert!(healthz(addr).contains("200 OK"));
     }
