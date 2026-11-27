@@ -1,6 +1,6 @@
 # 0042 — An emit carries a key, headers and a time, and a flow reads those of its message
 
-- Status: Proposed. The syntax of points 1 and 3 waits for the founder.
+- Status: Accepted, not built yet. The founder chose the syntax of points 1 and 3 (2026-11-27).
 - Date: 2026-11-27
 
 ## Context
