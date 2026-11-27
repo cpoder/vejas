@@ -389,6 +389,22 @@ mod tests {
         Config(v.as_object().cloned().unwrap_or_default())
     }
 
+    #[test]
+    fn a_service_holds_unless_it_says_dead_letter() {
+        let held = |v: Value| match when_down(&config(v)) {
+            WhenDown::Hold(p) => Some((p.health.map(|(url, ..)| url), p.max)),
+            WhenDown::DeadLetter => None,
+        };
+        assert_eq!(held(json!({})), Some((None, Duration::from_secs(60))));
+        assert_eq!(held(json!({"WHEN_DOWN": "dead-letter"})), None);
+        assert_eq!(
+            held(json!({"WHEN_DOWN": "hold", "BASE_URL": "http://h:1", "HEALTH_URL": "{BASE_URL}/health", "PROBE_MAX_MS": 5000})),
+            Some((Some("http://h:1/health".to_string()), Duration::from_secs(5)))
+        );
+        // a HEALTH_URL that names no setting is no probe: the run is
+        assert_eq!(held(json!({"HEALTH_URL": "{NOPE}/health"})), Some((None, Duration::from_secs(60))));
+    }
+
     fn args(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }

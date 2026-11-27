@@ -872,7 +872,7 @@ fn approval_authorized(request: &tiny_http::Request) -> bool {
 /// set, the documented production posture, leaves the human unable to approve
 /// from the panel.
 fn is_human_route(path: &str) -> bool {
-    matches!(path, "/dlq/replay" | "/dlq/purge")
+    matches!(path, "/dlq/replay" | "/dlq/purge" | "/hold/release" | "/hold/probe")
         || (path.starts_with("/proposals/")
             && (path.ends_with("/approve") || path.ends_with("/reject")))
 }
@@ -1074,6 +1074,54 @@ fn dlq_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
         return Err((401, "unauthorized: X-Approval-Token required".into()));
     }
     Err((409, DLQ_HUMAN_ACT.into()))
+}
+
+const HOLD_HUMAN_ACT: &str = "approval required: releasing a held message or probing its system \
+    is a human action in governed mode: the panel, or X-Approval-Token (ADR-0024, ADR-0040)";
+
+/// Releasing a held message, or probing now (ADR-0040, point 5): human acts in
+/// governed mode, as a DLQ replay is.
+fn hold_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
+    if !require_approval() || approval_authorized(request) {
+        return Ok(());
+    }
+    if request.headers().iter().any(|h| h.field.equiv("x-approval-token")) {
+        return Err((401, "unauthorized: X-Approval-Token required".into()));
+    }
+    Err((409, HOLD_HUMAN_ACT.into()))
+}
+
+/// Release the message a flow holds, or have it probe now (ADR-0040, point 5),
+/// recorded in the audit with who asked. The flow takes it at its next
+/// tenth of a second; a flow that holds nothing here answers 409, since in a
+/// cluster another instance may hold it.
+fn hold_act(registry: &Registry, flow: Option<&str>, release: bool, actor: &str) -> Result<Value, (u16, String)> {
+    let flow = flow.ok_or((400, "give the flow: {\"flow\": \"name\"}".to_string()))?;
+    let handle = registry.lock().unwrap().get(flow).cloned().ok_or((404, format!("no flow {flow}")))?;
+    let hold = handle.state.lock().unwrap().hold.clone();
+    let Some(hold) = hold else {
+        return Err((409, format!("{flow} holds no message on this instance")));
+    };
+    let kind = if release { "hold-release" } else { "hold-probe" };
+    if release {
+        handle.release.store(true, Ordering::SeqCst);
+    } else {
+        handle.probe_now.store(true, Ordering::SeqCst);
+    }
+    let record = json!({
+        "ts": now_secs(), "actor": actor, "kind": kind, "unit": flow,
+        "service": hold["service"], "subject": hold["subject"],
+    });
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    match bus::connect(&url).map(|nc| nc.jetstream()) {
+        Ok(js) => {
+            if let Err(e) = connectors::to_audit(&js, flow, &record) {
+                eprintln!("[vejas] {kind}: audit not written: {e}");
+            }
+        }
+        Err(e) => eprintln!("[vejas] {kind}: audit not written: {e}"),
+    }
+    Ok(json!({"ok": true, "flow": flow, "action": if release { "release" } else { "probe" }, "hold": hold}))
 }
 
 /// Governed-change mode (ADR-0024): when `VEJAS_REQUIRE_APPROVAL=1`, a direct
@@ -5430,7 +5478,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"type": "object", "properties": props, "required": req})
     };
     let mut tools = vec![
-        json!({"name": "vejas_topology", "description": "List running flows and connectors with their status.", "inputSchema": obj(json!({}), vec![])}),
+        json!({"name": "vejas_topology", "description": "List running flows and connectors with their status, and for a flow that holds its message while a system is down its `hold`: the service, since when, the last error, the probes, the next one, the messages behind (ADR-0040).", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_graph", "description": "The pipeline graph: sources, flows, composed services, destinations, connectors.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_surface", "description": "The business surface of every flow: mappings, transcoding tables, constants.", "inputSchema": obj(json!({}), vec![])}),
         json!({"name": "vejas_language", "description": "The VejasScript reference: grammar, builtins, and the rules for flow files and connector manifests. Read this before writing any .vjs.", "inputSchema": obj(json!({}), vec![])}),
@@ -6180,6 +6228,17 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             match r {
                 Ok(v) => respond(request, 200, v.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
+            }
+        }
+        (tiny_http::Method::Post, "/hold/release") | (tiny_http::Method::Post, "/hold/probe") => {
+            if let Err((code, e)) = hold_http_gate(&request) {
+                return respond(request, code, e, "text/plain");
+            }
+            let body = read_body(&mut request);
+            let release = path_only == "/hold/release";
+            match hold_act(&registry, body.get("flow").and_then(|v| v.as_str()), release, &actor) {
+                Ok(v) => respond(request, 200, v.to_string(), "application/json"),
+                Err((code, e)) => respond(request, code, e, "text/plain"),
             }
         }
         (tiny_http::Method::Post, "/dlq/purge") => {
