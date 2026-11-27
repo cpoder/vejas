@@ -3523,7 +3523,7 @@ Rules:
 - Put every business-meaningful value (thresholds, tables, queue names) in UPPERCASE literals.
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
-- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; `event` is the request's JSON body as sent (an object, an array, or null when there is none), {path params} are variables, and `request` holds {method, path, params, query, headers} (`headers`: accept, content-type, idempotency-key, user-agent, x-correlation-id, x-request-id, and those an `API_HEADERS` list names, in lower case, never one whose name reads as a credential, in any spelling; the trace record masks the value of each header the list names, where the request shows it). A path parameter named `event` or `request` is read as `request.params.<name>`, and a body field named `request` as `event.request`. A body that is not JSON answers 400. The whole API is described at GET /api/openapi.json.
+- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; `event` is the request's JSON body as sent (an object, an array, or null when there is none), {path params} are variables, and `request` holds {method, path, params, query, headers} (`headers`: accept, content-type, idempotency-key, user-agent, x-correlation-id, x-request-id, and those an `API_HEADERS` list names, in lower case, never one whose name reads as a credential, in any spelling; the trace record masks the value of each header the list names, where the request shows it). A path parameter named `event` or `request` is read as `request.params.<name>`, and a body field named `request` as `event.request`. Path parameters and the query arrive decoded: `%3A` is `:`, and a `+` in the query is a space. A body that is not JSON answers 400. The whole API is described at GET /api/openapi.json.
 - A message that is not JSON is a dead letter, unless the flow reads `unreadable`: its event is then {unreadable: {error, text, base64}}: `text` when the bytes are UTF-8 text, `base64` when they are not, the other null. An `api` flow that reads it takes such a body instead of answering 400. A JSON event with its own `unreadable` field sets the variable too. `unreadable.base64 ?? base64(unreadable.text)` is the message in base64 whatever its bytes are, since `base64()` gives a text's UTF-8 bytes. To forward the bytes, keep them under a key that ends in `base64` (`raw_base64`): the masks read base64 under such a key only. The base64 of a short text (256 bytes at most) that holds a secret is masked as the secret is.
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
@@ -4548,8 +4548,15 @@ fn json_schema_from_literal(v: &Value) -> Value {
 }
 
 /// Match a request (method, path under /api/) to a route; capture path params.
+/// A segment is percent-decoded once the path is split, so an encoded `/`
+/// stays inside its parameter: `/orders/a%20b%2Fc` gives `id` = `a b/c`.
 fn match_api_route(root: &Path, method: &str, rel: &str) -> Option<(String, Vec<(String, String)>)> {
-    let parts: Vec<&str> = rel.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<String> = rel
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(metrics::percent_decode)
+        .collect();
     for r in api_routes(root) {
         if r.method != method || r.segs.len() != parts.len() {
             continue;
@@ -4564,7 +4571,7 @@ fn match_api_route(root: &Path, method: &str, rel: &str) -> Option<(String, Vec<
                         break;
                     }
                 }
-                Seg::Param(name) => params.push((name.clone(), (*part).to_string())),
+                Seg::Param(name) => params.push((name.clone(), part.clone())),
             }
         }
         if ok {
@@ -4578,18 +4585,19 @@ fn method_str(m: &tiny_http::Method) -> String {
     m.as_str().to_ascii_uppercase()
 }
 
+/// The query string as `request.query`, decoded as clients encode it: `+` is
+/// a space and `%XX` a byte, in names and values alike. Everything after the
+/// first `?` is the query, so a value may hold a `?`. A name given twice keeps
+/// its last value.
 fn parse_query(url: &str) -> Value {
+    let decoded = |s: &str| metrics::percent_decode(&s.replace('+', " "));
     let mut q = serde_json::Map::new();
-    if let Some(qs) = url.split('?').nth(1) {
-        for pair in qs.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let mut kv = pair.splitn(2, '=');
-            let k = kv.next().unwrap_or("").to_string();
-            let v = kv.next().unwrap_or("").to_string();
+    if let Some((_, qs)) = url.split_once('?') {
+        for pair in qs.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let k = decoded(k);
             if !k.is_empty() {
-                q.insert(k, Value::String(v));
+                q.insert(k, Value::String(decoded(v)));
             }
         }
     }
@@ -6491,6 +6499,32 @@ mod tests {
         assert_eq!(out("open_hook"), json!(["vx.>"]), "without ALLOW a webhook reaches any vx subject");
         assert_eq!(out("shop_hook"), json!(["vx.shop", "vx.shop.>"]), "an ALLOW entry allows itself and below");
         assert_eq!(out("tick"), json!(["vx.ops.ping"]));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_api_request_reads_its_query_and_its_path_decoded() {
+        let q = parse_query("/api/x?now=2026-03-01T10%3A00%3A00.000Z&q=caf%C3%A9+au+lait&a%20b=1&plus=%2B&ask=what?&&flag");
+        assert_eq!(q["now"], "2026-03-01T10:00:00.000Z", "%3A is a colon");
+        assert_eq!(q["q"], "café au lait", "+ is a space, %C3%A9 the UTF-8 of é");
+        assert_eq!(q["a b"], "1", "a name is decoded as its value is");
+        assert_eq!(q["plus"], "+", "%2B is a plus");
+        assert_eq!(q["ask"], "what?", "a ? after the first one stays in its value");
+        assert_eq!(q["flag"], "", "a name without = has an empty value");
+        assert_eq!(parse_query("/api/x"), json!({}));
+
+        let root = std::env::temp_dir().join(format!("vejas-api-decoded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("flows")).unwrap();
+        fs::write(
+            root.join("flows").join("get_order.vjs"),
+            "# flow: get_order\napi \"GET /orders/{id}\"\nrespond 200, {id: id}\n",
+        )
+        .unwrap();
+        let (_, params) = match_api_route(&root, "GET", "orders/a%20b%2Fc").unwrap();
+        assert_eq!(params, vec![("id".to_string(), "a b/c".to_string())], "an encoded / stays inside its parameter");
+        assert!(match_api_route(&root, "GET", "%6Frders/1").is_some(), "a literal segment is matched decoded");
+        assert!(match_api_route(&root, "GET", "orders/a/c").is_none(), "a / as sent separates segments");
         let _ = fs::remove_dir_all(&root);
     }
 

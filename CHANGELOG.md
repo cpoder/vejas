@@ -198,6 +198,14 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   chunked body was refused the same way.
 
 ### Fixed
+- **An `api` flow reads its query and its path parameters decoded.**
+  `request.query` held each value as it was sent, so
+  `?now=2026-03-01T10%3A00%3A00.000Z` read as `2026-03-01T10%3A00%3A00.000Z`
+  and a `+` stayed a `+`. A path parameter kept its `%20`, and an `invoke`
+  that put it in a URL encoded it a second time (`a%2520b`). Both now arrive
+  decoded: `%XX` is a byte of UTF-8 text, `+` in the query is a space, and
+  an encoded `/` stays inside its parameter. Everything after the first `?`
+  is the query, so a value may hold a `?`.
 - **An emit a stream does not store fails its run.** Before acking a batch's
   messages, the runtime checked that the server had read their emits, not that
   a stream had stored them. A stream that was full and discarded new messages,

@@ -100,6 +100,9 @@ A=$(post -X POST -H 'Content-Type: application/json' -H 'X-Request-ID: rq-7' -H 
 echo "$A" | grep -q '"query":"blue shoes"' && ok "a body field named query is the body's" || ko "query: $A"
 echo "$A" | grep -q '"page":"2"' && echo "$A" | grep -q '"kind":"products"' \
   && ok "the query string in request.query, the path parameter a variable" || ko "page, kind: $A"
+D=$(post -X POST -H 'Content-Type: application/json' -d '{}' "$H/api/search/caf%C3%A9%20au%2Flait?page=2026-03-01T10%3A00%3A00.000Z+Z%2B")
+echo "$D" | grep -qF '"kind":"café au/lait"' && echo "$D" | grep -qF '"page":"2026-03-01T10:00:00.000Z Z+"' \
+  && ok "a path parameter and the query arrive decoded" || ko "decoded: $D"
 echo "$A" | grep -q '"method":"POST"' && echo "$A" | grep -q '"path":"/search/products"' \
   && ok "request has the method and the path" || ko "request: $A"
 GOT=$(python3 -c 'import json, sys; print(" ".join(sorted(json.loads(sys.argv[1].rsplit(" ", 1)[0])["headers"])))' "$A" 2>/dev/null)
