@@ -452,8 +452,9 @@ pub struct Program {
     pub tool: Option<String>,
     /// When set, this flow is exposed as a synchronous HTTP endpoint:
     /// `api "POST /orders"` / `api "GET /orders/{id}"`. The runtime routes
-    /// (method, path) here, binds {path params} into the event, and returns the
-    /// flow's `respond`. Several flows (one per verb) compose a REST resource.
+    /// (method, path) here, runs it on the body as sent with its {path params}
+    /// as variables (ADR-0039), and returns the flow's `respond`. Several flows
+    /// (one per verb) compose a REST resource.
     pub api: Option<String>,
     /// When set, this file is a connector instance manifest: `driver "http-in"`
     /// plus UPPERCASE literal config. It is run by a native driver, not as a flow.
@@ -1778,6 +1779,38 @@ impl Program {
     pub fn writes_bus(&self) -> bool {
         stmts_write_bus(&self.stmts)
     }
+
+    /// Whether the code reads the variable `name` anywhere. A flow that reads
+    /// `unreadable` takes the messages that are not JSON (ADR-0039).
+    pub fn reads_var(&self, name: &str) -> bool {
+        stmts_read_var(&self.stmts, name)
+    }
+}
+
+fn stmts_read_var(stmts: &[Stmt], name: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Assign(_, e) => expr_reads_var(e, name),
+        Stmt::For(_, iter, body) => expr_reads_var(iter, name) || stmts_read_var(body, name),
+        Stmt::If(arms, otherwise) => {
+            arms.iter().any(|(cond, _, body)| expr_reads_var(cond, name) || stmts_read_var(body, name))
+                || otherwise.as_deref().is_some_and(|body| stmts_read_var(body, name))
+        }
+        Stmt::Emit(a, b) | Stmt::Respond(a, b) => expr_reads_var(a, name) || expr_reads_var(b, name),
+        Stmt::InvokeMerge(_, args) => args.iter().any(|(_, v)| expr_reads_var(v, name)),
+    })
+}
+
+fn expr_reads_var(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Var(n) => n == name,
+        Expr::Lit(_) => false,
+        Expr::FString(parts) => parts.iter().any(|p| matches!(p, FStringPart::Expr(e) if expr_reads_var(e, name))),
+        Expr::Doc(pairs) | Expr::Invoke(_, pairs) => pairs.iter().any(|(_, e)| expr_reads_var(e, name)),
+        Expr::Array(es) | Expr::Call(_, es) => es.iter().any(|e| expr_reads_var(e, name)),
+        Expr::Field(base, _, _) => expr_reads_var(base, name),
+        Expr::Index(a, b) | Expr::Filter(a, b) | Expr::Bin(_, a, b) => expr_reads_var(a, name) || expr_reads_var(b, name),
+        Expr::Projection(b) | Expr::Unary(_, b) => expr_reads_var(b, name),
+    }
 }
 
 fn stmts_write_bus(stmts: &[Stmt]) -> bool {
@@ -2527,6 +2560,12 @@ pub struct Ctx {
 }
 
 pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, String> {
+    run_with(prog, event, Map::new(), engine)
+}
+
+/// [`run`], with variables of the run's own over the event's fields: an `api`
+/// flow's path parameters and its `request` (ADR-0039).
+pub fn run_with(prog: &Program, event: &Value, given: Map<String, Value>, engine: &mut Engine) -> Result<Ctx, String> {
     engine.failure = None;
     let mut vars = Map::new();
     if let Value::Object(obj) = event {
@@ -2534,6 +2573,7 @@ pub fn run(prog: &Program, event: &Value, engine: &mut Engine) -> Result<Ctx, St
             vars.insert(k.clone(), v.clone());
         }
     }
+    vars.extend(given);
     vars.insert("event".into(), event.clone());
     let mut ctx = Ctx { vars, emits: Vec::new(), response: None };
     exec_block(&prog.stmts, &mut ctx, engine)?;
@@ -3119,6 +3159,30 @@ mod tests {
         let prog = parse(src)?;
         let mut engine = Engine::live(std::env::temp_dir(), "default".into());
         run(&prog, &event, &mut engine).map(|c| c.emits)
+    }
+
+    #[test]
+    fn a_flow_says_whether_it_reads_a_variable() {
+        let reads = |src: &str| parse(src).unwrap().reads_var("unreadable");
+        assert!(reads("source \"vx.a\"\nif unreadable:\n  emit \"vx.bad\", {raw: unreadable.base64}\nend\n"));
+        assert!(reads("source \"vx.a\"\nfor x in [1]:\n  emit f\"vx.{unreadable?.error}\", {}\nend\n"));
+        assert!(reads("source \"vx.a\"\ninvoke log(m: unreadable)\n"));
+        assert!(!reads("source \"vx.a\"\nemit \"vx.o\", {u: \"unreadable\", v: event.unreadable_x}\n"));
+    }
+
+    #[test]
+    fn a_run_given_variables_keeps_its_event_as_sent() {
+        let prog = parse("api \"PUT /orders/{id}\"\nrespond 200, {id: id, body_id: event.id, n: len(event), page: request.query.page}\n").unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        let given = json!({"id": "from-path", "request": {"query": {"page": "2"}}});
+        let Value::Object(given) = given else { unreachable!() };
+        let ctx = run_with(&prog, &json!({"id": "from-body", "x": 1}), given, &mut engine).unwrap();
+        let (_, body) = ctx.response.unwrap();
+        assert_eq!(body, json!({"id": "from-path", "body_id": "from-body", "n": 2, "page": "2"}));
+        // an array is the event as it came
+        let prog = parse("api \"POST /bulk\"\nrespond 200, {n: len(event), first: event[0].id}\n").unwrap();
+        let ctx = run(&prog, &json!([{"id": "a"}, {"id": "b"}]), &mut engine).unwrap();
+        assert_eq!(ctx.response.unwrap().1, json!({"n": 2, "first": "a"}));
     }
 
     #[test]

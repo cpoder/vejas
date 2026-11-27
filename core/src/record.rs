@@ -107,7 +107,7 @@ const EMITS_MAX: usize = 100;
 const READ_MAX: usize = 10_000;
 /// How many of the latest hops a search looks through, at most.
 pub const SEARCH_WINDOW: u64 = 50_000;
-const MASKED: &str = "<masked>";
+pub(crate) const MASKED: &str = "<masked>";
 const TAKEN_OUT: &str = "<secret>";
 
 const DEFAULT_MAX_HOPS: i64 = 100_000;
@@ -1266,8 +1266,13 @@ impl Scrub {
         }
     }
 
-    /// A text as a JSON string, at most `max` bytes once scrubbed.
+    /// A text as a JSON string, at most `max` bytes once scrubbed: masked
+    /// whole when it reads as no text (`reads_as_text`), as UTF-16 does,
+    /// whose NULs keep every mask from reading it.
     fn write_text(&self, out: &mut String, text: &str, cut: bool, max: usize) {
+        if !reads_as_text(text.as_bytes(), cut) {
+            return json_string(out, MASKED);
+        }
         self.write_text_in(out, text, cut, max, 0);
     }
 
@@ -1360,7 +1365,9 @@ impl Scrub {
             }
             // its opening quote stays, and it stays open
             json.truncate(json.len() - held.len() + 1);
+            let base64 = w.key.is_some_and(|(s, e)| names_base64(&text[s..e]));
             match &content {
+                Some(content) if base64 && self.hides_in_base64(content, true, nest + 1) => json.push_str(MASKED),
                 Some(content) => {
                     let mut read = String::with_capacity(content.len() + 16);
                     self.write_text_as(&mut read, content, true, drop, usize::MAX, nest + 1);
@@ -1390,6 +1397,48 @@ impl Scrub {
     /// An object key: scrubbed as a text, never read as JSON.
     fn write_key(&self, out: &mut String, key: &str) {
         self.write_text_in(out, key, false, usize::MAX, NEST_MAX);
+    }
+
+    /// Whether a value in base64, under a key that says it is one
+    /// (`names_base64`), hides what a mask hides: its bytes are read as a
+    /// text and masked as a text is. Bytes that read as no text
+    /// (`reads_as_text`), EBCDIC, UTF-16 or compressed, are hidden whole: no
+    /// mask finds a credential in them, and base64 keeps them exact.
+    /// Whitespace, as MIME, PEM or a fold writes it, and padding, as chunks
+    /// joined keep it, are read past; a last character alone, where a value
+    /// was cut, is left out. A `cut` value, the start of a longer one as a
+    /// preview shows it, is read as cut, so that the start of a value handed
+    /// out it ends in hides it. A value that does not decode is no base64,
+    /// and fewer bytes than a credential's start (`none`, `TODO`) hide
+    /// nothing. A data URI (`data:…,`) is read past its head.
+    fn hides_in_base64(&self, value: &str, cut: bool, nest: u8) -> bool {
+        use base64::engine::{DecodePaddingMode, Engine as _, GeneralPurpose, GeneralPurposeConfig};
+        const READ: GeneralPurposeConfig = GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true);
+        const STANDARD: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::STANDARD, READ);
+        const URL_SAFE: GeneralPurpose = GeneralPurpose::new(&base64::alphabet::URL_SAFE, READ);
+        let decoded = |b: &[u8]| STANDARD.decode(b).or_else(|_| URL_SAFE.decode(b)).ok();
+        let uri = value.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("data:"));
+        let value = if uri { value.split_once(',').map_or(value, |(_, data)| data) } else { value };
+        let bare: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=').collect();
+        let Some(bytes) = decoded(&bare[..bare.len() - usize::from(bare.len() % 4 == 1)]) else {
+            return false;
+        };
+        if bytes.len() < PREFIX_MIN {
+            return false;
+        }
+        if !reads_as_text(&bytes, cut) {
+            return true;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if cut && self.vault_start_at_end(&text) < text.len() {
+            return true;
+        }
+        let mut read = String::new();
+        self.write_text_in(&mut read, &text, cut, usize::MAX, nest);
+        let marks = |s: &str| s.matches(MASKED).count() + s.matches(TAKEN_OUT).count();
+        marks(&read) > marks(&text)
     }
 
     /// A number, unless it holds a value handed out: then TAKEN_OUT, as a string.
@@ -1971,7 +2020,7 @@ impl<'de> Visitor<'de> for Json<'_> {
         }
         self.out.push('[');
         let mut comma = false;
-        while seq.next_element_seed(Element { to: self.inner(), comma })?.is_some() {
+        while seq.next_element_seed(Element { to: self.inner(), comma, base64: false })?.is_some() {
             comma = true;
         }
         self.out.push(']');
@@ -2006,6 +2055,8 @@ impl<'de> Visitor<'de> for Json<'_> {
                 let from = self.out.len();
                 map.next_value_seed(self.inner())?;
                 values.push(from..self.out.len());
+            } else if names_base64(key) {
+                map.next_value_seed(Base64(self.inner()))?;
             } else {
                 map.next_value_seed(self.inner())?;
             }
@@ -2022,6 +2073,124 @@ impl<'de> Visitor<'de> for Json<'_> {
         }
         self.out.push('}');
         Ok(())
+    }
+}
+
+/// Whether a key says its value is bytes in base64: `base64` (a message that
+/// is not JSON, ADR-0039), `data_base64` (CloudEvents), `contentBase64`,
+/// `base64Content`, and `contentBytes` (Microsoft Graph's attachments).
+fn names_base64(key: &str) -> bool {
+    let key = key.as_bytes();
+    key.len() >= 6 && (key[key.len() - 6..].eq_ignore_ascii_case(b"base64") || key[..6].eq_ignore_ascii_case(b"base64"))
+        || key.eq_ignore_ascii_case(b"contentBytes")
+}
+
+/// Whether bytes read as a text the masks can read. UTF-8 does, but for its
+/// control characters other than the delimiters text formats use
+/// (`delimits`): one byte in eight at most, a run of one counted once, as
+/// padding is (a record's NULs). Another encoding does when ASCII is ASCII
+/// in it and the rest stands apart, as Latin-1's accents do: printable ASCII
+/// seven bytes in ten, and no three bytes past ASCII in a row, which the
+/// letters of EBCDIC, Cyrillic words and compressed bytes run to, however
+/// many spaces pad them. Neither does with four ASCII characters of UTF-16
+/// or UTF-32 in a row anywhere in it, behind an ASCII envelope too
+/// (`holds_wide_text`). A `cut` text may stop inside a character.
+pub(crate) fn reads_as_text(bytes: &[u8], cut: bool) -> bool {
+    if bytes.contains(&0) && holds_wide_text(bytes) {
+        return false;
+    }
+    let utf8 = match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(e) => cut && e.error_len().is_none(),
+    };
+    if utf8 {
+        let control = |b: u8| b < 0x20 && !delimits(b) || b == 0x7f;
+        let controls = bytes.iter().enumerate().filter(|&(i, &b)| control(b) && (i == 0 || bytes[i - 1] != b)).count();
+        return controls * 8 <= bytes.len();
+    }
+    let printable = bytes.iter().filter(|&&b| delimits(b) || (0x20..=0x7e).contains(&b)).count();
+    printable * 10 >= bytes.len() * 7 && !bytes.windows(3).any(|three| three.iter().all(|&b| b >= 0x80))
+}
+
+/// The control characters a text format delimits with: whitespace, FIX's
+/// SOH, the separators FS, GS, RS and US, and the ESC a coloured log writes.
+fn delimits(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r' | 0x01 | 0x1b..=0x1f)
+}
+
+/// Whether bytes hold four ASCII characters in a row of UTF-16 or UTF-32, in
+/// either byte order and at any offset: each a printable byte beside one
+/// NUL, or three. NULs that pad come in runs, and do not.
+fn holds_wide_text(bytes: &[u8]) -> bool {
+    [2, 4].into_iter().any(|width: usize| {
+        (0..width).any(|phase| {
+            let mut row = 0;
+            bytes.get(phase..).unwrap_or_default().chunks_exact(width).any(|unit| {
+                let wide = unit.iter().filter(|&&b| b == 0).count() == width - 1
+                    && [unit[0], unit[width - 1]].iter().any(|b| (0x20..=0x7e).contains(b));
+                row = if wide { row + 1 } else { 0 };
+                row >= 4
+            })
+        })
+    })
+}
+
+/// The value of a key that says it holds bytes in base64 (`names_base64`).
+/// No mask reads a credential in base64, so the bytes are read as text and
+/// masked as a text is: when the mask finds one in them, or they read as no
+/// text, the value is masked whole; when not, it is written as it came. An
+/// array holds such values too. A value that is no base64 is a text like
+/// another, and one that is no string or array a value like another.
+struct Base64<'a>(Json<'a>);
+
+impl<'de> DeserializeSeed<'de> for Base64<'_> {
+    type Value = ();
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Base64<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+        if self.0.scrub.hides_in_base64(v, false, self.0.nest) {
+            json_string(self.0.out, MASKED);
+            return Ok(());
+        }
+        self.0.visit_str(v)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        self.0.visit_unit()
+    }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
+        self.0.visit_bool(v)
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
+        self.0.visit_i64(v)
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
+        self.0.visit_u64(v)
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
+        self.0.visit_f64(v)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        if self.0.depth >= DEPTH_MAX {
+            return Err(de::Error::custom("nested too deep for a record"));
+        }
+        self.0.out.push('[');
+        let mut comma = false;
+        while seq.next_element_seed(Element { to: self.0.inner(), comma, base64: true })?.is_some() {
+            comma = true;
+        }
+        self.0.out.push(']');
+        Ok(())
+    }
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<(), A::Error> {
+        self.0.visit_map(map)
     }
 }
 
@@ -2076,10 +2245,12 @@ impl<'de> Visitor<'de> for Name<'_> {
     }
 }
 
-/// An element of an array, after a comma unless it is the first.
+/// An element of an array, after a comma unless it is the first; bytes in
+/// base64 when the array is under a key that says so.
 struct Element<'a> {
     to: Json<'a>,
     comma: bool,
+    base64: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for Element<'_> {
@@ -2087,6 +2258,9 @@ impl<'de> DeserializeSeed<'de> for Element<'_> {
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
         if self.comma {
             self.to.out.push(',');
+        }
+        if self.base64 {
+            return d.deserialize_any(Base64(self.to));
         }
         d.deserialize_any(self.to)
     }
@@ -2182,12 +2356,16 @@ impl<'de> Visitor<'de> for Hidden<'_> {
 }
 
 /// A payload as the record keeps it, as the value of "input": JSON scrubbed in
-/// place, anything else as scrubbed text, and past `INPUT_MAX` only its size
-/// and the start of its scrubbed text.
+/// place, anything else as scrubbed text, or masked whole when its bytes
+/// read as no text (`reads_as_text`), and past `INPUT_MAX` only its size and
+/// the start of its scrubbed text.
 fn payload(out: &mut String, input: &Kept, scrub: &Scrub) {
     if input.whole() {
         if scrub.spans_json(&input.bytes) || !scrubbed_json(&input.bytes, out, scrub, 0) {
             // not JSON, or too deep to keep as JSON: a text
+            if !reads_as_text(&input.bytes, false) {
+                return json_string(out, MASKED);
+            }
             scrub.write_text_in(out, &String::from_utf8_lossy(&input.bytes), false, usize::MAX, NEST_MAX);
         }
         return;
@@ -2877,6 +3055,211 @@ mod tests {
         // in a text too: a query string
         let t = input_of(br#"{"url":"https://h/cb?accessToken=at-2&state=s"}"#, &[]);
         assert_eq!(t["url"], "https://h/cb?accessToken=<masked>&state=s");
+    }
+
+    #[test]
+    fn a_credential_is_no_more_hidden_in_base64_than_in_a_text() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // bytes that are not UTF-8, as a message that is not JSON brings them
+        let mut latin1 = br#"{"password":"hunter2-B64","city":""#.to_vec();
+        latin1.extend_from_slice(&[0xe9, b'"', b'}']);
+        // in the URL alphabet, without its padding, and with MIME's line breaks
+        let mut url = br#"{"password":"hunter2-URL","tail":""#.to_vec();
+        url.extend_from_slice(&[0xfb, 0xff, b'"', b'}']);
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&url);
+        assert!(url.contains(['-', '_']), "{url}");
+        let mime = b64(br#"{"api_key":"k3y-MIME-0001","n":1}"#).as_bytes().chunks(16).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("\r\n");
+        let event = json!({
+            "unreadable": {"base64": b64(&latin1), "text": null},
+            "file": {"data_base64": b64(b"just bytes")},
+            "contentBase64": "not base64, as its commas say",
+            "labelBase64": "no base64 here",
+            "photoBase64": 12,
+            "urlBase64": url,
+            "mime_base64": mime,
+        });
+        let seen = shown().json(&event);
+        assert_eq!(seen["unreadable"]["base64"], MASKED);
+        assert_eq!((&seen["urlBase64"], &seen["mime_base64"]), (&json!(MASKED), &json!(MASKED)));
+        assert_eq!(seen["file"]["data_base64"], b64(b"just bytes"));
+        assert_eq!(seen["contentBase64"], "not base64, as its commas say");
+        // words that decode once their spaces are read past: masked whole
+        assert_eq!(seen["labelBase64"], MASKED);
+        assert_eq!(seen["photoBase64"], 12);
+        // cut short, as in a preview
+        let start = format!(r#"{{"unreadable":{{"base64":"{}"#, &b64(&latin1)[..26]);
+        let preview = shown().text(&start, true);
+        assert!(!preview.contains(&b64(&latin1)[..16]), "{preview}");
+        let a = input_of(serde_json::to_vec(&event).unwrap().as_slice(), &[]);
+        assert_eq!(a["unreadable"]["base64"], MASKED, "the record reads it so too");
+    }
+
+    #[test]
+    fn base64_the_masks_cannot_read_is_masked_whole() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // `password=hunter2-EBC&user=bob` in EBCDIC (cp500), as from IBM MQ
+        let ebcdic = [
+            0x97, 0x81, 0xa2, 0xa2, 0xa6, 0x96, 0x99, 0x84, 0x7e, 0x88, 0xa4, 0x95, 0xa3, 0x85, 0x99, 0xf2, 0x60, 0xc5, 0xc2, 0xc3, 0x50,
+            0xa4, 0xa2, 0x85, 0x99, 0x7e, 0x82, 0x96, 0x82,
+        ];
+        // UTF-16 with its BOM, and without, which is UTF-8 all the same
+        let mut utf16 = vec![0xff, 0xfe];
+        let mut utf16le = Vec::new();
+        for b in br#"{"password":"hunter2-U16"}"# {
+            utf16.extend([*b, 0]);
+            utf16le.extend([*b, 0]);
+        }
+        // bytes as compressed ones are
+        let noise: Vec<u8> = (0..64u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for bytes in [&ebcdic[..], &utf16, &utf16le, &noise] {
+            let seen = shown().json(&json!({"unreadable": {"base64": b64(bytes), "text": null}}));
+            assert_eq!(seen["unreadable"]["base64"], MASKED, "{bytes:?}");
+        }
+        // Latin-1 with its accents reads as a text: kept when it holds none
+        let latin1 = b"caf\xe9 cr\xe8me br\xfbl\xe9e, deux";
+        assert_eq!(shown().json(&json!({"base64": b64(latin1)}))["base64"], b64(latin1));
+        // EBCDIC however many spaces pad it, after an ASCII header too, and
+        // UTF-32
+        let cp500 = |text: &str| -> Vec<u8> {
+            text.bytes()
+                .map(|b| match b {
+                    b'A'..=b'I' => 0xc1 + (b - b'A'),
+                    b'J'..=b'R' => 0xd1 + (b - b'J'),
+                    b'S'..=b'Z' => 0xe2 + (b - b'S'),
+                    b'0'..=b'9' => 0xf0 + (b - b'0'),
+                    b'=' => 0x7e,
+                    b'-' => 0x60,
+                    _ => 0x40,
+                })
+                .collect()
+        };
+        let padded = cp500(&format!("{:<40}{:<60}{:<290}", "CUST0001 DUPONT", "PASSWORD=HUNTER2-EBCPAD", "PARIS"));
+        let mut mqrfh2 = b"RFH ".to_vec();
+        mqrfh2.extend("<mcd><Msd>jms_text</Msd></mcd>".repeat(4).as_bytes());
+        mqrfh2.extend(cp500("PASSWORD=HUNTER2-RFH"));
+        let utf32: Vec<u8> = b"password=hunter2-U32".iter().flat_map(|&b| [b, 0, 0, 0]).collect();
+        for bytes in [&padded, &mqrfh2, &utf32] {
+            assert_eq!(shown().json(&json!({"base64": b64(bytes)}))["base64"], MASKED, "{bytes:?}");
+        }
+        // a record its NULs pad reads as a text
+        let mut nul = b"CUST0001Dupont".to_vec();
+        nul.extend([0; 14]);
+        nul.extend(b"Paris");
+        nul.extend([0; 15]);
+        nul.extend(b"000123");
+        assert!(reads_as_text(&nul, false) && !reads_as_text(&utf32, false));
+        // UTF-16 or UTF-32 behind an ASCII envelope, however short
+        let wide = |text: &[u8], width: usize, big: bool| -> Vec<u8> {
+            text.iter()
+                .flat_map(|&b| {
+                    let mut unit = vec![0; width];
+                    unit[if big { width - 1 } else { 0 }] = b;
+                    unit
+                })
+                .collect()
+        };
+        let mut rfh2 = b"RFH \x00\x00\x00\x02\x00\x00\x00\xa8".to_vec();
+        rfh2.extend("<mcd><Msd>jms_text</Msd></mcd>".repeat(4).as_bytes());
+        rfh2.extend(wide(b"password=hunter2-RFH16", 2, false));
+        let mut mime = b"Content-Type: text/plain; charset=utf-16le\r\n".repeat(4);
+        mime.extend(wide(b"password=hunter2-MIME16", 2, false));
+        let mut be32 = b"ENVELOPE ".repeat(20);
+        be32.extend(wide(b"pass", 4, true));
+        for bytes in [&rfh2, &mime, &be32] {
+            assert!(!reads_as_text(bytes, false), "{bytes:?}");
+            assert_eq!(shown().json(&json!({"base64": b64(bytes)}))["base64"], MASKED, "{bytes:?}");
+        }
+        // the delimiters of FIX, of records, of a coloured log: a text
+        let fix = b"8=FIX.4.2\x019=65\x0135=A\x0149=SENDER\x0156=TARGET\x0134=1\x0152=20261127-10:00:00\x0198=0\x01108=30\x0110=062\x01";
+        let records = b"id\x1fname\x1fcity\x1e1\x1fDupont\x1fParis\x1e2\x1fMartin\x1fLyon\x1e";
+        let log = b"\x1b[31mERROR\x1b[0m \x1b[1mflow\x1b[0m failed";
+        for bytes in [&fix[..], &records[..], &log[..]] {
+            assert!(reads_as_text(bytes, false), "{bytes:?}");
+        }
+        assert_eq!(shown().json(&json!({"base64": b64(&nul)}))["base64"], b64(&nul));
+        // base64 as producers write it: a space after, a space or a fold
+        // inside, cut one past a group, chunks joined with their padding, a
+        // data URI in capitals
+        let form = b64(b"password=hunter2-FORM&user=bob");
+        let written = [
+            format!("{form} "),
+            format!("{} {}", &form[..20], &form[20..]),
+            format!("{}\r\n {}", &form[..20], &form[20..]),
+            b64(b"password=hunter2-FORM&user=bob&more=1234567")[..41].to_string(),
+            format!("{}{}", b64(b"password=hunte"), b64(b"r2-JOIN&u=b")),
+            format!("DATA:TEXT/PLAIN;BASE64,{form}"),
+        ];
+        for value in written {
+            assert_eq!(shown().json(&json!({"data_base64": value}))["data_base64"], MASKED, "{value}");
+        }
+        // fewer bytes than a credential's start: what a placeholder decodes to
+        for placeholder in ["none", "null", "N/A", "TODO"] {
+            assert_eq!(shown().json(&json!({"file_base64": placeholder}))["file_base64"], placeholder);
+        }
+        // an array of them, a key that starts so, Graph's, a data URI
+        let event = json!({
+            "attachments_base64": [b64(br#"{"api_key":"k3y-ARR-0001"}"#), b64(b"plain")],
+            "base64Content": b64(b"password=hunter2-PFX"),
+            "contentBytes": b64(b"password=hunter2-GRAPH"),
+            "photo_base64": format!("data:text/plain;base64,{}", b64(b"password=hunter2-URI")),
+        });
+        let seen = shown().json(&event);
+        assert_eq!(seen["attachments_base64"], json!([MASKED, b64(b"plain")]));
+        assert_eq!((&seen["base64Content"], &seen["contentBytes"], &seen["photo_base64"]), (&json!(MASKED), &json!(MASKED), &json!(MASKED)));
+    }
+
+    #[test]
+    fn a_payload_or_a_text_that_reads_as_no_text_is_masked_whole() {
+        let utf16: Vec<u8> = b"password=hunter2-U16LE&user=bob".iter().flat_map(|&b| [b, 0]).collect();
+        let ebcdic = [0x97, 0x81, 0xa2, 0xa2, 0xa6, 0x96, 0x99, 0x84, 0x7e, 0x88, 0xa4, 0x95, 0xa3, 0x85, 0x99, 0xf2];
+        assert_eq!(input_of(&utf16, &[]), json!(MASKED));
+        assert_eq!(input_of(&ebcdic, &[]), json!(MASKED));
+        assert_eq!(input_of(b"caf\xe9 au lait, password=hunter2-L1", &[]), json!("caf\u{fffd} au lait, password=<masked>"));
+        let lossy = String::from_utf8_lossy(&utf16).into_owned();
+        assert_eq!((shown().text(&lossy, true), shown().payload(&lossy)), (MASKED.to_string(), MASKED.to_string()));
+        // NULs that pad, as a record's: a text
+        let padded = "CUST0001Dupont\0\0\0\0\0\0\0\0Paris\0\0\0\0\0\0\0\0000123";
+        assert_eq!(shown().payload(padded), padded);
+    }
+
+    #[test]
+    fn base64_cut_short_hides_the_start_of_a_value_it_ends_in() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let secret = "sk_live_Q7wE9rT2yU4iO6pA8sD0fG";
+        let mut bytes = vec![0xff];
+        bytes.extend([b'A'; 79]);
+        bytes.extend(secret.as_bytes());
+        bytes.extend(b" tail");
+        let full = b64(&bytes);
+        // 2, 3 and 1 characters past a whole group: each still decodes
+        for cut in [134, 135, 133, 132] {
+            let preview = format!(r#"{{"unreadable":{{"base64":"{}"#, &full[..cut]);
+            let out = shown_text(&scrub(&[secret]), &preview, true);
+            assert!(out.contains(MASKED) && !out.contains(&full[..40]), "{cut}: {out}");
+        }
+        // the last group cut short holds one more character: `sk_l`, past the
+        // start a text shows
+        let mut bytes = vec![0xff];
+        bytes.extend([b'A'; 95]);
+        bytes.extend(secret.as_bytes());
+        let full = b64(&bytes);
+        for cut in [134, 135] {
+            let preview = format!(r#"{{"unreadable":{{"base64":"{}"#, &full[..cut]);
+            let out = shown_text(&scrub(&[secret]), &preview, true);
+            assert!(out.contains(MASKED) && !out.contains(&full[..40]), "{cut}: {out}");
+        }
+        // a credential the mask names, cut in its value
+        let mut xml = vec![0xff];
+        xml.extend(b"<r>");
+        xml.extend([b'x'; 70]);
+        xml.extend(b"<password>hunter2-XML-0001</password></r>");
+        let full = b64(&xml);
+        let preview = format!(r#"{{"unreadable":{{"base64":"{}"#, &full[..130]);
+        let out = shown_text(&scrub(&[]), &preview, true);
+        assert!(out.contains(MASKED) && !out.contains(&full[..40]), "{out}");
     }
 
     #[test]

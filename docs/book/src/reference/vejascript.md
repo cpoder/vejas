@@ -29,7 +29,7 @@ VejasScript in 20 lines:
 Exposing a flow (instead of, or besides, `source`):
   tool "what calling this flow does" <- exposes the flow as an MCP tool
   api "POST /orders"                 <- expose the flow as a SYNCHRONOUS HTTP endpoint under /api (POST /api/orders)
-  api "GET /orders/{id}"             <- a REST resource = several flows, ONE per verb; {path params} become event variables (here `id`)
+  api "GET /orders/{id}"             <- a REST resource = several flows, ONE per verb; {path params} become variables (here `id`)
   API_REQUEST = {customer: "string", total: "number"}   <- optional: typed request schema for the generated OpenAPI
   API_RESPONSE = {id: "string", status: "string"}       <- optional: typed 200 response schema
   respond 201, {id: id, status: "created"}   <- the SYNCHRONOUS HTTP response (status code + JSON body); `emit` still fires bus side-effects
@@ -39,7 +39,8 @@ Rules:
 - Put every business-meaningful value (thresholds, tables, queue names) in UPPERCASE literals.
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
-- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
+- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; `event` is the request's JSON body as sent (an object, an array, or null when there is none), {path params} are variables, and `request` holds {method, path, params, query, headers} (`headers`: accept, content-type, idempotency-key, user-agent, x-correlation-id, x-request-id, and those an `API_HEADERS` list names, in lower case, never one whose name reads as a credential, in any spelling; the trace record masks the value of each header the list names, where the request shows it). A path parameter named `event` or `request` is read as `request.params.<name>`, and a body field named `request` as `event.request`. A body that is not JSON answers 400. The whole API is described at GET /api/openapi.json.
+- A message that is not JSON is a dead letter, unless the flow reads `unreadable`: its event is then {unreadable: {error, text, base64}}: `text` when the bytes are UTF-8 text, `base64` when they are not, the other null. An `api` flow that reads it takes such a body instead of answering 400. A JSON event with its own `unreadable` field sets the variable too. To forward the bytes, keep them under a key that ends in `base64` (`raw_base64`): the masks read base64 under such a key only.
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.

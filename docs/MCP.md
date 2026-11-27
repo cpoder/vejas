@@ -63,8 +63,8 @@ no server code to touch.
 
 The HTTP twin of flow-as-tool: a flow that declares `api "VERB /path"` (e.g.
 `api "GET /orders/{id}"`) is served synchronously under `/api` — the request's
-JSON body, `{path params}` and `query` become the event, `respond status,
-{…}` is the response, and `GET /api/openapi.json` describes the whole API
+JSON body as sent is the event, `{path params}` are variables, `request` holds
+the method, path, query and headers, `respond status, {…}` is the response, and `GET /api/openapi.json` describes the whole API
 (generated, OpenAPI 3.0). A REST resource is a set of flows, one per verb:
 `docs/examples/rest-api`.
 

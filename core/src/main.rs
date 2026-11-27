@@ -401,7 +401,13 @@ fn replay_literal(
             let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
             let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
             let js = bus::connect(&url).ok()?.jetstream();
-            connectors::hydrate_recent(&js, &stream, subject, n).ok()
+            connectors::hydrate_recent_with(&js, &stream, subject, n, |data| {
+                let message = Message::of(data);
+                message.runs_in(&before).then(|| match message {
+                    Message::Json(event) | Message::Unreadable(event) => event,
+                })
+            })
+            .ok()
         });
         match hydrated {
             Some(rows) if !rows.is_empty() => (
@@ -483,15 +489,19 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
         .source
         .clone()
         .ok_or("flow has no bus source to replay")?;
-    let rows = connectors::hydrate_recent(&js, &stream, &source_subj, n)?;
+    // a message that is not JSON, when either version runs it (ADR-0039)
+    let rows = connectors::hydrate_recent_with(&js, &stream, &source_subj, n, |data| {
+        let message = Message::of(data);
+        (message.runs_in(&current) || message.runs_in(&candidate)).then_some(message)
+    })?;
     let mut results = Vec::new();
     let (mut changed, mut not_recorded) = (0, 0);
     let scrub = record::shown();
     let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
-    for (seq, subject, event) in &rows {
-        let (event, hidden) = shadow_input(event, &scrub, &reads);
-        let b = shadow_emits(&current, &event, root, &pkg);
-        let a = shadow_emits(&candidate, &event, root, &pkg);
+    for (seq, subject, message) in &rows {
+        let (event, hidden) = shadow_input(message.event(), &scrub, &reads);
+        let b = message.shadow(&current, &event, root, &pkg);
+        let a = message.shadow(&candidate, &event, root, &pkg);
         let ch = compared(&b, &a);
         match ch {
             Some(true) => changed += 1,
@@ -651,13 +661,14 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
             let batch = connectors::fetch_round(&sub).unwrap_or_default();
             let scrub = record::shown();
             for m in &batch {
-                let Ok(event) = serde_json::from_slice::<Value>(&m.data) else {
+                let message = Message::of(&m.data);
+                if !message.runs_in(&current) && !message.runs_in(&candidate) {
                     continue;
-                };
-                let (event, hidden) = shadow_input(&event, &scrub, &reads);
+                }
+                let (event, hidden) = shadow_input(message.event(), &scrub, &reads);
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
-                let b = shadow_emits(&current, &event, &root, &pkg);
-                let a = shadow_emits(&candidate, &event, &root, &pkg);
+                let b = message.shadow(&current, &event, &root, &pkg);
+                let a = message.shadow(&candidate, &event, &root, &pkg);
                 let ch = compared(&b, &a);
                 total.fetch_add(1, Ordering::SeqCst);
                 match ch {
@@ -1202,8 +1213,11 @@ fn preview_of(v: &Value) -> String {
         }
     }
     let mut out = Upto(Vec::new());
+    // serde_json reads a whole string before it writes it: only what the
+    // preview shows is written, a 600 KB base64 cut to it first
+    let v = clipped(v, &mut (CHARS + 1));
     // stopped on purpose past ENOUGH: what was written is all the preview needs
-    let _ = serde_json::to_writer(&mut out, v);
+    let _ = serde_json::to_writer(&mut out, &v);
     let s = match std::str::from_utf8(&out.0) {
         Ok(s) => s,
         Err(e) => std::str::from_utf8(&out.0[..e.valid_up_to()]).unwrap_or_default(),
@@ -1213,6 +1227,53 @@ fn preview_of(v: &Value) -> String {
         format!("{cut}…")
     } else {
         s.to_string()
+    }
+}
+
+/// As much of `v` as `room` characters of it written show: its strings cut,
+/// and no member past them. Written, it starts as `v` does for at least those
+/// characters, an escape only making it longer.
+fn clipped(v: &Value, room: &mut usize) -> Value {
+    let take = |room: &mut usize, n: usize| *room = room.saturating_sub(n);
+    match v {
+        Value::String(s) => {
+            let keep: String = s.chars().take(*room).collect();
+            take(room, keep.chars().count() + 2);
+            Value::String(keep)
+        }
+        Value::Array(items) => {
+            take(room, 1);
+            let mut out = Vec::new();
+            for item in items {
+                if *room == 0 {
+                    break;
+                }
+                out.push(clipped(item, room));
+                take(room, 1);
+            }
+            Value::Array(out)
+        }
+        Value::Object(map) => {
+            take(room, 1);
+            let mut out = serde_json::Map::new();
+            for (key, item) in map {
+                if *room == 0 {
+                    break;
+                }
+                // a key is kept whole, and one past the room is the last
+                // thing written: cut, it would sort elsewhere, or be another
+                // key, and show a value under a name not its own
+                take(room, key.chars().count() + 3);
+                let item = if *room == 0 { Value::Null } else { clipped(item, room) };
+                out.insert(key.clone(), item);
+                take(room, 1);
+            }
+            Value::Object(out)
+        }
+        other => {
+            take(room, other.to_string().len());
+            other.clone()
+        }
     }
 }
 
@@ -1378,6 +1439,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 s
             };
             let prog = vjs::parse(&src)?;
+            // A flow that reads `unreadable` runs the messages that are not JSON
+            // too; for the others they are dead letters (ADR-0039).
+            let takes_unreadable = prog.reads_var("unreadable");
             // the version (content hash of the effective source) this flow runs —
             // tags any message it dead-letters (ADR-0021).
             let flow_version: Arc<str> = versions::hash_content(&src).into();
@@ -1511,6 +1575,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let start_nanos = metrics::now_nanos();
                     let event: Value = match serde_json::from_slice(&msg.data) {
                         Ok(v) => v,
+                        Err(e) if takes_unreadable => unreadable_event(&msg.data, &e),
                         Err(e) => {
                             // Not JSON: permanent poison. Dead-letter it (ADR-0015)
                             // — publish before ack, nak if the DLQ write fails.
@@ -1701,6 +1766,60 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     set_state(&handle, |st| {
         st.status = "stopped".into();
     });
+}
+
+/// The event of a message that is not JSON, for a flow that reads `unreadable`
+/// (ADR-0039): why it is not, and the message once, its text when its bytes
+/// are UTF-8 text, its bytes in base64 when they are not: another encoding,
+/// or UTF-8 of control characters as UTF-16 is, which the masks hide whole.
+/// Once, so that the masks read the text (ADR-0017) and the event is no
+/// larger than twice the message. A field like another, so a replay of the
+/// event runs the same way.
+fn unreadable_event(data: &[u8], error: &serde_json::Error) -> Value {
+    use base64::Engine as _;
+    let (text, base64) = match std::str::from_utf8(data) {
+        Ok(text) if record::reads_as_text(data, false) => (Value::String(text.to_string()), Value::Null),
+        _ => (Value::Null, Value::String(base64::engine::general_purpose::STANDARD.encode(data))),
+    };
+    json!({"unreadable": {"error": error.to_string(), "text": text, "base64": base64}})
+}
+
+/// A message a shadow run reads (time travel, the canary, a replay): its JSON,
+/// or the event of one that is not JSON (ADR-0039).
+enum Message {
+    Json(Value),
+    Unreadable(Value),
+}
+
+impl Message {
+    fn of(data: &[u8]) -> Message {
+        match serde_json::from_slice(data) {
+            Ok(event) => Message::Json(event),
+            Err(e) => Message::Unreadable(unreadable_event(data, &e)),
+        }
+    }
+
+    fn event(&self) -> &Value {
+        match self {
+            Message::Json(event) | Message::Unreadable(event) => event,
+        }
+    }
+
+    /// Whether a version of the flow runs it: one that does not read
+    /// `unreadable` leaves a message that is not JSON to the dead letters.
+    fn runs_in(&self, prog: &vjs::Program) -> bool {
+        matches!(self, Message::Json(_)) || prog.reads_var("unreadable")
+    }
+
+    /// What a version of the flow does with it, `event` being the event as
+    /// the shadow run reads it (`shadow_input`).
+    fn shadow(&self, prog: &vjs::Program, event: &Value, root: &Path, pkg: &str) -> Value {
+        if self.runs_in(prog) {
+            shadow_emits(prog, event, root, pkg)
+        } else {
+            json!({"emits": [], "error": "not JSON: a dead letter, since this version does not read `unreadable`"})
+        }
+    }
 }
 
 /// The messages a flow loop settled last, acked after a run or a dead letter,
@@ -3352,7 +3471,7 @@ const LANGUAGE_VJS: &str = r#"VejasScript in 20 lines:
 Exposing a flow (instead of, or besides, `source`):
   tool "what calling this flow does" <- exposes the flow as an MCP tool
   api "POST /orders"                 <- expose the flow as a SYNCHRONOUS HTTP endpoint under /api (POST /api/orders)
-  api "GET /orders/{id}"             <- a REST resource = several flows, ONE per verb; {path params} become event variables (here `id`)
+  api "GET /orders/{id}"             <- a REST resource = several flows, ONE per verb; {path params} become variables (here `id`)
   API_REQUEST = {customer: "string", total: "number"}   <- optional: typed request schema for the generated OpenAPI
   API_RESPONSE = {id: "string", status: "string"}       <- optional: typed 200 response schema
   respond 201, {id: id, status: "created"}   <- the SYNCHRONOUS HTTP response (status code + JSON body); `emit` still fires bus side-effects
@@ -3362,7 +3481,8 @@ Rules:
 - Put every business-meaningful value (thresholds, tables, queue names) in UPPERCASE literals.
 - A flow file's first line is `# flow: <snake_case_name>`; it lives under flows/ (or packages/<pkg>/flows/).
 - Its sample input lives at flows/fixtures/<flow>.json (or packages/<pkg>/fixtures/) — one JSON event.
-- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; the request's JSON body, {path params} and `query` are all in the event. The whole API is described at GET /api/openapi.json.
+- A flow is triggered by ONE of: `source "vx…"` (bus), `tool "…"` (MCP), or `api "VERB /path"` (HTTP). An `api` flow answers with `respond <status>, {body}`; `event` is the request's JSON body as sent (an object, an array, or null when there is none), {path params} are variables, and `request` holds {method, path, params, query, headers} (`headers`: accept, content-type, idempotency-key, user-agent, x-correlation-id, x-request-id, and those an `API_HEADERS` list names, in lower case, never one whose name reads as a credential, in any spelling; the trace record masks the value of each header the list names, where the request shows it). A path parameter named `event` or `request` is read as `request.params.<name>`, and a body field named `request` as `event.request`. A body that is not JSON answers 400. The whole API is described at GET /api/openapi.json.
+- A message that is not JSON is a dead letter, unless the flow reads `unreadable`: its event is then {unreadable: {error, text, base64}}: `text` when the bytes are UTF-8 text, `base64` when they are not, the other null. An `api` flow that reads it takes such a body instead of answering 400. A JSON event with its own `unreadable` field sets the variable too. To forward the bytes, keep them under a key that ends in `base64` (`raw_base64`): the masks read base64 under such a key only.
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
@@ -4283,8 +4403,8 @@ fn run_flow_on_input(root: &Path, file: &str, input: &Value) -> Result<Vec<Value
 
 // ───────────────────────── HTTP API (flow-as-endpoint) ─────────────────────────
 // A flow declares `api "VERB /path"`; the runtime routes (method, path) to it,
-// binds {path params} into the event, runs it, and returns its `respond`. Several
-// flows (one per verb) compose a REST resource. GET /api/openapi.json describes
+// runs it on the body as sent, its {path params} variables (ADR-0039), and
+// returns its `respond`. Several flows (one per verb) compose a REST resource. GET /api/openapi.json describes
 // the whole surface. All served under /api/…
 
 enum Seg {
@@ -4301,6 +4421,10 @@ struct ApiRoute {
     /// Optional typed schemas (field -> type name) from API_REQUEST / API_RESPONSE.
     req_schema: Option<Value>,
     resp_schema: Option<Value>,
+    /// The flow takes a body that is not JSON (it reads `unreadable`).
+    takes_unreadable: bool,
+    /// The headers it names in `API_HEADERS`, as written.
+    headers: Vec<String>,
 }
 
 /// Parse an `api` spec ("POST /orders", "GET /orders/{id}") into (method, segs).
@@ -4341,6 +4465,8 @@ fn api_routes(root: &Path) -> Vec<ApiRoute> {
             op_id: stem,
             req_schema: literal("API_REQUEST"),
             resp_schema: literal("API_RESPONSE"),
+            takes_unreadable: prog.reads_var("unreadable"),
+            headers: api_headers_wanted(&prog),
         });
     }
     out
@@ -4370,6 +4496,9 @@ fn json_schema_from_literal(v: &Value) -> Value {
             }
             json!({"type": "object", "properties": Value::Object(props)})
         }
+        // a list of such items: `[{sku: "string"}]`
+        Value::Array(items) => json!({"type": "array", "items": items.first().map(json_schema_from_literal).unwrap_or_else(|| json!({}))}),
+        Value::String(t) => json!({"type": map_type(t)}),
         _ => json!({"type": "object"}),
     }
 }
@@ -4532,10 +4661,34 @@ fn flow_writes_bus(root: &Path, file: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What an `api` flow is given (ADR-0039): the body as it came, the path's
+/// parameters, and `request`, the request they came in, whose `headers` are
+/// read from the request's once the flow says which it wants
+/// (`request_headers`).
+struct ApiCall {
+    body: Vec<u8>,
+    params: serde_json::Map<String, Value>,
+    headers: Vec<(String, String)>,
+    request: Value,
+}
+
+/// An `api` flow's event: the body as sent, or null when there is none. A
+/// body that is not JSON is refused, unless the flow reads `unreadable`.
+fn api_event(body: &[u8], takes_unreadable: bool) -> Result<Value, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Value::Null);
+    }
+    match serde_json::from_slice(body) {
+        Ok(event) => Ok(event),
+        Err(e) if takes_unreadable => Ok(unreadable_event(body, &e)),
+        Err(e) => Err(format!("the request's body is not JSON: {e}")),
+    }
+}
+
 fn run_api_flow(
     root: &Path,
     file: &str,
-    input: &Value,
+    call: ApiCall,
     method: &str,
     incoming: Option<trace::Context>,
 ) -> (u16, String) {
@@ -4556,6 +4709,9 @@ fn run_api_flow(
     let mut invoked = Vec::new();
     let mut steps = None;
     let mut failure = None;
+    // what the flow was given, for the record
+    let mut input = json!({"request": call.request.clone()});
+    let mut not_json = false;
     let result = (|| -> Result<vjs::Ctx, String> {
         let path = path.as_deref().ok_or("path not allowed")?;
         let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -4567,19 +4723,31 @@ fn run_api_flow(
             .and_then(|spec| spec.split_whitespace().nth(1))
             .unwrap_or_default()
             .to_string();
+        let mut request = call.request;
+        let (headers, withheld) = request_headers(&call.headers, &api_headers_wanted(&prog));
+        request["headers"] = headers;
+        input["request"] = request_recorded(&request, &withheld);
+        let event = api_event(&call.body, prog.reads_var("unreadable")).inspect_err(|_| not_json = true)?;
+        // path parameters are variables, over the body's fields of the same name
+        let mut given = call.params;
+        given.insert("request".into(), request);
         let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(path));
         engine.trace_under(traced.then_some(&hop));
         engine.carry(Some(hop.context()));
         engine.record_steps(record::on());
-        let run = vjs::run(&prog, input, &mut engine);
+        let run = vjs::run_with(&prog, &event, given, &mut engine);
         invoked = engine.take_spans();
         steps = engine.take_steps();
         failure = engine.take_failure();
+        // the body goes to the record once the run is done with it, not copied
+        input["event"] = event;
         run
     })();
     // The emits leave before the answer: a caller told 2xx can count on them.
     let unsent = result.as_ref().ok().and_then(|ctx| publish_emits(&ctx.emits, &hop.context()).err());
-    let failed = result.is_err() || unsent.is_some();
+    // a body that is not JSON is the caller's error: a 400, as a flow's
+    // `respond 400` is, and no failure of the flow
+    let failed = (result.is_err() && !not_json) || unsent.is_some();
     // A failed request counts no emit, as a failed run of the flow loop.
     let emits = match &result {
         Ok(ctx) if !failed => ctx.emits.len() as u64,
@@ -4599,6 +4767,7 @@ fn run_api_flow(
                 json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
             ),
         },
+        (Err(e), _) if not_json => (400, json!({"error": e}).to_string()),
         // A service that answered nothing (ADR-0032): the caller may try again.
         (Err(e), _) => match &failure {
             Some(f) if f.timed_out => (504, json!({"error": e}).to_string()),
@@ -4629,12 +4798,12 @@ fn run_api_flow(
         if let Some(path) = &path {
             span = span.attr("code.file.path", metrics::Attr::Computed(relative_to(root, path).into()));
         }
-        if let Some(e) = result.err().or(unsent.map(|u| u.error().to_string())) {
+        if let Some(e) = result.err().filter(|_| !not_json).or(unsent.map(|u| u.error().to_string())) {
             span = span.failed(e);
         }
         record::end(
             span,
-            record::Extras::new().emits(subjects).input_value(input).answer(Some(&body)).steps(steps),
+            record::Extras::new().emits(subjects).input_value(&input).answer(Some(&body)).steps(steps),
         );
     }
     (code, body)
@@ -4655,7 +4824,7 @@ fn openapi_json(root: &Path) -> Value {
                 .collect::<Vec<_>>()
                 .join("/")
         );
-        let params: Vec<Value> = r
+        let mut params: Vec<Value> = r
             .segs
             .iter()
             .filter_map(|s| match s {
@@ -4665,6 +4834,18 @@ fn openapi_json(root: &Path) -> Value {
                 _ => None,
             })
             .collect();
+        // the headers the flow names, the ones it is given: once each, and
+        // none any spelling of which reads as a credential
+        let mut given: Vec<String> = Vec::new();
+        for name in &r.headers {
+            let lower = name.to_ascii_lowercase();
+            if !given.contains(&lower) && !r.headers.iter().any(|w| w.eq_ignore_ascii_case(name) && header_carries_credential(w)) {
+                given.push(lower);
+            }
+        }
+        params.extend(given.into_iter().map(|name| {
+            json!({"name": name, "in": "header", "required": false, "schema": {"type": "string"}})
+        }));
         // Tag operations by their resource (the first literal path segment).
         let tag = r
             .segs
@@ -4691,16 +4872,20 @@ fn openapi_json(root: &Path) -> Value {
         if !params.is_empty() {
             op["parameters"] = Value::Array(params);
         }
+        // a body that is not JSON, whatever the method, unless the flow
+        // reads `unreadable`
+        if !r.takes_unreadable {
+            op["responses"]["400"] = json!({"description": "The body is not JSON"});
+        }
         if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
-            let req_schema = r
-                .req_schema
-                .as_ref()
-                .map(json_schema_from_literal)
-                .unwrap_or_else(|| json!({"type": "object"}));
-            op["requestBody"] = json!({
-                "required": true,
-                "content": {"application/json": {"schema": req_schema}}
-            });
+            // the body as sent (ADR-0039): any JSON, none at all, and any
+            // bytes for a flow that reads `unreadable`
+            let req_schema = r.req_schema.as_ref().map(json_schema_from_literal).unwrap_or_else(|| json!({}));
+            let mut content = json!({"application/json": {"schema": req_schema}});
+            if r.takes_unreadable {
+                content["*/*"] = json!({"schema": {"type": "string", "format": "binary"}});
+            }
+            op["requestBody"] = json!({"required": false, "content": content});
         }
         let entry = paths.entry(path_str).or_insert_with(|| json!({}));
         entry[r.method.to_ascii_lowercase()] = op;
@@ -5067,6 +5252,140 @@ fn respond(request: tiny_http::Request, code: u16, body: String, ctype: &str) {
     );
 }
 
+/// A request's body as it came, for an `api` flow.
+fn read_raw_body(request: &mut tiny_http::Request) -> Vec<u8> {
+    let mut body = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body);
+    body
+}
+
+/// The headers an `api` flow is given unasked (ADR-0039): what the request
+/// is and where it comes from, none of which carries a credential.
+const API_HEADERS_GIVEN: [&str; 6] = ["accept", "content-type", "idempotency-key", "user-agent", "x-correlation-id", "x-request-id"];
+
+/// The headers of a request as an `api` flow sees them (ADR-0039): those of
+/// [`API_HEADERS_GIVEN`] and those its `API_HEADERS` literal names, in lower
+/// case, a repeated one joined with ", ". A header whose name reads as a
+/// credential is withheld even when `API_HEADERS` names it, and the trace
+/// record, open to read, masks the value of each one the list names
+/// (`request_recorded`). The name is read as the request and as the flow
+/// write it, since camelCase tells in one only (`X-MfaCode`, `x-mfacode`).
+/// A name is withheld when any of its spellings reads as one, each the
+/// request sends and each the list has. The names withheld come back apart,
+/// in lower case.
+fn request_headers(headers: &[(String, String)], wanted: &[String]) -> (Value, Vec<String>) {
+    let named = |field: &str| wanted.iter().any(|written| written.eq_ignore_ascii_case(field));
+    let credentials: Vec<String> = headers
+        .iter()
+        .map(|(field, _)| field.as_str())
+        .filter(|field| named(field))
+        .chain(wanted.iter().map(String::as_str))
+        .filter(|name| header_carries_credential(name))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut out = serde_json::Map::new();
+    let mut withheld = Vec::new();
+    for (field, value) in headers {
+        let name = field.to_ascii_lowercase();
+        let given = API_HEADERS_GIVEN.contains(&name.as_str()) || named(field) && !credentials.contains(&name);
+        if !given {
+            if named(field) && !withheld.contains(&name) {
+                withheld.push(name);
+            }
+            continue;
+        }
+        match out.get_mut(&name) {
+            Some(Value::String(seen)) => {
+                seen.push_str(", ");
+                seen.push_str(value);
+            }
+            _ => {
+                out.insert(name, Value::String(value.clone()));
+            }
+        }
+    }
+    (Value::Object(out), withheld)
+}
+
+/// The request as the record keeps it: the value of a header the flow named
+/// in `API_HEADERS` masked, since no list of names tells every credential
+/// apart, those of [`API_HEADERS_GIVEN`] as sent, and the names of those it
+/// named and was not given in `withheld_headers`.
+fn request_recorded(request: &Value, withheld: &[String]) -> Value {
+    let mut recorded = request.clone();
+    if let Some(headers) = recorded.get_mut("headers").and_then(Value::as_object_mut) {
+        for (name, value) in headers.iter_mut() {
+            if !API_HEADERS_GIVEN.contains(&name.as_str()) {
+                *value = Value::String(record::MASKED.into());
+            }
+        }
+    }
+    if !withheld.is_empty() {
+        recorded["withheld_headers"] = json!(withheld);
+    }
+    recorded
+}
+
+/// The headers a flow names in its `API_HEADERS` literal, as it writes them:
+/// none when it has no such list.
+fn api_headers_wanted(prog: &vjs::Program) -> Vec<String> {
+    prog.surface
+        .iter()
+        .find(|e| e.name == "API_HEADERS")
+        .and_then(|e| e.value.as_array())
+        .map(|names| names.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a header's name reads as one that carries a credential, as written
+/// or with camelCase read as the record's mask reads it (`X-AuthToken`): a
+/// name the mask takes for one (ADR-0017), one with a word headers name a
+/// credential by (`x-csrftoken`, `cf-access-jwt-assertion`, `x-amzn-oidc-data`,
+/// `x-session-id`, `x-hub-signature-256`, `x-shopify-hmac-sha256`), one of
+/// whose parts is a credential's (`x-pin`, `x-mfa-code`, `x-functions-key`,
+/// `ocp-apim-subscription-key`), or one with a part that starts with `auth`
+/// (`x-auth-code`, `x-authcode`). The name of a key is none (`x-key-id`), nor
+/// a key that names an event or a route (`x-event-key`, `x-routing-key`), nor
+/// a dedupe key (`I-Twilio-Idempotency-Token`), though the rest of its name
+/// is read (`x-idempotency-secret`), nor who a proxy says the caller is
+/// (`x-authenticated-user-email`, `x-auth-request-user`). A name can be
+/// missed: the record masks the value of every header a flow names.
+fn header_carries_credential(name: &str) -> bool {
+    static CREDENTIAL: OnceLock<regex::Regex> = OnceLock::new();
+    let credential = CREDENTIAL.get_or_init(|| {
+        regex::RegexBuilder::new(secrets::SECRET_KEY_PATTERN)
+            .case_insensitive(true)
+            .build()
+            .expect("SECRET_KEY_PATTERN is a valid pattern")
+    });
+    const WORDS: [&str; 14] =
+        ["token", "secret", "passw", "pwd", "cookie", "session", "csrf", "xsrf", "jwt", "assertion", "signature", "hmac", "credential", "oidc"];
+    const PARTS: [&str; 13] =
+        ["authentication", "sig", "otp", "pass", "passcode", "passphrase", "pin", "pw", "totp", "mfa", "bearer", "cred", "dpop"];
+    // as written and with camelCase read as snake_case: `X-PassWord` reads as
+    // `x-pass_word`, which no word of the pattern is
+    [name.to_ascii_lowercase(), secrets::key_as_read(name).to_ascii_lowercase()].iter().any(|read| {
+        let mut parts: Vec<&str> = read.split(['-', '_']).collect();
+        // a dedupe key is none, whatever it is called: the rest of the name is read
+        if let Some(at) = parts.iter().position(|part| part.starts_with("idempotency")) {
+            let alone = parts[at] == "idempotency" && matches!(parts.get(at + 1), Some(&("key" | "token")));
+            parts.drain(at..at + 1 + usize::from(alone));
+        }
+        let read = parts.join("-");
+        // who a proxy says the caller is
+        let caller = matches!(parts.last(), Some(&("user" | "email" | "groups" | "username" | "userid")));
+        credential.is_match(&read)
+            || WORDS.iter().any(|word| read.contains(word))
+            || parts.iter().enumerate().any(|(i, part)| {
+                PARTS.contains(part)
+                    || part.starts_with("auth") && !matches!(*part, "author" | "authenticated") && !caller
+                    || part.ends_with("key")
+                        && !matches!(parts.get(i + 1), Some(&("id" | "name")))
+                        && !(*part == "key" && matches!(i.checked_sub(1).and_then(|at| parts.get(at)), Some(&("event" | "routing" | "partition" | "cache" | "sort" | "dedup" | "dedupe"))))
+            })
+    })
+}
+
 fn read_body(request: &mut tiny_http::Request) -> Value {
     let mut body = String::new();
     let _ = request.as_reader().read_to_string(&mut body);
@@ -5139,17 +5458,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                         );
                     }
                 }
-                let body = read_body(&mut request);
-                let mut ev = match body {
-                    Value::Object(o) => o,
-                    _ => serde_json::Map::new(),
-                };
-                for (k, v) in params {
-                    ev.insert(k, Value::String(v));
-                }
-                ev.insert("query".into(), parse_query(&url));
+                let params: serde_json::Map<String, Value> =
+                    params.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                let given = json!({
+                    "method": m,
+                    "path": format!("/{rel}"),
+                    "params": params.clone(),
+                    "query": parse_query(&url),
+                });
+                let headers = request
+                    .headers()
+                    .iter()
+                    .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+                    .collect();
+                let call = ApiCall { body: read_raw_body(&mut request), params, headers, request: given };
                 let incoming = request_trace(&request);
-                let (code, out) = run_api_flow(&root, &file, &Value::Object(ev), &m, incoming);
+                let (code, out) = run_api_flow(&root, &file, call, &m, incoming);
                 respond(request, code, out, "application/json")
             }
             None => respond(
@@ -6129,6 +6453,83 @@ mod tests {
     }
 
     #[test]
+    fn an_api_flow_takes_its_body_as_sent() {
+        assert_eq!(api_event(b"", false), Ok(Value::Null));
+        assert_eq!(api_event(b" \n", false), Ok(Value::Null));
+        assert_eq!(api_event(b"[1,2]", false), Ok(json!([1, 2])));
+        assert_eq!(api_event(b"\"x\"", false), Ok(json!("x")));
+        let e = api_event(b"a=1&b=2", false).unwrap_err();
+        assert!(e.starts_with("the request's body is not JSON: "), "{e}");
+        // a flow that reads `unreadable` takes it
+        let got = api_event(b"a=1&b=2", true).unwrap();
+        assert_eq!((&got["unreadable"]["text"], &got["unreadable"]["base64"]), (&json!("a=1&b=2"), &Value::Null));
+        assert!(got["unreadable"]["error"].as_str().is_some_and(|e| !e.is_empty()));
+        // bytes that are not UTF-8 come in base64, and only so
+        let got = api_event(&[0xff, 0xfe], true).unwrap();
+        assert_eq!((&got["unreadable"]["base64"], &got["unreadable"]["text"]), (&json!("//4="), &Value::Null));
+        // nor are UTF-16's, whose NULs are UTF-8 all the same
+        let got = api_event(b"p\0w\0=\0x\0", true).unwrap();
+        assert_eq!((&got["unreadable"]["base64"], &got["unreadable"]["text"]), (&json!("cAB3AD0AeAA="), &Value::Null));
+    }
+
+    #[test]
+    fn an_api_flow_sees_no_header_that_carries_a_credential() {
+        let credentials = [
+            "Authorization", "Authentication", "Proxy-Authorization", "Cookie", "Cookie2", "X-Api-Key", "X-Amzn-Oidc-Accesstoken",
+            "X-Amzn-Oidc-Data", "Cf-Access-Jwt-Assertion", "X-Goog-Iap-Jwt-Assertion", "Ocp-Apim-Subscription-Key", "X-Functions-Key",
+            "X-Access-Key", "X-CSRFToken", "X-Session-Id", "X-AuthToken", "X-AccessToken", "X-RefreshToken", "X-SessionToken",
+            "X-Hub-Signature-256", "X-Shopify-Hmac-Sha256",
+        ];
+        let mut headers: Vec<(String, String)> = credentials.iter().map(|name| (name.to_string(), "cred-HDR".to_string())).collect();
+        let others = [("Content-Type", "application/json"), ("X-Request-ID", "rq-1"), ("X-Github-Event", "push"), ("X-Tenant", "t1"), ("Accept", "a"), ("accept", "b")];
+        headers.extend(others.map(|(name, value)| (name.to_string(), value.to_string())));
+        let prog = vjs::parse("# flow: hook\napi \"POST /hook\"\nAPI_HEADERS = [\"X-Github-Event\"]\nrespond 200, {}\n").unwrap();
+        assert_eq!(api_headers_wanted(&prog), ["X-Github-Event"]);
+        // each credential asked for too: withheld all the same
+        let mut wanted = api_headers_wanted(&prog);
+        wanted.extend(credentials.iter().map(|name| name.to_ascii_lowercase()));
+        // camelCase that tells in the flow's spelling only
+        let camel = [("x-mfacode".to_string(), "cred-HDR".to_string())];
+        let (seen_camel, withheld_camel) = request_headers(&camel, &["X-MfaCode".into()]);
+        assert_eq!((seen_camel, withheld_camel), (json!({}), vec!["x-mfacode".to_string()]));
+        let (seen, withheld) = request_headers(&headers, &wanted);
+        assert_eq!(seen, json!({"content-type": "application/json", "x-request-id": "rq-1", "x-github-event": "push", "accept": "a, b"}));
+        assert_eq!(withheld.len(), credentials.len());
+        // unasked, only those that say what the request is
+        assert_eq!(request_headers(&headers, &[]).0, json!({"content-type": "application/json", "x-request-id": "rq-1", "accept": "a, b"}));
+        // whatever their case, and whichever part names the credential
+        for name in [
+            "X-PassWord", "X-PassWd", "X-Db-PassWord", "x-pin", "X-Mfa-Code", "X-MfaCode", "X-Totp", "Dpop", "X-Passphrase", "X-Bearer",
+            "X-Auth-Code", "x-authcode", "X-Auth-Hash", "x-auth-nonce", "X-Idempotency-Secret", "X-Auth-Request-Access-Token",
+        ] {
+            assert!(header_carries_credential(name), "{name}");
+        }
+        // the name of a key, a key that names an event or a route, a dedupe
+        // key, who a proxy says the caller is
+        for name in [
+            "X-Key-Id", "X-Signing-Key-Name", "X-Event-Key", "X-Routing-Key", "I-Twilio-Idempotency-Token", "X-Idempotency-Key",
+            "X-IdempotencyKey", "Idempotency-Key", "X-Authenticated-User-Email", "Cf-Access-Authenticated-User-Email",
+            "X-Auth-Request-User", "X-Auth-Request-Email", "X-Author", "X-Github-Event",
+        ] {
+            assert!(!header_carries_credential(name), "{name}");
+        }
+        // two spellings of one name, one of which reads as a credential
+        let twice = [("X-MfaCode".to_string(), "mfa-camel".to_string()), ("x-mfacode".to_string(), "mfa-lower".to_string())];
+        assert_eq!(request_headers(&twice, &["x-mfacode".into()]), (json!({}), vec!["x-mfacode".to_string()]));
+        let lower = [("x-mfacode".to_string(), "mfa-lower".to_string())];
+        assert_eq!(request_headers(&lower, &["x-mfacode".into(), "X-MfaCode".into()]).0, json!({}));
+        // the record masks what the flow named, and says what it was not given
+        let request = json!({"method": "POST", "headers": seen});
+        let recorded = request_recorded(&request, &withheld);
+        assert_eq!(recorded["headers"]["x-github-event"], record::MASKED);
+        assert_eq!((&recorded["headers"]["x-request-id"], &recorded["headers"]["accept"]), (&json!("rq-1"), &json!("a, b")));
+        assert!(recorded["headers"].get("x-functions-key").is_none());
+        assert!(recorded["withheld_headers"].as_array().unwrap().contains(&json!("x-functions-key")));
+        assert!(request_recorded(&request, &[]).get("withheld_headers").is_none());
+        assert_eq!(request["headers"]["x-github-event"], "push", "the flow gets it as sent");
+    }
+
+    #[test]
     fn a_replay_leaves_out_the_events_whose_calls_are_not_recorded() {
         let root = std::env::temp_dir().join(format!("vejas-replay-calls-{}", std::process::id()));
         std::fs::create_dir_all(root.join("flows")).unwrap();
@@ -6536,9 +6937,18 @@ mod tests {
             json!({"t": "é€😀a".repeat(5000)}),
             json!("ü".repeat(161)),
             json!({"n": (0..10_000).collect::<Vec<u32>>()}),
+            json!({"unreadable": {"error": "not JSON", "text": null, "base64": "QUJD".repeat(150_000)}}),
+            json!({"q": "\"\u{1}".repeat(400), "k": 1}),
+            json!({"k".repeat(300): 1}),
+            // a key the room ends in, beside one it starts
+            json!({"pass": "x".repeat(146), "password": 987_654}),
         ];
         for v in &values {
             assert_eq!(preview_of(v), whole(v));
+        }
+        for n in 120..=160 {
+            let v = json!({"login": "x".repeat(n), "mfa_method": "sms", "mfa_token": 482_913, "mfa": 1});
+            assert_eq!(preview_of(&v), whole(&v), "{n}");
         }
         assert_eq!(preview_of(&values[1]).chars().count(), 160, "exactly 160: whole");
     }
