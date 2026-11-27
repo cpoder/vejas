@@ -116,9 +116,11 @@ respond 200, {id: id, status: "shipped"}
   answers 400, unless the flow reads `unreadable` (see the
   [language reference](../reference/vejascript.md)).
 - `{path params}` are variables (`id` above), over a body field of the same
-  name; `event.id` stays the body's.
+  name; `event.id` stays the body's. A parameter arrives decoded:
+  `/orders/a%20b` gives `a b`, and an encoded `/` stays inside it.
 - `request` holds the rest: `request.method`, `request.path`,
-  `request.params`, `request.query` (the query string's values) and
+  `request.params`, `request.query` (the query string's values, decoded:
+  `%3A` is `:` and `+` a space) and
   `request.headers`, names in lower case: `accept`, `content-type`,
   `idempotency-key`, `user-agent`, `x-correlation-id`, `x-request-id`, and
   those the flow names in a list, `API_HEADERS = ["x-github-event"]`. A
