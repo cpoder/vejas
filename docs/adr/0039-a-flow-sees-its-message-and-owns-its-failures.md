@@ -95,7 +95,8 @@ The bench names no client and ships nothing: what it taught is written here.
   `unreadable.base64 ?? base64(unreadable.text)` is the message in base64
   whatever its bytes are: a reject that must carry the original value in
   base64 can. It is pure, as every builtin is. What it gives is read by no
-  mask unless it sits under a key that says it is base64.
+  mask unless it sits under a key that says it is base64; the base64 of a
+  text that holds a secret is masked as the secret is, under any key.
 - It is a field like another, so a replay of the recorded event runs the
   same way, and no engine change was needed. A JSON message with its own
   field `unreadable` sets the variable too: the language reference says so.
@@ -124,7 +125,9 @@ end
   retries stay deliveries (ADR-0032). A `secret()` or a `seen()` whose
   store does not answer is a failure a later delivery may change, at the
   pace a message comes back when nothing says otherwise: the catch takes it
-  on the last delivery. An `api` flow's request has no later delivery, so
+  on the last delivery. A secret the store says it does not have is an
+  error in the code, which no delivery changes. An `api` flow's request has
+  no later delivery, so
   its catch takes the failure at once, and answers 503 when nothing catches
   such a failure.
 - `e` is `{error, service, status, attempts}`: `service` null for an error
@@ -172,10 +175,13 @@ end
 - The window is a number and `s`, `m`, `h` or `d`, up to ten years, written
   in the statement or in an UPPERCASE constant, so the parser checks it. A
   constant's window is its literal, wherever the constant is written: an
-  event's field of the same name never sets it. The
-  stored value is when the window passes. The bucket keeps a key as long as
-  the flow's longest window: a longer one raises its limit, a shorter one
-  never lowers it.
+  event's field of the same name never sets it, and the parser refuses a
+  flow that sets the constant anywhere else, since that value would not be
+  the window. The stored value is when the window passes. The bucket keeps
+  a key as long as the flow's longest window: a longer one raises its
+  limit, a shorter one never lowers it. A mark reads the limit again once
+  a minute and raises it to the longest window the instance has written,
+  should two instances have raised it at once.
 - A key is any value but null; a number or a document is read as its JSON
   text.
 - The runtime holds a run's marks while its emits are confirmed, so a copy
@@ -194,8 +200,9 @@ end
   travel) reads every key as new: it reads no state, and its steps show the
   branch it took.
 - Limit: two copies that run at the same instant, on two instances or as
-  two requests, can both pass. A sender that needs exactly once keeps its
-  own key.
+  two requests, can both pass. So can a copy on another instance in the
+  second after a flow's first mark, while that instance still takes the
+  bucket as absent. A sender that needs exactly once keeps its own key.
 
 ## Consequences
 

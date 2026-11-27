@@ -37,6 +37,10 @@ struct State {
     max_age: Duration,
     /// When `max_age` was read.
     checked: Option<Instant>,
+    /// The longest window a run gave here: a mark raises the bucket to it,
+    /// whatever its own window, so that a bucket another instance lowered
+    /// in a race keeps the keys as long again.
+    longest: Duration,
     /// Until when the bucket is taken as absent.
     absent_until: Option<Instant>,
     /// The marks of the runs whose emits wait for the stream's answer, each
@@ -89,15 +93,37 @@ impl Bucket {
     fn open(&self, window: Option<Duration>) -> Result<Option<bus::Kv>, String> {
         let mut state = self.state();
         let now = Instant::now();
-        if let Some(kv) = &state.kv {
-            let stale = state.checked.is_none_or(|at| now.duration_since(at) > RECHECK);
-            let longer = window.is_some_and(|w| !state.max_age.is_zero() && (w > state.max_age || stale));
+        if let Some(window) = window {
+            state.longest = state.longest.max(window);
+        }
+        let window = window.map(|_| state.longest);
+        if let Some(kv) = state.kv.clone() {
+            let bounded = !state.max_age.is_zero();
+            let longer = window.is_some_and(|w| bounded && w > state.max_age);
+            let stale = window.is_some() && bounded && state.checked.is_none_or(|at| now.duration_since(at) > RECHECK);
+            if !longer && !stale {
+                return Ok(Some(kv));
+            }
             if !longer {
-                return Ok(Some(kv.clone()));
+                // a window read again that does not come keeps the bucket
+                // as it is: the next mark asks again
+                return Ok(Some(match self.read_again(&mut state, window, now) {
+                    Ok(Some(kv)) => kv,
+                    _ => {
+                        state.checked = Some(now);
+                        kv
+                    }
+                }));
             }
         } else if window.is_none() && state.absent_until.is_some_and(|until| now < until) {
             return Ok(None);
         }
+        self.read_again(&mut state, window, now)
+    }
+
+    /// The bucket as the bus has it, raised to `window` when it keeps a key
+    /// less long, or none when it does not exist and no mark needs it.
+    fn read_again(&self, state: &mut State, window: Option<Duration>, now: Instant) -> Result<Option<bus::Kv>, String> {
         let stream = format!("KV_{}", self.name);
         // A bus that does not answer is no absent bucket: `seen` would read
         // a duplicate as new.

@@ -778,6 +778,27 @@ fn collect_own(stmts: &[Stmt], out: &mut Vec<String>) {
     }
 }
 
+/// How many statements give `name` a value, at any depth: an assignment, a
+/// loop's variable, a catch's name.
+fn assignments(block: &Block, name: &str) -> usize {
+    block
+        .stmts
+        .iter()
+        .map(|st| match st {
+            Stmt::Assign(path, _) => usize::from(path.first().is_some_and(|first| first == name)),
+            Stmt::For(var, _, body) => usize::from(var == name) + assignments(body, name),
+            Stmt::If(arms, otherwise) => {
+                arms.iter().map(|(_, _, body)| assignments(body, name)).sum::<usize>()
+                    + otherwise.as_ref().map_or(0, |body| assignments(body, name))
+            }
+            Stmt::Try(body, caught, handler) => {
+                assignments(body, name) + usize::from(caught.as_deref() == Some(name)) + assignments(handler, name)
+            }
+            Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) | Stmt::Remember(..) => 0,
+        })
+        .sum()
+}
+
 /// Each `remember` whose window names a constant gets the constant's literal
 /// (ADR-0039): the parser checked it holds a duration.
 fn windows_from_constants(block: &mut Block, constants: &HashMap<&str, &Value>) {
@@ -1335,6 +1356,11 @@ impl<'a> Parser<'a> {
             match held {
                 Some(Value::String(text)) => {
                     window_of(text).map_err(|e| err_at(*at, self.src, &format!("{name}: {e}")))?;
+                    // the window is the constant's literal: another value
+                    // the flow gives it would not be the window
+                    if assignments(&stmts, name) > 1 {
+                        return Err(err_at(*at, self.src, &format!("the window of `remember` is the literal of {name}, and the flow sets {name} elsewhere too: give that window a constant of its own")));
+                    }
                 }
                 _ => {
                     return Err(err_at(*at, self.src, &format!("the window of `remember` is a duration: {name} is no constant of the flow that holds one, as {name} = \"7d\" does")))
@@ -3234,10 +3260,13 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or("secret() needs a string reference, e.g. secret(\"slack/webhook\")")?;
-                let value = engine.secrets.get(reference).map_err(|e| {
+                let value = engine.secrets.read(reference).map_err(|missing| {
+                    if !missing.later {
+                        return missing.error;
+                    }
                     // a store that did not answer may answer the next
                     // delivery: a catch waits for the last (ADR-0039)
-                    let failure = crate::connectors::answer::Failure::unanswered(e);
+                    let failure = crate::connectors::answer::Failure::unanswered(missing.error);
                     let error = failure.error.clone();
                     engine.failure = Some(failure);
                     error
@@ -3403,7 +3432,13 @@ fn builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         // a string is read as `str` gives it, and null stays null.
         "base64" => match arg(0) {
             Value::Null => Value::Null,
-            v => Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, to_display(&v))),
+            v => {
+                let text = to_display(&v);
+                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &text);
+                // a credential in it is masked in its base64 as in the clear
+                crate::secrets::derived(&text, &encoded);
+                Value::String(encoded)
+            }
         },
         _ => return Err(format!("unknown function {name}()")),
     })
@@ -4844,16 +4879,22 @@ end
 "#,
         )
         .unwrap();
-        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(MapStore(Default::default())));
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(Unreachable));
         engine.delivered(Some(1));
         failed(run(&prog, &json!({}), &mut engine));
-        assert!(engine.take_failure().is_some_and(|f| f.retry && f.attempts == vejas_connector::MAX_DELIVERIES));
+        let failure = engine.take_failure().expect("a failure a later delivery may change");
+        assert!(failure.retry && failure.attempts == vejas_connector::MAX_DELIVERIES);
+        assert!(!failure.delay.is_zero(), "a nak with no delay spends the deliveries at once");
         engine.delivered(Some(vejas_connector::MAX_DELIVERIES));
         let ctx = run(&prog, &json!({}), &mut engine).unwrap();
         assert_eq!(
             ctx.emits,
             [("vx.r".to_string(), json!({"service": null, "status": null, "attempts": vejas_connector::MAX_DELIVERIES}))]
         );
+        // a store that answers there is no such secret: no delivery changes it
+        let mut none = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(MapStore(Default::default())));
+        none.delivered(Some(1));
+        assert_eq!(run(&prog, &json!({}), &mut none).unwrap().emits[0].0, "vx.r");
         // a declaration whose secret does not resolve names the service as
         // the flow does, as a call's failure does
         let (url, _) = system(|_| (200, "{}", 0));
@@ -4871,6 +4912,20 @@ end
         bare.delivered(Some(3));
         let ctx = run(&call, &json!({"id": "x"}), &mut bare).unwrap();
         assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": 3}));
+    }
+
+    /// A secret store that does not answer.
+    struct Unreachable;
+    impl crate::secrets::SecretStore for Unreachable {
+        fn kind(&self) -> &'static str {
+            "unreachable"
+        }
+        fn get(&self, _reference: &str) -> Result<String, String> {
+            Err("vault: connection refused".into())
+        }
+        fn read(&self, reference: &str) -> Result<String, crate::secrets::Missing> {
+            self.get(reference).map_err(|error| crate::secrets::Missing { error, later: true })
+        }
     }
 
     #[test]
@@ -4914,5 +4969,14 @@ end
         let prog = parse("remember event.id for KEEP\nKEEP = \"1h\"\n").unwrap();
         let ctx = run(&prog, &json!({"id": "a", "KEEP": "3650d"}), &mut Engine::live(std::env::temp_dir(), "default".into())).unwrap();
         assert_eq!(ctx.marks, [("a".to_string(), std::time::Duration::from_secs(3600))]);
+        // a constant the flow sets elsewhere too would not be the window
+        for src in [
+            "KEEP = \"1h\"\nif event.vip:\n    KEEP = \"30d\"\nend\nremember event.id for KEEP\n",
+            "KEEP = \"1h\"\nfor KEEP in event.all:\n    x = 1\nend\nremember event.id for KEEP\n",
+            "KEEP = \"1h\"\ntry:\n    x = 1\ncatch KEEP:\n    x = 2\nend\nremember event.id for KEEP\n",
+        ] {
+            let e = parse(src).err().unwrap_or_else(|| panic!("{src:?} parsed"));
+            assert!(e.contains("sets KEEP elsewhere too"), "{e}");
+        }
     }
 }

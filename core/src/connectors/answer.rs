@@ -68,7 +68,11 @@ impl Failure {
             retry: true,
             timed_out: false,
             attempts: vejas_connector::MAX_DELIVERIES,
-            delay: vejas_connector::pull::ack_wait(),
+            // the consumer's ack wait; unset, it is JetStream's 30 s, and a
+            // nak with no delay would spend the deliveries at once
+            delay: Some(vejas_connector::pull::ack_wait())
+                .filter(|wait| !wait.is_zero())
+                .unwrap_or(Duration::from_secs(30)),
         }
     }
 }

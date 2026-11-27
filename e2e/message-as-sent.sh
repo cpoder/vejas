@@ -60,7 +60,7 @@ cat > "$R/flows/raw.vjs" <<'V'
 # flow: raw
 source "vx.mas.raw"
 if unreadable:
-  emit "vx.mas.rejected", {raw: unreadable.text, why: unreadable.error, b64: unreadable.base64 ?? base64(unreadable.text)}
+  emit "vx.mas.rejected", {raw: unreadable.text, why: unreadable.error, raw_base64: unreadable.base64 ?? base64(unreadable.text)}
 else:
   emit "vx.mas.ok", {id: id}
 end
@@ -181,7 +181,7 @@ nats -s $URL pub vx.mas.raw 'id=42;bad' > /dev/null 2>&1
 nats -s $URL pub vx.mas.raw '{"id":"j1"}' > /dev/null 2>&1
 nats -s $URL pub vx.mas.strict 'still bad' > /dev/null 2>&1
 for _ in $(seq 1 50); do grep -q 'vx.mas.ok' "$S/bus" && grep -q 'vx.mas.rejected' "$S/bus" && break; sleep 0.1; done
-grep -q '"raw":"id=42;bad"' "$S/bus" && grep -q '"b64":"aWQ9NDI7YmFk"' "$S/bus" \
+grep -q '"raw":"id=42;bad"' "$S/bus" && grep -q '"raw_base64":"aWQ9NDI7YmFk"' "$S/bus" \
   && ok "a flow that reads unreadable publishes its own reject, with the message as text and in base64" || ko "bus: $(cat "$S/bus")"
 grep -q '"id":"j1"' "$S/bus" && ok "and runs a JSON message as before" || ko "bus JSON: $(cat "$S/bus")"
 letters(){ curl -s -m 5 "$H/dlq" | python3 -c 'import json,sys; print(" ".join(d.get("last_error","")[:8] + ":" + d.get("unit","?") for d in json.load(sys.stdin)["dead_letters"]))'; }
