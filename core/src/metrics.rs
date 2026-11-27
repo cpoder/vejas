@@ -58,14 +58,13 @@ struct Unit {
     held_on: Option<String>,
     held: bool,
     probes: u64,
-    /// Detect units: what the engine lost without failing, by `LOSS_KINDS`.
-    /// `loss_cur` is the running program's count (monotonic since it was
-    /// compiled); `loss_base` sums the programs this unit ran before, so the
-    /// exported counter only grows while the process lives.
+    /// Detect units: what the engine lost without failing, by `LOSS_KINDS`,
+    /// summed over every program the unit ran since the process started.
+    /// When runs were last said lost, and whether a later loss waits to be.
     detect: bool,
-    loss_base: [u64; 3],
-    loss_cur: [u64; 3],
-    loss_warned: Option<Instant>,
+    loss: [u64; 3],
+    loss_said: Option<Instant>,
+    loss_pending: bool,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -145,39 +144,69 @@ pub const LOSS_KINDS: [&str; 3] = ["runs_dropped", "runs_evicted", "filters_with
 /// How often a unit that keeps losing is reported again.
 const LOSS_WARN_EVERY: Duration = Duration::from_secs(60);
 
-/// A detect unit compiled a new program: what the previous one counted is
-/// kept, the new one counts from zero.
-pub fn losses_new_program(unit: &str) {
+/// The unit is a detect unit: it shows its losses, zero or not.
+pub fn declare_detect(unit: &str) {
+    units().lock().unwrap().entry(unit.to_string()).or_default().detect = true;
+}
+
+/// What a report of losses asks of the caller.
+#[derive(Debug, PartialEq)]
+pub enum LossNews {
+    /// Nothing to say.
+    Quiet,
+    /// Say these totals now, on the log and the bus.
+    Say([u64; 3]),
+    /// Runs were lost but were said less than `LOSS_WARN_EVERY` ago: ask
+    /// again with `flush_losses` from this instant.
+    Later(Instant),
+}
+
+fn loss_news(u: &mut Unit) -> LossNews {
+    match u.loss_said {
+        Some(t) if t.elapsed() < LOSS_WARN_EVERY => {
+            u.loss_pending = true;
+            LossNews::Later(t + LOSS_WARN_EVERY)
+        }
+        _ => {
+            u.loss_said = Some(Instant::now());
+            u.loss_pending = false;
+            LossNews::Say(u.loss)
+        }
+    }
+}
+
+/// Add what one program lost since its last report. Several programs of a
+/// unit may report at once (a reload overlaps the old and the new): each
+/// adds its own delta, so the total only grows. A loss of runs is news; a
+/// filter that could not judge an event is counted, not said, since mixed
+/// traffic does that in the normal course.
+pub fn add_losses(unit: &str, delta: [u64; 3]) -> LossNews {
     let mut map = units().lock().unwrap();
     let u = map.entry(unit.to_string()).or_default();
     u.detect = true;
     for i in 0..3 {
-        u.loss_base[i] += u.loss_cur[i];
-        u.loss_cur[i] = 0;
+        u.loss[i] += delta[i];
     }
+    if delta[0] == 0 && delta[1] == 0 {
+        return LossNews::Quiet;
+    }
+    loss_news(u)
 }
 
-/// The running program's loss counters. Returns the unit's totals when they
-/// grew and the unit was not reported in the last `LOSS_WARN_EVERY`: the
-/// caller says so once, on the log and the bus.
-pub fn set_losses(unit: &str, cur: [u64; 3]) -> Option<[u64; 3]> {
+/// A loss held back by the rate limit, said once the minute has passed.
+pub fn flush_losses(unit: &str) -> LossNews {
     let mut map = units().lock().unwrap();
-    let u = map.entry(unit.to_string()).or_default();
-    u.detect = true;
-    let grew = cur.iter().zip(u.loss_cur.iter()).any(|(n, o)| n > o);
-    u.loss_cur = cur;
-    if !grew || u.loss_warned.is_some_and(|t| t.elapsed() < LOSS_WARN_EVERY) {
-        return None;
-    }
-    u.loss_warned = Some(Instant::now());
-    Some(std::array::from_fn(|i| u.loss_base[i] + u.loss_cur[i]))
+    let Some(u) = map.get_mut(unit).filter(|u| u.loss_pending) else {
+        return LossNews::Quiet;
+    };
+    loss_news(u)
 }
 
 /// A detect unit's loss totals since the process started, if it is one.
 pub fn losses(unit: &str) -> Option<[u64; 3]> {
     let map = units().lock().unwrap();
     let u = map.get(unit).filter(|u| u.detect)?;
-    Some(std::array::from_fn(|i| u.loss_base[i] + u.loss_cur[i]))
+    Some(u.loss)
 }
 
 /// A message that was dead-lettered (ADR-0015). Kept separate from `observe`
@@ -324,7 +353,7 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
             out.push_str(&format!(
                 "vejas_detect_losses_total{{unit=\"{}\",kind=\"{kind}\"}} {}\n",
                 esc(unit),
-                u.loss_base[i] + u.loss_cur[i]
+                u.loss[i]
             ));
         }
     }
@@ -952,21 +981,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_losses_survive_a_new_program_and_warn_once() {
+    fn detect_losses_add_up_and_are_said_once_a_minute() {
         let unit = "detect:losses_t";
-        assert_eq!(losses(unit), None, "not a detect unit before it reports");
-        losses_new_program(unit);
-        assert_eq!(set_losses(unit, [0, 0, 0]), None, "nothing lost, nothing said");
-        assert_eq!(set_losses(unit, [3, 0, 1]), Some([3, 0, 1]), "the first loss is said");
-        assert_eq!(set_losses(unit, [5, 0, 1]), None, "then not again within the minute");
-        // A restart compiles a new program that counts from zero: the total
-        // the process exports keeps growing.
-        losses_new_program(unit);
-        set_losses(unit, [2, 0, 0]);
-        assert_eq!(losses(unit), Some([7, 0, 1]));
+        assert_eq!(losses(unit), None, "not a detect unit before it says so");
+        declare_detect(unit);
+        assert_eq!(losses(unit), Some([0, 0, 0]));
+        assert_eq!(add_losses(unit, [0, 0, 2]), LossNews::Quiet, "a filter that could not judge is not news");
+        assert_eq!(add_losses(unit, [3, 0, 0]), LossNews::Say([3, 0, 2]), "the first lost run is said");
+        assert!(matches!(add_losses(unit, [2, 0, 0]), LossNews::Later(_)), "then held back");
+        assert!(matches!(flush_losses(unit), LossNews::Later(_)), "still within the minute");
+        // two programs of the unit report deltas at once, as across a reload:
+        // the total is their sum and never goes back
+        add_losses(unit, [1, 0, 0]);
+        add_losses(unit, [1, 0, 1]);
+        assert_eq!(losses(unit), Some([7, 0, 3]));
+        units().lock().unwrap().get_mut(unit).unwrap().loss_said =
+            Some(Instant::now() - LOSS_WARN_EVERY);
+        assert_eq!(flush_losses(unit), LossNews::Say([7, 0, 3]), "the held-back loss is said after the minute");
+        assert_eq!(flush_losses(unit), LossNews::Quiet, "and only once");
         let text = render(&[]);
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"runs_dropped\"} 7"));
-        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 1"));
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 3"));
         assert!(!text.contains("vejas_detect_losses_total{unit=\"flow:"), "only detect units carry it");
     }
 

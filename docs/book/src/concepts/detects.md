@@ -141,20 +141,31 @@ as `vejas_detect_losses_total{unit, kind}` and under `losses` in
 - `runs_dropped`: sequences never opened because the cap was reached;
 - `runs_evicted`: open sequences closed early to make room (only under an
   eviction strategy, not the default);
-- `filters_without_value`: events a `.where()` discarded because it could
-  not judge them, a field missing or of the wrong type, and the event was
-  taken as not matching.
+- `filters_without_value`: events a `.where()` could not judge, a field
+  missing or of another type, and took as not matching. On a source that
+  mixes event shapes this is the normal course; it says how often.
 
 The totals count since the runtime started and do not go back when a unit
-restarts or reloads. The first loss of a unit, then at most one a minute,
-is also a line on the log and a `losses` event on `<root>.flow.events`,
-with the three totals.
+restarts or reloads. A loss of runs is also said: the first, then at most
+one a minute (a loss held back is said once the minute has passed), as a
+line on the log and a `losses` event on `<root>.flow.events` with the three
+totals. `filters_without_value` is counted, not said.
 
 The engine refuses at load what it would not run: `import`, `context`,
 a `timer()` source, `.enrich()` and `.alert(webhook: ...)` are errors
 (E100 to E104), not warnings.
 
 ## What it costs
+
+Since engine c6171ae, a pattern with 8 sequences waiting or more looks up
+the sequences an event can advance instead of visiting each one: equality,
+order and range conditions between the event and what a sequence captured
+are indexed. It applies without `.partition_by`, without a negation that
+spans the pattern, and to those conditions only; other sequences are
+visited as before. Matches that one event completes are emitted in the
+order their sequences opened. The figures below were measured before the
+index (engine 1cb201b) and are kept until the bench is run again; the
+engine itself measures about 1.4 to 1.6 KB a waiting sequence.
 
 A stateless rule runs at about 30 000 events/s in 10 MB. A correlation is
 sized by how many of its sequences are **open at once** — first steps still

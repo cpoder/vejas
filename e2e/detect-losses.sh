@@ -7,10 +7,12 @@
 #   L2 filter    an event a .where() cannot judge (the field is missing) is
 #                counted as filters_without_value
 #   L3 topology  /topology carries the same totals under the detect unit
-#   L4 said      the loss is a `losses` event on <root>.flow.events and a line
-#                on the runtime's log
-#   L5 restart   a restart compiles a new program; the exported totals do not
-#                go back (the process kept them)
+#   L4 said      a loss of runs is a `losses` event on <root>.flow.events and
+#                a line on the runtime's log, once; a filter that could not
+#                judge an event is counted, not said
+#   L5 reload    runs keep being lost while the unit is reloaded again and
+#                again (old and new programs overlap): the exported total
+#                never goes down
 #
 # Throwaway nats(-js)+runtime on their own ports; teardown by captured PID.
 #   e2e/detect-losses.sh
@@ -144,21 +146,31 @@ if grep -q '"transition":"losses"' "$WORK/events.txt" && grep -q '"unit":"detect
 else
   bad "no losses event: $(cat "$WORK/events.txt")"
 fi
-grep -q 'detect:capped: the engine lost events without an error' "$WORK/rt.log" && ok "a line on the log" || bad "no log line"
+grep -q 'detect:capped: the engine lost runs without an error' "$WORK/rt.log" && ok "a line on the log" || bad "no log line"
+grep -q '"unit":"detect:filtered"' "$WORK/events.txt" && bad "a filter loss was said on the bus" || ok "a filter that could not judge is not said"
 n=$(grep -c '"unit":"detect:capped"' "$WORK/events.txt")
 [ "$n" -le 1 ] && ok "said once, not per event ($n)" || bad "said $n times in a minute"
 
-echo "L5 restart"
-kill "$RT_PID"; wait "$RT_PID" 2>/dev/null; RT_PID=""
-start_rt
-# a new process starts from zero: what it exports is its own count
-after=$(loss detect:capped runs_dropped)
-[ -n "$after" ] && ok "a restarted runtime exports the counter again (${after})" || bad "no counter after restart"
-touch "$ROOT/detects/capped.vpl"; curl -s -X POST -o /dev/null "$API/reload" 2>/dev/null
-"$NATS" -s "$URL" pub vxl.login '{"event_type":"Login","user":"late"}' > /dev/null 2>&1
-sleep 2
-again=$(loss detect:capped runs_dropped)
-[ "${again:-0}" -ge "${after:-0}" ] && ok "a reloaded program does not take the total back (${after} -> ${again})" || bad "total went back: ${after} -> ${again}"
+echo "L5 reload"
+( i=0; while [ -f "$WORK/feeding" ]; do i=$((i+1)); "$NATS" -s "$URL" pub vxl.login "{\"event_type\":\"Login\",\"user\":\"r$i\"}" > /dev/null 2>&1; done ) &
+FEED_PID=$!; touch "$WORK/feeding"
+( while [ -f "$WORK/feeding" ]; do loss detect:capped runs_dropped; sleep 0.1; done ) > "$WORK/samples.txt" &
+SAMPLE_PID=$!
+for r in 1 2 3 4 5; do
+  sleep 1; touch "$ROOT/detects/capped.vpl"; curl -s -X POST -o /dev/null "$API/reload"
+done
+sleep 2; rm -f "$WORK/feeding"; wait "$FEED_PID" "$SAMPLE_PID" 2>/dev/null
+if python3 - "$WORK/samples.txt" "$dropped" <<'PY'
+import sys
+v = [int(x) for x in open(sys.argv[1]).read().split() if x.strip().isdigit()]
+assert len(v) > 20, f"only {len(v)} samples"
+back = [(a, b) for a, b in zip(v, v[1:]) if b < a]
+assert not back, f"went down: {back[:5]}"
+assert v[-1] > int(sys.argv[2]), f"did not grow past {sys.argv[2]}: {v[-1]}"
+print(f"{len(v)} samples, {v[0]} -> {v[-1]}")
+PY
+then ok "five reloads under load: the total never went down"; else bad "the total went down across a reload"; fi
+grep -q 'detect:capped' <(curl -s "$API/topology") && ok "the unit runs after the reloads" || bad "unit gone after reloads"
 
 [ "$fail" = 0 ] && echo "detect-losses: all passed" || { echo "detect-losses: FAILED"; tail -20 "$WORK/rt.log"; }
 exit "$fail"

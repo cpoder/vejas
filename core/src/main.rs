@@ -2766,7 +2766,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             if let Some(max) = detect_max_runs() {
                 program.set_max_runs(max);
             }
-            metrics::losses_new_program(&handle.spec.name);
+            let mut losses = LossWatch::new(&handle.spec.name);
             let version: Arc<str> = versions::hash_content(&src).into();
             let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
             let mut sources: Vec<(String, String)> = Vec::new();
@@ -2959,6 +2959,8 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                     let first = match rx.recv_timeout(Duration::from_millis(500)) {
                         Ok(m) => m,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // a quiet unit still says the losses it held back
+                            losses.report(&handle.spec.name, &program, &js, &subj_root);
                             // Nothing to feed: close what time has closed on
                             // quiet sources. Those emits stand for no message,
                             // so there is nothing to ack; a crash before the
@@ -3066,7 +3068,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         // The program decodes the payload itself: its decoder
                         // interns field names and event types once per program,
                         // not once per message (21.6 → 5.4 µs an event).
-                        match program.feed_json(event_type, &msg.data) {
+                        let fed = program.feed_json(event_type, &msg.data);
+                        losses.report(&handle.spec.name, &program, &js, &subj_root);
+                        match fed {
                             Err(varpulis_engine::Error::Event(e)) => {
                                 // Not an event: permanent poison. Dead-letter it
                                 // (ADR-0015), publish before ack, nak if the DLQ
@@ -3194,7 +3198,6 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         (processed_at - round_t0).as_secs_f64(),
                         processed_at.elapsed().as_secs_f64(),
                     );
-                    report_losses(&handle.spec.name, &program, &js, &subj_root);
                     if let Some(store) = &store {
                         if acks_since_snapshot > 0
                             && retrying.is_empty()
@@ -3241,23 +3244,52 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
     });
 }
 
-/// Whether the program has state worth a snapshot: a sequence, a window or a
-/// join. Read off a snapshot of the freshly compiled program: the engine lists
-/// every such operator in it, with or without anything in flight. A snapshot
-/// that is not JSON is taken as stateful.
-/// What the engine lost without failing (a run never opened at the cap, a run
-/// evicted, an event a filter discarded for want of a value) goes to
-/// `/metrics` and `/topology`. The first loss, then at most one a minute, is
-/// also said on the log and as a `losses` event on `<root>.flow.events`, so a
-/// detection that did not happen leaves a trace.
-fn report_losses(unit: &str, program: &varpulis_engine::Program, js: &bus::JetStream, subj_root: &str) {
-    let l = program.losses();
-    let Some(total) = metrics::set_losses(unit, [l.runs_dropped, l.runs_evicted, l.filters_without_value]) else {
-        return;
-    };
+/// What one program of a detect unit has lost without an error (a run never
+/// opened at the cap, a run evicted, an event a filter could not judge),
+/// handed to `/metrics` and `/topology` as deltas: two programs of the same
+/// unit may overlap for a moment across a reload, and each adds only what it
+/// lost itself. A loss of runs is also said on the log and as a `losses`
+/// event on `<root>.flow.events`: the first, then at most one a minute, and
+/// the last one held back is said once the minute has passed.
+struct LossWatch {
+    last: [u64; 3],
+    flush_at: Option<Instant>,
+}
+
+impl LossWatch {
+    fn new(unit: &str) -> Self {
+        metrics::declare_detect(unit);
+        LossWatch { last: [0; 3], flush_at: None }
+    }
+
+    /// Cheap when nothing moved: three compares, no lock.
+    fn report(&mut self, unit: &str, program: &varpulis_engine::Program, js: &bus::JetStream, subj_root: &str) {
+        let l = program.losses();
+        let cur = [l.runs_dropped, l.runs_evicted, l.filters_without_value];
+        let said = if cur != self.last {
+            let delta: [u64; 3] = std::array::from_fn(|i| cur[i].saturating_sub(self.last[i]));
+            self.last = cur;
+            metrics::add_losses(unit, delta)
+        } else if self.flush_at.is_some_and(|t| Instant::now() >= t) {
+            metrics::flush_losses(unit)
+        } else {
+            return;
+        };
+        self.flush_at = match said {
+            metrics::LossNews::Say(total) => {
+                say_losses(unit, total, js, subj_root);
+                None
+            }
+            metrics::LossNews::Later(at) => Some(at),
+            metrics::LossNews::Quiet => None,
+        };
+    }
+}
+
+fn say_losses(unit: &str, total: [u64; 3], js: &bus::JetStream, subj_root: &str) {
     eprintln!(
-        "[vejas] {unit}: the engine lost events without an error: runs_dropped={} runs_evicted={} \
-         filters_without_value={} (since start; see vejas_detect_losses_total)",
+        "[vejas] {unit}: the engine lost runs without an error: runs_dropped={} runs_evicted={} \
+         (since start; filters_without_value={}; see vejas_detect_losses_total)",
         total[0], total[1], total[2]
     );
     let mut event = json!({ "transition": "losses", "ts": now_secs(), "unit": unit });
@@ -3273,11 +3305,26 @@ fn report_losses(unit: &str, program: &varpulis_engine::Program, js: &bus::JetSt
 /// `VEJAS_DETECT_MAX_RUNS`: how many runs a pattern of a detect unit keeps
 /// open at once (per partition for a partitioned one). Unset, the engine's
 /// default (10 000) holds. Past it, new runs are not opened and are counted
-/// as `runs_dropped`.
+/// as `runs_dropped`. A value that is not a positive number is said once and
+/// ignored.
 fn detect_max_runs() -> Option<usize> {
-    env::var("VEJAS_DETECT_MAX_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0)
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let raw = env::var("VEJAS_DETECT_MAX_RUNS").ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("[vejas] VEJAS_DETECT_MAX_RUNS={raw:?} is not a positive number: the engine's default holds");
+            }
+            None
+        }
+    }
 }
 
+/// Whether the program has state worth a snapshot: a sequence, a window or a
+/// join. Read off a snapshot of the freshly compiled program: the engine lists
+/// every such operator in it, with or without anything in flight. A snapshot
+/// that is not JSON is taken as stateful.
 fn program_is_stateful(program: &varpulis_engine::Program) -> bool {
     let Ok(bytes) = program.snapshot() else {
         return true;
