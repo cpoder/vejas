@@ -117,6 +117,25 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   chunked body was refused the same way.
 
 ### Fixed
+- **An emit the stream does not store fails its run.** Before acking a batch's
+  messages, the runtime checked that the server had read their emits, not that
+  `VEJAS` had stored them. A stream that was full and discarded new messages, a
+  full disk or a cluster with no leader for the stream dropped the emit, and
+  the message was acked and recorded as a success: the event was lost without
+  a trace. An emit under the stream's root now waits for the stream's answer,
+  all of a batch's answers at once. One the stream refuses fails its run: the
+  message comes back after `ack_wait`, then is a dead letter that names the
+  refusal (`publish vx.orders.ready: maximum messages exceeded`). The batch's
+  other runs stand, and the refused run's other emits may be stored already,
+  so they leave again with it. An `api` flow answers 503. A runtime that runs
+  only `api` flows makes `VEJAS` before their first emit: before, those emits
+  were lost when no unit on the bus had made it. A detect unit's batch
+  with a refused emit redelivers as a whole, as one the bus does not confirm,
+  since its engine has taken in every event of it. A flow's success is now
+  recorded in `/events` once its emits are confirmed, so a batch the bus does
+  not confirm shows as failed there rather than done. Waiting for the stream
+  costs the flow hop 13 % of its throughput at full speed, 7 µs of CPU per
+  event (ADR-0035, amendment).
 - **An `api` flow answers 503 when the bus does not confirm its emits.** It
   answered 200, or what the flow said, without knowing whether its emits had
   left: with the bus down, the caller was told the event was taken and it was

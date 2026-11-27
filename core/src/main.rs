@@ -1459,7 +1459,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             let mut one_by_one = engine.reaches_system(&prog);
             let mut settled = Settled::default();
             let mut round = sub.round_of(if one_by_one { 1 } else { bus::PULL_BATCH })?;
-            let mut batch = nc.batch();
+            let mut batch = nc.batch_stored(&subj_root);
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -1473,12 +1473,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 let fetch = &mut round;
                 let mut fetched = 0usize;
                 let mut first_at: Option<Instant> = None;
-                // Emits are core publishes, held and confirmed by ONE barrier per
-                // batch before their source messages are acked — one round-trip a
-                // batch instead of one per emit, at-least-once preserved (ADR-0002).
-                let mut to_ack: Vec<bus::Message> = Vec::new();
-                // A success is recorded once the barrier confirms its emits left.
-                let mut done: Vec<(metrics::Span, record::Extras)> = Vec::new();
+                // Emits are held and confirmed once a batch, before their source
+                // messages are acked: the stream's answer to each one it stores,
+                // all awaited together (ADR-0002). A run that succeeded is settled
+                // then: acked and recorded, or failed if the stream refused one
+                // of its emits.
+                let mut ran: Vec<Ran> = Vec::new();
                 for msg in fetch {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
@@ -1577,33 +1577,17 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     }
                     let steps = engine.take_steps();
                     match outcome {
-                        Ok(ctx) => {
-                            let emits = ctx.emits.len() as u64;
-                            metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
-                            let subjects: Vec<String> = ctx.emits.iter().map(|(s, _)| s.clone()).collect();
-                            if observing && hop.sampled {
-                                done.push((
-                                    hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos)
-                                        .attr("vejas.emits", emits),
-                                    record::Extras::new().emits(subjects.clone()).input(&msg.data).steps(steps),
-                                ));
-                            }
-                            record_trace(
-                                &handle.spec.name,
-                                &msg.subject,
-                                true,
-                                None,
-                                subjects,
-                                // The preview is derived from the stored event when
-                                // /events is read; serialising it here cost every
-                                // message a second walk of its JSON.
-                                String::new(),
-                                Some(event),
-                                Some(&hop),
-                                msg.delivery(),
-                            );
-                            to_ack.push(msg); // acked after the batch flush
-                        }
+                        Ok(ctx) => ran.push(Ran {
+                            emits: held..batch.held(),
+                            subjects: ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+                            event,
+                            hop,
+                            steps,
+                            start_nanos,
+                            secs: t0.elapsed().as_secs_f64(),
+                            observing,
+                            msg,
+                        }),
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
                             metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
@@ -1655,29 +1639,33 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                     }
                 }
-                // Publish-before-ack barrier for the batch: one round-trip confirms
-                // the server received every emit, THEN ack the fully-published
-                // source messages. On failure, ack none — the batch redelivers
-                // (nothing is lost; at-least-once, ADR-0002).
+                // Publish-before-ack for the batch: the stream's answers confirm
+                // every emit it stores (a round trip, any other), THEN the runs
+                // are settled and their messages acked. A batch the bus does not
+                // confirm acks none and redelivers; an emit the stream refused
+                // fails its own run (nothing is lost; at-least-once, ADR-0002).
                 metrics::observe_fetch(&handle.spec.name, fetched);
                 let processed_at = Instant::now();
-                let confirmed = batch.confirm();
-                match &confirmed {
-                    Ok(()) => {
-                        // done, whether or not the acks get through
-                        for msg in &to_ack {
-                            settled.add(msg);
-                        }
-                        if let Err(e) = nc.ack_all(&to_ack) {
-                            eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
-                        handle.spec.name
-                    ),
+                let confirmed = batch.confirm_each();
+                if let Err(e) = &confirmed {
+                    eprintln!("[vejas] {}: flush before ack failed: {e} (batch redelivers)", handle.spec.name);
                 }
-                end_confirmed(done, &confirmed);
+                let unit = Unit {
+                    handle: &handle,
+                    file: &code_file,
+                    version: &flow_version,
+                    overlay_of: overlay_of.as_ref(),
+                    js: &js,
+                    durable: &durable,
+                };
+                let acked = settle(ran, &confirmed, &unit);
+                // done, whether or not the acks get through
+                for msg in &acked {
+                    settled.add(msg);
+                }
+                if let Err(e) = nc.ack_all(&acked) {
+                    eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
+                }
                 if !one_by_one && engine.made_a_call() {
                     one_by_one = true;
                 }
@@ -1744,6 +1732,103 @@ impl Settled {
     fn holds(&self, seq: u64) -> bool {
         self.seqs.contains(&seq)
     }
+}
+
+/// A run of a flow that succeeded, held until its batch is confirmed.
+struct Ran {
+    msg: bus::Message,
+    /// Where its emits are in the batch.
+    emits: std::ops::Range<usize>,
+    subjects: Vec<String>,
+    event: Value,
+    hop: trace::Hop,
+    steps: Option<vjs::Steps>,
+    start_nanos: u128,
+    secs: f64,
+    observing: bool,
+}
+
+/// What settling a run needs of the flow it ran in.
+struct Unit<'a> {
+    handle: &'a Handle,
+    file: &'a Arc<str>,
+    version: &'a Arc<str>,
+    overlay_of: Option<&'a Arc<str>>,
+    js: &'a bus::JetStream,
+    durable: &'a str,
+}
+
+/// Settle the runs of a batch once it has been confirmed, and give back the
+/// messages to ack: the runs that succeeded and the dead letters. A run whose
+/// emits the stream stored succeeded, and is recorded so. A run with an emit the stream refused failed as a run that
+/// errs does: its message comes back after ack_wait, and is a dead letter
+/// once its deliveries are spent (ADR-0015). Its other emits may be stored
+/// already, and are sent again with it (at least once). A batch that is not
+/// confirmed acks none of its runs, and each redelivers.
+fn settle(ran: Vec<Ran>, confirmed: &Result<Vec<bus::Refused>, String>, unit: &Unit) -> Vec<bus::Message> {
+    let name = &unit.handle.spec.name;
+    let mut acked = Vec::with_capacity(ran.len());
+    for run in ran {
+        let failed = match confirmed {
+            Err(e) => Some(format!("flush before ack failed: {e} (redelivers)")),
+            Ok(refused) => refused
+                .iter()
+                .find(|r| run.emits.contains(&r.index))
+                .map(|r| format!("publish {}: {}", r.subject, r.error)),
+        };
+        let msg = &run.msg;
+        let Some(error) = failed else {
+            let emits = run.subjects.len() as u64;
+            metrics::observe(name, true, emits, run.secs);
+            if run.observing && run.hop.sampled {
+                let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos)
+                    .attr("vejas.emits", emits);
+                let extras = record::Extras::new().emits(run.subjects.clone()).input(&msg.data).steps(run.steps);
+                record::end(span, extras);
+            }
+            // The preview is derived from the stored event when /events is
+            // read; serialising it here cost every message a second walk of
+            // its JSON.
+            record_trace(name, &msg.subject, true, None, run.subjects, String::new(), Some(run.event), Some(&run.hop), msg.delivery());
+            acked.push(run.msg);
+            continue;
+        };
+        metrics::observe(name, false, 0, run.secs);
+        let mut said = error.clone();
+        let mut dead_lettered = false;
+        // An emit the stream refused fails the run, and its deliveries count;
+        // a batch the bus did not confirm only redelivers.
+        let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
+        if confirmed.is_ok() {
+            eprintln!("[vejas] {name}: {error}");
+            set_state(unit.handle, |st| st.last_error = Some(error.clone()));
+            if delivered >= MAX_DELIVERIES {
+                let carried = run.hop.context();
+                let message = msg.delivery().map(|d| d.message());
+                match connectors::to_dlq(unit.js, name, &msg.subject, delivered, &error, &msg.data, unit.version, Some(&carried), message, unit.durable) {
+                    Ok(()) => {
+                        dead_lettered = true;
+                        metrics::inc_dead_letter(name);
+                        said = format!("{error} — dead-lettered after {delivered} deliveries");
+                    }
+                    Err(de) => {
+                        said = format!("{error} — DLQ publish failed: {de}");
+                        let _ = msg.nak();
+                    }
+                }
+            }
+        }
+        if run.observing {
+            let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos);
+            let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
+            record::end(span.failed(error), record::Extras::new().input(&msg.data).steps(run.steps));
+        }
+        record_trace(name, &msg.subject, false, Some(said), vec![], String::new(), Some(run.event), Some(&run.hop), msg.delivery());
+        if dead_lettered {
+            acked.push(run.msg);
+        }
+    }
+    acked
 }
 
 /// End the successful hops of a batch once its barrier has answered: a hop
@@ -2017,7 +2102,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut acks_since_snapshot: u64 = 0;
             let mut last_snapshot = Instant::now();
-            let mut outbox = nc.batch();
+            // A refused emit fails the whole batch here, which redelivers: a
+            // detect unit's engine has taken in every event of it.
+            let mut outbox = nc.batch_stored(&subj_root);
             let result = (|| -> Result<(), String> {
                 loop {
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -4193,13 +4280,37 @@ fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) -> Result<
     }
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let nc = bus::connect(&url).map_err(|e| Unsent::Unconfirmed(format!("NATS unreachable: {e}")))?;
-    let mut batch = nc.batch();
+    let root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    ensure_stream(&nc, &root);
+    let mut batch = nc.batch_stored(&root);
     for (subj, payload) in emits {
         batch
             .publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried)
             .map_err(|e| Unsent::Refused(format!("publish {subj}: {e}")))?;
     }
-    batch.confirm().map_err(Unsent::Unconfirmed)
+    // One the stream refused may be stored later: the request is sent again.
+    match batch.confirm_each().map_err(Unsent::Unconfirmed)?.into_iter().next() {
+        None => Ok(()),
+        Some(refused) => Err(Unsent::Unconfirmed(format!("publish {}: {}", refused.subject, refused.error))),
+    }
+}
+
+/// Make the stream an api flow's emits go to, once, if no unit has made it: a
+/// runtime that only answers HTTP runs no unit on the bus that would. Without
+/// it, the stream would refuse each emit for want of a stream (503).
+fn ensure_stream(nc: &bus::Bus, root: &str) {
+    static MADE: AtomicBool = AtomicBool::new(false);
+    if MADE.load(Ordering::Relaxed) {
+        return;
+    }
+    let made = nc.jetstream().add_stream(&bus::StreamConfig {
+        name: env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into()),
+        subjects: vec![format!("{root}.>")],
+        ..Default::default()
+    });
+    if made.is_ok() {
+        MADE.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Why an api flow's emits did not all leave.

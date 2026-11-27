@@ -216,3 +216,34 @@ TLS performance (`tls://` was checked for behaviour: a private CA in the trust
 store, an upgrade from `nats://`, an unknown CA refused). Failover between the
 servers of a NATS cluster, or more than one server in `NATS_URL`: the runs here
 restart one server in place.
+
+## Amendment, 2026-11-27: the stream answers for the emits it stores
+
+Point 3 kept the rule "the server confirms it has read them". That was not
+enough. The server reading a publish does not mean `VEJAS` stored it: a stream
+that is full and discards new messages, a full disk, or a cluster with no leader
+for the stream drops it, and the barrier still comes back. A bench on a stream
+limited to one message showed it: two emits, one kept, no error, no dead letter,
+and the source message acked.
+
+An emit under the stream's root (`Bus::batch_stored`) is now published the way a
+JetStream publish is, with a reply, and the batch waits for every answer at once,
+within the barrier's wait. An answer that is an error, or no stream for the
+subject, refuses that emit: its run fails as a run that errs does, and the other
+runs of the batch stand (`Batch::confirm_each`). No answer in time fails the
+batch as the barrier did. Emits outside the root keep the barrier. A service
+that answers on a stream's subject before the stream does counts as read, as
+before; nothing in the repo does that.
+
+Measured on the flow hop, with 20 000 events already stored when the runtime
+starts, five runs each, interleaved: 13 500 events/s before and 11 700 after
+(-13 %), 88 and 95 µs of runtime CPU per event, 224 and 228 µs of server CPU.
+With publishers in the loop (`bench/flow-only.sh`) the rate does not move,
+because they are slower than the flow. The cost is on the client side, since
+the server's CPU does not move: each emit now has a reply subject, a timer and a
+channel of its own. Two ways to take it back, not tried: a subscription per
+batch that collects its answers, or the atomic batch publish of nats-server
+2.12, one answer for a batch that is stored whole or not at all.
+
+The answers come back on `_INBOX.>`, which a runtime with a publish allow-list
+already needed.

@@ -329,6 +329,17 @@ impl Bus {
         Batch {
             bus: self.clone(),
             held: Vec::new(),
+            stored: None,
+        }
+    }
+
+    /// The same, for the emits of units: a publish under `root` is a stream's,
+    /// and its batch is confirmed once that stream has said it stored it.
+    pub fn batch_stored(&self, root: &str) -> Batch {
+        Batch {
+            bus: self.clone(),
+            held: Vec::new(),
+            stored: Some(format!("{root}.")),
         }
     }
 
@@ -405,6 +416,17 @@ impl Bus {
 pub struct Batch {
     bus: Bus,
     held: Vec<(Subject, Option<HeaderMap>, Bytes)>,
+    /// `root.`: the subjects whose publishes wait for the stream's answer.
+    stored: Option<String>,
+}
+
+/// A publish of a batch that the stream refused to store: its place in the
+/// batch (what [`Batch::held`] was when it was held) and why.
+#[derive(Debug)]
+pub struct Refused {
+    pub index: usize,
+    pub subject: String,
+    pub error: String,
 }
 
 impl Batch {
@@ -472,8 +494,34 @@ impl Batch {
     /// lost its first half. So a connection replaced while the batch was leaving
     /// fails the barrier, and the batch redelivers.
     pub fn confirm(&mut self) -> Result<(), String> {
+        match self.confirm_each()?.into_iter().next() {
+            None => Ok(()),
+            Some(refused) => Err(format!("publish {}: {}", refused.subject, refused.error)),
+        }
+    }
+
+    /// [`Batch::confirm`], saying which publishes the stream refused. A batch
+    /// made by [`Bus::batch_stored`] asks the stream for an answer to each
+    /// publish under its root, the way a JetStream publish does, and waits for
+    /// them all at once.
+    ///
+    /// The barrier proves the server read a publish, not that a stream stored
+    /// it. A stream that is full and discards new messages, a disk that is
+    /// full, or a cluster with no leader for the stream drops the publish, and
+    /// the source message must not be acked for it.
+    ///
+    /// Ok lists the publishes the stream refused: there is no stream for the
+    /// subject, or the stream answered an error. Each is the refusal of its
+    /// own run, and the others of the batch stand. Err means the batch is not
+    /// confirmed as a whole: the connection, or an answer that did not come
+    /// within the barrier's wait.
+    ///
+    /// A publish outside the root, or one answered by a service that listens
+    /// on its subject instead of by the stream, counts as read, as with the
+    /// barrier.
+    pub fn confirm_each(&mut self) -> Result<Vec<Refused>, String> {
         if self.held.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let link = &self.bus.0.link;
         if !link.up() {
@@ -481,16 +529,72 @@ impl Batch {
             return Err("the connection is down".into());
         }
         let epoch = link.epoch();
+        let js = &self.bus.0.js;
+        let stored = self.stored.as_deref();
         let held = &mut self.held;
         wait(async {
-            for (subject, headers, payload) in held.drain(..) {
-                match headers {
-                    Some(headers) => sent(link.client.publish_with_headers(subject, headers, payload)).await?,
-                    None => sent(link.client.publish(subject, payload)).await?,
+            let mut answers = Vec::new();
+            let mut plain = false;
+            for (index, (subject, headers, payload)) in held.drain(..).enumerate() {
+                if stored.is_some_and(|root| subject.starts_with(root)) {
+                    // a count of the bytes it shares, not a copy
+                    let name = subject.clone();
+                    let sending = match headers {
+                        Some(headers) => timeout(SEND_WAIT, js.publish_with_headers(subject, headers, payload)).await,
+                        None => timeout(SEND_WAIT, js.publish(subject, payload)).await,
+                    };
+                    let answer = match sending {
+                        Ok(answer) => answer.map_err(|e| e.to_string())?,
+                        Err(_) => return Err("timed out: the bus connection is not taking writes".into()),
+                    };
+                    answers.push((index, name, answer));
+                } else {
+                    plain = true;
+                    match headers {
+                        Some(headers) => sent(link.client.publish_with_headers(subject, headers, payload)).await?,
+                        None => sent(link.client.publish(subject, payload)).await?,
+                    }
                 }
             }
-            link.barrier_since(epoch).await
+            if plain {
+                link.barrier_since(epoch).await?;
+            }
+            let heard = timeout(BARRIER_WAIT, async {
+                let mut refused = Vec::new();
+                for (index, subject, answer) in answers {
+                    if let Some(error) = refusal(answer.await)? {
+                        refused.push(Refused { index, subject: subject.to_string(), error });
+                    }
+                }
+                Ok(refused)
+            });
+            match heard.await {
+                Ok(refused) => refused,
+                Err(_) => Err("timed out waiting for the stream to store the batch".into()),
+            }
         })
+    }
+}
+
+/// What the stream's answer to one publish says: None when it stored it, the
+/// reason when it refused it, Err when the answer did not come.
+fn refusal(answer: Result<jetstream::publish::PublishAck, jetstream::context::PublishError>) -> Result<Option<String>, String> {
+    use jetstream::context::PublishErrorKind;
+    let Err(error) = answer else {
+        return Ok(None);
+    };
+    match error.kind() {
+        PublishErrorKind::StreamNotFound => Ok(Some("no stream stores this subject".into())),
+        PublishErrorKind::TimedOut | PublishErrorKind::BrokenPipe => Err(error.to_string()),
+        _ => {
+            let stream = std::error::Error::source(&error).and_then(|source| source.downcast_ref::<jetstream::Error>());
+            match stream {
+                Some(said) => Ok(Some(said.to_string())),
+                // a service on the subject answered first: read, as with the barrier
+                None if error.kind() == PublishErrorKind::Other => Ok(None),
+                None => Ok(Some(error.to_string())),
+            }
+        }
     }
 }
 
@@ -1700,6 +1804,50 @@ mod live {
             seen.push(String::from_utf8_lossy(&message.data).into_owned());
         }
         assert_eq!(seen, ["kept", "after"]);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_batch_says_which_publish_its_stream_refused() {
+        let server = Server::start();
+        let bus = connect(&server.url()).unwrap();
+        bus.jetstream()
+            .add_stream(&StreamConfig {
+                name: "FULL".into(),
+                subjects: vec!["t.>".into()],
+                max_msgs: 2,
+                discard: Discard::New,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut batch = bus.batch_stored("t");
+        for n in 0..3 {
+            batch.publish("t.full", n.to_string()).unwrap();
+        }
+        // outside the root: the barrier alone
+        batch.publish("u.plain", "plain").unwrap();
+        let refused = batch.confirm_each().unwrap();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!((refused[0].index, refused[0].subject.as_str()), (2, "t.full"));
+        assert!(refused[0].error.starts_with("maximum messages exceeded"), "{}", refused[0].error);
+        assert_eq!(bus.jetstream().stream_state("FULL").unwrap().messages, 2);
+
+        // under the root, and no stream for it
+        let mut batch = bus.batch_stored("w");
+        batch.publish("w.nowhere", "x").unwrap();
+        let refused = batch.confirm_each().unwrap();
+        assert_eq!(refused[0].error, "no stream stores this subject");
+
+        // `confirm` reads a refusal as a batch that failed
+        let mut batch = bus.batch_stored("t");
+        batch.publish("t.full", "again").unwrap();
+        let error = batch.confirm().unwrap_err();
+        assert!(error.starts_with("publish t.full: maximum messages exceeded"), "{error}");
+
+        // a batch that asks no stream knows nothing of it
+        let mut batch = bus.batch();
+        batch.publish("t.full", "read by the server, dropped by the stream").unwrap();
+        batch.confirm().unwrap();
     }
 
     #[test]

@@ -125,6 +125,8 @@ jobs:
         run: e2e/bus-down.sh
       - name: A flow invokes a service that answers from an HTTP API (ADR-0032)
         run: e2e/invoke-http.sh
+      - name: An emit the stream does not store fails its run
+        run: e2e/emit-stored.sh
       - name: Docs book builds (broken includes fail here, not on deploy)
         run: |
           curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar xz
