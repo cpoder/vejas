@@ -13,11 +13,11 @@ GET on the reads the console makes, and nothing else:
 | `/`, `/panel` | the console |
 | `/healthz` | the probe a proxy or an orchestrator polls |
 | `/topology`, `/graph` | the map: the units, their state, how they connect |
-| `/surface` | the business values each flow carries, shown, never changed |
+| `/surface` | the business values each flow carries, shown, never changed, masked by the runtime as the trace record masks (ADR-0017) |
 | `/events` | what went through the bus, masked as the console masks it |
 | `/dlq` | the dead letters, the newest 50, without replay or purge |
 | `/traces?search=`, `/traces/{id}` | the trace record |
-| `/file`, `/shape`, `/rules` | a flow's, a service's or a connector's code (`.vjs` in `flows/`, `services/`, `connectors/`) and what its page derives from it |
+| `/file`, `/shape`, `/rules` | a flow's, a service's or a connector's code (`.vjs` in `flows/`, `services/`, `connectors/`) and what its page derives from it; a file whose literals or code those masks would change is not served |
 | `/drivers`, `/evictions` | the drivers there are, the versions a promote evicted |
 
 Everything else answers `404 not found`, the same for a route that exists and
