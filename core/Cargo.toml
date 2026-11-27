@@ -42,7 +42,7 @@ base64 = "0.22"
 # The Varpulis CEP engine, embedded as a library (ADR-0031): compile a VPL
 # program, feed it events, publish its emits. No async runtime in its tree —
 # its own CI (scripts/check-engine-deps.py) fails if one ever appears.
-varpulis-engine = { git = "https://github.com/varpulis/varpulis", rev = "142cc59168bc1215ca14d32363044bc381e6ed11" }
+varpulis-engine = { git = "https://github.com/varpulis/varpulis", rev = "c6171aefec029661a31fe6e694a720e64ae3890a" }
 
 [[bin]]
 name = "vejas-runtime"

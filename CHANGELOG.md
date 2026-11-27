@@ -19,11 +19,15 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   open at once (10 000 by default, per partition).
 
 ### Changed
-- **The Varpulis engine moves from 1cb201b to 142cc59.** It refuses at load,
+- **The Varpulis engine moves from 1cb201b to c6171ae.** It refuses at load,
   with codes E100 to E104, what it used to ignore with a warning or in
   silence: `import`, `context`, a `timer()` source, `.enrich()` and
   `.alert(webhook: ...)`. A detect unit that used one stops at load and says
-  why. It also carries the dependency security updates of that range.
+  why. It also carries the dependency security updates of that range, and
+  a predicate index: once a pattern has 8 sequences waiting or more, an
+  event looks up the sequences it can advance instead of visiting each one,
+  so a correlation with many open sequences no longer slows down with their
+  number.
 
 ## [0.8.0] — 2026-11-27
 
