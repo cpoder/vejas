@@ -198,6 +198,12 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   chunked body was refused the same way.
 
 ### Fixed
+- **A replay sends dead letters back in the order their events came.** A
+  replay of a unit's letters, or of all of them, published the newest first,
+  so a flow that takes its messages one by one ran them in reverse: three
+  payments that died while a system was down came back last first. Letters
+  now go back in the order their messages first came on the bus, whatever
+  order they died in; those that name no message (an emit's) come after.
 - **An `api` flow reads its query and its path parameters decoded.**
   `request.query` held each value as it was sent, so
   `?now=2026-03-01T10%3A00%3A00.000Z` read as `2026-03-01T10%3A00%3A00.000Z`

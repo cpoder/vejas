@@ -10,7 +10,8 @@
 # flow's that keeps it as long as the longest window. A run whose call failed
 # marks nothing, so the same key is processed again later. Copies of one
 # message find the first one's mark. An api flow remembers too, and
-# `remember` is a write for the write gate.
+# `remember` is a write for the write gate. A replay of a flow's dead letters
+# sends them back in the order their events came, not the order they died.
 #   e2e/flow-owns-failures.sh                    (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -27,16 +28,18 @@ PORT=4304; URL=nats://127.0.0.1:$PORT; H="http://127.0.0.1:8778"; SP=8779
 TOK="e2e-owns-$$"
 
 # A system that answers 503 for an id with DOWN in it, 404 for one with GONE,
-# and the quote otherwise. It writes down each id it is asked for.
+# and the quote otherwise, or for every id once calls.up exists. It writes
+# down each id it is asked for.
 cat > "$S/system.py" <<'PY'
-import http.server, json, sys
+import http.server, json, os, sys
 calls = sys.argv[2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         qid = self.path.rsplit("/", 1)[-1]
         with open(calls, "a") as f:
             f.write(qid + "\n")
-        status = 503 if "DOWN" in qid else 404 if "GONE" in qid else 200
+        up = os.path.exists(calls + ".up")
+        status = 200 if up else 503 if "DOWN" in qid else 404 if "GONE" in qid else 200
         body = json.dumps({"quote": {"id": qid}} if status == 200 else {"error": "no"}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -57,6 +60,19 @@ driver "http-rpc"
 URL = "http://127.0.0.1:$SP/quotes/{id}"
 ATTEMPTS = 3
 DELAY_MS = 200
+V
+# the same system, a second apart: a message it fails dies on its second delivery
+cat > "$R/services/slow_quote.vjs" <<V
+driver "http-rpc"
+URL = "http://127.0.0.1:$SP/quotes/{id}"
+ATTEMPTS = 2
+DELAY_MS = 1000
+V
+cat > "$R/flows/ordered.vjs" <<'V'
+# flow: ordered
+source "vx.fo.ord"
+o = invoke slow_quote(id: event.id)
+emit "vx.fo.ordered", {id: event.id}
 V
 cat > "$R/flows/refine.vjs" <<'V'
 # flow: refine
@@ -133,7 +149,7 @@ for _ in $(seq 1 50); do nats -s $URL server check connection > /dev/null 2>&1 &
 NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:8778 VEJAS_TOKEN="$TOK" VEJAS_ACK_WAIT_SECS=2 \
   "$BIN" > "$S/rt.log" 2>&1 & RT=$!
 until curl -sf -o /dev/null "$H/healthz"; do sleep 0.1; done
-for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.fo' "$S/rt.log")" -ge 4 ] && break; sleep 0.1; done
+for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.fo' "$S/rt.log")" -ge 5 ] && break; sleep 0.1; done
 nats -s $URL sub 'vx.fo.>' > "$S/bus" 2>/dev/null & SUB=$!
 sleep 0.5
 
@@ -248,6 +264,23 @@ D=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOK" "$H/a
 P=$(curl -s -o /dev/null -w "%{http_code}" "$H/api/ping")
 [ "$P" = 200 ] && ! nats -s $URL stream ls -n 2>/dev/null | grep -q "_ping_" \
   && ok "an api flow that remembers nothing opens no memory" || ko "ping: $P, $(nats -s $URL stream ls -n 2>/dev/null | tr '\n' ' ')"
+
+echo "── a replay sends letters back in the order their events came"
+# o1 is not found and dies at once, o2's system is down and it dies on its
+# second delivery a second later, o3 dies at once in between: the letters are
+# o1, o3, o2, newest first o2, o3, o1, and neither is the order they came in.
+for id in o1-GONE o2-DOWN o3-GONE; do nats -s $URL pub vx.fo.ord "{\"id\":\"$id\"}" > /dev/null 2>&1; done
+for _ in $(seq 1 100); do [ "$(letters | tr ' ' '\n' | grep -cx flow:ordered)" -ge 3 ] && break; sleep 0.1; done
+died(){ curl -s -m 5 "$H/dlq" | python3 -c 'import json,sys
+ls = [d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "flow:ordered"]
+print(" ".join(json.loads(d["payload"])["id"] for d in reversed(ls)))'; }
+DIED=$(died)
+touch "$S/calls.up"
+A=$(curl -s -m 10 -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"unit":"flow:ordered"}' "$H/dlq/replay")
+until_sent vx.fo.ordered '"id"' 3
+GOT=$(msgs vx.fo.ordered | python3 -c 'import json,sys; print(" ".join(json.loads(l)["id"] for l in sys.stdin))')
+[ "$DIED" = "o1-GONE o3-GONE o2-DOWN" ] && echo "$A" | grep -q '"replayed":3' && [ "$GOT" = "o1-GONE o2-DOWN o3-GONE" ] \
+  && ok "they died $DIED, and their replay ran $GOT" || ko "replay order: died $DIED, replay $A, ran $GOT"
 
 echo "── the bus is down"
 kill $NP 2>/dev/null; wait $NP 2>/dev/null; NP=""

@@ -4219,10 +4219,23 @@ fn dlq_audit(
     }
 }
 
+/// Dead letters in the order their events came on the bus, the order a replay
+/// sends them back in: a flow that takes its messages one by one then runs
+/// them as they first came, whatever order they died in. By the message that
+/// died (`original_seq`, the first one's when a replay died again); the
+/// letters that name none (an emit's, or one written before) come after, in
+/// the order they died. `letters` is newest first, as `dlq_list` reads them.
+fn in_bus_order(mut letters: Vec<Value>) -> Vec<Value> {
+    letters.reverse();
+    letters.sort_by_key(|l| l["original_seq"].as_u64().unwrap_or(u64::MAX));
+    letters
+}
+
 /// Replay dead letters: re-publish each to its ORIGINAL subject (where the
 /// corrected flow reprocesses it), then remove it from the DLQ. Publish-before-
 /// delete, so a failed re-inject keeps the dead letter. By `seq`, by `unit`, or
-/// all (both None). A replay goes to the unit whose letter it is, and to no
+/// all (both None), in the order their events came ([`in_bus_order`]). A
+/// replay goes to the unit whose letter it is, and to no
 /// other consumer of the subject (ADR-0015 Amendment C): a letter whose unit
 /// is no longer declared stays, as nothing would take its replay.
 fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) -> Result<Value, String> {
@@ -4264,7 +4277,7 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
         }
         targets.push(take(&env));
     } else {
-        for env in dlq_list(100_000)? {
+        for env in in_bus_order(dlq_list(100_000)?) {
             if unit.map(|u| env["unit"].as_str() == Some(u)).unwrap_or(true) {
                 targets.push(take(&env));
             }
@@ -5039,7 +5052,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. The letter of an alert a stream refused (`emit`) goes to its subject for every reader. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why, as does one whose payload was cut to fit (`cut`). Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. The letter of an alert a stream refused (`emit`) goes to its subject for every reader. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why, as does one whose payload was cut to fit (`cut`). Target one by `seq`, a whole `unit`, or all (omit both); several go back in the order their events came on the bus. Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where
@@ -6855,6 +6868,21 @@ mod tests {
         }
         assert!(entries.iter().any(|e| e["name"] == "SUBJECT"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replay_sends_letters_back_in_the_order_their_events_came() {
+        // newest first, as dlq_list reads them: the message 41 died after a
+        // replay, 30 and 12 once each, and an emit's letter names no message
+        let letters = vec![
+            json!({"seq": 9, "original_seq": 41}),
+            json!({"seq": 8, "emit": true}),
+            json!({"seq": 7, "original_seq": 12}),
+            json!({"seq": 6, "original_seq": 30}),
+            json!({"seq": 5, "emit": true}),
+        ];
+        let order: Vec<u64> = in_bus_order(letters).iter().filter_map(|l| l["seq"].as_u64()).collect();
+        assert_eq!(order, vec![7, 6, 9, 5, 8]);
     }
 
     #[test]
