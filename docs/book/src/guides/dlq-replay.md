@@ -43,6 +43,9 @@ not replayed.
   stays, and the answer's `errors` says why: its unit is no longer declared,
   or no longer reads that subject. An `emit` letter goes back on its subject
   for every reader, since no reader has had it.
+- Several letters go back in the order their events first came on the bus,
+  whatever order they died in, so a flow that takes its messages one by one
+  runs them in that order. The `emit` letters come after.
 - In [governed mode](governed-mode.md) both are human acts: `vejas_dlq_replay`
   and `vejas_dlq_purge` are refused, and the HTTP routes want the
   `X-Approval-Token` header, which the panel sends.
