@@ -3,8 +3,10 @@
 # to reach the NATS wire as it was: a line break in the field became protocol
 # commands, and through http-in that needed no credential. A refused subject fails
 # the run like any other error, so the message reaches the DLQ. So does an emit
-# over the server's limit, in a flow or a detect unit, and the emits its run made
-# before it never leave.
+# over the server's limit in a flow, and the emits its run made before it never
+# leave. In a detect unit none of the run's alerts leave either: each is a dead
+# letter at once, the large one cut, since its message delivered again would
+# feed the engine twice.
 #   e2e/emit-subject.sh                      (needs the nats CLI)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -117,7 +119,7 @@ C=$(curl -s -m 10 -o "$S/bigapi" -w '%{http_code}' -X POST -H 'Content-Type: app
 [ "$C" = "500" ] && grep -q "over the server's limit" "$S/bigapi" && grep -q "none of this request's events left" "$S/bigapi" \
   && ok "answered $C: $(head -c 160 "$S/bigapi")" || ko "answered $C: $(head -c 200 "$S/bigapi")"
 
-echo "── a detect unit's refused emit takes back the others too"
+echo "── a detect unit's emit over the limit takes back the others too"
 nats -s $URL sub vx.blob.first --raw > "$S/blob-first" 2>/dev/null & BLOB=$!
 sleep 0.5
 python3 -c 'import json; print(json.dumps({"event_type": "Blob", "s": "x" * 400000}))' > "$S/blob.json"
@@ -125,9 +127,12 @@ curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' --data-bin
   "http://127.0.0.1:$IN/ingest/blob.in"
 blob_letters(){ curl -s -m 5 "$H/dlq" | python3 -c '
 import json, sys
-print(len([d for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "detect:blob"]))'; }
-for _ in $(seq 1 150); do [ "$(blob_letters)" = "1" ] && break; sleep 0.1; done
-[ "$(blob_letters)" = "1" ] && ok "the message reached the DLQ after its deliveries" || ko "the message never reached the DLQ"
+print(" ".join(sorted("%s:%s:%s:%s" % (d.get("original_subject"), d.get("attempts"), bool(d.get("emit")), bool(d.get("cut")))
+    for d in json.load(sys.stdin)["dead_letters"] if d.get("unit") == "detect:blob")))'; }
+for _ in $(seq 1 150); do [ "$(blob_letters | wc -w)" = "2" ] && break; sleep 0.1; done
+L=$(blob_letters)
+[ "$L" = "vx.blob.big:1:True:True vx.blob.first:1:True:False" ] \
+  && ok "both alerts are dead letters at once, the large one cut: $L" || ko "letters: '$L'"
 [ -s "$S/blob-first" ] && ko "the first emit left $(grep -c . "$S/blob-first") times" || ok "the first emit never left"
 
 echo "── a shadow run shows the same error"

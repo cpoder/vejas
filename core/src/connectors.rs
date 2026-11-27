@@ -43,7 +43,7 @@ pub use process::without_runtime_credentials;
 pub use slot::Slot;
 pub use snapshots::{open_state_store, snapshot_get, snapshot_put, Snapshot};
 pub use vejas_connector::clock::iso8601_utc;
-pub use vejas_connector::dlq::{dlq_unit_token, ensure_dlq_stream, to_dlq, DLQ_STREAM};
+pub use vejas_connector::dlq::{dlq_unit_token, emit_to_dlq, ensure_dlq_stream, to_dlq, DLQ_STREAM};
 pub use vejas_connector::pull::{ack_wait, fetch_round, hydrate_recent, subject_matches};
 pub use vejas_connector::trace_preview;
 

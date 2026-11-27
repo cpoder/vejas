@@ -1402,6 +1402,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 return Err("no `source` declaration".into());
             };
             let nc = bus::connect(&url)?;
+            // before the first message: see `Bus::read_streams`
+            nc.read_streams();
             let js = nc.jetstream();
             let _ = js.add_stream(&bus::StreamConfig {
                 name: stream.clone(),
@@ -1459,7 +1461,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             let mut one_by_one = engine.reaches_system(&prog);
             let mut settled = Settled::default();
             let mut round = sub.round_of(if one_by_one { 1 } else { bus::PULL_BATCH })?;
-            let mut batch = nc.batch();
+            let mut batch = nc.batch_stored(&subj_root);
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -1473,12 +1475,12 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 let fetch = &mut round;
                 let mut fetched = 0usize;
                 let mut first_at: Option<Instant> = None;
-                // Emits are core publishes, held and confirmed by ONE barrier per
-                // batch before their source messages are acked — one round-trip a
-                // batch instead of one per emit, at-least-once preserved (ADR-0002).
-                let mut to_ack: Vec<bus::Message> = Vec::new();
-                // A success is recorded once the barrier confirms its emits left.
-                let mut done: Vec<(metrics::Span, record::Extras)> = Vec::new();
+                // Emits are held and confirmed once a batch, before their source
+                // messages are acked: the stream's answer to each one it stores,
+                // all awaited together (ADR-0002). A run that succeeded is settled
+                // then: acked and recorded, or failed if the stream refused one
+                // of its emits.
+                let mut ran: Vec<Ran> = Vec::new();
                 for msg in fetch {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
@@ -1577,33 +1579,17 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     }
                     let steps = engine.take_steps();
                     match outcome {
-                        Ok(ctx) => {
-                            let emits = ctx.emits.len() as u64;
-                            metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
-                            let subjects: Vec<String> = ctx.emits.iter().map(|(s, _)| s.clone()).collect();
-                            if observing && hop.sampled {
-                                done.push((
-                                    hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos)
-                                        .attr("vejas.emits", emits),
-                                    record::Extras::new().emits(subjects.clone()).input(&msg.data).steps(steps),
-                                ));
-                            }
-                            record_trace(
-                                &handle.spec.name,
-                                &msg.subject,
-                                true,
-                                None,
-                                subjects,
-                                // The preview is derived from the stored event when
-                                // /events is read; serialising it here cost every
-                                // message a second walk of its JSON.
-                                String::new(),
-                                Some(event),
-                                Some(&hop),
-                                msg.delivery(),
-                            );
-                            to_ack.push(msg); // acked after the batch flush
-                        }
+                        Ok(ctx) => ran.push(Ran {
+                            emits: held..batch.held(),
+                            subjects: ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+                            event,
+                            hop,
+                            steps,
+                            start_nanos,
+                            secs: t0.elapsed().as_secs_f64(),
+                            observing,
+                            msg,
+                        }),
                         Err(e) => {
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
                             metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
@@ -1655,29 +1641,33 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         }
                     }
                 }
-                // Publish-before-ack barrier for the batch: one round-trip confirms
-                // the server received every emit, THEN ack the fully-published
-                // source messages. On failure, ack none — the batch redelivers
-                // (nothing is lost; at-least-once, ADR-0002).
+                // Publish-before-ack for the batch: the stream's answers confirm
+                // every emit it stores (a round trip, any other), THEN the runs
+                // are settled and their messages acked. A batch the bus does not
+                // confirm acks none and redelivers; an emit the stream refused
+                // fails its own run (nothing is lost; at-least-once, ADR-0002).
                 metrics::observe_fetch(&handle.spec.name, fetched);
                 let processed_at = Instant::now();
-                let confirmed = batch.confirm();
-                match &confirmed {
-                    Ok(()) => {
-                        // done, whether or not the acks get through
-                        for msg in &to_ack {
-                            settled.add(msg);
-                        }
-                        if let Err(e) = nc.ack_all(&to_ack) {
-                            eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
-                        handle.spec.name
-                    ),
+                let confirmed = batch.confirm_each();
+                if let Err(e) = &confirmed {
+                    eprintln!("[vejas] {}: flush before ack failed: {e} (batch redelivers)", handle.spec.name);
                 }
-                end_confirmed(done, &confirmed);
+                let unit = Unit {
+                    handle: &handle,
+                    file: &code_file,
+                    version: &flow_version,
+                    overlay_of: overlay_of.as_ref(),
+                    js: &js,
+                    durable: &durable,
+                };
+                let acked = settle(ran, &confirmed, &unit);
+                // done, whether or not the acks get through
+                for msg in &acked {
+                    settled.add(msg);
+                }
+                if let Err(e) = nc.ack_all(&acked) {
+                    eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
+                }
                 if !one_by_one && engine.made_a_call() {
                     one_by_one = true;
                 }
@@ -1746,15 +1736,202 @@ impl Settled {
     }
 }
 
-/// End the successful hops of a batch once its barrier has answered: a hop
-/// whose emits did not leave is recorded as failed, and its message redelivers.
-fn end_confirmed(done: Vec<(metrics::Span, record::Extras)>, confirmed: &Result<(), String>) {
-    for (span, extras) in done {
-        match confirmed {
-            Ok(()) => record::end(span, extras),
-            Err(e) => record::end(span.failed(format!("flush before ack failed: {e} (redelivers)")), extras),
+/// A run of a flow that succeeded, held until its batch is confirmed.
+struct Ran {
+    msg: bus::Message,
+    /// Where its emits are in the batch.
+    emits: std::ops::Range<usize>,
+    subjects: Vec<String>,
+    event: Value,
+    hop: trace::Hop,
+    steps: Option<vjs::Steps>,
+    start_nanos: u128,
+    secs: f64,
+    observing: bool,
+}
+
+/// What settling a run needs of the flow it ran in.
+struct Unit<'a> {
+    handle: &'a Handle,
+    file: &'a Arc<str>,
+    version: &'a Arc<str>,
+    overlay_of: Option<&'a Arc<str>>,
+    js: &'a bus::JetStream,
+    durable: &'a str,
+}
+
+/// A message a detect unit's engine took in, and its alerts, held until the
+/// batch is confirmed.
+struct Alerted {
+    msg: bus::Message,
+    seq: u64,
+    /// Where its alerts are in the batch.
+    emits: std::ops::Range<usize>,
+    /// Where its alerts went that the batch held.
+    subjects: Vec<String>,
+    /// Its alerts the batch could not hold, already dead letters.
+    parked: Vec<String>,
+    hop: trace::Hop,
+    start_nanos: u128,
+    secs: f64,
+    observing: bool,
+}
+
+/// Hold the alerts of one run of a detect unit in the batch. They leave all
+/// together or not at all (ADR-0032): the first one the batch will not hold, a
+/// payload over the server's limit, takes the others back out, and is the error.
+fn hold_alerts(
+    outbox: &mut bus::Batch,
+    emits: &[varpulis_engine::Emit],
+    subj_root: &str,
+    stem: &str,
+    carried: &trace::Context,
+) -> Result<Vec<String>, String> {
+    let first = outbox.held();
+    let mut subjects = Vec::with_capacity(emits.len());
+    for emit in emits {
+        let subject = emit_subject(emit, subj_root, stem);
+        if let Err(e) = outbox.publish_traced(&subject, emit.to_payload(), carried) {
+            outbox.rollback(first);
+            return Err(format!("publish {subject}: {e}"));
+        }
+        subjects.push(subject);
+    }
+    Ok(subjects)
+}
+
+/// The alerts of a run that the batch would not hold: none left, and each is a
+/// dead letter, the one too large cut to fit (see `confirm_alerts`).
+#[allow(clippy::too_many_arguments)]
+fn park_run(
+    js: &bus::JetStream,
+    unit: &str,
+    emits: &[varpulis_engine::Emit],
+    subj_root: &str,
+    stem: &str,
+    error: &str,
+    version: &str,
+    carried: &trace::Context,
+) -> Result<(), String> {
+    for emit in emits {
+        let subject = emit_subject(emit, subj_root, stem);
+        connectors::emit_to_dlq(js, unit, &subject, error, &emit.to_payload(), version, Some(carried))
+            .map_err(|de| format!("{error}, and its dead letter failed: {de} (the unit starts again)"))?;
+        metrics::inc_dead_letter(unit);
+    }
+    eprintln!("[vejas] {unit}: {error}: none of the run's {} alerts left, each is a dead letter", emits.len());
+    Ok(())
+}
+
+/// Confirm the alerts of a detect unit's batch. A message its engine has
+/// taken in must not come back to it, where it would count twice, so an alert
+/// is never sent again by delivering its message again. One the stream refuses
+/// is a dead letter of its own (ADR-0015), whose replay publishes it where it
+/// was going, and its message is acked. Gives back those, as their place in the
+/// batch and the refusal. An error means the batch is not confirmed, or a
+/// refused alert could not be kept: the unit starts again, with a new engine,
+/// and its messages come back to it. A unit with a snapshot replays from it and
+/// sends the alerts again (at least once, ADR-0031); one whose program keeps
+/// state without a store starts empty, as after any crash.
+fn confirm_alerts(
+    outbox: &mut bus::Batch,
+    js: &bus::JetStream,
+    unit: &str,
+    version: &str,
+    trace_of: impl Fn(usize) -> Option<trace::Context>,
+) -> Result<Vec<(usize, String)>, String> {
+    let refused = outbox
+        .confirm_each()
+        .map_err(|e| format!("flush before ack failed: {e} (the unit starts again)"))?;
+    let mut parked = Vec::with_capacity(refused.len());
+    for r in refused {
+        let error = format!("publish {}: {}", r.subject, r.error);
+        connectors::emit_to_dlq(js, unit, &r.subject, &error, &r.payload, version, trace_of(r.index).as_ref())
+            .map_err(|de| format!("{error}, and its dead letter failed: {de} (the unit starts again)"))?;
+        metrics::inc_dead_letter(unit);
+        eprintln!("[vejas] {unit}: {error}: the alert is a dead letter");
+        parked.push((r.index, error));
+    }
+    Ok(parked)
+}
+
+/// Settle the runs of a batch once it has been confirmed, and give back the
+/// messages to ack: the runs that succeeded and the dead letters. A run whose
+/// emits the stream stored succeeded, and is recorded so. A run with an emit
+/// the stream refused failed as a run that errs does: its message comes back
+/// after ack_wait, and is a dead letter once its deliveries are spent
+/// (ADR-0015), or at once when no delivery could change the refusal (a
+/// message over the stream's size limit). Its other emits may be stored
+/// already, and are sent again with it (at least once). A batch that is not
+/// confirmed acks none of its runs, and each redelivers.
+fn settle(ran: Vec<Ran>, confirmed: &Result<Vec<bus::Refused>, String>, unit: &Unit) -> Vec<bus::Message> {
+    let name = &unit.handle.spec.name;
+    let mut acked = Vec::with_capacity(ran.len());
+    for run in ran {
+        let failed = match confirmed {
+            Err(e) => Some((format!("flush before ack failed: {e} (redelivers)"), false)),
+            Ok(refused) => refused
+                .iter()
+                .find(|r| run.emits.contains(&r.index))
+                .map(|r| (format!("publish {}: {}", r.subject, r.error), r.lasting)),
+        };
+        let msg = &run.msg;
+        let Some((error, lasting)) = failed else {
+            let emits = run.subjects.len() as u64;
+            metrics::observe(name, true, emits, run.secs);
+            if run.observing && run.hop.sampled {
+                let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos)
+                    .attr("vejas.emits", emits);
+                let extras = record::Extras::new().emits(run.subjects.clone()).input(&msg.data).steps(run.steps);
+                record::end(span, extras);
+            }
+            // The preview is derived from the stored event when /events is
+            // read; serialising it here cost every message a second walk of
+            // its JSON.
+            record_trace(name, &msg.subject, true, None, run.subjects, String::new(), Some(run.event), Some(&run.hop), msg.delivery());
+            acked.push(run.msg);
+            continue;
+        };
+        metrics::observe(name, false, 0, run.secs);
+        let mut said = error.clone();
+        let mut dead_lettered = false;
+        // An emit the stream refused fails the run, and its deliveries count;
+        // a batch the bus did not confirm only redelivers.
+        let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
+        if confirmed.is_ok() {
+            eprintln!("[vejas] {name}: {error}");
+            set_state(unit.handle, |st| st.last_error = Some(error.clone()));
+            if lasting || delivered >= MAX_DELIVERIES {
+                let carried = run.hop.context();
+                let message = msg.delivery().map(|d| d.message());
+                match connectors::to_dlq(unit.js, name, &msg.subject, delivered, &error, &msg.data, unit.version, Some(&carried), message, unit.durable) {
+                    Ok(()) => {
+                        dead_lettered = true;
+                        metrics::inc_dead_letter(name);
+                        said = if lasting {
+                            format!("{error} — dead-lettered at once: no delivery could change it")
+                        } else {
+                            format!("{error} — dead-lettered after {delivered} deliveries")
+                        };
+                    }
+                    Err(de) => {
+                        said = format!("{error} — DLQ publish failed: {de}");
+                        let _ = msg.nak();
+                    }
+                }
+            }
+        }
+        if run.observing {
+            let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos);
+            let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
+            record::end(span.failed(error), record::Extras::new().input(&msg.data).steps(run.steps));
+        }
+        record_trace(name, &msg.subject, false, Some(said), vec![], String::new(), Some(run.event), Some(&run.hop), msg.delivery());
+        if dead_lettered {
+            acked.push(run.msg);
         }
     }
+    acked
 }
 
 /// The span of one hop of a flow or detect unit on the bus (ADR-0034): kind
@@ -1855,6 +2032,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
             break;
         }
+        let began = Instant::now();
         let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let mut program =
@@ -1883,6 +2061,8 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                 .unwrap_or(&handle.spec.name)
                 .to_string();
             let nc = bus::connect(&url)?;
+            // before the first message: see `Bus::read_streams`
+            nc.read_streams();
             let js = nc.jetstream();
             let _ = js.add_stream(&bus::StreamConfig {
                 name: stream.clone(),
@@ -1944,12 +2124,25 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // After the restore: a restored window's sources start counting
             // their silence from now.
             program.set_idle_grace(idle_grace);
-            match resume_seq {
+            // A program with state has its consumer made again at each start,
+            // after what its engine holds: the snapshot's sequence, else the
+            // ack floor. A message the consumer delivers a second time is then
+            // one this engine took in, and it is not fed again (see the batch
+            // below). A stateless program keeps its consumer, which other
+            // instances may share: a message delivered again alerts again.
+            let start = match resume_seq {
+                Some(seq) => Some(seq),
+                None if stateful => js.ack_floor(&stream, &durable).ok().map(|floor| floor + 1),
+                None => None,
+            };
+            match start {
                 Some(seq) => {
-                    // The server cannot move an existing consumer: re-create it after the snapshot.
+                    // The server cannot move an existing consumer: re-create it.
                     let _ = js.delete_consumer(&stream, &durable);
                     js.create_pull_consumer(&stream, &durable, &filters, connectors::ack_wait(), Some(seq))?;
-                    metrics::observe_restore(&handle.spec.name, seq);
+                    if resume_seq.is_some() {
+                        metrics::observe_restore(&handle.spec.name, seq);
+                    }
                 }
                 None => js.create_pull_consumer(&stream, &durable, &filters, connectors::ack_wait(), None)?,
             }
@@ -2017,7 +2210,10 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut acks_since_snapshot: u64 = 0;
             let mut last_snapshot = Instant::now();
-            let mut outbox = nc.batch();
+            // A message the engine has taken in is not fed to it again, where
+            // it would count twice: a batch the bus does not confirm starts
+            // the unit again (see `confirm_alerts`), and a copy is acked.
+            let mut outbox = nc.batch_stored(&subj_root);
             let result = (|| -> Result<(), String> {
                 loop {
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -2049,24 +2245,31 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                         let hop = trace::Hop::begin(None);
                                         let carried = hop.context();
                                         let start_nanos = metrics::now_nanos();
-                                        let mut subjects = Vec::with_capacity(emits.len());
-                                        let mut lost: Option<String> = None;
-                                        for emit in &emits {
-                                            let subject = emit_subject(emit, &subj_root, &stem);
-                                            match nc.publish_traced(&subject, emit.to_payload(), &carried) {
-                                                Ok(()) => subjects.push(subject),
-                                                Err(e) => {
-                                                    eprintln!("[vejas] {}: publish {subject}: {e}", handle.spec.name);
-                                                    // nothing redelivers a tick: these emits are gone
-                                                    lost.get_or_insert(format!("publish {subject}: {e}"));
+                                        let (subjects, mut lost) = match hold_alerts(&mut outbox, &emits, &subj_root, &stem, &carried) {
+                                            Ok(subjects) => (subjects, None),
+                                            Err(error) => {
+                                                park_run(&js, &handle.spec.name, &emits, &subj_root, &stem, &error, &version, &carried)?;
+                                                (Vec::new(), Some(error))
+                                            }
+                                        };
+                                        // No message to deliver again stands behind what time
+                                        // closed: see `confirm_alerts`.
+                                        let confirmed = confirm_alerts(&mut outbox, &js, &handle.spec.name, &version, |_| Some(carried.clone()));
+                                        let dead = lost.is_some() || confirmed.as_ref().is_ok_and(|parked| !parked.is_empty());
+                                        match &confirmed {
+                                            Ok(parked) => {
+                                                if let Some((_, e)) = parked.first() {
+                                                    lost.get_or_insert(e.clone());
                                                 }
                                             }
+                                            Err(e) => lost = Some(e.clone()),
                                         }
                                         metrics::observe_tick_emits(&handle.spec.name, emits.len() as u64);
                                         if metrics::wants(hop.sampled, lost.is_some()) {
                                             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, &handle.spec.name, start_nanos)
                                                 .attr("vejas.flow.version", metrics::Attr::Computed(version.clone()))
                                                 .attr("vejas.emits", emits.len() as u64);
+                                            let span = if dead { span.attr("vejas.dlq", true) } else { span };
                                             record::end(
                                                 match lost {
                                                     Some(e) => span.failed(e),
@@ -2075,6 +2278,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                                 record::Extras::new().emits(subjects),
                                             );
                                         }
+                                        confirmed?;
                                     }
                                     Ok(_) => {}
                                     Err(e) => eprintln!("[vejas] {}: tick: {e}", handle.spec.name),
@@ -2095,13 +2299,24 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         }
                     }
                     let mut to_ack: Vec<(bus::Message, u64)> = Vec::new();
-                    // A success is recorded once the barrier confirms its emits left.
-                    let mut done: Vec<(metrics::Span, record::Extras)> = Vec::new();
+                    // The runs that alerted, recorded once their alerts are confirmed.
+                    let mut alerted: Vec<Alerted> = Vec::new();
                     for msg in batch {
                         if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                             return Ok(()); // un-acked: redelivers to whoever holds the durable next
                         }
                         let seq = msg.delivery().map(|i| i.stream_seq).unwrap_or(0);
+                        // A second delivery, of an ack lost or late: the engine of
+                        // a program with state took the message in, its consumer
+                        // being made at this start, so it is acked and not fed.
+                        // One nak'd when its dead letter failed was never taken in.
+                        if stateful
+                            && msg.delivery().is_some_and(|d| d.delivered > 1)
+                            && !retrying.contains(&seq)
+                        {
+                            to_ack.push((msg, seq));
+                            continue;
+                        }
                         // The consumer's filters are the `.from()` subjects, so one
                         // matches; the first declared wins when two overlap.
                         let Some(event_type) = sources
@@ -2155,101 +2370,98 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                     );
                                 }
                             }
-                            fed => {
-                                // A run's emits leave all together or not at all
-                                // (ADR-0032): one the batch refuses, a payload over
-                                // the server's limit, takes the others back out of
-                                // the batch, and the message fails as a run that
-                                // errs does, dead-lettered once its deliveries are
-                                // spent. Its emits used to leave at every delivery.
-                                let mark = outbox.held();
-                                let run = fed.map_err(|e| e.to_string()).and_then(|emits| {
-                                    let mut subjects = Vec::with_capacity(emits.len());
-                                    for emit in &emits {
-                                        let subject = emit_subject(emit, &subj_root, &stem);
-                                        outbox
-                                            .publish_traced(&subject, emit.to_payload(), &carried)
-                                            .map_err(|e| format!("publish {subject}: {e}"))?;
-                                        subjects.push(subject);
-                                    }
-                                    Ok(subjects)
-                                });
-                                match run {
-                                    Ok(subjects) => {
-                                        let emits = subjects.len() as u64;
-                                        metrics::observe(&handle.spec.name, true, emits, t0.elapsed().as_secs_f64());
-                                        if observing && hop.sampled {
-                                            let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos)
-                                                .attr("vejas.emits", emits);
-                                            done.push((span, record::Extras::new().emits(subjects.clone()).input(&msg.data)));
-                                        }
-                                        record_trace(
-                                            &handle.spec.name,
-                                            &msg.subject,
-                                            true,
-                                            None,
-                                            subjects,
-                                            connectors::trace_preview(&msg.data),
-                                            None,
-                                            Some(&hop),
-                                            msg.delivery(),
-                                        );
-                                        to_ack.push((msg, seq));
-                                    }
-                                    Err(e) => {
-                                        outbox.rollback(mark);
-                                        eprintln!("[vejas] {}: {e}", handle.spec.name);
-                                        metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
-                                        let delivered =
-                                            msg.delivery().map(|i| i.delivered).unwrap_or(1);
-                                        let mut dead_lettered = false;
-                                        if delivered >= MAX_DELIVERIES {
-                                            match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
-                                                Ok(()) => {
-                                                    dead_lettered = true;
-                                                    metrics::inc_dead_letter(&handle.spec.name);
-                                                    let _ = msg.ack();
-                                                    retrying.remove(&seq);
-                                                }
-                                                Err(_) => {
-                                                    let _ = msg.nak();
-                                                    retrying.insert(seq);
-                                                }
-                                            }
-                                        } else {
-                                            retrying.insert(seq); // left un-acked: redelivers after ack_wait
-                                        }
-                                        if observing {
-                                            let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
-                                            let span = if dead_lettered { span.attr("vejas.dlq", true) } else { span };
-                                            record::end(span.failed(e.clone()), record::Extras::new().input(&msg.data));
-                                        }
-                                        record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
-                                            vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
-                                        set_state(&handle, |st| st.last_error = Some(e));
-                                    }
+                            Err(e) => {
+                                // The engine took the event in before it failed:
+                                // delivered again, it would count twice. It is a
+                                // dead letter at once, and a replay of it is the
+                                // operator's choice.
+                                let err = e.to_string();
+                                eprintln!("[vejas] {}: {err}", handle.spec.name);
+                                metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
+                                let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                                connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable)
+                                    .map_err(|de| format!("{err}, and its dead letter failed: {de}"))?;
+                                metrics::inc_dead_letter(&handle.spec.name);
+                                if observing {
+                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
+                                    record::end(span.attr("vejas.dlq", true).failed(err.clone()), record::Extras::new().input(&msg.data));
                                 }
+                                record_trace(&handle.spec.name, &msg.subject, false, Some(format!("{err} — dead-lettered at once: the engine has taken it in")),
+                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
+                                set_state(&handle, |st| st.last_error = Some(err));
+                                to_ack.push((msg, seq));
+                            }
+                            Ok(emits) => {
+                                let first = outbox.held();
+                                let (subjects, parked) = match hold_alerts(&mut outbox, &emits, &subj_root, &stem, &carried) {
+                                    Ok(subjects) => (subjects, Vec::new()),
+                                    Err(error) => {
+                                        park_run(&js, &handle.spec.name, &emits, &subj_root, &stem, &error, &version, &carried)?;
+                                        (Vec::new(), vec![error])
+                                    }
+                                };
+                                alerted.push(Alerted {
+                                    emits: first..outbox.held(),
+                                    msg,
+                                    seq,
+                                    subjects,
+                                    parked,
+                                    hop,
+                                    start_nanos,
+                                    secs: t0.elapsed().as_secs_f64(),
+                                    observing,
+                                });
                             }
                         }
                     }
                     let processed_at = Instant::now();
-                    // Publish-before-ack barrier, one round-trip per batch (ADR-0002).
-                    let confirmed = outbox.confirm();
-                    match &confirmed {
-                        Ok(()) => {
-                            let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
-                            for (_, seq) in &to_ack {
-                                retrying.remove(seq);
-                                acked_max = acked_max.max(*seq);
+                    // Publish before ack, one round-trip per batch (ADR-0002).
+                    let confirmed = confirm_alerts(&mut outbox, &js, &handle.spec.name, &version, |index| {
+                        alerted.iter().find(|a| a.emits.contains(&index)).map(|a| a.hop.context())
+                    });
+                    let refused = match confirmed {
+                        Ok(refused) => refused,
+                        Err(e) => {
+                            for a in &alerted {
+                                if a.observing {
+                                    let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos);
+                                    record::end(span.failed(e.clone()), record::Extras::new().input(&a.msg.data));
+                                }
+                                record_trace(&handle.spec.name, &a.msg.subject, false, Some(e.clone()), vec![],
+                                    connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
                             }
-                            acks_since_snapshot += to_ack.len() as u64;
+                            return Err(e);
                         }
-                        Err(e) => eprintln!(
-                            "[vejas] {}: flush before ack failed: {e} (batch redelivers)",
-                            handle.spec.name
-                        ),
+                    };
+                    for a in alerted {
+                        let mut lost = a.parked;
+                        let held_back = lost.len();
+                        lost.extend(refused.iter().filter(|(index, _)| a.emits.contains(index)).map(|(_, e)| e.clone()));
+                        let stored = (a.subjects.len() - (lost.len() - held_back)) as u64;
+                        metrics::observe(&handle.spec.name, lost.is_empty(), stored, a.secs);
+                        let said = lost.first().map(|e| format!("{e} — the alert is a dead letter"));
+                        if a.observing && (a.hop.sampled || said.is_some()) {
+                            let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos)
+                                .attr("vejas.emits", stored);
+                            let extras = record::Extras::new().emits(a.subjects.clone()).input(&a.msg.data);
+                            match &said {
+                                None => record::end(span, extras),
+                                Some(e) => record::end(span.attr("vejas.dlq", true).failed(e.clone()), extras),
+                            }
+                        }
+                        if let Some(e) = &said {
+                            set_state(&handle, |st| st.last_error = Some(e.clone()));
+                        }
+                        record_trace(&handle.spec.name, &a.msg.subject, said.is_none(), said, a.subjects,
+                            connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
+                        to_ack.push((a.msg, a.seq));
                     }
-                    end_confirmed(done, &confirmed);
+                    let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
+                    for (_, seq) in &to_ack {
+                        retrying.remove(seq);
+                        acked_max = acked_max.max(*seq);
+                    }
+                    acks_since_snapshot += to_ack.len() as u64;
                     metrics::observe_round(
                         &handle.spec.name,
                         0.0,
@@ -2287,6 +2499,11 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                     st.restarts += 1;
                     st.last_error = Some(e);
                 });
+                // a batch the bus did not confirm starts the unit again: one
+                // that ran a while since its last start starts again soon
+                if began.elapsed() >= Duration::from_secs(60) {
+                    delay = Duration::from_secs(1);
+                }
                 thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
@@ -3858,6 +4075,10 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
         unit: String,
         // The durable it read the message with; none in a letter written before.
         consumer: Option<String>,
+        // An emit a stream refused: its replay is for every reader of the subject.
+        emit: bool,
+        // The payload was cut to fit the letter: it can be read, not replayed.
+        cut: bool,
     }
     let mut targets: Vec<Letter> = Vec::new();
     let take = |env: &Value| Letter {
@@ -3868,6 +4089,8 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
         original: env["original_seq"].as_u64(),
         unit: env["unit"].as_str().unwrap_or("").to_string(),
         consumer: env["consumer"].as_str().map(str::to_string),
+        emit: env["emit"].as_bool().unwrap_or(false),
+        cut: env["cut"].as_bool().unwrap_or(false),
     };
     if let Some(s) = seq {
         let m = js.get_message(connectors::DLQ_STREAM, s)?;
@@ -3888,12 +4111,24 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
     let units: HashSet<String> = scan_all(root).into_iter().map(|spec| spec.name).collect();
     let stream = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
     for letter in targets {
-        let Letter { seq: s, subject: subj, payload, died_in, original, unit: of_unit, consumer } = letter;
+        let Letter { seq: s, subject: subj, payload, died_in, original, unit: of_unit, consumer, emit, cut } = letter;
         if subj.is_empty() || s == 0 {
             errs.push(format!("seq {s}: the letter names no subject. Discard it."));
             continue;
         }
-        if !units.contains(&of_unit) {
+        if cut {
+            let kept = match original {
+                Some(n) => format!(" The message that died stays in the stream as sequence {n} until its retention removes it."),
+                None => String::new(),
+            };
+            errs.push(format!(
+                "seq {s}: the letter holds only the start of a payload too large to keep whole, so a replay would send another event.{kept} Discard the letter."
+            ));
+            continue;
+        }
+        // An emit a stream refused is for every reader of its subject: no unit
+        // or consumer of its own to check.
+        if !emit && !units.contains(&of_unit) {
             errs.push(if of_unit.is_empty() {
                 format!("seq {s}: the letter names no unit. Discard it, or publish its payload by hand.")
             } else {
@@ -3903,7 +4138,7 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
         }
         // A fix that moved the unit to another subject would leave the replay to
         // no one: the other consumers of this one ack it unread.
-        if let Some(consumer) = consumer {
+        if let Some(consumer) = consumer.filter(|_| !emit) {
             match js.consumer_filters(&stream, &consumer) {
                 Ok(f) if f.is_empty() || f.iter().any(|p| connectors::subject_matches(p, &subj)) => {}
                 Ok(_) => {
@@ -3918,7 +4153,11 @@ fn dlq_replay(root: &Path, seq: Option<u64>, unit: Option<&str>, actor: &str) ->
         }
         let hop = trace::Hop::begin(died_in);
         let start_nanos = metrics::now_nanos();
-        let published = js.publish_replay(&subj, &payload, &hop.context(), &of_unit, original);
+        let published = if emit {
+            js.publish_traced(&subj, &payload, &hop.context())
+        } else {
+            js.publish_replay(&subj, &payload, &hop.context(), &of_unit, original)
+        };
         if metrics::wants(hop.sampled, published.is_err()) {
             let span = metrics::Span::hop(&hop, metrics::Kind::Producer, "dlq:replay", start_nanos)
                 .messaging("send", &subj)
@@ -4193,19 +4432,65 @@ fn publish_emits(emits: &[(String, Value)], carried: &trace::Context) -> Result<
     }
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let nc = bus::connect(&url).map_err(|e| Unsent::Unconfirmed(format!("NATS unreachable: {e}")))?;
-    let mut batch = nc.batch();
+    nc.read_streams();
+    let root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    ensure_stream(&nc, &root);
+    let mut batch = nc.batch_stored(&root);
     for (subj, payload) in emits {
         batch
             .publish_traced(subj, serde_json::to_vec(payload).unwrap_or_default(), carried)
-            .map_err(|e| Unsent::Refused(format!("publish {subj}: {e}")))?;
+            .map_err(|e| Unsent::Refused(format!("publish {subj}: {e}, so none of this request's events left")))?;
     }
-    batch.confirm().map_err(Unsent::Unconfirmed)
+    let refused = batch.confirm_each().map_err(Unsent::Unconfirmed)?;
+    let Some(first) = refused.first() else {
+        return Ok(());
+    };
+    let said = format!("publish {}: {}", first.subject, first.error);
+    // One the stream refused for now may be stored later: the request is sent
+    // again. One no later try could store is the request's own error.
+    match refused.iter().find(|r| r.lasting) {
+        None => Err(Unsent::Unconfirmed(said)),
+        Some(r) => Err(Unsent::Refused(format!(
+            "publish {}: {}, which no later try changes: {} of this request's {} events went out",
+            r.subject,
+            r.error,
+            emits.len() - refused.len(),
+            emits.len()
+        ))),
+    }
+}
+
+/// Make the stream an api flow's emits go to, if the bus has not seen it: a
+/// runtime that only answers HTTP runs no unit on the bus that would, and its
+/// emits would be stored by no stream. One deleted since is made again once
+/// the bus has read the streams again. A stream that cannot be made, or
+/// streams that cannot be listed, are tried again at that pace, not at every
+/// request.
+fn ensure_stream(nc: &bus::Bus, root: &str) {
+    static TRIED: Mutex<Option<Instant>> = Mutex::new(None);
+    let name = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    if nc.has_stream(&name) {
+        return;
+    }
+    {
+        let mut tried = TRIED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tried.is_some_and(|at| at.elapsed() < bus::STREAMS_SEEN_FOR) {
+            return;
+        }
+        *tried = Some(Instant::now());
+    }
+    let _ = nc.jetstream().add_stream(&bus::StreamConfig {
+        name,
+        subjects: vec![format!("{root}.>")],
+        ..Default::default()
+    });
 }
 
 /// Why an api flow's emits did not all leave.
 enum Unsent {
-    /// The batch refused one, a payload over the server's limit or a subject
-    /// it cannot carry: none left, and sending the request again changes nothing.
+    /// The batch refused one, a payload over the server's limit, or the stream
+    /// refused one in a way no later try changes: sending the request again
+    /// changes nothing.
     Refused(String),
     /// The bus did not confirm them: some may be missing, and the request can
     /// be sent again.
@@ -4302,10 +4587,7 @@ fn run_api_flow(
     };
     metrics::observe(&unit, !failed, emits, t0.elapsed().as_secs_f64());
     let (code, body) = match (&result, &unsent) {
-        (Ok(_), Some(Unsent::Refused(e))) => (
-            500,
-            json!({"error": format!("{e}, so none of this request's events left")}).to_string(),
-        ),
+        (Ok(_), Some(Unsent::Refused(e))) => (500, json!({"error": e}).to_string()),
         (Ok(_), Some(Unsent::Unconfirmed(e))) => (
             503,
             json!({"error": format!("the bus did not confirm this request's events ({e}), so some may be missing: send the request again")}).to_string(),
@@ -4489,7 +4771,7 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "sap_send_idoc", "description": "Send an IDoc INTO SAP via transactional RFC (exactly-once). `control` is the EDI_DC40 control record (e.g. {TABNAM:\"EDI_DC40\", IDOCTYP:\"MATMAS05\", MESTYP:\"MATMAS\", SNDPRN, SNDPRT:\"LS\", RCVPRN, RCVPRT:\"LS\", DIRECT:\"2\"}); `data` is the array of EDI_DD40 segments ({SEGNAM, SDATA}). Pass a stable `tid` (24 chars) derived from an idempotency key for dedup across retries; omit for a fresh one. Returns the transaction id.", "inputSchema": obj(json!({"control": {"type": "object"}, "data": {"type": "array"}, "tid": {"type": "string"}}), vec!["control", "data"])}),
         json!({"name": "vejas_trace", "description": "What happened to one business event, end to end, from the trace record (ADR-0034). With `trace_id` (32 hex digits, as /events, vejas_events and every dead letter give it): every hop the event went through, in the order they started: unit, subject, delivery attempt, flow version, the subjects it emitted, the payload it received (credential-named keys masked, vault values taken out), the statements each flow ran with their line of code, a sink's downstream answer, the error and whether it was dead-lettered. With `search` instead (an order number, a customer id, any text): the latest traces whose payloads, subjects, units or errors mention it, newest first; read one of them by its trace_id. Answer from the record, not from a guess.", "inputSchema": obj(json!({"trace_id": {"type": "string"}, "search": {"type": "string"}, "limit": {"type": "integer"}}), vec![])}),
         json!({"name": "vejas_dlq", "description": "List dead letters — poison messages parked in the DLQ (ADR-0015) instead of dropped: unit, original subject, attempts, last error, payload, each with a `seq` for replay/purge. Newest first, at most 200; a payload past 16 KB is cut there.", "inputSchema": obj(json!({"limit": {"type": "integer"}}), vec![])}),
-        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why. Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
+        json!({"name": "vejas_dlq_replay", "description": "Replay dead letters — re-inject each to its ORIGINAL subject, for the unit it died in alone (no other consumer of the subject runs it), so the (now corrected) flow reprocesses it, then remove it from the DLQ. The letter of an alert a stream refused (`emit`) goes to its subject for every reader. A letter that no unit would take (its unit removed, or reading another subject now) stays, and `errors` says why, as does one whose payload was cut to fit (`cut`). Target one by `seq`, a whole `unit`, or all (omit both). Do this AFTER fixing the cause (vejas_set_literal, previewed with vejas_replay_literal). Refused in governed mode: a human replays them in the panel, after approving the fix.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
         json!({"name": "vejas_dlq_purge", "description": "Discard dead letters without replaying — by `seq`, by `unit`, or all (omit both). Refused in governed mode: a human discards them in the panel.", "inputSchema": obj(json!({"seq": {"type": "integer"}, "unit": {"type": "string"}}), vec![])}),
     ];
     // generation-by-prompt shells out to the agent CLI: only advertised where

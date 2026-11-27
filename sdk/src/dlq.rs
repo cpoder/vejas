@@ -61,7 +61,7 @@ pub fn to_dlq(
 ) -> Result<(), String> {
     ensure_dlq_stream(js);
     let now = epoch_secs();
-    let mut envelope = serde_json::json!({
+    let envelope = serde_json::json!({
         "original_subject": subject,
         "unit": unit,
         "attempts": attempts,
@@ -82,15 +82,74 @@ pub fn to_dlq(
         // filter still takes `original_subject` (ADR-0015 Amendment C).
         "consumer": consumer,
     });
-    // The trace the message died in (ADR-0034): a replay continues it, so the
-    // death and the second chance read as one story. Never at the cost of the
-    // letter: if its 70 bytes push the envelope past the server's limit, the
-    // letter goes without it.
+    park(js, envelope, unit, subject, attempts, version, trace)
+}
+
+/// Park an emit that a stream refused, when no redelivery of the message
+/// behind it could send it again: the alert of a detect unit, whose engine has
+/// taken that message in. `subject` is where the emit was going, and its
+/// replay publishes it there, for every reader, not for the unit alone.
+pub fn emit_to_dlq(
+    js: &bus::JetStream,
+    unit: &str,
+    subject: &str,
+    last_error: &str,
+    payload: &[u8],
+    version: &str,
+    trace: Option<&trace::Context>,
+) -> Result<(), String> {
+    ensure_dlq_stream(js);
+    let now = epoch_secs();
+    let envelope = serde_json::json!({
+        "original_subject": subject,
+        "unit": unit,
+        "attempts": 1,
+        "first_seen": now,
+        "dead_at": now,
+        "last_error": last_error,
+        "version": version,
+        "payload": String::from_utf8_lossy(payload),
+        "emit": true,
+    });
+    park(js, envelope, unit, subject, 1, version, trace)
+}
+
+/// Store a letter in the DLQ and announce it. The trace the message died in
+/// (ADR-0034): a replay continues it, so the death and the second chance read
+/// as one story. Never at the cost of the letter: if its 70 bytes push the
+/// envelope past the server's limit, the letter goes without it. Nor does a
+/// payload near that limit cost the letter: it is cut until the letter fits,
+/// and the letter says so, since what it holds can be read but not replayed.
+fn park(
+    js: &bus::JetStream,
+    mut envelope: Value,
+    unit: &str,
+    subject: &str,
+    attempts: i64,
+    version: &str,
+    trace: Option<&trace::Context>,
+) -> Result<(), String> {
+    let limit = js.max_payload();
     let mut body = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+    while body.len() > limit {
+        let text = envelope["payload"].as_str().unwrap_or_default();
+        if text.is_empty() {
+            return Err(format!("a letter of {} bytes without its payload is over the server's limit", body.len()));
+        }
+        // escaping may make the text take more room in the letter than its bytes
+        let mut keep = text.len() * (limit - limit / 10) / body.len();
+        while !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = text[..keep].to_string();
+        envelope["payload"] = cut.into();
+        envelope["cut"] = true.into();
+        body = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+    }
     if let Some(t) = trace {
         envelope["traceparent"] = t.traceparent().into();
         let traced = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
-        if traced.len() <= js.max_payload() {
+        if traced.len() <= limit {
             body = traced;
         }
     }

@@ -5,8 +5,9 @@ message broker among other services" — the entire platform substrate:
 
 - **Transport & persistence.** Every event between units crosses a
   JetStream stream (`VEJAS`, subjects `vx.>`). A hop is acknowledged only
-  after the next stage's write is confirmed — *publish-before-ack*, so a
-  crash anywhere redelivers instead of losing (at-least-once, end to end).
+  after the stream that stores each of the hop's emits has said it stored
+  it — *publish-before-ack*, so a crash anywhere redelivers instead of losing
+  (at-least-once, end to end).
 - **State.** Offsets, versions, leases, proposals: JetStream KV buckets.
   There is no database.
 - **Scaling.** Flows and sinks are competing consumers on durables — add an
@@ -31,6 +32,11 @@ The full contract: [Subjects reference](../reference/subjects.md).
 At-least-once, per-subject FIFO, redelivery after `VEJAS_ACK_WAIT_SECS`
 (default 30s; floor 1s), 5 attempts then the dead-letter queue with an
 explicit envelope — never a silent drop
-([DLQ & replay](../guides/dlq-replay.md)). Consumers must be idempotent or
+([DLQ & replay](../guides/dlq-replay.md)). An emit the stream refuses to
+store (a stream that is full and discards new messages, a full disk, no
+leader in a cluster) fails its run like an error: the message comes back,
+then becomes a dead letter that names the refusal. A detect unit's alert is
+a dead letter of its own instead, since its engine has taken the message in.
+Consumers must be idempotent or
 carry a dedup key; the transport invariants are CI-tested on a live bus
 (FIFO, redelivery→cap→DLQ, kill -9 no-loss, reconnection).

@@ -117,6 +117,47 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   chunked body was refused the same way.
 
 ### Fixed
+- **An emit a stream does not store fails its run.** Before acking a batch's
+  messages, the runtime checked that the server had read their emits, not that
+  a stream had stored them. A stream that was full and discarded new messages,
+  a full disk or a cluster with no leader for the stream dropped the emit, and
+  the message was acked and recorded as a success: the event was lost without
+  a trace. An emit to a subject a stream stores, `VEJAS` or any other, now
+  waits for that stream's answer. One the stream refuses fails its run: the
+  message comes back after `ack_wait`, then is a dead letter that names the
+  refusal (`publish vx.orders.ready: maximum messages exceeded`). A refusal no
+  delivery changes, a message over the stream's own size limit, is a dead
+  letter at the first delivery, and an `api` flow answers 500 for it, where it
+  answers 503 for any other refusal. A sealed stream is one too; a full
+  stream, account or disk is not. The batch's other runs stand, and the
+  refused run's other emits may be stored already, so they leave again with
+  it. A flow's success is recorded in `/events` once its emits are confirmed.
+  The runtime reads the account's streams when a unit starts and every 30 s
+  after, in the background, which takes the permission to list them
+  (`$JS.API.STREAM.LIST`); without it, the subjects under the root are taken
+  for stored. A stream that stores without answering (`no_ack`) keeps the
+  check of before. A runtime that runs only `api` flows makes `VEJAS` before their
+  first emit, and again within 30 s when it is deleted: before, those emits
+  were lost when no unit on the bus had made it. Waiting for the stream costs
+  a flow 4 % of its rate when it drains a backlog, and nothing that shows with
+  publishers in the loop (ADR-0035, amendment).
+- **A detect unit no longer feeds its engine a message twice.** A batch the
+  bus did not confirm was delivered again to the same engine, which had taken
+  every event of it in: a window counted them twice. Such a batch now starts
+  the unit again with a new engine, from its snapshot when it keeps one, whose
+  replay sends the alerts again. A message the server delivers again, its ack
+  lost or late, is acked without being fed when the program keeps state: the
+  unit's consumer is made again at each start, after what its engine holds. A
+  stateless program alerts again for it, at least once. An alert a stream
+  refuses is a dead letter of its own, marked `"emit": true`, and its message
+  is acked; its replay publishes the alert where it was going, for every
+  reader. An event the engine fails on is a dead letter at once.
+  When an alert is too large for the server, none of the run's alerts leave
+  and each is a dead letter. Alerts that time closes, with no message behind
+  them, are confirmed the same way: before, nothing checked that they left.
+- **A dead letter never fails for its size.** A payload that would take its
+  letter past the server's limit is cut to fit, and the letter says so
+  (`"cut": true`). A replay refuses it, since it holds only the start.
 - **An `api` flow answers 503 when the bus does not confirm its emits.** It
   answered 200, or what the flow said, without knowing whether its emits had
   left: with the bus down, the caller was told the event was taken and it was
