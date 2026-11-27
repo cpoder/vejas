@@ -8,6 +8,17 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **A public mode** (ADR-0041). `VEJAS_PUBLIC=1` serves the console's reads
+  and answers 404 to everything else, whatever the credential: every write,
+  `/mcp`, the `api` flows, the secrets, the samples, the previews, the
+  proposals and the metrics. No agent starts, nor the control channel. Reads
+  are capped, and the panel shows no action and says it is a read-only
+  demo. The allowlist sits in one place, and `e2e/public-mode.sh` tries
+  every route the runtime serves against it. See the guide "A public demo,
+  read only".
+- **`VEJAS_STREAM_MAX_AGE_SECS`**: how long the runtime's stream keeps a
+  message. Unset, it keeps them for ever, as before; set, an existing stream
+  takes the age at the next start.
 - **A flow can catch a failure** (ADR-0039). `try:` ... `catch e:` ... `end`
   runs the catch instead of failing the run, for a failure no later delivery
   may change: an error in the code, a call the service does not try again,

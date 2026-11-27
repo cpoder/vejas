@@ -28,6 +28,7 @@
 - [Cluster & zero-downtime](guides/clustering.md)
 - [The rules view](guides/rules-view.md)
 - [Observability](guides/observability.md)
+- [A public demo, read only](guides/public-demo.md)
 - [Golden-traffic curation](guides/golden-traffic.md)
 
 # Connectors

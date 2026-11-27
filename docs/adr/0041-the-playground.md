@@ -1,6 +1,6 @@
 # 0041 — The playground: the language in the browser, and a live runtime shown read-only
 
-- Status: Proposed
+- Status: Accepted (partial). Built: the public mode of point 2 (`VEJAS_PUBLIC`) and the stream's retention setting. Not built: the demo in `deploy/demo/`, the `vejas-lang` crate and the browser page.
 - Date: 2026-11-27
 
 ## Context

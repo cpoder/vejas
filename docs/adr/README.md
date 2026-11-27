@@ -50,7 +50,7 @@ the old one.
 | [0038](0038-one-connector-contract-two-packagings.md) | One connector contract, two packagings: a crate, in the runtime or standalone | Accepted (partial): the split and the crate built; standalone packaging not |
 | [0039](0039-a-flow-sees-its-message-and-owns-its-failures.md) | A flow sees its message as it came, and owns its failures | Accepted: the request as sent, messages that are not JSON, `try`/`catch` and `seen`/`remember` built |
 | [0040](0040-a-flow-holds-its-source-while-a-system-is-down.md) | A flow holds its source while a system it calls is down | Proposed |
-| [0041](0041-the-playground.md) | The playground: the language in the browser, and a live runtime shown read-only | Proposed |
+| [0041](0041-the-playground.md) | The playground: the language in the browser, and a live runtime shown read-only | Accepted (partial) |
 | [0042](0042-an-emit-carries-a-key-headers-and-a-time.md) | An emit carries a key, headers and a time, and a flow reads those of its message | Accepted |
 
 ## Template
