@@ -55,6 +55,24 @@ impl Failure {
     }
 }
 
+impl Failure {
+    /// What a run needed from the runtime did not come: a secret store, or
+    /// the flow's memory, did not answer. A later delivery may get it, at the
+    /// pace a message comes back when nothing says otherwise, up to the last
+    /// delivery the runtime makes (ADR-0039).
+    pub fn unanswered(error: String) -> Self {
+        Failure {
+            error: shown(error),
+            service: String::new(),
+            status: None,
+            retry: true,
+            timed_out: false,
+            attempts: vejas_connector::MAX_DELIVERIES,
+            delay: vejas_connector::pull::ack_wait(),
+        }
+    }
+}
+
 /// An error as it leaves a call: masked as the record masks one (ADR-0017).
 /// A value a secret store handed out, or a credential-named pair a system
 /// echoed in its answer, then reaches no log, span, answer or dead letter.

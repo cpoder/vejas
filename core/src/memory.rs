@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vejas_connector::bus;
 
@@ -20,11 +20,25 @@ pub struct Bucket {
     state: Mutex<State>,
 }
 
+/// How long a bucket that is not there is taken as absent, before `seen`
+/// asks again: a flow that reads keys before it marks any asks once a second
+/// at most, not at each message.
+const ABSENT_FOR: Duration = Duration::from_secs(1);
+
+/// How often a mark reads again how long the bucket keeps its keys: another
+/// instance, running another version of the flow, may have set it in the same
+/// instant to a shorter window.
+const RECHECK: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct State {
     kv: Option<bus::Kv>,
     /// How long the bucket keeps a key, as last read or set: zero for no limit.
     max_age: Duration,
+    /// When `max_age` was read.
+    checked: Option<Instant>,
+    /// Until when the bucket is taken as absent.
+    absent_until: Option<Instant>,
     /// The marks of the runs whose emits wait for the stream's answer, each
     /// with when its window passes: a copy of their message in the same round
     /// reads them before they are written.
@@ -74,16 +88,29 @@ impl Bucket {
     /// a run gave, and never less once it did.
     fn open(&self, window: Option<Duration>) -> Result<Option<bus::Kv>, String> {
         let mut state = self.state();
-        let longer = window.is_some_and(|w| !state.max_age.is_zero() && w > state.max_age);
+        let now = Instant::now();
         if let Some(kv) = &state.kv {
+            let stale = state.checked.is_none_or(|at| now.duration_since(at) > RECHECK);
+            let longer = window.is_some_and(|w| !state.max_age.is_zero() && (w > state.max_age || stale));
             if !longer {
                 return Ok(Some(kv.clone()));
             }
+        } else if window.is_none() && state.absent_until.is_some_and(|until| now < until) {
+            return Ok(None);
         }
         let stream = format!("KV_{}", self.name);
-        let kept = self.js.stream_state(&stream).ok().map(|s| s.max_age);
+        // A bus that does not answer is no absent bucket: `seen` would read
+        // a duplicate as new.
+        let kept = self
+            .js
+            .stream_state_if_any(&stream)
+            .map_err(|e| format!("the bucket {} did not answer: {e}", self.name))?
+            .map(|s| s.max_age);
         let max_age = match (kept, window) {
-            (None, None) => return Ok(None),
+            (None, None) => {
+                state.absent_until = Some(now + ABSENT_FOR);
+                return Ok(None);
+            }
             (None, Some(window)) => window,
             (Some(kept), Some(window)) if !kept.is_zero() && window > kept => {
                 self.js.put_stream(&bus::StreamConfig {
@@ -105,6 +132,8 @@ impl Bucket {
             .key_value(&bus::KvConfig { bucket: self.name.clone(), history: 1, max_age })
             .ok_or_else(|| format!("the bucket {} could not be opened", self.name))?;
         state.max_age = max_age;
+        state.checked = Some(now);
+        state.absent_until = None;
         state.kv = Some(kv.clone());
         Ok(Some(kv))
     }

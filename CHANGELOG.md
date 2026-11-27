@@ -12,21 +12,28 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   runs the catch instead of failing the run, for a failure no later delivery
   may change: an error in the code, a call the service does not try again,
   or a call on the delivery that spends the service's `ATTEMPTS`. Until then
-  the message comes back as before: retries stay deliveries. An `api`
-  flow's catch takes the failure at once. `e` holds `{error, service,
-  status, attempts}`. What the `try` emitted, remembered or responded before
+  the message comes back as before: retries stay deliveries. A `secret()`
+  or `seen()` whose store does not answer waits for the last delivery too;
+  in an `api` flow, such a failure answers 503 (a `secret()` one answered
+  500). An `api` flow's catch takes the failure at once. `e` holds
+  `{error, service, status, attempts}`. What the `try` emitted, remembered or responded before
   the failure is dropped; the variables it set stay. The trace record writes
   the step that failed as `caught`. A flow can so publish its own business
   reject when a system stays down, where the message became a dead letter.
+- **`base64()`**, a builtin: the base64 of a text's UTF-8 bytes; a value
+  that is not a string is read as `str` gives it, and null stays null. With
+  it, `unreadable.base64 ?? base64(unreadable.text)` is a message that is
+  not JSON in base64, whatever its bytes are (ADR-0039).
 - **A flow can drop a duplicate** (ADR-0039). `seen(key)` is true when a run
   of the flow said `remember key for "7d"` and the window has not passed.
   The runtime keeps the keys in a JetStream key-value bucket of the flow's,
   `VEJAS_SEEN_<flow>_<hash>`, under their SHA-256, and writes a run's marks
   once its emits are stored: a run that fails marks nothing, and a copy in
   the same batch finds the first one's mark. The bucket keeps a key as long
-  as the flow's longest window. The trace record counts the marks a run
-  wrote (`vejas.remembered`), or says why they were not
-  (`vejas.remember.error`): the message is acked, since its emits are
+  as the flow's longest window. A sampled run's trace record counts the
+  marks it wrote (`vejas.remembered`). A mark that cannot be written is
+  logged, and is in the record whether the run was sampled or not
+  (`vejas.remember.error`); the message is acked, since its emits are
   stored. `remember` is a write for the write gate. A run that is shown
   reads every key as new. A memory that does not answer fails the run as a
   call that may answer later does; an `api` flow answers 503. Two copies

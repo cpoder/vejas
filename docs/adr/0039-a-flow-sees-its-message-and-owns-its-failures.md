@@ -91,6 +91,11 @@ The bench names no client and ships nothing: what it taught is written here.
   `isBase64Encoded` flag), no mask reads them. A message that is not JSON
   and reads as no text is masked whole wherever the record, the events and
   the dead letters show it as text.
+- A builtin, `base64()`, gives the base64 of a text's UTF-8 bytes, so
+  `unreadable.base64 ?? base64(unreadable.text)` is the message in base64
+  whatever its bytes are: a reject that must carry the original value in
+  base64 can. It is pure, as every builtin is. What it gives is read by no
+  mask unless it sits under a key that says it is base64.
 - It is a field like another, so a replay of the recorded event runs the
   same way, and no engine change was needed. A JSON message with its own
   field `unreadable` sets the variable too: the language reference says so.
@@ -116,14 +121,20 @@ end
   delivery that spends the service's `ATTEMPTS`, and at the latest on the
   last of the five deliveries any message gets. Before that the run fails
   and the message comes back after the service's delay, as without `try`:
-  retries stay deliveries (ADR-0032). An `api` flow's request has no later
-  delivery, so its catch takes the failure at once.
+  retries stay deliveries (ADR-0032). A `secret()` or a `seen()` whose
+  store does not answer is a failure a later delivery may change, at the
+  pace a message comes back when nothing says otherwise: the catch takes it
+  on the last delivery. An `api` flow's request has no later delivery, so
+  its catch takes the failure at once, and answers 503 when nothing catches
+  such a failure.
 - `e` is `{error, service, status, attempts}`: `service` null for an error
   in the code, `status` null when the system gave no answer, `attempts` the
   delivery's number (1 for a request). `catch:` without a name is allowed.
 - What the `try` emitted, remembered or responded before the failure is
-  dropped: the run's effects stay all or nothing. The variables it set stay,
-  as a branch's do. A failure in the catch fails the run, or goes to the
+  dropped: the run's effects stay all or nothing, and the trace record
+  shows those statements as run, not as sent. The variables it set stay, as
+  a branch's do; a filter whose condition failed gives the flow its own
+  back. A failure in the catch fails the run, or goes to the
   `try` around it.
 - A run that is shown makes no call (ADR-0032), so its catch takes no
   call's failure: such a run fails there and says why, as before.
@@ -159,7 +170,9 @@ end
   The read and the mark are apart for that reason: a flow marks only what
   it published.
 - The window is a number and `s`, `m`, `h` or `d`, up to ten years, written
-  in the statement or in an UPPERCASE constant, so the parser checks it. The
+  in the statement or in an UPPERCASE constant, so the parser checks it. A
+  constant's window is its literal, wherever the constant is written: an
+  event's field of the same name never sets it. The
   stored value is when the window passes. The bucket keeps a key as long as
   the flow's longest window: a longer one raises its limit, a shorter one
   never lowers it.
@@ -167,11 +180,14 @@ end
   text.
 - The runtime holds a run's marks while its emits are confirmed, so a copy
   later in the same batch reads them. A mark that cannot be written fails
-  nothing: the emits are stored, so the message is acked, and the trace
-  says `vejas.remember.error`. The next copy is then processed again.
+  nothing: the emits are stored, so the message is acked. The log, the
+  unit's last error and the trace record say `vejas.remember.error`, whether
+  the run was sampled or not. The next copy is then processed again.
 - A bucket that does not answer fails the run, which the next delivery may
-  change, as a call's failure. An `api` flow answers 503, and opens its
-  bucket only when a run reads or marks a key.
+  change, as a call's failure; a bus that answers is asked whether the
+  bucket exists, and an error is never read as "no bucket". An `api` flow
+  answers 503, and opens its bucket only when a run reads or marks a key.
+  Until a bucket exists, `seen` asks for it once a second at most.
 - The lookup and the mark sit at the edges of the run, as the event and the
   ack do, so the run itself stays pure. `remember` is a write for the write
   gate of a read-method `api` flow. A shown run (preview, replay, time

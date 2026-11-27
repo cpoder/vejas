@@ -778,6 +778,36 @@ fn collect_own(stmts: &[Stmt], out: &mut Vec<String>) {
     }
 }
 
+/// Each `remember` whose window names a constant gets the constant's literal
+/// (ADR-0039): the parser checked it holds a duration.
+fn windows_from_constants(block: &mut Block, constants: &HashMap<&str, &Value>) {
+    for st in block.stmts.iter_mut() {
+        match st {
+            Stmt::Remember(_, window) => {
+                if let Expr::Var(name) = window {
+                    if let Some(value) = constants.get(name.as_str()) {
+                        *window = Expr::Lit((*value).clone());
+                    }
+                }
+            }
+            Stmt::If(arms, otherwise) => {
+                for (_, _, body) in arms.iter_mut() {
+                    windows_from_constants(body, constants);
+                }
+                if let Some(body) = otherwise {
+                    windows_from_constants(body, constants);
+                }
+            }
+            Stmt::For(_, _, body) => windows_from_constants(body, constants),
+            Stmt::Try(body, _, handler) => {
+                windows_from_constants(body, constants);
+                windows_from_constants(handler, constants);
+            }
+            Stmt::Assign(..) | Stmt::Emit(..) | Stmt::Respond(..) | Stmt::InvokeMerge(..) => {}
+        }
+    }
+}
+
 /// A name in capitals (`MIN_TOTAL_EUR`): how a business literal is named.
 fn is_upper_name(name: &str) -> bool {
     name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
@@ -1310,6 +1340,17 @@ impl<'a> Parser<'a> {
                     return Err(err_at(*at, self.src, &format!("the window of `remember` is a duration: {name} is no constant of the flow that holds one, as {name} = \"7d\" does")))
                 }
             }
+        }
+        // A window a constant holds is the constant's literal: read at run
+        // time, the variable could be an event's field of the same name,
+        // since the constant is assigned where it is written.
+        let windows: HashMap<&str, &Value> = self
+            .windows
+            .iter()
+            .filter_map(|(name, _)| surface.iter().find(|e| &e.name == name).map(|e| (name.as_str(), &e.value)))
+            .collect();
+        if !windows.is_empty() {
+            windows_from_constants(&mut stmts, &windows);
         }
         let mut prog = Program {
             source,
@@ -2370,6 +2411,20 @@ impl Steps {
         self.failed = true;
     }
 
+    /// The statements from the `first`th step on sent and answered nothing:
+    /// a `catch` dropped what its `try` emitted or responded before the
+    /// failure.
+    fn dropped_since(&mut self, first: u64) {
+        let first_in_tail = self.count - self.tail.len() as u64;
+        let head = self.head.iter_mut().skip(first as usize);
+        let tail = self.tail.iter_mut().skip(first.saturating_sub(first_in_tail) as usize);
+        for step in head.chain(tail) {
+            if let What::Emit(line, _) | What::Respond(line, _) = step.what {
+                step.what = What::Line(line);
+            }
+        }
+    }
+
     /// A `catch` took the failure the last step said: the run goes on.
     fn caught(&mut self) {
         if !std::mem::replace(&mut self.failed, false) {
@@ -2512,17 +2567,10 @@ impl Engine {
         }
         let memory = self.memory.as_ref().ok_or("seen() reads what a flow on the bus or an api flow remembered: this run has no memory")?;
         memory.seen(key).map_err(|e| {
-            let error = format!("seen(): {e}");
             // a bucket that did not answer may answer the next delivery
-            self.failure = Some(crate::connectors::answer::Failure {
-                error: error.clone(),
-                service: String::new(),
-                status: None,
-                retry: true,
-                timed_out: false,
-                attempts: vejas_connector::MAX_DELIVERIES,
-                delay: std::time::Duration::from_secs(1),
-            });
+            let failure = crate::connectors::answer::Failure::unanswered(format!("seen(): {e}"));
+            let error = failure.error.clone();
+            self.failure = Some(failure);
             error
         })
     }
@@ -2859,6 +2907,10 @@ fn run_service(name: &str, args: Map<String, Value>, engine: &mut Engine, caller
         Ok(s) => s,
         Err(e) => {
             engine.depth -= 1;
+            // a failure names the service as the flow does, as a call's does
+            if let Some(failure) = engine.failure.as_mut() {
+                failure.service = name.to_string();
+            }
             return Err(e);
         }
     };
@@ -3000,11 +3052,15 @@ fn exec_stmt(stmt: &Stmt, step: Option<u64>, ctx: &mut Ctx, engine: &mut Engine)
             // what the statements of the try sent, remembered and answered
             // is dropped with their failure: a run's effects stay all or none
             let (emits, marks, response) = (ctx.emits.len(), ctx.marks.len(), ctx.response.clone());
+            let first = engine.steps.as_ref().map(|steps| steps.count);
             if let Err(error) = exec_block(body, ctx, engine) {
                 let failure = engine.caught(&error).ok_or(error)?;
                 ctx.emits.truncate(emits);
                 ctx.marks.truncate(marks);
                 ctx.response = response;
+                if let (Some(first), Some(steps)) = (first, engine.steps.as_mut()) {
+                    steps.dropped_since(first);
+                }
                 if let Some(name) = name {
                     ctx.vars.insert(name.clone(), failure);
                 }
@@ -3148,14 +3204,16 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                 } else {
                     vec![]
                 };
-                let keep = truthy(&eval(cond, ctx, engine)?);
+                let keep = eval(cond, ctx, engine);
+                // the flow's own variables come back, also when the condition
+                // failed: a catch runs with them
                 for (k, old) in saved {
                     match old {
                         Some(v) => ctx.vars.insert(k, v),
                         None => ctx.vars.remove(&k),
                     };
                 }
-                if keep {
+                if truthy(&keep?) {
                     out.push(item);
                 }
             }
@@ -3176,7 +3234,15 @@ fn eval(e: &Expr, ctx: &mut Ctx, engine: &mut Engine) -> Result<Value, String> {
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or("secret() needs a string reference, e.g. secret(\"slack/webhook\")")?;
-                Value::String(engine.secrets.get(reference)?)
+                let value = engine.secrets.get(reference).map_err(|e| {
+                    // a store that did not answer may answer the next
+                    // delivery: a catch waits for the last (ADR-0039)
+                    let failure = crate::connectors::answer::Failure::unanswered(e);
+                    let error = failure.error.clone();
+                    engine.failure = Some(failure);
+                    error
+                })?;
+                Value::String(value)
             } else {
                 builtin(name, &vals)?
             }
@@ -3333,6 +3399,12 @@ fn builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             _ => Value::Null,
         },
         "abs" => arg(0).as_f64().map(|f| num(f.abs())).unwrap_or(Value::Null),
+        // The base64 of a text's UTF-8 bytes (ADR-0039): a value that is not
+        // a string is read as `str` gives it, and null stays null.
+        "base64" => match arg(0) {
+            Value::Null => Value::Null,
+            v => Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, to_display(&v))),
+        },
         _ => return Err(format!("unknown function {name}()")),
     })
 }
@@ -3809,6 +3881,20 @@ end\n";
         assert_eq!(p["r"], "FA.2026.77");
         assert_eq!(p["t"], "x");
         assert_eq!(p["l"], 3);
+    }
+
+    #[test]
+    fn base64_gives_the_utf8_bytes_of_a_text() {
+        let p = one_emit(
+            r#"emit "vx.t", {a: base64("a"), e: base64(word), n: base64(nothing), d: base64(doc), raw: unreadable.base64 ?? base64(unreadable.text)}"#,
+            json!({"word": "é", "nothing": null, "doc": {"k": 1}, "unreadable": {"error": "x", "text": "id=42;bad", "base64": null}}),
+        );
+        assert_eq!(p["a"], "YQ==");
+        assert_eq!(p["e"], "w6k=");
+        assert_eq!(p["n"], Value::Null);
+        assert_eq!(p["d"], "eyJrIjoxfQ==");
+        // a message that is not JSON, in base64 whatever its bytes are
+        assert_eq!(p["raw"], "aWQ9NDI7YmFk");
     }
 
     #[test]
@@ -4743,5 +4829,90 @@ end
         assert!(parse("remember event.k for \"1d\"\n").unwrap().writes_bus());
         assert!(!parse("x = seen(event.k)\nrespond 200, {seen: x}\n").unwrap().writes_bus());
         assert!(parse("try:\n    x = 1\ncatch e:\n    remember event.k for \"1d\"\nend\n").unwrap().writes_bus());
+    }
+
+    #[test]
+    fn what_the_runtime_did_not_give_waits_for_the_last_delivery() {
+        // a secret store that does not answer may answer a later delivery
+        let prog = parse(
+            r#"try:
+    k = secret("absent/key")
+    emit "vx.ok", {}
+catch e:
+    emit "vx.r", {service: e.service, status: e.status, attempts: e.attempts}
+end
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::with_secrets(std::env::temp_dir(), "default".into(), Arc::new(MapStore(Default::default())));
+        engine.delivered(Some(1));
+        failed(run(&prog, &json!({}), &mut engine));
+        assert!(engine.take_failure().is_some_and(|f| f.retry && f.attempts == vejas_connector::MAX_DELIVERIES));
+        engine.delivered(Some(vejas_connector::MAX_DELIVERIES));
+        let ctx = run(&prog, &json!({}), &mut engine).unwrap();
+        assert_eq!(
+            ctx.emits,
+            [("vx.r".to_string(), json!({"service": null, "status": null, "attempts": vejas_connector::MAX_DELIVERIES}))]
+        );
+        // a declaration whose secret does not resolve names the service as
+        // the flow does, as a call's failure does
+        let (url, _) = system(|_| (200, "{}", 0));
+        let call = parse(
+            r#"try:
+    o = invoke get_order(id: event.id)
+catch e:
+    emit "vx.r", {service: e.service, attempts: e.attempts}
+end
+"#,
+        )
+        .unwrap();
+        let root = declared("unresolved", &url, "");
+        let mut bare = Engine::with_secrets(root, "default".into(), Arc::new(MapStore(Default::default())));
+        bare.delivered(Some(3));
+        let ctx = run(&call, &json!({"id": "x"}), &mut bare).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": 3}));
+    }
+
+    #[test]
+    fn a_filter_whose_condition_fails_gives_the_flow_its_variables_back() {
+        let p = one_emit(
+            r#"id = event.id
+try:
+    open = event.lines[qty.n > 0]
+catch e:
+    emit "vx.rejected", {order: id}
+end"#,
+            json!({"id": "O-1", "lines": [{"id": "L-9", "qty": 3}]}),
+        );
+        assert_eq!(p["order"], "O-1");
+    }
+
+    #[test]
+    fn what_a_try_sent_before_its_failure_is_no_step_that_sent() {
+        let prog = parse(
+            r#"try:
+    emit "vx.inside", {}
+    respond 201, {}
+    x = event.n.deep
+catch e:
+    emit "vx.r", {}
+end
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::live(std::env::temp_dir(), "default".into());
+        engine.record_steps(true);
+        run(&prog, &json!({"n": 5}), &mut engine).unwrap();
+        assert_eq!(steps_of(&mut engine), ["1", "2", "3", "4 caught", "6>vx.r"]);
+    }
+
+    #[test]
+    fn a_window_a_constant_holds_is_its_literal_whatever_the_event_says() {
+        // the constant is assigned where it is written, after the remember:
+        // its literal holds all the same, and an event's field of its name
+        // does not
+        let prog = parse("remember event.id for KEEP\nKEEP = \"1h\"\n").unwrap();
+        let ctx = run(&prog, &json!({"id": "a", "KEEP": "3650d"}), &mut Engine::live(std::env::temp_dir(), "default".into())).unwrap();
+        assert_eq!(ctx.marks, [("a".to_string(), std::time::Duration::from_secs(3600))]);
     }
 }
