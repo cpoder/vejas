@@ -135,9 +135,11 @@ respond 200, {id: id, status: "shipped"}
 - A path parameter named `event` or `request` is read as
   `request.params.event`, and a body field named `request` as
   `event.request`: those two names are the runtime's.
-- `respond` is the HTTP answer; `emit` still fires bus side-effects
-  (best-effort — if the side effect must be guaranteed, emit to a subject
-  and let an async flow own it).
+- `respond` is the HTTP answer, sent once the bus has confirmed the run's
+  `emit`s, so a caller told 2xx can count on them. When the bus does not
+  confirm them, the answer is 503 and the caller sends the request again;
+  an emit the bus can never take (a payload over its limit, say) answers
+  500.
 - The whole API self-describes at `GET /api/openapi.json`
   (`API_REQUEST`/`API_RESPONSE` literals type it; `VEJAS_API_TITLE` and
   friends fill the metadata).

@@ -1,6 +1,8 @@
 # 0025 — MQTT: a hand-rolled sync client, not a dependency
 
-- Status: Proposed
+- Status: Accepted. The client (`core/src/mqtt.rs`) and the `mqtt-in` and
+  `mqtt-out` drivers are built, with TLS over a direct rustls stream (open
+  question 1), and CI certifies both drivers against a real mosquitto.
 - Date: 2026-08-23
 
 ## Context

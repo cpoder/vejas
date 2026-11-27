@@ -17,6 +17,6 @@ request/response path (`rpc:exec`) is cluster-safe through a queue group:
 each instance holds its own SAP logon, the bus distributes.
 
 The end-to-end bridge (IDoc in → flow → response) is exercised in the
-recorded demo; a live SAP is required for the last mile, which is why the
-recipe carries a stated exception rather than a mock that would prove
-nothing.
+recorded demo; a live SAP is required for the last mile. The connector has
+no recipe in the [certified catalog](catalog.md): CI has no SAP to run it
+against, and a mock would prove nothing.

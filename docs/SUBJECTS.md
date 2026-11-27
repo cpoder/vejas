@@ -5,7 +5,8 @@ Everything on the bus lives under one subject root: `vx.` (configurable via
 
 Bundled connectors are **native Rust drivers** run from a declarative manifest
 (`connectors/<name>.vjs`: `driver "..."` + literal config, editable in the panel,
-hot-addable). No subprocess, no Python. Drivers today:
+hot-addable). No Python, and no subprocess outside the exec drivers, whose job
+is to run one. Drivers today:
 
 - **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT, MAX_CONNECTIONS.
 - **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS
@@ -13,8 +14,9 @@ hot-addable). No subprocess, no Python. Drivers today:
 - **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS; optional `ENVELOPE = true` publishes `{endpoint, fetched_at, body}` (like oauth-poll) so a stateless flow gets a `collected_at`; `endpoint` is the URL without its user info and its query. Like http-out and oauth-poll, it follows no redirect: a 3xx is an error.
 - **oauth-poll** (source:poll) — OAuth2 client-credentials REST poller: token from
   TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
-  pagination via NEXT_LINK_FIELD (default `@odata.nextLink`, absolute links followed
-  as-is) capped by MAX_PAGES, publishes one `{endpoint, fetched_at, body}` message
+  pagination via NEXT_LINK_FIELD (default `@odata.nextLink`; a next page on
+  another scheme, host or port than its page is not followed, since the token
+  would go along) capped by MAX_PAGES, publishes one `{endpoint, fetched_at, body}` message
   per page on SUBJECT. SCOPE is optional (omitted from the token form when empty —
   e.g. CrowdStrike). `EXPAND = [{name, list, detail, key, as, list_field?}]` adds a
   client-side $expand — every item of the list array (`list_field`, default
@@ -30,7 +32,8 @@ hot-addable). No subprocess, no Python. Drivers today:
   3.1.1 client, in-binary, zero dependency (ADR-0025). QoS 1 maps our
   at-least-once natively: the source holds the broker's PUBACK until the bus
   publish is confirmed; the sink acks the bus only after the broker's PUBACK.
-  TLS / QoS 2 / MQTT 5 → the mosquitto exec-bridge escape hatch.
+  `TLS = true` connects over rustls (public CA roots only); QoS 2 / MQTT 5 → the
+  mosquitto exec-bridge escape hatch.
 - **mq source/sink** (standalone binary, `connectors/mq`) — IBM MQ as a
   first-class transactional citizen (ADR-0023): MQGET under syncpoint → bus
   publish (await pub-ack) → MQCMIT, and the mirror for the sink. Hand-declared

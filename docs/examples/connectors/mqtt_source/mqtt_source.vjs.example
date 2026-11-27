@@ -5,7 +5,8 @@
 # Singleton is structural in 3.1.1 (shared subscriptions are MQTT 5).
 # Subjects in: (none) · out: vx.mqtt.sensors.in · secrets: mqtt/username,
 # mqtt/password (uncomment for an authenticated broker; CI runs anonymous).
-# TLS / QoS 2 / MQTT 5 -> the mosquitto exec-bridge escape hatch.
+# TLS = true connects over rustls (public CA roots only); QoS 2 / MQTT 5 ->
+# the mosquitto exec-bridge escape hatch.
 driver "mqtt-in"
 BROKER = "broker.example.com:1883"
 TOPIC = "sensors/temp"
