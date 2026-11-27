@@ -96,7 +96,9 @@ The bench names no client and ships nothing: what it taught is written here.
   whatever its bytes are: a reject that must carry the original value in
   base64 can. It is pure, as every builtin is. What it gives is read by no
   mask unless it sits under a key that says it is base64; the base64 of a
-  text that holds a secret is masked as the secret is, under any key.
+  short text that holds a secret, a credential pair, is masked as the
+  secret is, under any key. The last 64 such values are kept apart from
+  the values the stores hand out, so that none pushes those out.
 - It is a field like another, so a replay of the recorded event runs the
   same way, and no engine change was needed. A JSON message with its own
   field `unreadable` sets the variable too: the language reference says so.
@@ -126,7 +128,8 @@ end
   store does not answer is a failure a later delivery may change, at the
   pace a message comes back when nothing says otherwise: the catch takes it
   on the last delivery. A secret the store says it does not have is an
-  error in the code, which no delivery changes. An `api` flow's request has
+  error in the code, which no delivery changes; in a service's declaration,
+  it fails the call to that service without a retry. An `api` flow's request has
   no later delivery, so
   its catch takes the failure at once, and answers 503 when nothing catches
   such a failure.

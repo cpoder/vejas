@@ -39,19 +39,25 @@ pub struct Failure {
 }
 
 impl Failure {
-    /// A declaration whose settings could not be resolved: a secret store that
-    /// did not answer, say. A later delivery may resolve them. Its own
-    /// attempts and delay are among what is not known, so the defaults apply.
-    pub fn unresolved(service: &str, error: String) -> Self {
-        Failure {
-            error: shown(error),
-            service: service.to_string(),
-            status: None,
-            retry: true,
-            timed_out: false,
-            attempts: 3,
-            delay: Duration::from_millis(1000),
-        }
+    /// A declaration whose settings could not be resolved. A secret store
+    /// that did not answer may answer a later delivery, at the pace a message
+    /// comes back (`unanswered`); a secret the store says it does not have,
+    /// or a setting its code cannot give, no delivery changes.
+    pub fn unresolved(service: &str, error: String, later: bool) -> Self {
+        let failure = if later {
+            Failure::unanswered(error)
+        } else {
+            Failure {
+                error: shown(error),
+                service: String::new(),
+                status: None,
+                retry: false,
+                timed_out: false,
+                attempts: 1,
+                delay: Duration::ZERO,
+            }
+        };
+        Failure { service: service.to_string(), ..failure }
     }
 }
 

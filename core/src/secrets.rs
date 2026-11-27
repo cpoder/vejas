@@ -14,7 +14,7 @@
 // value is read from `{mount}/data/{path}` and the `{key}` field. For env it is
 // the whole reference uppercased with separators turned into underscores.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -223,19 +223,45 @@ fn remember(value: &str) {
     }
 }
 
-/// A value made from `from`, as `base64()` makes one: when `from` holds a
-/// value handed out or held, `value` is masked as that value is, since no
-/// mask reads through the encoding (ADR-0039).
+/// The values made from one handed out or held, as `base64()` makes one,
+/// the last ones only: apart from the values handed out, so that however
+/// many come, none pushes a store's value out of the masks.
+static DERIVED: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+const DERIVED_MAX: usize = 64;
+/// Longer than this, a text is a message, not a credential pair: the masks
+/// read its base64 under a key that says it is base64.
+const DERIVED_FROM_MAX: usize = 256;
+
+/// A value made from `from`, as `base64()` makes one: when `from` is short
+/// and holds a value handed out or held, `value` is masked as that value
+/// is, since no mask reads through the encoding (ADR-0039).
 pub(crate) fn derived(from: &str, value: &str) {
-    let holds = |held: &String| !held.is_empty() && from.contains(held.as_str());
+    if from.len() > DERIVED_FROM_MAX {
+        return;
+    }
+    let holds = |held: &String| !held.is_empty() && held.len() <= from.len() && from.contains(held.as_str());
     let handed = HANDED_OUT
         .get()
         .is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.keys().any(holds));
     let held = handed
         || HELD.get().is_some_and(|held| held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().any(holds));
-    if held {
-        remember(value);
+    if !held {
+        return;
     }
+    let mut derived = DERIVED.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(at) = derived.iter().position(|known| known == value) {
+        // masked already: the last one made again
+        if let Some(known) = derived.remove(at) {
+            derived.push_back(known);
+        }
+        return;
+    }
+    if derived.len() >= DERIVED_MAX {
+        derived.pop_front();
+    }
+    derived.push_back(value.to_string());
+    drop(derived);
+    HANDED_OUT_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Every value handed out and still remembered, and every value held
@@ -247,6 +273,9 @@ pub fn handed_out() -> Vec<String> {
         .unwrap_or_default();
     if let Some(held) = HELD.get() {
         values.extend(held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned());
+    }
+    if let Some(derived) = DERIVED.get() {
+        values.extend(derived.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned());
     }
     values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     values.dedup();
@@ -701,6 +730,18 @@ mod tests {
         let values = handed_out();
         assert!(values.iter().any(|v| v == "dXNlcjpkZXJpdmVkLXNlY3JldC12YWx1ZS0x"));
         assert!(!values.iter().any(|v| v == "bm90aGluZyBoYW5kZWQgb3V0IGluIGl0"));
+        // a message that holds it is no credential pair: its base64 is not kept
+        let message = format!("{}derived-secret-value-1", "x".repeat(DERIVED_FROM_MAX));
+        derived(&message, "a-long-message-in-base64");
+        assert!(!handed_out().iter().any(|v| v == "a-long-message-in-base64"));
+        // however many are made, the store's value stays among the masks
+        for n in 0..DERIVED_MAX * 2 {
+            derived(&format!("{n}:derived-secret-value-1"), &format!("derived-in-base64-{n}"));
+        }
+        let values = handed_out();
+        assert!(values.iter().any(|v| v == "derived-secret-value-1"));
+        assert!(values.iter().any(|v| *v == format!("derived-in-base64-{}", DERIVED_MAX * 2 - 1)));
+        assert!(!values.iter().any(|v| v == "derived-in-base64-0"));
     }
 
     #[test]

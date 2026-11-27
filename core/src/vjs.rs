@@ -2856,9 +2856,12 @@ impl Engine {
                             Engine::with_secrets(self.project_root.clone(), pkg.to_string(), self.secrets.clone());
                         match run(&prog, &Value::Object(Map::new()), &mut resolving) {
                             Ok(ctx) => ctx.vars.into_iter().filter(|(k, _)| is_upper_name(k)).collect(),
-                            // a store that did not answer may answer the next delivery
+                            // a store that did not answer may answer a later
+                            // delivery; a secret it does not have will not
                             Err(e) => {
-                                let failure = crate::connectors::answer::Failure::unresolved(&key, format!("service {key}: {e}"));
+                                let later = resolving.failure.is_some();
+                                let failure =
+                                    crate::connectors::answer::Failure::unresolved(&key, format!("service {key}: {e}"), later);
                                 let error = failure.error.clone();
                                 self.failure = Some(failure);
                                 return Err(error);
@@ -4214,7 +4217,7 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
     }
 
     #[test]
-    fn a_declaration_holds_settings_and_its_secrets_may_resolve_later() {
+    fn a_declaration_holds_settings_and_a_secret_its_store_lacks_is_not_tried_again() {
         let (url, seen) = system(|_| (200, "{}", 0));
         let root = declared("settings", &url, "");
         let services = root.join("services");
@@ -4228,11 +4231,12 @@ HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
         let mut engine = live(root.clone());
         let e = failed(run(&parse("o = invoke loops(id: 1)\n").unwrap(), &json!({}), &mut engine));
         assert!(e.contains("its file holds settings, and invokes and emits nothing"), "{e}");
-        // a secret the store does not give: a later delivery may get it
+        // a secret the store says it does not have: no delivery gives it (a
+        // store that does not answer: what_the_runtime_did_not_give_...)
         let e = failed(run(&parse("o = invoke locked(id: 1)\n").unwrap(), &json!({}), &mut engine));
         assert!(e.contains("missing/key") && e.contains("not found"), "{e}");
         let f = engine.take_failure().unwrap();
-        assert!(f.retry && !f.timed_out && f.attempts == 3, "{f:?}");
+        assert!(!f.retry && !f.timed_out && f.service == "locked", "{f:?}");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -4908,10 +4912,21 @@ end
         )
         .unwrap();
         let root = declared("unresolved", &url, "");
-        let mut bare = Engine::with_secrets(root, "default".into(), Arc::new(MapStore(Default::default())));
-        bare.delivered(Some(3));
+        // a secret the store says it does not have: no delivery changes it
+        let mut bare = Engine::with_secrets(root.clone(), "default".into(), Arc::new(MapStore(Default::default())));
+        bare.delivered(Some(1));
         let ctx = run(&call, &json!({"id": "x"}), &mut bare).unwrap();
-        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": 3}));
+        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": 1}));
+        // a store that does not answer: the catch waits for the last delivery
+        let mut down = Engine::with_secrets(root, "default".into(), Arc::new(Unreachable));
+        down.delivered(Some(1));
+        failed(run(&call, &json!({"id": "x"}), &mut down));
+        let failure = down.take_failure().expect("a failure a later delivery may change");
+        assert_eq!((failure.service.as_str(), failure.attempts), ("get_order", vejas_connector::MAX_DELIVERIES));
+        assert!(!failure.delay.is_zero());
+        down.delivered(Some(vejas_connector::MAX_DELIVERIES));
+        let ctx = run(&call, &json!({"id": "x"}), &mut down).unwrap();
+        assert_eq!(ctx.emits[0].1, json!({"service": "get_order", "attempts": vejas_connector::MAX_DELIVERIES}));
     }
 
     /// A secret store that does not answer.

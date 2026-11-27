@@ -16,7 +16,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   or `seen()` whose store does not answer waits for the last delivery too;
   in an `api` flow, such a failure answers 503 (a `secret()` one answered
   500). A secret the store says it does not have stays an error in the
-  code. An `api` flow's catch takes the failure at once. `e` holds
+  code; in a service's declaration, the call to that service now fails
+  without a retry, where it was tried three times, a second apart. An `api` flow's catch takes the failure at once. `e` holds
   `{error, service, status, attempts}`. What the `try` emitted, remembered or responded before
   the failure is dropped; the variables it set stay. The trace record writes
   the step that failed as `caught`. A flow can so publish its own business
@@ -25,7 +26,8 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   that is not a string is read as `str` gives it, and null stays null. With
   it, `unreadable.base64 ?? base64(unreadable.text)` is a message that is
   not JSON in base64, whatever its bytes are (ADR-0039). The base64 of a
-  text that holds a secret is masked as the secret is.
+  short text (256 bytes at most) that holds a secret is masked as the
+  secret is.
 - **A flow can drop a duplicate** (ADR-0039). `seen(key)` is true when a run
   of the flow said `remember key for "7d"` and the window has not passed.
   The runtime keeps the keys in a JetStream key-value bucket of the flow's,
