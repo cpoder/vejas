@@ -376,6 +376,17 @@
   .banner svg { color: var(--err); margin-top: 2px; }
   .banner p { margin: 0; }
   .banner b { color: var(--err); }
+  /* a public runtime (ADR-0041): said once at the top, and no action shows */
+  .demo-note { display: flex; gap: 10px; align-items: center; border-radius: 10px; padding: 10px 14px; margin: 0 0 18px;
+               background: var(--in-wash); color: var(--ink); font-size: 14px; max-width: 1060px; }
+  .demo-note[hidden] { display: none; }
+  .demo-note svg { color: var(--in); flex: none; }
+  .demo-note p { margin: 0; }
+  body.public .item.add, body.public .rail [data-key="secrets"], body.public a[href^="#/new"], body.public a[href="#/secrets"],
+  body.public [data-act="edit-sample"], body.public [data-act="test-con"], body.public [data-act="golden"],
+  body.public [data-act="dlq"], body.public [data-act="decide"], body.public .filebox .bar .primary { display: none; }
+  .val.ro { cursor: default; background: var(--sunk); border-color: var(--line2); }
+  .val.ro .n { color: var(--ink3); }
   #toast { position: fixed; bottom: 18px; right: 18px; max-width: 440px; padding: 11px 16px; border-radius: 10px;
            background: var(--ink); color: var(--surface); font-size: 14px; opacity: 0; transform: translateY(6px);
            transition: opacity .25s, transform .25s; pointer-events: none; box-shadow: 0 6px 24px rgba(0, 0, 0, .18); z-index: 5; }
@@ -449,6 +460,7 @@
 </nav>
 
 <main>
+  <div class="demo-note" id="demo-note" hidden><svg class="i" aria-hidden="true"><use href="#i-pulse"/></svg><p><b>A live demo, read only.</b> These flows run on real events as you watch. You can look at everything; nothing here can be changed.</p></div>
   <div class="banner" id="banner" role="alert" hidden></div>
   <div class="page" id="page"><p class="lede">Loading…</p></div>
 </main>
@@ -504,6 +516,7 @@ const send = (url, payload, headers = {}) => fetch(url, { method: 'POST',
     ...(writeToken ? {Authorization: `Bearer ${writeToken}`} : {}), ...headers},
   body: JSON.stringify(payload) });
 async function post(url, payload) {
+  if (PUBLIC) throw new Error('This is a read-only demo: nothing can be changed here.');
   let res = await send(url, payload);
   if (res.status === 401 && !writeToken) {
     writeToken = (prompt('Write token (VEJAS_TOKEN)') || '').trim();
@@ -522,6 +535,10 @@ const setLiteral = (file, name, key, value) => post('/surface/set', {file, name,
 // as access_Token): an underscore where a lowercase letter or a digit meets an
 // uppercase one.
 const SECRET_KEY_PATTERN = "{{SECRET_PATTERN}}";
+// A public runtime (ADR-0041) serves this page read only: no action shows, no
+// write leaves it, and the runtime would refuse one anyway.
+const PUBLIC = '{{PUBLIC}}' === 'true';
+if (PUBLIC) { document.body.classList.add('public'); $('#demo-note').hidden = false; }
 const keyAsRead = k => String(k).replace(/([a-z0-9])(?=[A-Z])/g, '$1_');
 const isSecretKey = k => new RegExp(SECRET_KEY_PATTERN, 'i').test(keyAsRead(k));
 // A path to a value, `auth.pass` or a literal's key `auth/pass`: a credential
@@ -595,7 +612,7 @@ async function loadCore() {
     getJSON('/surface'),
     getJSON('/topology').catch(() => ({flows: [], connectors: []})),
     getJSON('/graph').catch(() => ({flows: [], services: [], connectors: []})),
-    getJSON('/secrets').catch(() => null),
+    PUBLIC ? null : getJSON('/secrets').catch(() => null),
   ]);
   Object.assign(S, {surface, topo, graph, secrets});
   renderRail();
@@ -767,7 +784,8 @@ async function render(opts = {}) {
   // once it is on screen, never while an older page still is
   const hooks = {after: null, ctx: null};
   // the page name comes from the address bar: only our own pages, never a prototype's member
-  try { await (Object.hasOwn(PAGES, r.page) ? PAGES[r.page] : pageMissing)(view, r, hooks); }
+  const page = PUBLIC && ['new', 'secrets'].includes(r.page) ? pageMissing : Object.hasOwn(PAGES, r.page) ? PAGES[r.page] : pageMissing;
+  try { await page(view, r, hooks); }
   catch (e) { hooks.ctx = null; view.innerHTML = `<div class="head"><h1>This page did not load</h1></div><p class="lede">${esc(e.message)}</p>`; }
   if (token !== pageToken) return;  // a newer route took over meanwhile
   PAGE = hooks.ctx; SHOWN = r;
@@ -957,6 +975,7 @@ function chip(ctx, name, bare = false) {
   const e = ctx.entries[name];
   if (!e) return esc(name);
   ctx.shown.add(name);
+  if (PUBLIC) return `<span class="val ro" title="${esc(e.doc || name)}">${bare ? chipValue(e) : chipLabel(e)}</span>`;
   return `<button type="button" class="val" data-lit="${esc(name)}" aria-expanded="false"${bare ? ` aria-label="Change ${esc(name)}"` : ''} title="${esc(e.doc || 'Change ' + name)}">${icon('edit')}${bare ? chipValue(e) : chipLabel(e)}</button>`;
 }
 function chipValue(e) {
@@ -1069,7 +1088,7 @@ async function pageFlow(view, r, hooks) {
   document.title = `${shortName(f.name)} · Vejas`;
   const [shape, preview] = await Promise.all([
     getJSON('/shape?file=' + enc(f.file)).catch(e => ({error: e.message})),
-    getJSON('/preview?file=' + enc(f.file)).catch(() => null),
+    PUBLIC ? null : getJSON('/preview?file=' + enc(f.file)).catch(() => null),
     loadEvents(r),
   ]);
   const ctx = makeCtx(f.file, 'flow', {pipeline: (preview && preview.pipeline) || {}, input: preview && preview.fixture ? preview.input : undefined});
@@ -1102,7 +1121,7 @@ function routeHtml(f, shape, ctx, preview) {
   if (topCalls || !checks) parts.push(calls, checks); else parts.push(checks, calls);
   parts.push(stopSends(f, shape, ctx, preview));
   return `<div class="route">${parts.join('')}</div>
-    <div class="legend"><span><i class="sw" style="background:var(--in)"></i>What comes in</span><span><i class="sw" style="background:var(--out)"></i>What goes out</span><span><i class="sw" style="background:var(--edit);border:1.5px solid var(--edit-line)"></i>A business value you can change</span></div>`;
+    <div class="legend"><span><i class="sw" style="background:var(--in)"></i>What comes in</span><span><i class="sw" style="background:var(--out)"></i>What goes out</span>${PUBLIC ? '<span><i class="sw" style="background:var(--sunk);border:1.5px solid var(--line2)"></i>A business value</span>' : '<span><i class="sw" style="background:var(--edit);border:1.5px solid var(--edit-line)"></i>A business value you can change</span>'}</div>`;
 }
 
 function stopReceives(f, shape, ctx, preview) {
@@ -1123,7 +1142,7 @@ function stopReceives(f, shape, ctx, preview) {
   } else {
     body += `<div class="names">${reads.map(p => `<span>${esc(p)}</span>`).join('')}</div>`;
   }
-  body += `<div class="more-line">${ctx.input !== undefined ? 'The values come from the sample event.' : 'No sample event yet. Write one to see what each step makes of it.'}
+  if (!PUBLIC) body += `<div class="more-line">${ctx.input !== undefined ? 'The values come from the sample event.' : 'No sample event yet. Write one to see what each step makes of it.'}
     <button class="btn small" type="button" data-act="edit-sample">${icon('sample')}${ctx.input !== undefined ? 'Edit the sample' : 'Write a sample'}</button></div><div id="sample-slot"></div>`;
   return stop('in', 'in', 'Receives', `an event on ${orList(subjects)}`, body);
 }
@@ -1504,6 +1523,7 @@ function fileEditor(kind, file, onClose) {
     <div class="bar"><button class="btn primary" type="button">${kind === 'script' ? 'Save the code' : 'Save the sample'}</button><button class="btn quiet" type="button">Close</button>
     <span class="msg">${kind === 'script' ? 'Saving reloads it at once.' : 'JSON, as the source would send it.'}</span></div>`;
   const [save, close] = $$('button', box), ta = $('textarea', box), path = $('.filebar', box);
+  if (PUBLIC) { ta.readOnly = true; $('.msg', box).textContent = 'Read only.'; }
   getJSON(kind === 'script' ? '/file?path=' + enc(file) : '/fixture?file=' + enc(file))
     .then(d => { path.textContent = d.path; ta.value = d.content; ta.focus(); })
     .catch(fail);
@@ -1982,7 +2002,7 @@ function reviewRefresh(force) {
   const pending = S.proposals.filter(p => p.status === 'pending');
   const decided = S.proposals.filter(p => p.status !== 'pending').slice(0, 8);
   let html = `<section class="section" style="margin-top:0"><h2>Dead letters <span class="count">${S.dlq.length}</span></h2>
-    <p>Events a connector or a flow could not handle, kept instead of lost. Fix the cause first, then replay them. Discarding deletes them for good.</p>`;
+    <p>Events a connector or a flow could not handle, kept instead of lost. ${PUBLIC ? 'On this demo they stay as they are.' : 'Fix the cause first, then replay them. Discarding deletes them for good.'}</p>`;
   html += S.dlq.length ? `<div class="list">${S.dlq.map(e => `<div class="it dl" data-key="dl-${Number(e.seq)}"><div>
         <div>${unitLink(e.unit)} could not handle an event on <span class="subject">${esc(e.original_subject || '')}</span></div>
         <div class="dl-err bad">${esc(e.last_error || '')}</div>
@@ -2129,7 +2149,7 @@ const ACTIONS = {
 };
 document.addEventListener('click', ev => {
   const val = ev.target.closest('.val');
-  if (val) { ev.preventDefault(); toggleEditor(val); return; }
+  if (val && !PUBLIC) { ev.preventDefault(); toggleEditor(val); return; }
   const b = ev.target.closest('[data-act]');
   if (b && ACTIONS[b.dataset.act]) { ev.preventDefault(); ACTIONS[b.dataset.act](b); }
 });
@@ -2167,7 +2187,7 @@ async function pollEvents() {
 }
 async function pollReview() {
   try {
-    const [d, p] = await Promise.all([getJSON('/dlq'), getJSON('/proposals')]);
+    const [d, p] = await Promise.all([getJSON('/dlq'), PUBLIC ? {proposals: []} : getJSON('/proposals')]);
     S.dlq = d.dead_letters || []; S.proposals = p.proposals || [];
   } catch { return; }
   renderReviewCount();

@@ -112,11 +112,7 @@ impl Ctx {
     /// The bus, with the stream that holds this instance's subjects.
     pub fn jetstream(&self) -> Result<bus::JetStream, String> {
         let js = bus::connect(&self.nats_url)?.jetstream();
-        let _ = js.add_stream(&bus::StreamConfig {
-            name: self.stream.clone(),
-            subjects: vec![format!("{}.>", self.subj_root)],
-            ..Default::default()
-        });
+        let _ = js.add_stream(&bus::StreamConfig::bus(&self.stream, &self.subj_root));
         Ok(js)
     }
     /// Full subject from a config value that may be a bare suffix or a vx.* path.

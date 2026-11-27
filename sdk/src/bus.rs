@@ -1233,6 +1233,41 @@ pub struct StreamConfig {
     pub deny_delete: bool,
 }
 
+impl StreamConfig {
+    /// The stream that holds a runtime's subjects, `<root>.>`, keeping its
+    /// messages as long as `VEJAS_STREAM_MAX_AGE_SECS` says: for ever when it
+    /// is unset or 0, as every release before it did.
+    pub fn bus(name: &str, subj_root: &str) -> Self {
+        StreamConfig {
+            name: name.to_string(),
+            subjects: vec![format!("{subj_root}.>")],
+            max_age: bus_max_age().unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+/// How long the runtime's stream keeps a message, when the operator said so:
+/// `VEJAS_STREAM_MAX_AGE_SECS`, in seconds, 0 for no limit. None when unset, or
+/// when the value is no number of seconds, which is said once.
+pub fn bus_max_age() -> Option<Duration> {
+    max_age_of(std::env::var("VEJAS_STREAM_MAX_AGE_SECS").ok().as_deref())
+}
+
+fn max_age_of(value: Option<&str>) -> Option<Duration> {
+    let value = value?.trim();
+    match value.parse::<u64>() {
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!("[vejas] VEJAS_STREAM_MAX_AGE_SECS={value:?} is not a number of seconds; the stream keeps its age limit")
+            });
+            None
+        }
+    }
+}
+
 /// A key-value bucket. The stream behind it is the one the sync client made,
 /// `allow_direct` off included, so buckets of earlier releases and new ones are
 /// the same thing.
@@ -1431,6 +1466,35 @@ impl JetStream {
                 let max_age = config.max_age.as_nanos() as u64;
                 current["max_msgs"] = json!(unlimited(config.max_msgs));
                 current["max_bytes"] = json!(unlimited(config.max_bytes));
+                current["max_age"] = json!(max_age);
+                let window = current["duplicate_window"].as_u64().unwrap_or(0);
+                if max_age > 0 && window > max_age {
+                    current["duplicate_window"] = json!(max_age);
+                }
+                self.api(
+                    format!("STREAM.UPDATE.{}", config.name),
+                    current.to_string().into(),
+                )
+                .map(|_| ())
+            }
+            other => other.map_err(|(_, what)| what),
+        }
+    }
+
+    /// Create a stream, or give the one that exists the age of `config` and
+    /// change nothing else: its other limits stay as an operator set them.
+    /// A shorter age drops at once what is older, read or not.
+    pub fn put_stream_age(&self, config: &StreamConfig) -> Result<(), String> {
+        /// JSStreamNameExistErr: the name is taken, with another config.
+        const NAME_IN_USE: u64 = 10058;
+        match self.create_stream(config) {
+            Err((Some(NAME_IN_USE), _)) => {
+                let info = self.api(format!("STREAM.INFO.{}", config.name), Bytes::new())?;
+                let mut current = info
+                    .get("config")
+                    .cloned()
+                    .ok_or("the server sent no stream config")?;
+                let max_age = config.max_age.as_nanos() as u64;
                 current["max_age"] = json!(max_age);
                 let window = current["duplicate_window"].as_u64().unwrap_or(0);
                 if max_age > 0 && window > max_age {
@@ -1859,6 +1923,16 @@ mod tests {
         fn tracestate(&self) -> Option<&str> {
             self.1
         }
+    }
+
+    #[test]
+    fn the_stream_keeps_its_messages_as_long_as_the_operator_says() {
+        assert_eq!(max_age_of(None), None);
+        assert_eq!(max_age_of(Some("3600")), Some(Duration::from_secs(3600)));
+        assert_eq!(max_age_of(Some(" 0 ")), Some(Duration::ZERO));
+        assert_eq!(max_age_of(Some("1h")), None);
+        let c = StreamConfig::bus("VEJAS", "vx");
+        assert_eq!(c.subjects, vec!["vx.>".to_string()]);
     }
 
     #[test]

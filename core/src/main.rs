@@ -31,6 +31,7 @@ mod memory;
 mod metrics;
 mod mqtt;
 mod proposals;
+mod public;
 mod record;
 mod secrets;
 mod signature;
@@ -1178,7 +1179,10 @@ fn rollback_literal(
 /// definition (secrets::SECRET_KEY_PATTERN) — so the mask and the admission lint
 /// (ADR-0017) share one source and cannot drift.
 fn panel_html() -> String {
-    include_str!("panel.html").replace("{{SECRET_PATTERN}}", secrets::SECRET_KEY_PATTERN)
+    include_str!("panel.html")
+        .replace("{{SECRET_PATTERN}}", secrets::SECRET_KEY_PATTERN)
+        // the panel shows no action on a public runtime (ADR-0041)
+        .replace("{{PUBLIC}}", if public::on() { "true" } else { "false" })
 }
 
 /// A trace entry's preview: the stored one, or derived from the stored event
@@ -1470,11 +1474,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // before the first message: see `Bus::read_streams`
             nc.read_streams();
             let js = nc.jetstream();
-            let _ = js.add_stream(&bus::StreamConfig {
-                name: stream.clone(),
-                subjects: vec![format!("{subj_root}.>")],
-                ..Default::default()
-            });
+            let _ = js.add_stream(&bus::StreamConfig::bus(&stream, &subj_root));
             let durable = handle.spec.name.replace([':', '.'], "_");
             // create the durable pull consumer (idempotent-ish), then bind
             let _ = js.create_pull_consumer(
@@ -2215,11 +2215,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // before the first message: see `Bus::read_streams`
             nc.read_streams();
             let js = nc.jetstream();
-            let _ = js.add_stream(&bus::StreamConfig {
-                name: stream.clone(),
-                subjects: vec![format!("{subj_root}.>")],
-                ..Default::default()
-            });
+            let _ = js.add_stream(&bus::StreamConfig::bus(&stream, &subj_root));
             // One durable consumer per unit over every `.from()` subject, so the
             // engine sees the bus in stream order: a sequence across two subjects
             // is judged in the order the events were published, also when a
@@ -2831,6 +2827,10 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
+            // A public runtime opens no port but the console's (ADR-0041).
+            if public::on() && driver_name == "http-in" {
+                return Err("http-in does not start on a public runtime (VEJAS_PUBLIC): it would open a port of its own".into());
+            }
             let driver = connectors::driver_for(&driver_name)
                 .ok_or_else(|| unknown_driver(&driver_name))?;
             // Resolve config by EVALUATING the manifest (so secret("…") in a
@@ -3163,7 +3163,8 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                 entry["subjects_in"] = json!([s]);
             }
-            if !prog.secret_refs.is_empty() {
+            // which secrets a connector reads is not a public page's (ADR-0041)
+            if !prog.secret_refs.is_empty() && !public::on() {
                 entry["secret_refs"] = json!(prog
                     .secret_refs
                     .iter()
@@ -3430,6 +3431,29 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     .to_string())
 }
 
+/// An answer as a public page sees it: paths relative to the root. Any other
+/// page sees them as the runtime does.
+fn shown_paths(root: &Path, v: Value) -> Value {
+    if public::on() { public::relative_paths(root, v) } else { v }
+}
+
+/// Does a file hold what the record's masks would hide (ADR-0017): a literal
+/// named or shaped as a credential, or a text in its code they would mask? A
+/// public page is not served its code, nor what its page derives from it,
+/// since a source cannot be masked and still read as the code (ADR-0041). A
+/// file that cannot be read or parsed counts as one that does.
+fn holds_a_credential(root: &Path, rel: &str) -> bool {
+    let Some(path) = guard_path(root, rel) else { return true };
+    let Ok(src) = fs::read_to_string(&path) else { return true };
+    let Ok(prog) = vjs::parse(&src) else { return true };
+    let scrub = record::shown();
+    let literal_hidden = prog.surface.iter().any(|e| {
+        let literal = json!({ e.name.clone(): e.value.clone() });
+        scrub.json(&literal) != literal
+    });
+    literal_hidden || scrub.text(&src, false) != src
+}
+
 // ───────────────────────── file access guard ─────────────────────────
 
 fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
@@ -3547,6 +3571,10 @@ Task: {task}"#;
 /// no CLI, so the generation tools must not be advertised there — an external
 /// agent writes the .vjs itself (vejas_language + vejas_write_flow).
 fn agent_available() -> bool {
+    // A public runtime starts no agent (ADR-0041), whatever is installed.
+    if public::on() {
+        return false;
+    }
     let agent = env::var("VEJAS_AGENT_CMD").unwrap_or_else(|_| "claude".into());
     if agent.contains('/') {
         return Path::new(&agent).exists();
@@ -3561,6 +3589,9 @@ const NO_AGENT_CLI: &str = "this deployment has no agent CLI (VEJAS_AGENT_CMD): 
 
 /// Ask the agent CLI for a file and return its content (markdown fences stripped).
 fn ask_agent(prompt: String) -> Result<String, String> {
+    if public::on() {
+        return Err("a public runtime starts no agent".into());
+    }
     let agent = env::var("VEJAS_AGENT_CMD").unwrap_or_else(|_| "claude".into());
     let mut command = Command::new(agent);
     connectors::without_runtime_credentials(&mut command);
@@ -3965,6 +3996,14 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
 }
 
 // ───────────────────────── dead-letter queue (ADR-0015) ─────────────────────────
+/// Is there a dead-letter stream yet? Asked without making one.
+fn dlq_exists() -> bool {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    bus::connect(&url)
+        .and_then(|nc| nc.jetstream().stream_state_if_any(connectors::DLQ_STREAM))
+        .is_ok_and(|state| state.is_some())
+}
+
 fn dlq_js() -> Result<bus::JetStream, String> {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let js = bus::connect(&url)?.jetstream();
@@ -4131,6 +4170,11 @@ fn join_code(root: &Path, hop: &mut Value, sources: &mut Sources) {
         })
         .unwrap_or_default();
     let mut of_service: HashMap<String, Option<Arc<Vec<String>>>> = HashMap::new();
+    // A public page (ADR-0041) is given no line of a file it may not read, and
+    // each line it is given goes through the record's masks (ADR-0017).
+    let flow_file = attrs["code.file.path"].as_str().map(str::to_string);
+    let mut withheld: HashMap<String, bool> = HashMap::new();
+    let scrub = public::on().then(record::shown);
     let Some(steps) = hop.get_mut("steps").and_then(Value::as_array_mut) else {
         return;
     };
@@ -4151,11 +4195,28 @@ fn join_code(root: &Path, hop: &mut Value, sources: &mut Sources) {
             },
         };
         let Some(code) = lines.as_ref().and_then(|l| l.get((line as usize).checked_sub(1)?)) else { continue };
+        let code = match &scrub {
+            None => code.clone(),
+            Some(scrub) => {
+                let file = match step.get("service").and_then(Value::as_str) {
+                    None => flow_file.clone(),
+                    Some(service) => service_file(service),
+                };
+                let Some(file) = file else { continue };
+                let rel = public::relative(root, &file);
+                let readable = public::file_allowed(root, &rel)
+                    && !*withheld.entry(rel.clone()).or_insert_with(|| holds_a_credential(root, &rel));
+                if !readable {
+                    continue;
+                }
+                scrub.text(&code, false)
+            }
+        };
         if sources.given + code.len() > JOIN_CODE_MAX {
             return;
         }
         sources.given += code.len();
-        step.insert("code".into(), Value::String(code.clone()));
+        step.insert("code".into(), Value::String(code));
     }
 }
 
@@ -4165,7 +4226,9 @@ fn trace_search(text: &str, limit: usize) -> Result<Value, (u16, String)> {
         return Err((400, "nothing to search for".into()));
     }
     let js = record_js().map_err(|e| (503, e))?;
-    let (traces, searched) = match record::search(&js, text, limit.clamp(1, 100), record::SEARCH_WINDOW) {
+    // a public runtime reads the newest hops only: strangers share it
+    let window = if public::on() { public::SEARCH_WINDOW } else { record::SEARCH_WINDOW };
+    let (traces, searched) = match record::search(&js, text, limit.clamp(1, 100), window) {
         Ok(found) => found,
         Err(e) if record_absent(&e) => (Vec::new(), 0),
         Err(e) => return Err((500, e)),
@@ -4673,11 +4736,7 @@ fn ensure_stream(nc: &bus::Bus, root: &str) {
         }
         *tried = Some(Instant::now());
     }
-    let _ = nc.jetstream().add_stream(&bus::StreamConfig {
-        name,
-        subjects: vec![format!("{root}.>")],
-        ..Default::default()
-    });
+    let _ = nc.jetstream().add_stream(&bus::StreamConfig::bus(&name, root));
 }
 
 /// Why an api flow's emits did not all leave.
@@ -5504,6 +5563,12 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     let method = request.method().clone();
     let url = request.url().to_string();
     let path_only = url.split('?').next().unwrap_or("").to_string();
+    // The public mode (ADR-0041) serves the console's reads and nothing else,
+    // before any credential is looked at: the same 404 for a write, `/mcp`, an
+    // `api` flow, a route that is not listed and one that does not exist.
+    if public::on() && !public::allows(is_read_method(&method), &path_only) {
+        return respond(request, 404, "not found".into(), "text/plain");
+    }
     // Optional write protection: when VEJAS_TOKEN is set, every MUTATING request
     // requires `Authorization: Bearer <token>`. A mutation is any non-read method
     // — POST (the whole built-in surface, /mcp included), and PUT/PATCH/DELETE on
@@ -5586,14 +5651,26 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     if method == tiny_http::Method::Get {
         let found = if path_only == "/traces" {
             Some(match qparam(&url, "search") {
+                Some(text) if public::on() && text.chars().count() > public::SEARCH_MAX_CHARS => {
+                    Err((400, format!("a search is {} characters at most here", public::SEARCH_MAX_CHARS)))
+                }
                 Some(text) => trace_search(
                     &metrics::percent_decode(&text.replace('+', " ")),
-                    qparam(&url, "limit").and_then(|l| l.parse().ok()).unwrap_or(20),
+                    qparam(&url, "limit")
+                        .and_then(|l| l.parse().ok())
+                        .unwrap_or(20)
+                        .min(if public::on() { public::SEARCH_LIMIT_MAX } else { usize::MAX }),
                 ),
                 None => Err((400, "GET /traces/{trace id}, or GET /traces?search=<text>".into())),
             })
         } else {
-            path_only.strip_prefix("/traces/").map(|id| trace_view(&root, id))
+            path_only.strip_prefix("/traces/").map(|id| {
+                if public::on() && id.chars().count() > public::TRACE_ID_MAX_CHARS {
+                    Err((400, "not a trace id".into()))
+                } else {
+                    trace_view(&root, id)
+                }
+            })
         };
         if let Some(found) = found {
             return match found {
@@ -5630,6 +5707,21 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(v) => respond(request, 200, proposal_shown(v, &record::shown()).to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             };
+        }
+    }
+
+    // A public page reads code, and only code: a `.vjs` of a flow, a service
+    // or a connector. Samples, manifests in JSON and packages stay out.
+    if public::on() {
+        let named = match path_only.as_str() {
+            "/file" => Some(qparam(&url, "path")),
+            "/shape" | "/rules" => Some(qparam(&url, "file")),
+            _ => None,
+        };
+        if let Some(named) = named {
+            if !named.is_some_and(|f| public::file_allowed(&root, &f) && !holds_a_credential(&root, &f)) {
+                return respond(request, 404, "not found".into(), "text/plain");
+            }
         }
     }
 
@@ -5679,21 +5771,22 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/topology") => respond(
             request,
             200,
-            as_shown(topology_json(&registry)).to_string(),
+            shown_paths(&root, as_shown(topology_json(&registry))).to_string(),
             "application/json",
         ),
         (tiny_http::Method::Get, "/graph") => respond(
             request,
             200,
-            graph_json(&root).to_string(),
+            shown_paths(&root, graph_json(&root)).to_string(),
             "application/json",
         ),
-        (tiny_http::Method::Get, "/surface") => respond(
-            request,
-            200,
-            surface_json(&root).to_string(),
-            "application/json",
-        ),
+        (tiny_http::Method::Get, "/surface") => {
+            let surface = surface_json(&root);
+            // A public page is shown the literals masked here, by the record's
+            // masks (ADR-0017), never by the browser alone (ADR-0041).
+            let surface = if public::on() { shown_paths(&root, record::shown().json(&surface)) } else { surface };
+            respond(request, 200, surface.to_string(), "application/json")
+        }
         (tiny_http::Method::Get, "/events") => {
             // `flow%3Aorder_sync`, as a browser encodes it, is `flow:order_sync`
             let flow = qparam(&url, "flow").map(|f| metrics::percent_decode(&f));
@@ -5720,7 +5813,11 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
         }
-        (tiny_http::Method::Get, "/dlq") => match dlq_list(200) {
+        // a public runtime makes no stream to answer a read: none yet is none
+        (tiny_http::Method::Get, "/dlq") if public::on() && !dlq_exists() => {
+            respond(request, 200, json!({"dead_letters": []}).to_string(), "application/json")
+        }
+        (tiny_http::Method::Get, "/dlq") => match dlq_list(if public::on() { public::DEAD_LETTERS_SHOWN } else { 200 }) {
             Ok(l) => respond(request, 200, as_shown(json!({"dead_letters": l})).to_string(), "application/json"),
             Err(e) => respond(request, 500, e, "text/plain"),
         },
@@ -5850,7 +5947,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(content) => respond(
                     request,
                     200,
-                    json!({"path": p.display().to_string(), "content": content}).to_string(),
+                    shown_paths(&root, json!({"path": p.display().to_string(), "content": content})).to_string(),
                     "application/json",
                 ),
                 Err(e) => respond(request, 404, e.to_string(), "text/plain"),
@@ -6125,6 +6222,31 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
     }
 }
 
+/// Bring the runtime's stream to the age `VEJAS_STREAM_MAX_AGE_SECS` sets,
+/// once NATS answers. Only that limit changes on a stream that exists: its
+/// other limits stay as they were set.
+fn stream_retention() {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let name = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
+    let root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
+    let config = bus::StreamConfig::bus(&name, &root);
+    while RUNNING.load(Ordering::SeqCst) {
+        match bus::connect(&url).and_then(|nc| nc.jetstream().put_stream_age(&config)) {
+            Ok(()) => {
+                eprintln!(
+                    "[vejas] stream {name} keeps messages {}",
+                    match config.max_age.as_secs() {
+                        0 => "with no age limit".to_string(),
+                        s => format!("{s} s at most"),
+                    }
+                );
+                return;
+            }
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
+    }
+}
+
 fn serve_http(registry: Registry, root: PathBuf, addr: String) {
     let server = match tiny_http::Server::http(&addr) {
         Ok(server) => server,
@@ -6133,7 +6255,7 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
             return;
         }
     };
-    if write_token().is_none() && beyond_loopback(&addr) {
+    if write_token().is_none() && beyond_loopback(&addr) && !public::on() {
         eprintln!(
             "[vejas] WARNING: {addr} with no VEJAS_TOKEN: whatever reaches this port can \
              write flows and run commands (exec connectors). Set VEJAS_TOKEN, or publish \
@@ -6142,11 +6264,13 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
     }
     eprintln!("[vejas] panel + monitoring on http://{addr}");
     // One thread per request, so a slow /flows/new never blocks monitoring, and a
-    // bound on them, so a burst costs a 503 instead of this loop.
+    // bound on them, so a burst costs a 503 instead of this loop. Lower on a
+    // public runtime, whatever is asked: strangers share it.
     let max_inflight = env::var("VEJAS_HTTP_MAX_INFLIGHT")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256)
+        .min(if public::on() { public::REQUESTS_IN_FLIGHT_MAX } else { usize::MAX })
         .max(1);
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for request in server.incoming_requests() {
@@ -6373,8 +6497,22 @@ fn main() {
     let (total, started, _) = reload(&registry, &root);
     eprintln!("[vejas] supervising {total} units ({started} started)");
 
-    // the control channel, only when this runtime names a tenant (ADR-0013)
-    control::start(registry.clone(), root.clone());
+    // The stream's age limit, when the operator set one: a stream made by an
+    // earlier start takes it too.
+    if bus::bus_max_age().is_some() {
+        background("stream-retention", stream_retention);
+    }
+
+    // the control channel, only when this runtime names a tenant (ADR-0013),
+    // and never on a public runtime, which takes no command (ADR-0041)
+    if public::on() {
+        eprintln!(
+            "[vejas] public mode (VEJAS_PUBLIC): the console's reads only; every write, \
+             /mcp, the api flows and the secrets answer 404; no agent, no control channel"
+        );
+    } else {
+        control::start(registry.clone(), root.clone());
+    }
 
     // watch VEJAS_VERSIONS: a promote on any instance fans out here (ADR-0021)
     {
