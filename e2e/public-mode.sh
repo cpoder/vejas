@@ -27,6 +27,8 @@ printf '# flow: demo\nsource "vx.demo.in"\nTIER = "gold"\nemit "vx.demo.out", {i
 printf '{"id": "sample-1"}\n' > "$R/flows/demo.fixture.json"
 printf 'api "GET /hello"\nrespond 200, {hello: "world"}\n' > "$R/flows/hello.vjs"
 printf 'emit "vx.demo.note", {n: n}\n' > "$R/services/note.vjs"
+# a flow whose literal is named as a credential: its value must leave in no answer
+printf '# flow: keyed\nsource "vx.keyed.in"\nAPI_TOKEN = "s3cr3t-value-77"\nPARTNER = {"name": "Authorization", "value": "pair-s3cr3t-88"}\nemit "vx.keyed.out", {ok: true}\n' > "$R/flows/keyed.vjs"
 printf '# connector: tick\ndriver "timer"\nSUBJECT = "vx.demo.tick"\nINTERVAL_SECS = 3600\n' > "$R/connectors/tick.vjs"
 
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p 4307 > /dev/null 2>&1 & NP=$!
@@ -97,6 +99,20 @@ c=$(call "$H/file?path=flows/demo.fixture.json"); refused "$c" && ok "a sample f
 c=$(call "$H/file?path=flows/../flows/demo.vjs"); refused "$c" && ok "a path with ..: 404" || ko "a .. path answered $c"
 c=$(call "$H/file"); refused "$c" && ok "no path: 404" || ko "no path answered $c"
 c=$(call "$H/shape?file=flows/demo.fixture.json"); refused "$c" && ok "the shape of a non-code file: 404" || ko "shape answered $c"
+
+echo "── a literal named as a credential leaves in no answer"
+leaked=0; asked=0
+for q in / /panel /topology /graph /surface /events /dlq "/traces?search=keyed" /drivers /evictions \
+         "/file?path=flows/keyed.vjs" "/shape?file=flows/keyed.vjs" "/rules?file=flows/keyed.vjs"; do
+  asked=$((asked + 1))
+  curl -s "$H$q" > "$S/b"
+  grep -q 's3cr3t-value-77\|pair-s3cr3t-88' "$S/b" && { ko "GET $q shows the credential"; leaked=1; }
+done
+[ $leaked = 0 ] && ok "$asked allowed reads, none shows either value" || true
+grep -q '"API_TOKEN"' <(curl -s "$H/surface") && ok "/surface still lists the literal, masked" || ko "/surface lost the literal"
+c=$(call "$H/file?path=flows/keyed.vjs"); refused "$c" && ok "the code of a flow that holds one: 404" || ko "its code answered $c"
+c=$(call "$H/shape?file=flows/keyed.vjs"); refused "$c" && ok "its shape: 404" || ko "its shape answered $c"
+c=$(call "$H/file?path=flows/demo.vjs"); [ "$c" = "200" ] && ok "a flow without one is still served" || ko "demo code answered $c"
 
 echo "── reads are capped"
 long=$(printf 'x%.0s' $(seq 1 201))

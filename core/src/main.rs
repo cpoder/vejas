@@ -3426,6 +3426,23 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
     .to_string())
 }
 
+/// Does a file hold what the record's masks would hide (ADR-0017): a literal
+/// named or shaped as a credential, or a text in its code they would mask? A
+/// public page is not served its code, nor what its page derives from it,
+/// since a source cannot be masked and still read as the code (ADR-0041). A
+/// file that cannot be read or parsed counts as one that does.
+fn holds_a_credential(root: &Path, rel: &str) -> bool {
+    let Some(path) = guard_path(root, rel) else { return true };
+    let Ok(src) = fs::read_to_string(&path) else { return true };
+    let Ok(prog) = vjs::parse(&src) else { return true };
+    let scrub = record::shown();
+    let literal_hidden = prog.surface.iter().any(|e| {
+        let literal = json!({ e.name.clone(): e.value.clone() });
+        scrub.json(&literal) != literal
+    });
+    literal_hidden || scrub.text(&src, false) != src
+}
+
 // ───────────────────────── file access guard ─────────────────────────
 
 fn guard_path(root: &Path, rel: &str) -> Option<PathBuf> {
@@ -5659,7 +5676,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             _ => None,
         };
         if let Some(named) = named {
-            if !named.is_some_and(|f| public::file_allowed(&root, &f)) {
+            if !named.is_some_and(|f| public::file_allowed(&root, &f) && !holds_a_credential(&root, &f)) {
                 return respond(request, 404, "not found".into(), "text/plain");
             }
         }
@@ -5720,12 +5737,13 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
             graph_json(&root).to_string(),
             "application/json",
         ),
-        (tiny_http::Method::Get, "/surface") => respond(
-            request,
-            200,
-            surface_json(&root).to_string(),
-            "application/json",
-        ),
+        (tiny_http::Method::Get, "/surface") => {
+            let surface = surface_json(&root);
+            // A public page is shown the literals masked here, by the record's
+            // masks (ADR-0017), never by the browser alone (ADR-0041).
+            let surface = if public::on() { record::shown().json(&surface) } else { surface };
+            respond(request, 200, surface.to_string(), "application/json")
+        }
         (tiny_http::Method::Get, "/events") => {
             // `flow%3Aorder_sync`, as a browser encodes it, is `flow:order_sync`
             let flow = qparam(&url, "flow").map(|f| metrics::percent_decode(&f));
