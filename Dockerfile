@@ -5,6 +5,7 @@ FROM rust:1-slim-trixie AS build
 WORKDIR /build
 # The runtime and the connector crate it is built on (ADR-0038).
 COPY sdk/ sdk/
+COPY third_party/ third_party/
 COPY core/ core/
 RUN cargo build --release --manifest-path core/Cargo.toml
 
