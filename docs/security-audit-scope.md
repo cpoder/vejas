@@ -301,7 +301,12 @@ re-deriving these — they are fixed and regression-tested; instead, try to
 - **M4 — `tiny_http`'s own pool is unbounded.** `VEJAS_HTTP_MAX_INFLIGHT` bounds the
   requests the runtime handles, not the connections the crate accepts: it holds a
   thread per connection and panics when the OS has none. The port is local by
-  default, and the failure is loud: `/healthz` stops answering.
+  default, and the failure is loud: `/healthz` stops answering. **Fixed
+  (2026-11-27):** tiny_http is vendored and patched (`third_party/tiny_http`):
+  connections are bounded (`VEJAS_HTTP_MAX_CONNECTIONS`), a refused thread drops
+  its connection, and sockets, heads and bodies have a timeout. The same pass
+  fixed a worse one: an unread body was drained with one allocation of its
+  declared length, so one `Content-Length` aborted the process.
 
 ## Method note
 

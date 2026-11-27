@@ -58,7 +58,11 @@ The runtime is a single OS process. Inside it:
 - **the HTTP server thread** — serves the panel, the JSON introspection
   endpoints, the editing endpoints, and the MCP endpoint. One request = one
   thread (so a slow `/flows/new` never blocks monitoring), at most
-  `VEJAS_HTTP_MAX_INFLIGHT` at once; past it the request gets a 503.
+  `VEJAS_HTTP_MAX_INFLIGHT` at once; past it the request gets a 503. The
+  server is tiny_http, vendored and patched (`third_party/tiny_http`): a body,
+  a request head and a connection count are bounded
+  (`VEJAS_HTTP_MAX_BODY_BYTES`, `VEJAS_HTTP_TIMEOUT_SECS`,
+  `VEJAS_HTTP_MAX_CONNECTIONS`).
 - **the bus** (`sdk/src/bus.rs`, ADR-0035) — the only thread that speaks NATS.
   One tokio worker runs the `async-nats` client on one connection, shared by the
   whole process. Everything above stays synchronous: a thread that needs the bus
