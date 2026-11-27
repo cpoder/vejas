@@ -31,4 +31,4 @@ Three design commitments shape everything:
   [changing safely](guides/change-safely.md),
   [governed mode](guides/governed-mode.md).
 - Connecting systems → [the certified catalog](connectors/catalog.md).
-- The full "why" → [the ADRs](decisions.md): 38 recorded decisions.
+- The full "why" → [the ADRs](decisions.md): 39 recorded decisions.
