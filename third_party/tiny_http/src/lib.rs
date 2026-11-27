@@ -99,7 +99,7 @@ use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -115,6 +115,7 @@ pub use connection::{ConfigListenAddr, ListenAddr, Listener};
 pub use request::{ReadWrite, Request};
 pub use response::{Response, ResponseBox};
 pub use test::TestRequest;
+pub use util::BodyTooLarge;
 
 mod client;
 mod common;
@@ -177,6 +178,35 @@ pub struct ServerConfig {
 
     /// If `Some`, then the server will use SSL to encode the communications.
     pub ssl: Option<SslConfig>,
+
+    /// Vejas patch: the bounds every connection is held to.
+    pub limits: Limits,
+}
+
+/// Vejas patch (README.md at the crate root): what one client may cost.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// The largest request body, declared or chunked. A `Content-Length` past it
+    /// is answered 413 before the body is read, and the connection closes; a
+    /// chunked body past it fails its read with [`BodyTooLarge`].
+    pub max_body_bytes: usize,
+    /// How long a socket read or write may wait, how long the request line and
+    /// headers may take to arrive (idle keep-alive included), and how long a
+    /// body may take to arrive. `None`: no bound, as upstream.
+    pub timeout: Option<Duration>,
+    /// Connections served at once, one thread each. Past it a new connection
+    /// is closed as soon as it is accepted.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_body_bytes: 8 * 1024 * 1024,
+            timeout: Some(Duration::from_secs(30)),
+            max_connections: 512,
+        }
+    }
 }
 
 /// Configuration of the server for SSL.
@@ -198,6 +228,7 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::from_socket_addrs(addr)?,
             ssl: None,
+            limits: Limits::default(),
         })
     }
 
@@ -214,6 +245,7 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::from_socket_addrs(addr)?,
             ssl: Some(config),
+            limits: Limits::default(),
         })
     }
 
@@ -226,13 +258,14 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::unix_from_path(path),
             ssl: None,
+            limits: Limits::default(),
         })
     }
 
     /// Builds a new server that listens on the specified address.
     pub fn new(config: ServerConfig) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = config.addr.bind()?;
-        Self::from_listener(listener, config.ssl)
+        Self::from_listener_with_limits(listener, config.ssl, config.limits)
     }
 
     /// Builds a new server using the specified TCP listener.
@@ -242,6 +275,15 @@ impl Server {
     pub fn from_listener<L: Into<Listener>>(
         listener: L,
         ssl_config: Option<SslConfig>,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        Self::from_listener_with_limits(listener, ssl_config, Limits::default())
+    }
+
+    /// Vejas patch: `from_listener`, with the bounds every connection is held to.
+    pub fn from_listener_with_limits<L: Into<Listener>>(
+        listener: L,
+        ssl_config: Option<SslConfig>,
+        limits: Limits,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = listener.into();
         // building the "close" variable
@@ -288,12 +330,23 @@ impl Server {
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = util::TaskPool::new();
+            // Vejas patch: connections being served, one thread each.
+            let open = Arc::new(AtomicUsize::new(0));
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
+                        // Vejas patch: past the bound, the connection closes
+                        // here, before a thread or a byte is spent on it.
+                        if open.load(Relaxed) >= limits.max_connections {
+                            log::debug!("connection refused: {} open", limits.max_connections);
+                            continue;
+                        }
+                        // Vejas patch: no read or write waits for good, the
+                        // TLS handshake included.
+                        sock.set_timeouts(limits.timeout);
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -311,7 +364,7 @@ impl Server {
                             Some(ref _ssl) => unreachable!(),
                         };
 
-                        Ok(ClientConnection::new(write_closable, read_closable))
+                        Ok(ClientConnection::new(write_closable, read_closable, limits.clone()))
                     }
                     Err(e) => Err(e),
                 };
@@ -320,7 +373,10 @@ impl Server {
                     Ok(client) => {
                         let messages = inside_messages.clone();
                         let mut client = Some(client);
+                        let slot = util::Slot::take(&open);
+                        let mut slot = Some(slot);
                         tasks_pool.spawn(Box::new(move || {
+                            let _slot = slot.take();
                             if let Some(client) = client.take() {
                                 // Synchronization is needed for HTTPS requests to avoid a deadlock
                                 if client.secure() {
@@ -338,10 +394,12 @@ impl Server {
                         }));
                     }
 
+                    // Vejas patch: upstream pushed the error and stopped
+                    // accepting for good, so one EMFILE ended the server. The
+                    // error is logged and accepting resumes.
                     Err(e) => {
                         log::error!("Error accepting new client: {}", e);
-                        inside_messages.push(e.into());
-                        break;
+                        thread::sleep(Duration::from_millis(50));
                     }
                 }
             }

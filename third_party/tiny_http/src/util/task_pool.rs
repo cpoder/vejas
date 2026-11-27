@@ -80,7 +80,10 @@ impl TaskPool {
     fn add_thread(&self, initial_fn: Option<Box<dyn FnMut() + Send>>) {
         let sharing = self.sharing.clone();
 
-        thread::spawn(move || {
+        // Vejas patch: upstream's `thread::spawn` panicked when the OS refused
+        // a thread, and took the accept loop with it. Refused, the task is
+        // dropped, and with it the connection it was to serve.
+        let spawned = thread::Builder::new().spawn(move || {
             let sharing = sharing;
             let _active_guard = Registration::new(&sharing.active_tasks);
 
@@ -124,6 +127,25 @@ impl TaskPool {
                 task();
             }
         });
+        if let Err(e) = spawned {
+            log::error!("no thread for a connection: {}", e);
+        }
+    }
+}
+
+/// Vejas patch: one connection being served, counted while it lives.
+pub struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    pub fn take(open: &Arc<AtomicUsize>) -> Slot {
+        open.fetch_add(1, Ordering::AcqRel);
+        Slot(open.clone())
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

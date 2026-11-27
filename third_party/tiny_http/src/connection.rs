@@ -87,6 +87,21 @@ impl Connection {
         }
     }
 
+    /// Vejas patch: the read and write timeouts of the socket.
+    pub(crate) fn set_timeouts(&self, timeout: Option<std::time::Duration>) {
+        match self {
+            Self::Tcp(s) => {
+                s.set_read_timeout(timeout).ok();
+                s.set_write_timeout(timeout).ok();
+            }
+            #[cfg(unix)]
+            Self::Unix(s) => {
+                s.set_read_timeout(timeout).ok();
+                s.set_write_timeout(timeout).ok();
+            }
+        }
+    }
+
     pub(crate) fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
         match self {
             Self::Tcp(s) => s.shutdown(how),

@@ -5,15 +5,15 @@ use std::sync::mpsc::{Receiver, Sender};
 
 /// A `Reader` that reads exactly the number of bytes from a sub-reader.
 ///
-/// If the limit is reached, it returns EOF. If the limit is not reached
-/// when the destructor is called, the remaining bytes will be read and
-/// thrown away.
+/// If the limit is reached, it returns EOF. (Vejas patch: the destructor no
+/// longer reads the remaining bytes; see `BodyGuard`.)
 pub struct EqualReader<R>
 where
     R: Read,
 {
     reader: R,
     size: usize,
+    #[allow(dead_code)] // Vejas patch: was sent to by the drain on drop
     last_read_signal: Sender<IoResult<()>>,
 }
 
@@ -59,32 +59,10 @@ where
     }
 }
 
-impl<R> Drop for EqualReader<R>
-where
-    R: Read,
-{
-    fn drop(&mut self) {
-        let mut remaining_to_read = self.size;
-
-        while remaining_to_read > 0 {
-            let mut buf = vec![0; remaining_to_read];
-
-            match self.reader.read(&mut buf) {
-                Err(e) => {
-                    self.last_read_signal.send(Err(e)).ok();
-                    break;
-                }
-                Ok(0) => {
-                    self.last_read_signal.send(Ok(())).ok();
-                    break;
-                }
-                Ok(other) => {
-                    remaining_to_read -= other;
-                }
-            }
-        }
-    }
-}
+// Vejas patch: no `Drop` here. Upstream drained the unread rest of the body
+// on drop with one allocation of the whole declared length, and with no bound
+// in time. The drain is in `BodyGuard` (body_guard.rs), which wraps every
+// `EqualReader` a request reads from, and is bounded in size and time.
 
 #[cfg(test)]
 mod tests {
@@ -124,8 +102,9 @@ mod tests {
             assert_eq!(vec[0], b'h');
         }
 
+        // Vejas patch: dropping it no longer drains (BodyGuard does).
         let mut string = String::new();
         org_reader.read_to_string(&mut string).unwrap();
-        assert_eq!(string, " world");
+        assert_eq!(string, "ello world");
     }
 }

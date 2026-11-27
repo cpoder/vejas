@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
-use crate::util::{EqualReader, FusedReader};
+use crate::util::{Abandon, BodyGuard, EqualReader, FusedReader};
 use crate::{HTTPVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
 
@@ -74,6 +75,27 @@ pub struct Request {
 
     // If Some, a message must be sent after responding
     notify_when_responded: Option<Sender<()>>,
+
+    // Vejas patch: set to close the connection instead of draining the body
+    abandon: Abandon,
+}
+
+/// Vejas patch: the bounds on one request's body (see util/body_guard.rs).
+pub(crate) struct BodyLimits {
+    pub(crate) max: usize,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) abandon: Abandon,
+}
+
+impl BodyLimits {
+    /// For a request built in memory ([`crate::TestRequest`]).
+    pub(crate) fn unbounded() -> Self {
+        BodyLimits {
+            max: usize::MAX,
+            deadline: None,
+            abandon: Abandon::default(),
+        }
+    }
 }
 
 struct NotifyOnDrop<R> {
@@ -135,6 +157,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
+    limits: BodyLimits,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -185,9 +208,22 @@ where
 
     // we wrap `source_data` around a reading whose nature depends on the transfer-encoding and
     // content-length headers
+    // Vejas patch: every body that is read from the socket is bounded in size
+    // and time, and one left unread is drained under the same bounds or closes
+    // the connection. An upgraded stream is bounded too: the runtime upgrades
+    // nothing, and a body read to EOF must not be the whole socket.
+    let BodyLimits {
+        max,
+        deadline,
+        abandon,
+    } = limits;
+    let guard = |r: Box<dyn Read + Send + 'static>, drain: bool| {
+        Box::new(BodyGuard::new(r, max, deadline, drain, abandon.clone()))
+            as Box<dyn Read + Send + 'static>
+    };
     let reader = if connection_upgrade {
         // if we have a `Connection: upgrade`, always keeping the whole reader
-        Box::new(source_data) as Box<dyn Read + Send + 'static>
+        guard(Box::new(source_data), false)
     } else if let Some(content_length) = content_length {
         if content_length == 0 {
             Box::new(io::empty()) as Box<dyn Read + Send + 'static>
@@ -198,6 +234,12 @@ where
             let mut offset = 0;
 
             while offset != content_length {
+                // Vejas patch: these bytes are read on the connection's
+                // thread; they too have a time to come in.
+                if deadline.map_or(false, |d| Instant::now() >= d) {
+                    let late = IoError::new(ErrorKind::TimedOut, "request body too slow");
+                    return Err(RequestCreationError::CreationIoError(late));
+                }
                 let read = source_data.read(&mut buffer[offset..])?;
                 if read == 0 {
                     // the socket returned EOF, but we were before the expected content-length
@@ -213,12 +255,12 @@ where
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
             let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
-            Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
+            guard(Box::new(FusedReader::new(data_reader)), true)
         }
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        Box::new(FusedReader::new(Decoder::new(source_data))) as Box<dyn Read + Send + 'static>
+        guard(Box::new(FusedReader::new(Decoder::new(source_data))), true)
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data
@@ -238,6 +280,7 @@ where
         body_length: content_length,
         must_send_continue: expects_continue,
         notify_when_responded: None,
+        abandon,
     })
 }
 
@@ -438,6 +481,19 @@ impl Request {
             sender.send(()).unwrap();
         }
         res
+    }
+
+    /// Vejas patch: sends a response, then closes the connection instead of
+    /// reading what is left of the body. For a caller that must not wait on
+    /// the client, such as an accept loop shedding load.
+    pub fn respond_and_close<R>(self, response: Response<R>) -> Result<(), IoError>
+    where
+        R: Read,
+    {
+        // With the flag set, an unread body is not drained when the request
+        // drops: the connection reads nothing more and closes.
+        self.abandon.set();
+        self.respond(response)
     }
 
     fn respond_impl<R>(&mut self, response: Response<R>) -> Result<(), IoError>

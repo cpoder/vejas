@@ -1,3 +1,5 @@
+pub use self::body_guard::BodyTooLarge;
+pub(crate) use self::body_guard::{Abandon, BodyGuard};
 pub use self::custom_stream::CustomStream;
 pub use self::equal_reader::EqualReader;
 pub use self::fused_reader::FusedReader;
@@ -5,10 +7,11 @@ pub use self::messages_queue::MessagesQueue;
 pub use self::refined_tcp_stream::RefinedTcpStream;
 pub use self::sequential::{SequentialReader, SequentialReaderBuilder};
 pub use self::sequential::{SequentialWriter, SequentialWriterBuilder};
-pub use self::task_pool::TaskPool;
+pub use self::task_pool::{Slot, TaskPool};
 
 use std::str::FromStr;
 
+mod body_guard;
 mod custom_stream;
 mod equal_reader;
 mod fused_reader;

@@ -30,6 +30,9 @@ jobs:
       - name: Language unit tests
         run: cargo test --manifest-path core/Cargo.toml
 
+      - name: The vendored tiny_http's own tests (third_party/tiny_http/README.md)
+        run: cargo test --lib --manifest-path third_party/tiny_http/Cargo.toml
+
       - name: Build the runtime
         run: cargo build --release --manifest-path core/Cargo.toml
 

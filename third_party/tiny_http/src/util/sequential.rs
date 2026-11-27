@@ -110,6 +110,17 @@ impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
     }
 }
 
+impl<R: Read + Send> SequentialReader<R> {
+    /// Vejas patch: blocks until the readers before this one are done, without
+    /// reading, so the connection can look at what they left behind first.
+    pub fn wait_turn(&mut self) {
+        if let SequentialReaderInner::Waiting(ref mut recv) = self.inner {
+            let reader = recv.recv().unwrap();
+            self.inner = SequentialReaderInner::MyTurn(reader);
+        }
+    }
+}
+
 impl<R: Read + Send> Read for SequentialReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let mut reader = match self.inner {
