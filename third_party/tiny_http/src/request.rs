@@ -8,9 +8,8 @@ use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use crate::util::{Abandon, BodyGuard, EqualReader, FusedReader};
+use crate::util::{Abandon, BodyGuard, ChunkedReader, EqualReader, FusedReader};
 use crate::{HTTPVersion, Header, Method, Response, StatusCode};
-use chunked_transfer::Decoder;
 
 /// Represents an HTTP request made by a client.
 ///
@@ -260,7 +259,12 @@ where
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        guard(Box::new(FusedReader::new(Decoder::new(source_data))), true)
+        // Vejas patch: a bounded chunk parser in place of chunked_transfer's
+        // Decoder. Its wire bytes (framing included) are held to the bound plus
+        // the drain's grace, the data to the bound by the guard.
+        let wire_limit = max.saturating_add(crate::util::DRAIN_GRACE);
+        let chunked = ChunkedReader::new(source_data, wire_limit, max, deadline);
+        guard(Box::new(FusedReader::new(chunked)), true)
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data
@@ -483,6 +487,17 @@ impl Request {
         res
     }
 
+    /// Vejas patch: drops the request without answering it, and closes the
+    /// connection without reading what is left of its body. For a caller that
+    /// must not write, not even the 500 a dropped request sends.
+    pub fn close_without_response(mut self) {
+        self.abandon.set();
+        drop(self.response_writer.take());
+        if let Some(sender) = self.notify_when_responded.take() {
+            sender.send(()).ok();
+        }
+    }
+
     /// Vejas patch: sends a response, then closes the connection instead of
     /// reading what is left of the body. For a caller that must not wait on
     /// the client, such as an accept loop shedding load.
@@ -504,15 +519,23 @@ impl Request {
 
         let do_not_send_body = self.method == Method::Head;
 
-        Self::ignore_client_closing_errors(response.raw_print(
+        let printed = response.raw_print(
             writer.by_ref(),
             self.http_version.clone(),
             &self.headers,
             do_not_send_body,
             None,
-        ))?;
+        );
+        let flushed = printed.as_ref().ok().map(|_| writer.flush());
+        // Vejas patch: a response that could not be written whole (a client
+        // that does not read, past the write deadline) ends the connection:
+        // no next request is read from it.
+        if printed.is_err() || matches!(flushed, Some(Err(_))) {
+            self.abandon.set();
+        }
+        Self::ignore_client_closing_errors(printed)?;
 
-        Self::ignore_client_closing_errors(writer.flush())
+        Self::ignore_client_closing_errors(flushed.unwrap_or(Ok(())))
     }
 
     fn ignore_client_closing_errors(result: io::Result<()>) -> io::Result<()> {

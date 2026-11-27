@@ -87,6 +87,24 @@ impl Connection {
         }
     }
 
+    /// Vejas patch: the socket's read timeout.
+    pub(crate) fn set_read_timeout(&self, t: std::time::Duration) {
+        match self {
+            Self::Tcp(s) => s.set_read_timeout(Some(t)).ok(),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_read_timeout(Some(t)).ok(),
+        };
+    }
+
+    /// Vejas patch: the socket's write timeout.
+    pub(crate) fn set_write_timeout(&self, t: std::time::Duration) {
+        match self {
+            Self::Tcp(s) => s.set_write_timeout(Some(t)).ok(),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_write_timeout(Some(t)).ok(),
+        };
+    }
+
     /// Vejas patch: the read and write timeouts of the socket.
     pub(crate) fn set_timeouts(&self, timeout: Option<std::time::Duration>) {
         match self {

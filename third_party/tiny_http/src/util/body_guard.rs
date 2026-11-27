@@ -72,7 +72,7 @@ const DRAIN_CHUNK: usize = 8 * 1024;
 /// a little over the bound is drained to its end, so the answer the handler
 /// gave (a 413) is not lost to a reset when the connection closes on unread
 /// bytes.
-const DRAIN_GRACE: usize = 64 * 1024;
+pub(crate) const DRAIN_GRACE: usize = 64 * 1024;
 
 impl<R: Read> BodyGuard<R> {
     pub(crate) fn new(

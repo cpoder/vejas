@@ -347,8 +347,9 @@ impl Server {
                         // Vejas patch: no read or write waits for good, the
                         // TLS handshake included.
                         sock.set_timeouts(limits.timeout);
+                        let clock = util::Clock::new(limits.timeout);
                         let (read_closable, write_closable) = match ssl {
-                            None => RefinedTcpStream::new(sock),
+                            None => RefinedTcpStream::new(sock, Some(clock)),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
                             Some(ref ssl) => {
                                 // trying to apply SSL over the connection
@@ -358,7 +359,7 @@ impl Server {
                                     Err(_) => continue,
                                 };
 
-                                RefinedTcpStream::new(sock)
+                                RefinedTcpStream::new(sock, Some(clock))
                             }
                             #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
                             Some(ref _ssl) => unreachable!(),

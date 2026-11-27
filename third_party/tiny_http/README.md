@@ -21,7 +21,12 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
 - No socket timeout and no thread bound: a client sending one byte at a time
   (slowloris) kept a thread for good, as many times as it opened connections.
 - A chunked body had no size bound, and was never drained: what the handler
-  left unread was parsed as the next request.
+  left unread was parsed as the next request. The decoder it used
+  (chunked_transfer 1.5) read a chunk-size line into memory with no bound and
+  no clock: an endless line of `1`s grew memory for as long as it came.
+- A connection parsed pipelined requests ahead with no bound while its
+  responses waited on one another: one client that pipelined and never read
+  filled every handler slot.
 - A request line or a header line had no length bound and the headers no count.
 - One `accept()` error (`EMFILE`) stopped the accept loop for good, and a
   refused thread panicked it.
@@ -33,8 +38,31 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
   served at once (default 512).
 - `ClientConnection` answers before the body is read, then closes: 413 for a
   declared `Content-Length` past the bound, 400 for one that is not one number
-  (or two that differ), 431 for a line past 8 KiB or more than 100 headers, 408
-  for a head that does not arrive within the timeout (idle keep-alive included).
+  (or two that differ), for a `Content-Length` with a `Transfer-Encoding`, or for
+  a line that ends in a bare LF, 501 for a `Transfer-Encoding` other than
+  `chunked` (`identity` before it is allowed), 431 for a line past 8 KiB or more
+  than 100 headers, 408 for a head that does not arrive within the timeout (idle
+  keep-alive included). After a 400, 413, 431 or 501 it reads and throws away
+  up to 64 KiB, for at most 2 s and until the client pauses 250 ms, so the
+  answer is not lost to a reset while the client is still sending.
+- One deadline per request (`Clock`, `src/util/refined_tcp_stream.rs`): the
+  timeout from the first byte of its head, for the head and the body together.
+  Every read from the socket waits at most until then (the socket timeout is set
+  to what is left before each read), the body's reads and its drain included, so
+  a body never takes more than the timeout. Before the first byte, the connection
+  may idle for the timeout. A socket timeout (`WouldBlock` on Linux) reads as
+  `TimedOut`. Over TLS only the plain socket timeouts apply.
+- A response may take the timeout, plus one second per 16 KiB it has written,
+  up to its flush; each write waits at most the timeout. A response that could
+  not be written ends the connection.
+- No request head is read before the previous response on the connection is
+  written: a connection has at most one request in flight.
+- A chunked body is read by `ChunkedReader` (`src/util/chunked.rs`), in place of
+  chunked_transfer's decoder: each line (size and extensions, each trailer) at
+  most 4 KiB, the trailers 8 KiB, CRLF only, the deadline checked before every
+  read, and every wire byte (sizes, extensions, CRLFs, data, trailers) counted
+  against the bound plus the drain's 64 KiB grace; the data alone is held to the
+  bound.
 - Every body read from the socket goes through `BodyGuard`
   (`src/util/body_guard.rs`): at most the bound (past it, the read fails with
   `BodyTooLarge`), within the timeout (past it, `TimedOut`). On drop it drains
@@ -44,15 +72,17 @@ Upstream 0.12.0 let one request take the runtime down or pin it:
   request is never read from the middle of a body. `EqualReader` no longer
   drains on its own drop.
 - `Request::respond_and_close`: answers, then closes the connection without
-  draining. The runtime's accept loop sheds load with it.
+  draining. `Request::close_without_response`: closes it unanswered (a dropped
+  request answers 500). The runtime answers its 503 with the first on a thread
+  of its own, and closes a request that gets no thread with the second, so its
+  dispatch loop never writes.
 - The socket gets the timeout as its read and write timeout, before the TLS
   handshake. Past `max_connections`, a new connection is closed as accepted.
 - The task pool spawns with `thread::Builder` and drops the connection when the
   OS refuses a thread; the accept loop logs an `accept()` error and goes on.
 
-A handler that reads a body can still be held for up to twice the timeout: the
-body deadline is checked between reads, and a read waits at most the socket
-timeout.
+A request holds a handler for at most the timeout to read its body, and its
+response for the timeout plus its write allowance.
 
 ## Upgrading
 

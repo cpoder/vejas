@@ -54,6 +54,8 @@ where
     trigger: Option<Receiver<()>>,
     writer: Arc<Mutex<W>>,
     on_finish: Sender<()>,
+    // Vejas patch: told when this writer is done (see `next_watched`)
+    watcher: Option<Sender<()>>,
 }
 
 impl<R: Read + Send> SequentialReaderBuilder<R> {
@@ -106,7 +108,19 @@ impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
             trigger: next_next_trigger,
             writer: self.writer.clone(),
             on_finish: tx,
+            watcher: None,
         })
+    }
+}
+
+impl<W: Write + Send> SequentialWriterBuilder<W> {
+    /// Vejas patch: the next writer, and a receiver told when it is dropped,
+    /// that is when the response it carries is written.
+    pub fn next_watched(&mut self) -> (SequentialWriter<W>, Receiver<()>) {
+        let (tx, rx) = channel();
+        let mut writer = self.next().unwrap();
+        writer.watcher = Some(tx);
+        (writer, rx)
     }
 }
 
@@ -181,5 +195,8 @@ where
 {
     fn drop(&mut self) {
         self.on_finish.send(()).ok();
+        if let Some(watcher) = self.watcher.take() {
+            watcher.send(()).ok();
+        }
     }
 }

@@ -6015,17 +6015,19 @@ fn body_error(e: &std::io::Error) -> (u16, String) {
 /// (VEJAS_HTTP_MAX_BODY_BYTES, 8 MiB), how long a read, a write, a request head
 /// and a body may take (VEJAS_HTTP_TIMEOUT_SECS, 30), and the connections served
 /// at once (VEJAS_HTTP_MAX_CONNECTIONS, 512). A value that is not a number, or
-/// is 0, keeps the default.
+/// is 0, keeps the default; one past the cap (1 GiB, a day, 65536) is the cap.
 fn http_limits(get: impl Fn(&str) -> Option<String>) -> tiny_http::Limits {
-    let num = |k: &str| get(k).and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    let num = |k: &str, cap: u64| {
+        get(k).and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0).map(|n| n.min(cap))
+    };
     let mut limits = tiny_http::Limits::default();
-    if let Some(n) = num("VEJAS_HTTP_MAX_BODY_BYTES") {
+    if let Some(n) = num("VEJAS_HTTP_MAX_BODY_BYTES", 1 << 30) {
         limits.max_body_bytes = usize::try_from(n).unwrap_or(usize::MAX);
     }
-    if let Some(n) = num("VEJAS_HTTP_TIMEOUT_SECS") {
+    if let Some(n) = num("VEJAS_HTTP_TIMEOUT_SECS", 86_400) {
         limits.timeout = Some(Duration::from_secs(n));
     }
-    if let Some(n) = num("VEJAS_HTTP_MAX_CONNECTIONS") {
+    if let Some(n) = num("VEJAS_HTTP_MAX_CONNECTIONS", 65_536) {
         limits.max_connections = usize::try_from(n).unwrap_or(usize::MAX);
     }
     limits
@@ -6883,6 +6885,19 @@ fn stream_retention() {
     }
 }
 
+/// A request the dispatch loop handed to a thread: if the thread never runs,
+/// it is closed unanswered when this drops, rather than answered 500 by the
+/// thread that drops it.
+struct Unanswered(Option<tiny_http::Request>);
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(request) = self.0.take() {
+            request.close_without_response();
+        }
+    }
+}
+
 fn serve_http(registry: Registry, root: PathBuf, addr: String) {
     let limits = http_limits(|k| env::var(k).ok());
     let server = match tiny_http::ConfigListenAddr::from_socket_addrs(addr.as_str())
@@ -6914,24 +6929,39 @@ fn serve_http(registry: Registry, root: PathBuf, addr: String) {
         .max(1);
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for request in server.incoming_requests() {
+        // This thread dispatches: it never writes to a client, which a client
+        // that does not read could make it wait on. Each request, a 503
+        // included, is answered on a thread of its own; one that gets no
+        // thread is closed unanswered (`Unanswered`), not answered 500 here.
+        // A connection has at most one request in flight (the server reads no
+        // head before the last response is written), so the 503 threads are
+        // at most VEJAS_HTTP_MAX_CONNECTIONS, each held at most the timeout.
+        let request = Unanswered(Some(request));
         let Some(slot) = connectors::Slot::try_take(&inflight, max_inflight) else {
             metrics::inc_rejected("panel");
-            // This thread is the accept loop: it closes the connection rather
-            // than read what is left of a body, which a slow client could make
-            // last.
-            let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap();
-            let busy = tiny_http::Response::from_string("too many requests in flight")
-                .with_status_code(503)
-                .with_header(header);
-            let _ = request.respond_and_close(busy);
+            let spawned = thread::Builder::new().name("http-busy".into()).spawn(move || {
+                let mut request = request;
+                let Some(request) = request.0.take() else { return };
+                let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap();
+                let busy = tiny_http::Response::from_string("too many requests in flight")
+                    .with_status_code(503)
+                    .with_header(header);
+                // closes the connection rather than read what is left of a body
+                let _ = request.respond_and_close(busy);
+            });
+            if let Err(e) = spawned {
+                eprintln!("[vejas] no thread to refuse a request: {e}");
+            }
             continue;
         };
         let registry = registry.clone();
         let root = root.clone();
-        // On failure the request drops with the closure and tiny_http answers 500.
         let spawned = thread::Builder::new().name("http-request".into()).spawn(move || {
             let _slot = slot;
-            handle_request(request, registry, root)
+            let mut request = request;
+            if let Some(request) = request.0.take() {
+                handle_request(request, registry, root)
+            }
         });
         if let Err(e) = spawned {
             metrics::inc_rejected("panel");
@@ -8286,6 +8316,128 @@ mod http_limits_tests {
         );
         assert!(out.starts_with("HTTP/1.1 503"), "{out}");
         assert!(closed && start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    }
+
+    /// Writes `chunk` again and again until the server stops taking it;
+    /// the time that took, or None if it took everything for `max`.
+    fn send_until_cut(s: &mut TcpStream, chunk: &[u8], every: Duration, max: Duration) -> Option<Duration> {
+        let start = Instant::now();
+        s.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+        while start.elapsed() < max {
+            match s.write(chunk) {
+                Ok(0) | Err(_) => return Some(start.elapsed()),
+                Ok(_) => {}
+            }
+            // a closed connection also shows as EOF on read
+            s.set_nonblocking(true).unwrap();
+            let mut b = [0u8; 4096];
+            let eof = loop {
+                match s.read(&mut b) {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
+                    Err(_) => break true,
+                }
+            };
+            s.set_nonblocking(false).unwrap();
+            if eof {
+                return Some(start.elapsed());
+            }
+            thread::sleep(every);
+        }
+        None
+    }
+
+    #[test]
+    fn an_endless_chunk_size_line_is_cut_at_its_bound() {
+        // The handler does not read the body; the drain after its answer meets
+        // a chunk-size line that never ends.
+        let addr = serve(limits(1 << 20, 5000), ok);
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        let cut = send_until_cut(&mut s, &[b'1'; 1024], Duration::from_millis(5), Duration::from_secs(4));
+        assert!(cut.map_or(false, |t| t < Duration::from_secs(2)), "{cut:?}");
+    }
+
+    #[test]
+    fn a_slow_chunk_extension_is_cut_at_the_timeout_from_the_head() {
+        let addr = serve(limits(1 << 20, 1000), ok);
+        let mut s = TcpStream::connect(addr).unwrap();
+        let start = Instant::now();
+        s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1;").unwrap();
+        let cut = send_until_cut(&mut s, b"a", Duration::from_millis(200), Duration::from_secs(5));
+        assert!(cut.is_some(), "never cut");
+        // one timeout from the head, not two
+        assert!(start.elapsed() < Duration::from_millis(1900), "{:?}", start.elapsed());
+    }
+
+    static PIPELINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn a_client_that_pipelines_and_never_reads_holds_one_request_at_most() {
+        fn big(request: tiny_http::Request) {
+            PIPELINED.fetch_add(1, Ordering::SeqCst);
+            respond(request, 200, "x".repeat(8 << 20), "text/plain");
+        }
+        let addr = serve(limits(1024, 500), big);
+        let mut s = TcpStream::connect(addr).unwrap();
+        let mut req = Vec::new();
+        for _ in 0..20 {
+            req.extend_from_slice(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+        }
+        s.write_all(&req).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        let n = PIPELINED.load(Ordering::SeqCst);
+        assert!(n <= 2, "{n} requests handled for a client that read nothing");
+        assert!(healthz(addr).contains("200 OK"));
+        drop(s);
+    }
+
+    #[test]
+    fn transfer_codings_and_line_ends_are_strict() {
+        let addr = serve(limits(1024, 5000), ok);
+        let cases: [(&[u8], &str); 5] = [
+            (b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n", "501"),
+            (b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", "501"),
+            (b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n", "400"),
+            (b"GET /x HTTP/1.1\nHost: x\r\n\r\n", "400"),
+            (b"GET /x HTTP/1.1\r\nHost: x\nX: y\r\n\r\n", "400"),
+        ];
+        for (req, code) in cases {
+            let (out, closed) = exchange(addr, req, Duration::from_secs(5));
+            assert!(out.starts_with(&format!("HTTP/1.1 {code}")), "{}: {out}", String::from_utf8_lossy(req));
+            assert!(closed);
+        }
+        let ok_te = b"POST /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: CHUNKED\r\n\r\n0\r\n\r\n";
+        assert!(exchange(addr, ok_te, Duration::from_secs(5)).0.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn an_idle_head_is_408() {
+        let addr = serve(limits(1024, 500), ok);
+        let (out, closed) = exchange(addr, b"GET /healthz HTTP/1.1\r\n", Duration::from_secs(5));
+        assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+        assert!(closed);
+    }
+
+    #[test]
+    fn an_early_413_reaches_a_client_still_sending() {
+        let addr = serve(limits(1024, 5000), ok);
+        let mut req = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n".to_vec();
+        req.extend(std::iter::repeat(b'a').take(60_000));
+        let (out, _) = exchange(addr, &req, Duration::from_secs(5));
+        assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    }
+
+    #[test]
+    fn the_limits_are_capped() {
+        let l = http_limits(|_| Some(u64::MAX.to_string()));
+        assert_eq!(l.timeout, Some(Duration::from_secs(86_400)));
+        assert_eq!(l.max_body_bytes, 1 << 30);
+        assert_eq!(l.max_connections, 65_536);
+        // and a server with them starts and answers
+        let addr = serve(l, ok);
+        assert!(healthz(addr).contains("200 OK"));
     }
 
     #[test]
