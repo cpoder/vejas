@@ -36,9 +36,91 @@ pub struct Failure {
     pub timed_out: bool,
     pub attempts: i64,
     pub delay: Duration,
+    /// What the system's outage does to a flow on the bus (ADR-0040): it
+    /// holds its message, or the message comes back until it is a dead letter.
+    pub down: WhenDown,
 }
 
+/// What a service's `WHEN_DOWN` says (ADR-0040). `Hold` unless the service
+/// says `"dead-letter"`: the founder chose hold as the default.
+#[derive(Clone, Debug, Default)]
+pub enum WhenDown {
+    /// Today's path: the message comes back after `DELAY_MS`, then it is a
+    /// dead letter or its catch runs. Also what a failure that is not a call's
+    /// takes: a secret store or a memory that did not answer.
+    #[default]
+    DeadLetter,
+    /// The flow holds its message and probes until the system answers.
+    Hold(Probe),
+}
+
+/// How a held flow asks whether the system is back (ADR-0040).
+#[derive(Clone)]
+pub struct Probe {
+    /// `HEALTH_URL`, filled from the service's settings, with the service's
+    /// headers: a GET that answers 2xx when the system is up. None: the probe
+    /// is the held message's run itself.
+    health: Option<(String, Vec<(String, String)>, Duration)>,
+    /// `PROBE_MAX_MS`: the longest wait between two probes.
+    pub max: Duration,
+}
+
+impl std::fmt::Debug for Probe {
+    // The headers hold the service's credentials: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Probe")
+            .field("health", &self.health.as_ref().map(|(url, ..)| url))
+            .field("max", &self.max)
+            .finish()
+    }
+}
+
+impl Probe {
+    /// Whether the probe asks a health URL rather than running the message.
+    pub fn has_health(&self) -> bool {
+        self.health.is_some()
+    }
+    /// Ask the health URL: whether it answered 2xx, or why not. Only called
+    /// when `has_health`.
+    pub fn ask(&self) -> Result<(), String> {
+        let Some((url, headers, timeout)) = &self.health else {
+            return Ok(());
+        };
+        match http_call("GET", url, headers, None, *timeout, None) {
+            Ok(answer) if (200..300).contains(&answer.status) => Ok(()),
+            Ok(answer) => Err(format!("HEALTH_URL answered {}", answer.status)),
+            Err(NoAnswer::TimedOut) => Err(format!("HEALTH_URL: timeout after {} ms", timeout.as_millis())),
+            Err(NoAnswer::Network(e)) => Err(shown(format!("HEALTH_URL: network: {e}"))),
+            Err(NoAnswer::Broken(e)) => Err(shown(format!("HEALTH_URL: {e}"))),
+        }
+    }
+}
+
+/// What a declaration's `WHEN_DOWN`, `HEALTH_URL` and `PROBE_MAX_MS` say.
+fn when_down(config: &Config) -> WhenDown {
+    if config.str("WHEN_DOWN").is_some_and(|w| w == "dead-letter") {
+        return WhenDown::DeadLetter;
+    }
+    let timeout = Duration::from_millis(config.u64_or("TIMEOUT_MS", 10_000));
+    let health = config
+        .str("HEALTH_URL")
+        .and_then(|template| filled(&template, &Map::new(), config).ok())
+        .map(|url| (url, config.headers(), timeout));
+    let max = Duration::from_millis(config.u64_or("PROBE_MAX_MS", 60_000).max(1)).min(DELAY_MAX);
+    WhenDown::Hold(Probe { health, max })
+}
+
+/// The values `WHEN_DOWN` takes.
+pub const WHEN_DOWN: &[&str] = &["hold", "dead-letter"];
+
 impl Failure {
+    /// Whether a flow on the bus holds its message on this failure: a later
+    /// try may change it, and its service holds while its system is down
+    /// (ADR-0040).
+    pub fn holds(&self) -> bool {
+        self.retry && matches!(self.down, WhenDown::Hold(_))
+    }
+
     /// A declaration whose settings could not be resolved. A secret store
     /// that did not answer may answer a later delivery, at the pace a message
     /// comes back (`unanswered`); a secret the store says it does not have,
@@ -55,6 +137,7 @@ impl Failure {
                 timed_out: false,
                 attempts: 1,
                 delay: Duration::ZERO,
+                down: WhenDown::DeadLetter,
             }
         };
         Failure { service: service.to_string(), ..failure }
@@ -79,6 +162,7 @@ impl Failure {
             delay: Some(vejas_connector::pull::ack_wait())
                 .filter(|wait| !wait.is_zero())
                 .unwrap_or(Duration::from_secs(30)),
+            down: WhenDown::DeadLetter,
         }
     }
 }
@@ -127,6 +211,7 @@ pub fn call(
         timed_out: why.timed_out,
         attempts: config.0.get("ATTEMPTS").and_then(Value::as_i64).unwrap_or(3).max(1),
         delay: Duration::from_millis(config.u64_or("DELAY_MS", 1000)).min(DELAY_MAX),
+        down: when_down(config),
     })
 }
 

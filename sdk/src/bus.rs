@@ -949,6 +949,13 @@ impl Message {
         self.answer(Bytes::from_static(b"-NAK"))
     }
 
+    /// Tell the server the message is still being worked on, so that its
+    /// `ack_wait` starts again and it is not delivered elsewhere meanwhile: a
+    /// flow that holds its message while a system is down (ADR-0040).
+    pub fn in_progress(&self) -> Result<(), String> {
+        self.answer(Bytes::from_static(b"+WIP"))
+    }
+
     /// Ask for this message again after `delay`, not at once: a call that got
     /// no answer gives its system that long (ADR-0032).
     pub fn nak_after(&self, delay: Duration) -> Result<(), String> {
@@ -1581,6 +1588,23 @@ impl JetStream {
         ack_wait: Duration,
         start_seq: Option<u64>,
     ) -> Result<(), String> {
+        self.create_pull_consumer_with(stream, durable, filters, ack_wait, start_seq, None)
+    }
+
+    /// The same, with at most `max_ack_pending` messages delivered and not yet
+    /// acked across every instance that reads the durable: 1 for a flow that
+    /// holds its message while a system is down, so that the others wait
+    /// (ADR-0040). None leaves the server's default. The server updates an
+    /// existing durable to it.
+    pub fn create_pull_consumer_with(
+        &self,
+        stream: &str,
+        durable: &str,
+        filters: &[String],
+        ack_wait: Duration,
+        start_seq: Option<u64>,
+        max_ack_pending: Option<i64>,
+    ) -> Result<(), String> {
         let mut config = json!({
             "durable_name": durable,
             "ack_policy": "explicit",
@@ -1594,6 +1618,9 @@ impl JetStream {
         if let Some(seq) = start_seq {
             config["deliver_policy"] = Value::from("by_start_sequence");
             config["opt_start_seq"] = Value::from(seq);
+        }
+        if let Some(max) = max_ack_pending {
+            config["max_ack_pending"] = Value::from(max);
         }
         match filters {
             [one] => config["filter_subject"] = Value::String(one.clone()),
@@ -2450,6 +2477,42 @@ mod live {
         assert_eq!(waiting.count(), 0);
         let error = puller.round().err().expect("the consumer is gone");
         assert!(error.contains("consumer gone"), "{error}");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_durable_takes_its_max_ack_pending_and_gives_it_back() {
+        let server = Server::start();
+        let js = connect(&server.url()).unwrap().jetstream();
+        js.add_stream(&StreamConfig {
+            name: "T".into(),
+            subjects: vec!["t.>".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = ["t.in".to_string()];
+        let pending = |js: &JetStream| {
+            let info = js.api("CONSUMER.INFO.T.d".into(), Bytes::new()).unwrap();
+            info["config"]["max_ack_pending"].as_i64().unwrap_or(-1)
+        };
+        js.create_pull_consumer_with("T", "d", &filter, Duration::from_secs(30), None, Some(1))
+            .unwrap();
+        assert_eq!(pending(&js), 1);
+        // The same durable created again without it is updated to the default.
+        js.create_pull_consumer("T", "d", &filter, Duration::from_secs(30), None)
+            .unwrap();
+        assert_ne!(pending(&js), 1);
+        js.create_pull_consumer_with("T", "d", &filter, Duration::from_secs(30), None, Some(1))
+            .unwrap();
+        assert_eq!(pending(&js), 1);
+        // In progress is an answer like an ack: it leaves the message pending.
+        let puller = js.pull_durable("T", "d", Some("t.in")).unwrap();
+        js.publish("t.in", "one").unwrap();
+        let message = puller.round_of(1).unwrap().next().expect("delivered");
+        message.in_progress().unwrap();
+        let info = js.api("CONSUMER.INFO.T.d".into(), Bytes::new()).unwrap();
+        assert_eq!(info["num_ack_pending"], 1);
+        message.ack().unwrap();
     }
 
     #[test]

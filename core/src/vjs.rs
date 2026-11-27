@@ -2128,6 +2128,9 @@ pub struct Engine {
     delivery: Option<i64>,
     /// What `seen` reads: the keys the flow's runs remembered (ADR-0039).
     memory: Option<Arc<dyn Memory>>,
+    /// A person released the held message (ADR-0040): its catch takes the
+    /// failure now, whatever its deliveries.
+    releasing: bool,
 }
 
 /// The keys a flow's runs remembered (ADR-0039, point 4), which `seen` reads.
@@ -2526,6 +2529,7 @@ impl Engine {
             called: false,
             delivery: None,
             memory: None,
+            releasing: false,
         }
     }
     /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
@@ -2581,6 +2585,11 @@ impl Engine {
     pub fn delivered(&mut self, delivery: Option<i64>) {
         self.delivery = delivery;
     }
+    /// Whether the runs that follow are the release of a held message
+    /// (ADR-0040): a catch then takes any failure, as on a last delivery.
+    pub fn releasing(&mut self, releasing: bool) {
+        self.releasing = releasing;
+    }
     /// What `seen` reads in the runs that follow.
     pub fn remember_in(&mut self, memory: Option<Arc<dyn Memory>>) {
         self.memory = memory;
@@ -2611,8 +2620,13 @@ impl Engine {
             return None;
         }
         let attempt = self.delivery.unwrap_or(1);
-        if let Some(f) = &self.failure {
-            if f.retry && attempt < f.attempts.min(vejas_connector::MAX_DELIVERIES) && self.delivery.is_some() {
+        if let Some(f) = self.failure.as_ref().filter(|_| !self.releasing && self.delivery.is_some()) {
+            // A flow on the bus holds its message while the system is down
+            // (ADR-0040): no delivery is its last, until a person releases it.
+            if f.holds() {
+                return None;
+            }
+            if f.retry && attempt < f.attempts.min(vejas_connector::MAX_DELIVERIES) {
                 return None;
             }
         }
