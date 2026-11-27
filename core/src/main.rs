@@ -2763,6 +2763,10 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let mut program =
                 varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
+            if let Some(max) = detect_max_runs() {
+                program.set_max_runs(max);
+            }
+            metrics::losses_new_program(&handle.spec.name);
             let version: Arc<str> = versions::hash_content(&src).into();
             let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
             let mut sources: Vec<(String, String)> = Vec::new();
@@ -3190,6 +3194,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         (processed_at - round_t0).as_secs_f64(),
                         processed_at.elapsed().as_secs_f64(),
                     );
+                    report_losses(&handle.spec.name, &program, &js, &subj_root);
                     if let Some(store) = &store {
                         if acks_since_snapshot > 0
                             && retrying.is_empty()
@@ -3240,6 +3245,39 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
 /// join. Read off a snapshot of the freshly compiled program: the engine lists
 /// every such operator in it, with or without anything in flight. A snapshot
 /// that is not JSON is taken as stateful.
+/// What the engine lost without failing (a run never opened at the cap, a run
+/// evicted, an event a filter discarded for want of a value) goes to
+/// `/metrics` and `/topology`. The first loss, then at most one a minute, is
+/// also said on the log and as a `losses` event on `<root>.flow.events`, so a
+/// detection that did not happen leaves a trace.
+fn report_losses(unit: &str, program: &varpulis_engine::Program, js: &bus::JetStream, subj_root: &str) {
+    let l = program.losses();
+    let Some(total) = metrics::set_losses(unit, [l.runs_dropped, l.runs_evicted, l.filters_without_value]) else {
+        return;
+    };
+    eprintln!(
+        "[vejas] {unit}: the engine lost events without an error: runs_dropped={} runs_evicted={} \
+         filters_without_value={} (since start; see vejas_detect_losses_total)",
+        total[0], total[1], total[2]
+    );
+    let mut event = json!({ "transition": "losses", "ts": now_secs(), "unit": unit });
+    for (kind, n) in metrics::LOSS_KINDS.iter().zip(total) {
+        event[*kind] = json!(n);
+    }
+    let body = serde_json::to_vec(&event).unwrap_or_default();
+    if let Err(e) = js.publish(&format!("{subj_root}.flow.events"), body) {
+        eprintln!("[vejas] {unit}: losses event not published: {e}");
+    }
+}
+
+/// `VEJAS_DETECT_MAX_RUNS`: how many runs a pattern of a detect unit keeps
+/// open at once (per partition for a partitioned one). Unset, the engine's
+/// default (10 000) holds. Past it, new runs are not opened and are counted
+/// as `runs_dropped`.
+fn detect_max_runs() -> Option<usize> {
+    env::var("VEJAS_DETECT_MAX_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0)
+}
+
 fn program_is_stateful(program: &varpulis_engine::Program) -> bool {
     let Ok(bytes) = program.snapshot() else {
         return true;
@@ -3684,7 +3722,7 @@ fn topology_json(registry: &Registry) -> Value {
     let mut detects = Vec::new();
     for handle in reg.values() {
         let st = handle.state.lock().unwrap();
-        let entry = json!({
+        let mut entry = json!({
             "name": handle.spec.name,
             "file": handle.spec.path.display().to_string(),
             "pkg": handle.spec.pkg,
@@ -3695,6 +3733,10 @@ fn topology_json(registry: &Registry) -> Value {
             "last_error": st.last_error,
             "hold": st.hold,
         });
+        // what the engine lost without an error, since the process started
+        if let Some(total) = matches!(handle.spec.kind, Kind::Detect).then(|| metrics::losses(&handle.spec.name)).flatten() {
+            entry["losses"] = metrics::LOSS_KINDS.iter().zip(total).map(|(k, n)| (k.to_string(), json!(n))).collect();
+        }
         match handle.spec.kind {
             Kind::Flow => flows.push(entry),
             Kind::Connector => connectors.push(entry),

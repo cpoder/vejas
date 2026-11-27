@@ -58,6 +58,14 @@ struct Unit {
     held_on: Option<String>,
     held: bool,
     probes: u64,
+    /// Detect units: what the engine lost without failing, by `LOSS_KINDS`.
+    /// `loss_cur` is the running program's count (monotonic since it was
+    /// compiled); `loss_base` sums the programs this unit ran before, so the
+    /// exported counter only grows while the process lives.
+    detect: bool,
+    loss_base: [u64; 3],
+    loss_cur: [u64; 3],
+    loss_warned: Option<Instant>,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -128,6 +136,48 @@ pub fn observe_restore(unit: &str, seq: u64) {
     let u = map.entry(unit.to_string()).or_default();
     u.restores += 1;
     u.restore_seq = seq;
+}
+
+/// What a detect unit's engine can lose without an error, in the order of
+/// `vejas_detect_losses_total{kind=...}` and `/topology`.
+pub const LOSS_KINDS: [&str; 3] = ["runs_dropped", "runs_evicted", "filters_without_value"];
+
+/// How often a unit that keeps losing is reported again.
+const LOSS_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// A detect unit compiled a new program: what the previous one counted is
+/// kept, the new one counts from zero.
+pub fn losses_new_program(unit: &str) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.detect = true;
+    for i in 0..3 {
+        u.loss_base[i] += u.loss_cur[i];
+        u.loss_cur[i] = 0;
+    }
+}
+
+/// The running program's loss counters. Returns the unit's totals when they
+/// grew and the unit was not reported in the last `LOSS_WARN_EVERY`: the
+/// caller says so once, on the log and the bus.
+pub fn set_losses(unit: &str, cur: [u64; 3]) -> Option<[u64; 3]> {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.detect = true;
+    let grew = cur.iter().zip(u.loss_cur.iter()).any(|(n, o)| n > o);
+    u.loss_cur = cur;
+    if !grew || u.loss_warned.is_some_and(|t| t.elapsed() < LOSS_WARN_EVERY) {
+        return None;
+    }
+    u.loss_warned = Some(Instant::now());
+    Some(std::array::from_fn(|i| u.loss_base[i] + u.loss_cur[i]))
+}
+
+/// A detect unit's loss totals since the process started, if it is one.
+pub fn losses(unit: &str) -> Option<[u64; 3]> {
+    let map = units().lock().unwrap();
+    let u = map.get(unit).filter(|u| u.detect)?;
+    Some(std::array::from_fn(|i| u.loss_base[i] + u.loss_cur[i]))
 }
 
 /// A message that was dead-lettered (ADR-0015). Kept separate from `observe`
@@ -266,6 +316,17 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
     out.push_str("# TYPE vejas_restore_seq gauge\n");
     for (unit, u) in map.iter() {
         out.push_str(&format!("vejas_restore_seq{{unit=\"{}\"}} {}\n", esc(unit), u.restore_seq));
+    }
+    out.push_str("# HELP vejas_detect_losses_total What a detect unit's engine lost without an error: runs never opened at the max_runs cap, runs evicted, events a filter discarded for want of a true/false value.\n");
+    out.push_str("# TYPE vejas_detect_losses_total counter\n");
+    for (unit, u) in map.iter().filter(|(_, u)| u.detect) {
+        for (i, kind) in LOSS_KINDS.iter().enumerate() {
+            out.push_str(&format!(
+                "vejas_detect_losses_total{{unit=\"{}\",kind=\"{kind}\"}} {}\n",
+                esc(unit),
+                u.loss_base[i] + u.loss_cur[i]
+            ));
+        }
     }
 
     out.push_str("# HELP vejas_round_seconds_sum Wall time of the consumer loop by phase: fetch (wait for the first message of a round), process, barrier (flush + acks).\n");
@@ -889,6 +950,25 @@ pub(crate) fn json_string(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_losses_survive_a_new_program_and_warn_once() {
+        let unit = "detect:losses_t";
+        assert_eq!(losses(unit), None, "not a detect unit before it reports");
+        losses_new_program(unit);
+        assert_eq!(set_losses(unit, [0, 0, 0]), None, "nothing lost, nothing said");
+        assert_eq!(set_losses(unit, [3, 0, 1]), Some([3, 0, 1]), "the first loss is said");
+        assert_eq!(set_losses(unit, [5, 0, 1]), None, "then not again within the minute");
+        // A restart compiles a new program that counts from zero: the total
+        // the process exports keeps growing.
+        losses_new_program(unit);
+        set_losses(unit, [2, 0, 0]);
+        assert_eq!(losses(unit), Some([7, 0, 1]));
+        let text = render(&[]);
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"runs_dropped\"} 7"));
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 1"));
+        assert!(!text.contains("vejas_detect_losses_total{unit=\"flow:"), "only detect units carry it");
+    }
 
     #[test]
     fn render_emits_prometheus_shape() {

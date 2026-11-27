@@ -126,6 +126,34 @@ a restart. `vejas_snapshots_total`, `vejas_snapshot_seq`,
 `vejas_snapshot_bytes`, `vejas_restores_total` and `vejas_restore_seq` on
 `/metrics` say what a unit is doing about it.
 
+## What the engine loses, counted
+
+A pattern keeps at most 10 000 sequences open at once (per partition for a
+partitioned one). Past that, a new first step opens no sequence: the match
+it would have found is lost. `VEJAS_DETECT_MAX_RUNS` sets the cap for every
+detect unit of the runtime; size it from the formula below, and partition
+before you raise it.
+
+Three counters say what was lost without an error, per unit, on `/metrics`
+as `vejas_detect_losses_total{unit, kind}` and under `losses` in
+`/topology`:
+
+- `runs_dropped`: sequences never opened because the cap was reached;
+- `runs_evicted`: open sequences closed early to make room (only under an
+  eviction strategy, not the default);
+- `filters_without_value`: events a `.where()` discarded because it could
+  not judge them, a field missing or of the wrong type, and the event was
+  taken as not matching.
+
+The totals count since the runtime started and do not go back when a unit
+restarts or reloads. The first loss of a unit, then at most one a minute,
+is also a line on the log and a `losses` event on `<root>.flow.events`,
+with the three totals.
+
+The engine refuses at load what it would not run: `import`, `context`,
+a `timer()` source, `.enrich()` and `.alert(webhook: ...)` are errors
+(E100 to E104), not warnings.
+
 ## What it costs
 
 A stateless rule runs at about 30 000 events/s in 10 MB. A correlation is
