@@ -2645,10 +2645,23 @@ impl Engine {
     /// those invoke, declares a driver (ADR-0032). Read from the files as they
     /// are now. A service that cannot be read fails its run without calling.
     pub fn reaches_system(&mut self, prog: &Program) -> bool {
+        self.systems(prog).0
+    }
+    /// Whether a run of `prog` may call a service that holds its source while
+    /// its system is down (ADR-0040): every declared service, unless it says
+    /// `WHEN_DOWN = "dead-letter"`. Its flow then takes one message at a time
+    /// across instances.
+    pub fn holds_its_source(&mut self, prog: &Program) -> bool {
+        self.systems(prog).1
+    }
+    /// Whether a run of `prog` may call a system, and whether one of those
+    /// holds its source.
+    fn systems(&mut self, prog: &Program) -> (bool, bool) {
         let caller = self.caller_pkg.clone();
         let mut seen: Vec<String> = Vec::new();
         let mut todo: Vec<(String, String)> = prog.invokes.iter().map(|n| (caller.clone(), n.clone())).collect();
         let mut reaches = false;
+        let mut holds = false;
         while let Some((pkg, name)) = todo.pop() {
             self.caller_pkg = pkg;
             let Ok((pkg, svc)) = self.resolve(&name) else { continue };
@@ -2663,12 +2676,17 @@ impl Engine {
             };
             if service.driver.is_some() {
                 reaches = true;
-                break;
+                let down = service.surface.iter().find(|e| e.name == "WHEN_DOWN").and_then(|e| e.value.as_str());
+                if down != Some("dead-letter") {
+                    holds = true;
+                    break;
+                }
+                continue;
             }
             todo.extend(service.invokes.iter().map(|n| (pkg.clone(), n.clone())));
         }
         self.caller_pkg = caller;
-        reaches
+        (reaches, holds)
     }
     /// What a check of a flow tells of its invokes without running it: the
     /// arguments a service that answers does not take (ADR-0032, point 1). A
@@ -2686,6 +2704,11 @@ impl Engine {
             };
             if service.driver.is_none() {
                 continue;
+            }
+            if let Some(down) = service.surface.iter().find(|e| e.name == "WHEN_DOWN").map(|e| &e.value) {
+                if !down.as_str().is_some_and(|d| crate::connectors::answer::WHEN_DOWN.contains(&d)) {
+                    problems.push(format!("invoke {name}: its WHEN_DOWN is {down}, not \"hold\" or \"dead-letter\""));
+                }
             }
             let (settings, url) = declared_shape(&service);
             let Some(url) = url else { continue };

@@ -1646,6 +1646,12 @@ impl JetStream {
         Ok(())
     }
 
+    /// What the server says of a consumer: its config, the messages it has
+    /// delivered and not had acked, those still to deliver (`num_pending`).
+    pub fn consumer_info(&self, stream: &str, consumer: &str) -> Result<Value, String> {
+        self.api(format!("CONSUMER.INFO.{stream}.{consumer}"), Bytes::new())
+    }
+
     pub fn delete_consumer(&self, stream: &str, consumer: &str) -> Result<(), String> {
         self.api(format!("CONSUMER.DELETE.{stream}.{consumer}"), Bytes::new())
             .map(|_| ())
