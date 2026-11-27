@@ -1839,6 +1839,10 @@ function traceHtml(hops, ring) {
     const attempt = a['vejas.delivery.attempt'] > 1 ? ` <span class="tag">attempt ${esc(a['vejas.delivery.attempt'])}</span>` : '';
     const version = a['vejas.flow.version'] ? ` <span class="kind" title="version ${esc(a['vejas.flow.version'])}">version ${esc(String(a['vejas.flow.version']).slice(0, 8))}</span>` : '';
     const answer = h.answer ? `<span title="${esc(h.answer)}">answered ${esc(trunc(h.answer, 60))}</span>` : '';
+    // the keys the run remembered for its flow's later runs (ADR-0039)
+    const keys = Number(a['vejas.remembered']) || 0;
+    const kept = a['vejas.remember.error'] ? ` <span class="bad">It could not remember its keys: ${esc(trunc(String(a['vejas.remember.error']), 200))}</span>`
+      : keys > 0 ? ` <span class="tag">remembered ${plural(keys, 'key')}</span>` : '';
     const outcome = h.ok
       ? (emits.length ? `sent to ${emits.map(s => `<span class="subject out">${esc(s)}</span>`).join(' ')}` : answer ? '' : 'done')
       : `<span class="bad">${esc(trunc(h.error || 'failed', 300))}${a['vejas.dlq'] ? '. Kept as a dead letter.' : ''}</span>`;
@@ -1849,10 +1853,11 @@ function traceHtml(hops, ring) {
     const lines = steps.map(st => {
       if (st.skipped) return `<div class="gap">      … ${esc(String(st.skipped))} more …</div>`;
       const failed = st.failed === true ? ' <span class="bad">failed here</span>' : '';
+      const caught = st.caught === true ? ' <span class="tag">failed here, the catch ran</span>' : '';
       const ind = st.service ? 'in' : '';
       if (st.version) return `<div class="did ${ind}">into ${esc(st.service)} <span title="version ${esc(st.version)}">${esc(String(st.version).slice(0, 8))}</span></div>`;
       const did = st.emit != null ? ` <span class="did">sent to ${esc(st.emit)}</span>` : st.respond != null ? ` <span class="did">answered ${esc(String(st.respond))}</span>` : '';
-      return `<div class="${ind}${failed ? ' fail' : ''}"><span class="n">${esc(String(st.line))}</span>${esc(st.code || '')}${did}${failed}</div>`;
+      return `<div class="${ind}${failed ? ' fail' : ''}"><span class="n">${esc(String(st.line))}</span>${esc(st.code || '')}${did}${failed}${caught}</div>`;
     }).join('');
     const gone = steps.some(st => st.line != null && st.code == null)
       ? '<div class="gap">Some lines show their number only: the code that ran them is no longer on disk or in the version store.</div>' : '';
@@ -1862,7 +1867,7 @@ function traceHtml(hops, ring) {
       <span class="at num">+${((h.start_us - t0) / 1000).toFixed(1)} ms</span>
       <div class="who">${icon(h.ok ? 'check' : 'x', h.ok ? 'ok-i' : 'err-i')}${unitHtml(h.unit)}${h.subject ? ` on <span class="subject">${esc(h.subject)}</span>` : ''}${attempt}${version}</div>
       <span class="took num">${(h.duration_us / 1000).toFixed(1)} ms</span>
-      <div class="what">${outcome}${answer}</div>
+      <div class="what">${outcome}${answer}${kept}</div>
       <div class="extra">${input}${stepsHtml}${h.ok ? goldenBtn(h.unit, seq) : ''}</div>
     </div>`;
   }).join('');

@@ -1,6 +1,6 @@
 # 0039 — A flow sees its message as it came, and owns its failures
 
-- Status: Accepted (partial). Points 1 and 2 are built. Points 3 and 4 are proposed: their syntax waits for the founder's review.
+- Status: Accepted. Points 1 to 4 are built. The founder chose the syntax of points 3 and 4 (2026-11-27), over an `on error` block for the whole flow and a declared `DEDUPE` setting.
 - Date: 2026-11-27
 
 ## Context
@@ -100,7 +100,7 @@ The bench names no client and ships nothing: what it taught is written here.
   versions that read `unreadable`. A version that does not leaves it to the
   dead letters, which counts as a change.
 
-### 3. `try` / `catch` (proposed)
+### 3. `try` / `catch` (built)
 
 ```
 try:
@@ -111,17 +111,29 @@ catch e:
 end
 ```
 
-- `catch` runs only for a failure no later delivery may change: an error the
-  service does not retry, or its attempts spent. Before that the run fails
-  and the message comes back after the service's delay, as today: retries
-  stay deliveries (ADR-0032).
-- `e` is `{error, service, status, attempts}`, `status` when the system
-  answered.
-- The emits held in the `try` before the failure are dropped: the run's
-  emits stay all or nothing.
+- `catch` runs only for a failure no later delivery may change: an error in
+  the code, a call the service does not try again, or a call on the
+  delivery that spends the service's `ATTEMPTS`, and at the latest on the
+  last of the five deliveries any message gets. Before that the run fails
+  and the message comes back after the service's delay, as without `try`:
+  retries stay deliveries (ADR-0032). An `api` flow's request has no later
+  delivery, so its catch takes the failure at once.
+- `e` is `{error, service, status, attempts}`: `service` null for an error
+  in the code, `status` null when the system gave no answer, `attempts` the
+  delivery's number (1 for a request). `catch:` without a name is allowed.
+- What the `try` emitted, remembered or responded before the failure is
+  dropped: the run's effects stay all or nothing. The variables it set stay,
+  as a branch's do. A failure in the catch fails the run, or goes to the
+  `try` around it.
+- A run that is shown makes no call (ADR-0032), so its catch takes no
+  call's failure: such a run fails there and says why, as before.
+- The trace record writes the step that failed as `caught` and the run as
+  succeeded: the steps that follow are the catch's.
+- `try` and `catch` are words of the language only where a statement
+  starts, so a flow that uses them as a variable or a field is unchanged.
 - The language stays pure: this is control flow, with no new effect.
 
-### 4. `seen` / `remember` (proposed)
+### 4. `seen` / `remember` (built)
 
 ```
 if seen(event.dedupKey):
@@ -133,22 +145,41 @@ else:
 end
 ```
 
-- `seen(key)` is true when a run of this flow remembered the key within the
-  window it gave. The runtime looks the key up in a JetStream key-value
-  bucket of the flow's. It is read before the run's calls, so a duplicate
-  makes none.
+- `seen(key)` is true when a run of this flow remembered the key and the
+  window it gave has not passed. The runtime looks the key up in a
+  JetStream key-value bucket of the flow's, `VEJAS_SEEN_` and the flow's
+  name and the start of its hash, under the key's SHA-256: any value a key
+  holds fits, and two flows never share a bucket. It is read where the flow
+  reads it, before the run's calls, so a duplicate makes none.
 - `remember key for "7d"` marks the key once the run's emits are stored
-  (the stream answers for them, ADR-0035 amendment). A run that failed or
-  went through a `catch` marks nothing, so its replay is processed again,
-  and a business reject that does not say `remember` leaves the key free.
+  (the stream answers for them, ADR-0035 amendment). A run that failed marks
+  nothing, so the message that comes back is processed again. A mark made in
+  a `try` before its failure is dropped; a `catch` marks what it remembers,
+  so a business reject that does not say `remember` leaves the key free.
   The read and the mark are apart for that reason: a flow marks only what
   it published.
+- The window is a number and `s`, `m`, `h` or `d`, up to ten years, written
+  in the statement or in an UPPERCASE constant, so the parser checks it. The
+  stored value is when the window passes. The bucket keeps a key as long as
+  the flow's longest window: a longer one raises its limit, a shorter one
+  never lowers it.
+- A key is any value but null; a number or a document is read as its JSON
+  text.
+- The runtime holds a run's marks while its emits are confirmed, so a copy
+  later in the same batch reads them. A mark that cannot be written fails
+  nothing: the emits are stored, so the message is acked, and the trace
+  says `vejas.remember.error`. The next copy is then processed again.
+- A bucket that does not answer fails the run, which the next delivery may
+  change, as a call's failure. An `api` flow answers 503, and opens its
+  bucket only when a run reads or marks a key.
 - The lookup and the mark sit at the edges of the run, as the event and the
   ack do, so the run itself stays pure. `remember` is a write for the write
   gate of a read-method `api` flow. A shown run (preview, replay, time
-  travel) reads `seen` from what the record kept.
-- Limit: two copies that arrive at the same instant on two instances can
-  both pass. A sender that needs exactly once keeps its own key.
+  travel) reads every key as new: it reads no state, and its steps show the
+  branch it took.
+- Limit: two copies that run at the same instant, on two instances or as
+  two requests, can both pass. A sender that needs exactly once keeps its
+  own key.
 
 ## Consequences
 
@@ -157,4 +188,8 @@ end
 - A message that is not JSON reaches a flow only when the flow asks for it,
   so no existing flow sees a new kind of event.
 - Points 3 and 4 add `try`/`catch`, a builtin, `seen`, and a statement,
-  `remember`. They wait for the founder's review of their syntax.
+  `remember`. A flow that does not use them is unchanged, and opens no
+  bucket.
+- A flow that publishes a business reject or drops duplicates says so in
+  its own lines, where it needed code outside Vejas, and the trace shows the
+  catch and the marks.

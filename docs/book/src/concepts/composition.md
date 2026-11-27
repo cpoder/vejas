@@ -75,6 +75,10 @@ emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
   [dead letter](../guides/dlq-replay.md) at once, replayed once the cause is
   fixed. A run's emits leave only when it succeeds, so a message tried again
   emits once.
+- A flow that knows what such a failure means writes the call in a `try`:
+  its `catch` runs instead of the dead letter, on the delivery that spends
+  the attempts, or at once when the service does not try again (ADR-0039).
+  `e.status` holds the status the system answered, null when it gave none.
 - The error names no URL and no header, and is masked as the trace record
   masks one, so a credential reaches no log, span, answer or dead letter.
 - A flow that calls a system takes its messages one by one: it asks for the

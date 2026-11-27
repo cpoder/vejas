@@ -27,6 +27,7 @@
 mod cluster;
 mod connectors;
 mod control;
+mod memory;
 mod metrics;
 mod mqtt;
 mod proposals;
@@ -1494,6 +1495,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 handle.spec.name
             );
             let mut engine = vjs::Engine::live(root.clone(), handle.spec.pkg.clone());
+            // What `seen` reads and `remember` marks (ADR-0039, point 4).
+            let memory = memory::Bucket::of(&js, &handle.spec.name);
+            engine.remember_in(Some(memory.clone()));
             // The flow's file as the record names it: a trace joins each
             // statement it ran with this file's code (ADR-0034, point 8).
             let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
@@ -1618,6 +1622,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     engine.carry(Some(carried.clone()));
                     // The record says which statements the event went through.
                     engine.record_steps(record::on());
+                    // A `catch` waits for the delivery that spends a call's attempts.
+                    engine.delivered(Some(msg.delivery().map(|d| d.delivered).unwrap_or(1)));
                     // Holding an emit is local, so a refusal is final for this message:
                     // it can never leave, however often it redelivers. That makes it
                     // a failed run, capped by MAX_DELIVERIES and dead-lettered, and
@@ -1647,6 +1653,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         Ok(ctx) => ran.push(Ran {
                             emits: held..batch.held(),
                             subjects: ctx.emits.iter().map(|(s, _)| s.clone()).collect(),
+                            marks: {
+                                // a copy of the message in this round reads them
+                                memory.hold(&ctx.marks);
+                                ctx.marks
+                            },
                             event,
                             hop,
                             steps,
@@ -1724,6 +1735,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     overlay_of: overlay_of.as_ref(),
                     js: &js,
                     durable: &durable,
+                    memory: &memory,
                 };
                 let acked = settle(ran, &confirmed, &unit);
                 // done, whether or not the acks get through
@@ -1861,6 +1873,8 @@ struct Ran {
     /// Where its emits are in the batch.
     emits: std::ops::Range<usize>,
     subjects: Vec<String>,
+    /// What it remembers, marked once its emits are stored (ADR-0039).
+    marks: Vec<(String, Duration)>,
     event: Value,
     hop: trace::Hop,
     steps: Option<vjs::Steps>,
@@ -1877,6 +1891,7 @@ struct Unit<'a> {
     overlay_of: Option<&'a Arc<str>>,
     js: &'a bus::JetStream,
     durable: &'a str,
+    memory: &'a memory::Bucket,
 }
 
 /// A message a detect unit's engine took in, and its alerts, held until the
@@ -1998,9 +2013,23 @@ fn settle(ran: Vec<Ran>, confirmed: &Result<Vec<bus::Refused>, String>, unit: &U
         let Some((error, lasting)) = failed else {
             let emits = run.subjects.len() as u64;
             metrics::observe(name, true, emits, run.secs);
+            // Its emits are stored: what it remembers is marked now. A mark
+            // that fails leaves the run done, its emits out: a later copy of
+            // the message is processed again, as it was before marks.
+            let remembered = unit.memory.write(&run.marks);
+            unit.memory.release(&run.marks);
+            if let Err(e) = &remembered {
+                eprintln!("[vejas] {name}: remember: {e}");
+                set_state(unit.handle, |st| st.last_error = Some(format!("remember: {e}")));
+            }
             if run.observing && run.hop.sampled {
                 let span = hop_span(&run.hop, name, unit.file, msg, unit.version, unit.overlay_of, run.start_nanos)
                     .attr("vejas.emits", emits);
+                let span = match &remembered {
+                    Ok(()) if run.marks.is_empty() => span,
+                    Ok(()) => span.attr("vejas.remembered", run.marks.len() as i64),
+                    Err(e) => span.attr("vejas.remember.error", e.clone()),
+                };
                 let extras = record::Extras::new().emits(run.subjects.clone()).input(&msg.data).steps(run.steps);
                 record::end(span, extras);
             }
@@ -2012,6 +2041,7 @@ fn settle(ran: Vec<Ran>, confirmed: &Result<Vec<bus::Refused>, String>, unit: &U
             continue;
         };
         metrics::observe(name, false, 0, run.secs);
+        unit.memory.release(&run.marks);
         let mut said = error.clone();
         let mut dead_lettered = false;
         // An emit the stream refused fails the run, and its deliveries count;
@@ -3466,7 +3496,17 @@ const LANGUAGE_VJS: &str = r#"VejasScript in 20 lines:
   key = secret("slack/webhook")      <- credentials resolve from the Vault at run time; NEVER a literal
   if code in ALERT_LEVELS:
       emit "vx.slack.out", {text: f"[{code}] {subject}"}
-  end                                <- every if/for closes with `end`
+  end                                <- every if/for/try closes with `end`
+  try:
+      o = invoke get_quote(id: id)   <- a failure no later delivery may change runs the catch, not a failed run
+  catch e:                           <- e = {error, service, status, attempts}; `catch:` when the flow does not read it
+      emit "vx.quote.rejected", {id: id, status: e.status, why: e.error}
+  end
+  if seen(event.key):                <- true when a run of this flow remembered the key and its window has not passed
+      emit "vx.quote.duplicate", {key: event.key}
+  else:
+      remember event.key for "7d"    <- marks the key once the run's emits are stored
+  end
 
 Exposing a flow (instead of, or besides, `source`):
   tool "what calling this flow does" <- exposes the flow as an MCP tool
@@ -3487,6 +3527,8 @@ Rules:
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
 - A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
+- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
+- `seen(key)` is true when a run of this flow said `remember key for "<window>"` and the window has not passed. The mark is written once the run's emits are stored: a run that fails marks nothing, so a message that comes back is processed again, and a catch marks only what it remembers. The window is a number and s, m, h or d, up to 3650d, written in the statement or in an UPPERCASE constant. A key is any value but null; a number or a document is read as its JSON text. A copy of a message finds the mark of a run before it, also in the same batch, but two copies that run at the same instant, on two instances or as two requests, can both pass. Where a run is SHOWN, `seen` is false for every key. `remember` is a write: a read-method `api` flow that remembers needs the token, as one that emits. A flow whose memory does not answer fails its run, as a call that may answer later does (an `api` flow answers 503).
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -4735,6 +4777,7 @@ fn run_api_flow(
         engine.trace_under(traced.then_some(&hop));
         engine.carry(Some(hop.context()));
         engine.record_steps(record::on());
+        engine.remember_in(Some(Arc::new(memory::OfApi(unit.clone()))));
         let run = vjs::run_with(&prog, &event, given, &mut engine);
         invoked = engine.take_spans();
         steps = engine.take_steps();
@@ -4744,7 +4787,29 @@ fn run_api_flow(
         run
     })();
     // The emits leave before the answer: a caller told 2xx can count on them.
+    // What the run remembers is held while they do, then marked once they
+    // are stored (ADR-0039, point 4). A run that remembers nothing opens no
+    // memory.
+    let marks: &[(String, Duration)] = result.as_ref().map(|ctx| ctx.marks.as_slice()).unwrap_or_default();
+    let memory = (!marks.is_empty()).then(|| memory::of_api(&unit));
+    if let Some(Ok(memory)) = &memory {
+        memory.hold(marks);
+    }
     let unsent = result.as_ref().ok().and_then(|ctx| publish_emits(&ctx.emits, &hop.context()).err());
+    // A mark that is not written leaves the request answered as the run
+    // says: its emits are stored, and a request sent again would emit twice.
+    let remembered = match &memory {
+        Some(Ok(memory)) => {
+            let written = if unsent.is_none() { memory.write(marks).err() } else { None };
+            memory.release(marks);
+            written
+        }
+        Some(Err(e)) if unsent.is_none() => Some(e.clone()),
+        _ => None,
+    };
+    if let Some(e) = &remembered {
+        eprintln!("[vejas] {unit}: remember: {e}");
+    }
     // a body that is not JSON is the caller's error: a 400, as a flow's
     // `respond 400` is, and no failure of the flow
     let failed = (result.is_err() && !not_json) || unsent.is_some();
@@ -4771,6 +4836,8 @@ fn run_api_flow(
         // A service that answered nothing (ADR-0032): the caller may try again.
         (Err(e), _) => match &failure {
             Some(f) if f.timed_out => (504, json!({"error": e}).to_string()),
+            // the flow's memory, which is the runtime's: the bus did not answer
+            Some(f) if f.service.is_empty() => (503, json!({"error": e}).to_string()),
             Some(_) => (502, json!({"error": e}).to_string()),
             None => (500, json!({"error": e}).to_string()),
         },
@@ -4797,6 +4864,11 @@ fn run_api_flow(
         }
         if let Some(path) = &path {
             span = span.attr("code.file.path", metrics::Attr::Computed(relative_to(root, path).into()));
+        }
+        match &remembered {
+            Some(e) => span = span.attr("vejas.remember.error", e.clone()),
+            None if !failed && !marks.is_empty() => span = span.attr("vejas.remembered", marks.len() as i64),
+            None => {}
         }
         if let Some(e) = result.err().filter(|_| !not_json).or(unsent.map(|u| u.error().to_string())) {
             span = span.failed(e);

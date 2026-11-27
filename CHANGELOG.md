@@ -8,6 +8,29 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **A flow can catch a failure** (ADR-0039). `try:` ... `catch e:` ... `end`
+  runs the catch instead of failing the run, for a failure no later delivery
+  may change: an error in the code, a call the service does not try again,
+  or a call on the delivery that spends the service's `ATTEMPTS`. Until then
+  the message comes back as before: retries stay deliveries. An `api`
+  flow's catch takes the failure at once. `e` holds `{error, service,
+  status, attempts}`. What the `try` emitted, remembered or responded before
+  the failure is dropped; the variables it set stay. The trace record writes
+  the step that failed as `caught`. A flow can so publish its own business
+  reject when a system stays down, where the message became a dead letter.
+- **A flow can drop a duplicate** (ADR-0039). `seen(key)` is true when a run
+  of the flow said `remember key for "7d"` and the window has not passed.
+  The runtime keeps the keys in a JetStream key-value bucket of the flow's,
+  `VEJAS_SEEN_<flow>_<hash>`, under their SHA-256, and writes a run's marks
+  once its emits are stored: a run that fails marks nothing, and a copy in
+  the same batch finds the first one's mark. The bucket keeps a key as long
+  as the flow's longest window. The trace record counts the marks a run
+  wrote (`vejas.remembered`), or says why they were not
+  (`vejas.remember.error`): the message is acked, since its emits are
+  stored. `remember` is a write for the write gate. A run that is shown
+  reads every key as new. A memory that does not answer fails the run as a
+  call that may answer later does; an `api` flow answers 503. Two copies
+  that run at the same instant on two instances can both pass.
 - **A flow can take a message that is not JSON** (ADR-0039). A flow that reads
   the variable `unreadable` runs such a message instead of leaving it to the
   dead letter queue: its event is `{unreadable: {error, text, base64}}`, why

@@ -1257,6 +1257,8 @@ pub struct StreamState {
     pub first_seq: u64,
     pub last_seq: u64,
     pub messages: u64,
+    /// The longest the stream keeps a message: zero for no limit.
+    pub max_age: Duration,
 }
 
 pub struct StoredMessage {
@@ -1448,6 +1450,7 @@ impl JetStream {
             first_seq: seq("first_seq"),
             last_seq: seq("last_seq"),
             messages: seq("messages"),
+            max_age: Duration::from_nanos(info["config"]["max_age"].as_u64().unwrap_or(0)),
         })
     }
 

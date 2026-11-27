@@ -23,6 +23,10 @@ const DELAY_MAX: Duration = Duration::from_secs(3600);
 pub struct Failure {
     /// The run's error, which names the service: `get_order: HTTP 503`.
     pub error: String,
+    /// The service, as the flow named it: what a `catch` says failed.
+    pub service: String,
+    /// The status the system answered with, when it answered.
+    pub status: Option<u16>,
     /// A later delivery may get an answer: by default after a 429, a 5xx, a
     /// timeout or a network error. The message is then delivered again after
     /// `delay`, while it has had fewer deliveries than `attempts`; otherwise it
@@ -38,8 +42,16 @@ impl Failure {
     /// A declaration whose settings could not be resolved: a secret store that
     /// did not answer, say. A later delivery may resolve them. Its own
     /// attempts and delay are among what is not known, so the defaults apply.
-    pub fn unresolved(error: String) -> Self {
-        Failure { error: shown(error), retry: true, timed_out: false, attempts: 3, delay: Duration::from_millis(1000) }
+    pub fn unresolved(service: &str, error: String) -> Self {
+        Failure {
+            error: shown(error),
+            service: service.to_string(),
+            status: None,
+            retry: true,
+            timed_out: false,
+            attempts: 3,
+            delay: Duration::from_millis(1000),
+        }
     }
 }
 
@@ -55,12 +67,13 @@ struct Why {
     error: String,
     retry: bool,
     timed_out: bool,
+    status: Option<u16>,
 }
 
 impl Why {
     /// A cause no later try can change.
     fn fixed(error: String) -> Self {
-        Why { error, retry: false, timed_out: false }
+        Why { error, retry: false, timed_out: false, status: None }
     }
 }
 
@@ -80,6 +93,8 @@ pub fn call(
     };
     answered.map_err(|why| Failure {
         error: shown(format!("{name}: {}", why.error)),
+        service: name.to_string(),
+        status: why.status,
         retry: why.retry,
         timed_out: why.timed_out,
         attempts: config.0.get("ATTEMPTS").and_then(Value::as_i64).unwrap_or(3).max(1),
@@ -104,8 +119,8 @@ fn http_rpc(
     let timeout = config.u64_or("TIMEOUT_MS", 10_000);
     let answer = http_call(&method, &url, &headers, body.as_deref(), Duration::from_millis(timeout), trace)
         .map_err(|no| match no {
-            NoAnswer::TimedOut => Why { error: format!("timeout after {timeout} ms"), retry: true, timed_out: true },
-            NoAnswer::Network(e) => Why { error: format!("network: {e}"), retry: true, timed_out: false },
+            NoAnswer::TimedOut => Why { error: format!("timeout after {timeout} ms"), retry: true, timed_out: true, status: None },
+            NoAnswer::Network(e) => Why { error: format!("network: {e}"), retry: true, timed_out: false, status: None },
             NoAnswer::Broken(e) => Why::fixed(e),
         })?;
     let status = answer.status;
@@ -114,6 +129,7 @@ fn http_rpc(
             error: format!("HTTP {status}{}", refusal(&url, &answer.body)),
             retry: listed(config, "RETRY_ON", status).unwrap_or(status == 429 || status >= 500),
             timed_out: false,
+            status: Some(status),
         });
     }
     let mut out = Map::new();

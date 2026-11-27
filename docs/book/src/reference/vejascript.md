@@ -24,7 +24,17 @@ VejasScript in 20 lines:
   key = secret("slack/webhook")      <- credentials resolve from the Vault at run time; NEVER a literal
   if code in ALERT_LEVELS:
       emit "vx.slack.out", {text: f"[{code}] {subject}"}
-  end                                <- every if/for closes with `end`
+  end                                <- every if/for/try closes with `end`
+  try:
+      o = invoke get_quote(id: id)   <- a failure no later delivery may change runs the catch, not a failed run
+  catch e:                           <- e = {error, service, status, attempts}; `catch:` when the flow does not read it
+      emit "vx.quote.rejected", {id: id, status: e.status, why: e.error}
+  end
+  if seen(event.key):                <- true when a run of this flow remembered the key and its window has not passed
+      emit "vx.quote.duplicate", {key: event.key}
+  else:
+      remember event.key for "7d"    <- marks the key once the run's emits are stored
+  end
 
 Exposing a flow (instead of, or besides, `source`):
   tool "what calling this flow does" <- exposes the flow as an MCP tool
@@ -45,14 +55,19 @@ Rules:
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
 - A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
+- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
+- `seen(key)` is true when a run of this flow said `remember key for "<window>"` and the window has not passed. The mark is written once the run's emits are stored: a run that fails marks nothing, so a message that comes back is processed again, and a catch marks only what it remembers. The window is a number and s, m, h or d, up to 3650d, written in the statement or in an UPPERCASE constant. A key is any value but null; a number or a document is read as its JSON text. A copy of a message finds the mark of a run before it, also in the same batch, but two copies that run at the same instant, on two instances or as two requests, can both pass. Where a run is SHOWN, `seen` is false for every key. `remember` is a write: a read-method `api` flow that remembers needs the token, as one that emits. A flow whose memory does not answer fails its run, as a call that may answer later does (an `api` flow answers 503).
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal.
 ```
 
 ## Design notes
 
 - **Pure by construction** (ADR-0001): no I/O, clock, or network exists in
-  the language. Effects happen only at the edges (`emit`, `respond`) —
-  which is what makes replay, time-travel and canary structurally safe.
+  the language. Effects happen only at the edges (`emit`, `respond`,
+  `remember`), and what a run reads beyond its event (a system's answer
+  through `invoke`, `seen`) is the runtime's: a run that is shown reads
+  neither, which is what makes replay, time-travel and canary structurally
+  safe.
 - **UPPERCASE literals are the contract with humans**: anything a domain
   expert may want to change belongs in one
   ([the business surface](../concepts/business-surface.md)).
