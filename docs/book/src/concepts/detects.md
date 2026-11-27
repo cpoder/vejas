@@ -157,7 +157,7 @@ a `timer()` source, `.enrich()` and `.alert(webhook: ...)` are errors
 
 ## What it costs
 
-Since engine c6171ae, a pattern with 8 sequences waiting or more looks up
+Since engine 6d40466, a pattern with 8 sequences waiting or more looks up
 the sequences an event can advance instead of visiting each one: equality,
 order and range conditions between the event and what a sequence captured
 are indexed. It applies without `.partition_by`, without a negation that

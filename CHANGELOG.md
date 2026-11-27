@@ -20,7 +20,7 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   open at once (10 000 by default, per partition).
 
 ### Changed
-- **The Varpulis engine moves from 1cb201b to c6171ae.** It refuses at load,
+- **The Varpulis engine moves from 1cb201b to 6d40466.** It refuses at load,
   with codes E100 to E104, what it used to ignore with a warning or in
   silence: `import`, `context`, a `timer()` source, `.enrich()` and
   `.alert(webhook: ...)`. A detect unit that used one stops at load and says
