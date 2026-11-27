@@ -2827,6 +2827,10 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
+            // A public runtime opens no port but the console's (ADR-0041).
+            if public::on() && driver_name == "http-in" {
+                return Err("http-in does not start on a public runtime (VEJAS_PUBLIC): it would open a port of its own".into());
+            }
             let driver = connectors::driver_for(&driver_name)
                 .ok_or_else(|| unknown_driver(&driver_name))?;
             // Resolve config by EVALUATING the manifest (so secret("…") in a
@@ -3159,7 +3163,8 @@ fn connector_graph(root: &Path) -> Vec<Value> {
             } else if let Some(s) = cfg.get("SUBJECT").and_then(|v| v.as_str()) {
                 entry["subjects_in"] = json!([s]);
             }
-            if !prog.secret_refs.is_empty() {
+            // which secrets a connector reads is not a public page's (ADR-0041)
+            if !prog.secret_refs.is_empty() && !public::on() {
                 entry["secret_refs"] = json!(prog
                     .secret_refs
                     .iter()
@@ -3424,6 +3429,12 @@ fn preview_json(root: &Path, file: &str) -> Result<String, String> {
         "invokes": prog.invokes,
     })
     .to_string())
+}
+
+/// An answer as a public page sees it: paths relative to the root. Any other
+/// page sees them as the runtime does.
+fn shown_paths(root: &Path, v: Value) -> Value {
+    if public::on() { public::relative_paths(root, v) } else { v }
 }
 
 /// Does a file hold what the record's masks would hide (ADR-0017): a literal
@@ -3985,6 +3996,14 @@ fn sap_rpc_request(root: &Path, op: &Value) -> Result<Value, String> {
 }
 
 // ───────────────────────── dead-letter queue (ADR-0015) ─────────────────────────
+/// Is there a dead-letter stream yet? Asked without making one.
+fn dlq_exists() -> bool {
+    let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    bus::connect(&url)
+        .and_then(|nc| nc.jetstream().stream_state_if_any(connectors::DLQ_STREAM))
+        .is_ok_and(|state| state.is_some())
+}
+
 fn dlq_js() -> Result<bus::JetStream, String> {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let js = bus::connect(&url)?.jetstream();
@@ -4151,6 +4170,11 @@ fn join_code(root: &Path, hop: &mut Value, sources: &mut Sources) {
         })
         .unwrap_or_default();
     let mut of_service: HashMap<String, Option<Arc<Vec<String>>>> = HashMap::new();
+    // A public page (ADR-0041) is given no line of a file it may not read, and
+    // each line it is given goes through the record's masks (ADR-0017).
+    let flow_file = attrs["code.file.path"].as_str().map(str::to_string);
+    let mut withheld: HashMap<String, bool> = HashMap::new();
+    let scrub = public::on().then(record::shown);
     let Some(steps) = hop.get_mut("steps").and_then(Value::as_array_mut) else {
         return;
     };
@@ -4171,11 +4195,28 @@ fn join_code(root: &Path, hop: &mut Value, sources: &mut Sources) {
             },
         };
         let Some(code) = lines.as_ref().and_then(|l| l.get((line as usize).checked_sub(1)?)) else { continue };
+        let code = match &scrub {
+            None => code.clone(),
+            Some(scrub) => {
+                let file = match step.get("service").and_then(Value::as_str) {
+                    None => flow_file.clone(),
+                    Some(service) => service_file(service),
+                };
+                let Some(file) = file else { continue };
+                let rel = public::relative(root, &file);
+                let readable = public::file_allowed(root, &rel)
+                    && !*withheld.entry(rel.clone()).or_insert_with(|| holds_a_credential(root, &rel));
+                if !readable {
+                    continue;
+                }
+                scrub.text(&code, false)
+            }
+        };
         if sources.given + code.len() > JOIN_CODE_MAX {
             return;
         }
         sources.given += code.len();
-        step.insert("code".into(), Value::String(code.clone()));
+        step.insert("code".into(), Value::String(code));
     }
 }
 
@@ -4185,7 +4226,9 @@ fn trace_search(text: &str, limit: usize) -> Result<Value, (u16, String)> {
         return Err((400, "nothing to search for".into()));
     }
     let js = record_js().map_err(|e| (503, e))?;
-    let (traces, searched) = match record::search(&js, text, limit.clamp(1, 100), record::SEARCH_WINDOW) {
+    // a public runtime reads the newest hops only: strangers share it
+    let window = if public::on() { public::SEARCH_WINDOW } else { record::SEARCH_WINDOW };
+    let (traces, searched) = match record::search(&js, text, limit.clamp(1, 100), window) {
         Ok(found) => found,
         Err(e) if record_absent(&e) => (Vec::new(), 0),
         Err(e) => return Err((500, e)),
@@ -5728,20 +5771,20 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
         (tiny_http::Method::Get, "/topology") => respond(
             request,
             200,
-            as_shown(topology_json(&registry)).to_string(),
+            shown_paths(&root, as_shown(topology_json(&registry))).to_string(),
             "application/json",
         ),
         (tiny_http::Method::Get, "/graph") => respond(
             request,
             200,
-            graph_json(&root).to_string(),
+            shown_paths(&root, graph_json(&root)).to_string(),
             "application/json",
         ),
         (tiny_http::Method::Get, "/surface") => {
             let surface = surface_json(&root);
             // A public page is shown the literals masked here, by the record's
             // masks (ADR-0017), never by the browser alone (ADR-0041).
-            let surface = if public::on() { record::shown().json(&surface) } else { surface };
+            let surface = if public::on() { shown_paths(&root, record::shown().json(&surface)) } else { surface };
             respond(request, 200, surface.to_string(), "application/json")
         }
         (tiny_http::Method::Get, "/events") => {
@@ -5769,6 +5812,10 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(out) => respond(request, 200, out.to_string(), "application/json"),
                 Err(e) => respond(request, 422, e, "text/plain"),
             }
+        }
+        // a public runtime makes no stream to answer a read: none yet is none
+        (tiny_http::Method::Get, "/dlq") if public::on() && !dlq_exists() => {
+            respond(request, 200, json!({"dead_letters": []}).to_string(), "application/json")
         }
         (tiny_http::Method::Get, "/dlq") => match dlq_list(if public::on() { public::DEAD_LETTERS_SHOWN } else { 200 }) {
             Ok(l) => respond(request, 200, as_shown(json!({"dead_letters": l})).to_string(), "application/json"),
@@ -5900,7 +5947,7 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
                 Ok(content) => respond(
                     request,
                     200,
-                    json!({"path": p.display().to_string(), "content": content}).to_string(),
+                    shown_paths(&root, json!({"path": p.display().to_string(), "content": content})).to_string(),
                     "application/json",
                 ),
                 Err(e) => respond(request, 404, e.to_string(), "text/plain"),
@@ -6176,15 +6223,15 @@ fn handle_request(mut request: tiny_http::Request, registry: Registry, root: Pat
 }
 
 /// Bring the runtime's stream to the age `VEJAS_STREAM_MAX_AGE_SECS` sets,
-/// once NATS answers. Only that limit is asked of a stream that exists; its
-/// other settings stay as the server reports them.
+/// once NATS answers. Only that limit changes on a stream that exists: its
+/// other limits stay as they were set.
 fn stream_retention() {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let name = env::var("VEJAS_STREAM").unwrap_or_else(|_| "VEJAS".into());
     let root = env::var("VEJAS_SUBJECT_ROOT").unwrap_or_else(|_| "vx".into());
     let config = bus::StreamConfig::bus(&name, &root);
     while RUNNING.load(Ordering::SeqCst) {
-        match bus::connect(&url).and_then(|nc| nc.jetstream().put_stream(&config)) {
+        match bus::connect(&url).and_then(|nc| nc.jetstream().put_stream_age(&config)) {
             Ok(()) => {
                 eprintln!(
                     "[vejas] stream {name} keeps messages {}",

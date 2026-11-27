@@ -1481,6 +1481,35 @@ impl JetStream {
         }
     }
 
+    /// Create a stream, or give the one that exists the age of `config` and
+    /// change nothing else: its other limits stay as an operator set them.
+    /// A shorter age drops at once what is older, read or not.
+    pub fn put_stream_age(&self, config: &StreamConfig) -> Result<(), String> {
+        /// JSStreamNameExistErr: the name is taken, with another config.
+        const NAME_IN_USE: u64 = 10058;
+        match self.create_stream(config) {
+            Err((Some(NAME_IN_USE), _)) => {
+                let info = self.api(format!("STREAM.INFO.{}", config.name), Bytes::new())?;
+                let mut current = info
+                    .get("config")
+                    .cloned()
+                    .ok_or("the server sent no stream config")?;
+                let max_age = config.max_age.as_nanos() as u64;
+                current["max_age"] = json!(max_age);
+                let window = current["duplicate_window"].as_u64().unwrap_or(0);
+                if max_age > 0 && window > max_age {
+                    current["duplicate_window"] = json!(max_age);
+                }
+                self.api(
+                    format!("STREAM.UPDATE.{}", config.name),
+                    current.to_string().into(),
+                )
+                .map(|_| ())
+            }
+            other => other.map_err(|(_, what)| what),
+        }
+    }
+
     /// Tests only: their own tests, and a connector's through the `test-support`
     /// feature. Nothing in a build that runs deletes a stream.
     #[cfg(any(test, feature = "test-support"))]

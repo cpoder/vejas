@@ -57,7 +57,18 @@ VEJAS_PUBLIC=1 VEJAS_STREAM_MAX_AGE_SECS=3600 vejas-runtime
 
 The setting is not tied to the public mode. Any runtime can bound its stream
 this way; unset, or `0`, the stream keeps its messages for ever, as before. A
-stream made by an earlier start takes the new age at the next start.
+stream made by an earlier start takes the new age at the next start, and only
+the age: its other limits stay as they were.
+
+Lowering the age deletes the older messages at once, including those a
+stopped consumer has not read yet: a flow that was down meanwhile never sees
+them.
+
+## Ports
+
+A public runtime opens one port, the console's. A connector with the
+`http-in` driver would open one of its own, so it does not start: the unit
+fails with a line that says why, and the demo must not ship one.
 
 ## In front of it
 

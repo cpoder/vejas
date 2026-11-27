@@ -48,6 +48,8 @@ pub const SEARCH_LIMIT_MAX: usize = 20;
 pub const TRACE_ID_MAX_CHARS: usize = 64;
 pub const DEAD_LETTERS_SHOWN: usize = 50;
 pub const REQUESTS_IN_FLIGHT_MAX: usize = 32;
+/// The newest hops a trace search reads, where a private runtime reads 50 000.
+pub const SEARCH_WINDOW: u64 = 2_000;
 
 /// Is the public mode on? Read once: a mode that changed while the runtime
 /// serves would be no barrier.
@@ -91,6 +93,42 @@ pub fn file_allowed(root: &Path, rel: &str) -> bool {
         && rel.extension().is_some_and(|e| e == "vjs")
 }
 
+/// A path as a public page is shown it: relative to the root, so that the
+/// host's layout stays the host's.
+pub fn relative(root: &Path, path: &str) -> String {
+    let p = Path::new(path);
+    if let Ok(rel) = p.strip_prefix(root) {
+        return rel.display().to_string();
+    }
+    if let Some(rel) = root.canonicalize().ok().and_then(|c| p.strip_prefix(c).ok().map(|r| r.display().to_string())) {
+        return rel;
+    }
+    path.trim_start_matches("./").to_string()
+}
+
+/// An answer with every path under the root written relative to it.
+pub fn relative_paths(root: &Path, mut v: serde_json::Value) -> serde_json::Value {
+    let mut prefixes = vec![format!("{}/", root.display())];
+    if let Ok(c) = root.canonicalize() {
+        prefixes.push(format!("{}/", c.display()));
+    }
+    prefixes.retain(|p| p.len() > 2);
+    fn walk(v: &mut serde_json::Value, prefixes: &[String]) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Some(rest) = prefixes.iter().find_map(|p| s.strip_prefix(p.as_str())) {
+                    *s = rest.to_string();
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, prefixes)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|x| walk(x, prefixes)),
+            _ => {}
+        }
+    }
+    walk(&mut v, &prefixes);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +158,15 @@ mod tests {
         for no in ["flows/a.json", "flows/a.fixture.json", "packages/p/flows/a.vjs", "detects/d.vpl", "secrets.json", "flows", "flows/../secrets.vjs", "/etc/x.vjs", "/app/../etc/x.vjs", "services.json"] {
             assert!(!file_allowed(root, no), "{no}");
         }
+    }
+
+    #[test]
+    fn a_public_page_sees_paths_from_the_root() {
+        let root = Path::new("/app");
+        assert_eq!(relative(root, "/app/flows/a.vjs"), "flows/a.vjs");
+        assert_eq!(relative(root, "./flows/a.vjs"), "flows/a.vjs");
+        let v = relative_paths(root, serde_json::json!({"file": "/app/flows/a.vjs", "l": ["/app/x/y", "/apple"], "n": 1}));
+        assert_eq!(v, serde_json::json!({"file": "flows/a.vjs", "l": ["x/y", "/apple"], "n": 1}));
     }
 
     #[test]
