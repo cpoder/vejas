@@ -290,13 +290,19 @@ held_until flow:rel
 C=$(calls /pay/rel1)
 up
 sleep 1   # its health still says down: it stays held
-A=$(act -H "Authorization: Bearer $TOK" -d '{"flow":"flow:rel"}' "$H/hold/release")
+# two people release it at once: one release is taken, the other answers 409
+act -H "Authorization: Bearer $TOK" -d '{"flow":"flow:rel"}' "$H/hold/release" > "$S/rel.a" & RA=$!
+act -H "Authorization: Bearer $TOK" -d '{"flow":"flow:rel"}' "$H/hold/release" > "$S/rel.b" & RB=$!
+wait $RA $RB
+A=$(for f in "$S/rel.a" "$S/rel.b"; do tail -c 4 "$f"; echo; done | sort | tr -d '\n')
 until_sent vx.fh.rel_rejected rel1
+sleep 0.3
 R1=$(msgs vx.fh.rel_rejected | grep rel1)
-echo "$A" | grep -q ' 200$' && [ "$(calls /pay/rel1)" = "$C" ] && [ "$(count vx.fh.rel_paid rel1)" = 0 ] \
+[ "$A" = " 200 409" ] && [ "$(count vx.fh.rel_rejected rel1)" = 1 ] && [ "$(calls /pay/rel1)" = "$C" ] && [ "$(count vx.fh.rel_paid rel1)" = 0 ] \
   && echo "$R1" | grep -q '"status":503' \
   && ok "the system back, a release still sends the message to its catch, with no call: $R1" \
   || ko "release: $A, calls $C then $(calls /pay/rel1), paid $(count vx.fh.rel_paid rel1), rejected $R1"
+[ "$A" = " 200 409" ] && ok "two releases at once: one taken, the other 409" || ko "two releases: $A"
 
 echo "── a flow that took its messages in rounds holds one: the round before is settled, the rest go back"
 cat > "$R/services/quote.vjs" <<V

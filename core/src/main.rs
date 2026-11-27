@@ -86,8 +86,39 @@ struct Handle {
     stop: AtomicBool,
     /// A person asked to release the held message, or to probe now
     /// (ADR-0040, point 5). The flow's loop takes them.
-    release: AtomicBool,
-    probe_now: AtomicBool,
+    release: Ask,
+    probe_now: Ask,
+    /// The holds this flow went into: each has its number, its generation.
+    holds: AtomicU64,
+}
+
+/// A person's act on a held message (ADR-0040, point 5). What is asked is one
+/// word: the generation of the hold it targets, then a number of the act's
+/// own. Only that hold takes it, and the act that asked is confirmed only by
+/// the hold taking that very word: a hold that ended, a new one, or a second
+/// act asked at the same time confirm nothing.
+#[derive(Default)]
+struct Ask {
+    asked: AtomicU64,
+    taken: AtomicU64,
+}
+
+/// The acts asked of held flows, numbered.
+static ACTS: AtomicU64 = AtomicU64::new(0);
+
+impl Ask {
+    /// The hold of generation `generation` takes what was asked of it.
+    fn take(&self, generation: u64) -> bool {
+        let asked = self.asked.load(Ordering::SeqCst);
+        if asked == 0 || asked >> 32 != generation {
+            return false;
+        }
+        if self.asked.compare_exchange(asked, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return false;
+        }
+        self.taken.store(asked, Ordering::SeqCst);
+        true
+    }
 }
 
 type Registry = Arc<Mutex<HashMap<String, Arc<Handle>>>>;
@@ -1100,26 +1131,32 @@ fn hold_act(registry: &Registry, flow: Option<&str>, release: bool, actor: &str)
     let flow = flow.ok_or((400, "give the flow: {\"flow\": \"name\"}".to_string()))?;
     let handle = registry.lock().unwrap().get(flow).cloned().ok_or((404, format!("no flow {flow}")))?;
     let holds_nothing = || (409, format!("{flow} holds no message on this instance"));
+    let generation_now = || handle.state.lock().unwrap().hold.as_ref().and_then(|h| h["generation"].as_u64());
     let Some(hold) = handle.state.lock().unwrap().hold.clone() else {
         return Err(holds_nothing());
     };
+    let generation = hold["generation"].as_u64().unwrap_or(0);
     let kind = if release { "hold-release" } else { "hold-probe" };
-    let flag = if release { &handle.release } else { &handle.probe_now };
-    flag.store(true, Ordering::SeqCst);
+    let ask = if release { &handle.release } else { &handle.probe_now };
+    let word = (generation << 32) | ((ACTS.fetch_add(1, Ordering::SeqCst) + 1) & 0xffff_ffff);
+    if ask.asked.compare_exchange(0, word, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err((409, format!("a {kind} of {flow} is asked already, and not taken yet")));
+    }
     // The flow takes it between two probes: a run or a probe under way
     // finishes first, a call each within its TIMEOUT_MS.
     let until = Instant::now() + Duration::from_secs(60);
-    while flag.load(Ordering::SeqCst) {
-        let ended = handle.state.lock().unwrap().hold.is_none();
+    while ask.taken.load(Ordering::SeqCst) != word {
+        let ended = generation_now() != Some(generation);
         if ended || Instant::now() >= until {
-            if flag.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if ask.asked.compare_exchange(word, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 return Err(if ended {
                     holds_nothing()
                 } else {
                     (503, format!("{flow} did not take the {kind} within a minute; ask again"))
                 });
             }
-            break; // taken as we gave up
+            // taken as we gave up: `taken` says so next
+            continue;
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1722,17 +1759,32 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let mut held_note = None;
                     if let (Err(error), Some(first)) = (&outcome, failure.as_ref().filter(|f| f.holds())) {
                         in_hand = Some(InHand::keep(&msg));
+                        // One at a time from now on, across instances. Should the
+                        // update fail, the messages given back below come back
+                        // after an ack wait, not at once into a pull.
+                        let mut give_back_after = None;
                         if !one_at_a_time {
-                            one_at_a_time = true;
-                            let _ = js.create_pull_consumer_with(
+                            match js.create_pull_consumer_with(
                                 &stream,
                                 &durable,
                                 std::slice::from_ref(&source),
                                 connectors::ack_wait(),
                                 None,
                                 Some(1),
-                            );
+                            ) {
+                                Ok(_) => one_at_a_time = true,
+                                Err(e) => {
+                                    eprintln!("[vejas] {}: one message at a time not set on {durable}: {e}", handle.spec.name);
+                                    give_back_after = Some(connectors::ack_wait().max(Duration::from_secs(1)));
+                                }
+                            }
                         }
+                        let give_back = |rest: bus::Message| {
+                            let _ = match give_back_after {
+                                Some(delay) => rest.nak_after(delay),
+                                None => rest.nak(),
+                            };
+                        };
                         // A flow that took its messages in rounds (a service
                         // edited to call a system): the messages after this one
                         // go back, those of the round asked for ahead too, and
@@ -1740,13 +1792,15 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                         // none waits on the hold unkept (ADR-0040).
                         if !one_by_one {
                             one_by_one = true;
-                            for rest in fetch.by_ref() {
-                                let _ = rest.nak();
-                            }
+                            // the round asked for ahead first: drained, it asks
+                            // for nothing more, and none given back comes into it
                             if let Some(ahead) = next.take() {
                                 for rest in ahead {
-                                    let _ = rest.nak();
+                                    give_back(rest);
                                 }
+                            }
+                            for rest in fetch.by_ref() {
+                                give_back(rest);
                             }
                             let confirmed = batch.confirm_each();
                             if let Err(e) = &confirmed {
@@ -1784,6 +1838,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             durable: &durable,
                             subj_root: &subj_root,
                             traced,
+                            generation: 0,
                         };
                         match hold(&mut holding, first, error) {
                             Held::Ran { outcome: o, steps: s, failure: f, ended, note } => {
@@ -1903,10 +1958,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 for msg in &acked {
                     settled.add(msg);
                 }
+                // no in-progress after the ack
+                drop(in_hand);
                 if let Err(e) = nc.ack_all(&acked) {
                     eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                 }
-                drop(in_hand);
                 if !one_by_one && engine.made_a_call() {
                     one_by_one = true;
                 }
@@ -2090,6 +2146,8 @@ struct Holding<'a> {
     durable: &'a str,
     subj_root: &'a str,
     traced: bool,
+    /// The hold's generation once the flow is held, 0 while it tries in hand.
+    generation: u64,
 }
 
 /// What became of a message a flow held (ADR-0040).
@@ -2180,16 +2238,17 @@ impl Drop for InHand {
 /// Wait `pause` with the message in hand (`InHand` keeps it in progress). A
 /// stop ends the wait at once; once the flow is held, so do a release and a
 /// probe a person asked for.
-fn hold_wait(h: &Holding, pause: Duration, held: bool) -> Woken {
+fn hold_wait(h: &Holding, pause: Duration) -> Woken {
+    let held = h.generation != 0;
     let until = Instant::now() + pause;
     loop {
         if !RUNNING.load(Ordering::SeqCst) || h.handle.stop.load(Ordering::SeqCst) {
             return Woken::Stop;
         }
-        if held && h.handle.release.swap(false, Ordering::SeqCst) {
+        if held && h.handle.release.take(h.generation) {
             return Woken::Release;
         }
-        if held && h.handle.probe_now.swap(false, Ordering::SeqCst) {
+        if held && h.handle.probe_now.take(h.generation) {
             return Woken::ProbeNow;
         }
         let now = Instant::now();
@@ -2249,7 +2308,7 @@ fn hold_state(h: &Holding, service: &str, since: u64, error: &str, status: Optio
     let hold = json!({
         "service": service, "since": since, "last_error": error, "status": status,
         "tries": tries, "probes": probes, "next_probe_at": now_secs() + next.as_secs(),
-        "behind": behind, "subject": h.msg.subject,
+        "behind": behind, "subject": h.msg.subject, "generation": h.generation,
     });
     set_state(h.handle, |st| {
         st.status = "held".into();
@@ -2296,7 +2355,7 @@ fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> H
     };
     // 1. In hand: a blip costs a delay and nothing else.
     while tries < attempts {
-        if let Woken::Stop = hold_wait(h, delay, false) {
+        if let Woken::Stop = hold_wait(h, delay) {
             return Held::Stopped;
         }
         tries += 1;
@@ -2316,8 +2375,7 @@ fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> H
     if let connectors::answer::WhenDown::Hold(p) = &last.1.down {
         probe = p.clone();
     }
-    h.handle.release.store(false, Ordering::SeqCst);
-    h.handle.probe_now.store(false, Ordering::SeqCst);
+    h.generation = (h.handle.holds.fetch_add(1, Ordering::SeqCst) + 1) & 0xffff_ffff;
     eprintln!("[vejas] {}: held while {service} is down: {}", h.handle.spec.name, last.0);
     metrics::set_held(&h.handle.spec.name, &service, true);
     hold_event(h, "held", &service, since, probes, last.1.status);
@@ -2327,7 +2385,7 @@ fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> H
     let mut pause = delay.min(probe.max);
     loop {
         hold_state(h, &service, since, &last.0, last.1.status, tries, probes, pause);
-        match hold_wait(h, pause, true) {
+        match hold_wait(h, pause) {
             Woken::Stop => {
                 hold_event(h, "stopped", &service, since, probes, last.1.status);
                 hold_over(h, &service);
@@ -2366,19 +2424,26 @@ fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> H
                     service = f.service.clone();
                     metrics::set_held(&h.handle.spec.name, &service, true);
                 }
+                let moved = f.service != last.1.service;
                 if let connectors::answer::WhenDown::Hold(p) = &f.down {
                     probe = p.clone();
                 }
+                pause = if moved {
+                    // a new system down: its probes start again from its delay
+                    f.delay.max(Duration::from_millis(1)).min(probe.max)
+                } else {
+                    (pause * 2).min(probe.max)
+                };
                 last = (outcome.err().unwrap_or_default(), f);
-                pause = (pause * 2).min(probe.max);
             }
             failure => {
                 let ended = failure.as_ref().is_none_or(|f| !f.retry);
                 // A failure no later try changes ends the hold too: its catch
                 // has run, or the message is a dead letter, not resumed.
-                let (transition, status) = match &failure {
-                    Some(f) if ended && outcome.is_err() => ("failed", f.status),
-                    _ => ("resumed", None),
+                let (transition, status) = if ended && outcome.is_err() {
+                    ("failed", failure.as_ref().and_then(|f| f.status))
+                } else {
+                    ("resumed", None)
                 };
                 hold_event(h, transition, &service, since, probes, status);
                 hold_over(h, &service);
@@ -3304,8 +3369,9 @@ fn start_proc(registry: &Registry, spec: Spec, root: &Path) {
             hold: None,
         }),
         stop: AtomicBool::new(false),
-        release: AtomicBool::new(false),
-        probe_now: AtomicBool::new(false),
+        release: Ask::default(),
+        probe_now: Ask::default(),
+        holds: AtomicU64::new(0),
     });
     registry.lock().unwrap().insert(spec.name.clone(), handle.clone());
     let root = root.to_path_buf();

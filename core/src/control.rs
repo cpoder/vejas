@@ -241,8 +241,9 @@ mod tests {
                 hold: None,
             }),
             stop: std::sync::atomic::AtomicBool::new(false),
-            release: std::sync::atomic::AtomicBool::new(false),
-            probe_now: std::sync::atomic::AtomicBool::new(false),
+            release: crate::Ask::default(),
+            probe_now: crate::Ask::default(),
+            holds: std::sync::atomic::AtomicU64::new(0),
         });
         let reg: Registry = Arc::new(Mutex::new(HashMap::from([("connector:ctl_probe".to_string(), handle)])));
         let (reply, _) = dispatch(&reg, &std::env::temp_dir(), &json!({"id": "1", "cmd": "status"}));
