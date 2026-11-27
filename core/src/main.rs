@@ -429,18 +429,8 @@ fn replay_literal(
         }
     };
     let pkg = pkg_of_path(&path);
-    let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
-        match vjs::run(prog, ev, &mut engine) {
-            Ok(ctx) => json!({
-                "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
-                "error": Value::Null,
-            }),
-            Err(e) => json!({ "emits": [], "error": e }),
-        }
-    };
     let mut results = Vec::new();
-    let mut changed_count = 0;
+    let (mut changed_count, mut not_recorded) = (0, 0);
     let scrub = record::shown();
     let reads = [vjs::event_reads(&before), vjs::event_reads(&after)].concat();
     for entry in &events {
@@ -448,22 +438,24 @@ fn replay_literal(
             continue; // unparseable event of a bad-json trace: nothing to replay
         };
         let (ev, hidden) = shadow_input(ev, &scrub, &reads);
-        let b = run_one(&before, &ev);
-        let a = run_one(&after, &ev);
-        let changed = b != a;
-        if changed {
-            changed_count += 1;
+        let b = shadow_emits(&before, &ev, root, &pkg);
+        let a = shadow_emits(&after, &ev, root, &pkg);
+        let changed = compared(&b, &a);
+        match changed {
+            Some(true) => changed_count += 1,
+            None => not_recorded += 1,
+            Some(false) => {}
         }
         let result = json!({
             "ts": entry["ts"], "subject": entry["subject"], "preview": trace_preview(entry),
-            "before": b, "after": a, "changed": changed,
+            "before": b, "after": a, "changed": changed == Some(true),
         });
         results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "name": name, "key": key, "value": value,
         "source": replay_source,
-        "events": results.len(), "changed": changed_count, "results": results,
+        "events": results.len(), "changed": changed_count, "not_recorded": not_recorded, "results": results,
     }))
 }
 
@@ -492,37 +484,29 @@ fn time_travel(root: &Path, file: &str, candidate_src: &str, n: usize) -> Result
         .clone()
         .ok_or("flow has no bus source to replay")?;
     let rows = connectors::hydrate_recent(&js, &stream, &source_subj, n)?;
-    let run_one = |prog: &vjs::Program, ev: &Value| -> Value {
-        let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.clone());
-        match vjs::run(prog, ev, &mut engine) {
-            Ok(ctx) => json!({
-                "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
-                "error": Value::Null,
-            }),
-            Err(e) => json!({ "emits": [], "error": e }),
-        }
-    };
     let mut results = Vec::new();
-    let mut changed = 0;
+    let (mut changed, mut not_recorded) = (0, 0);
     let scrub = record::shown();
     let reads = [vjs::event_reads(&current), vjs::event_reads(&candidate)].concat();
     for (seq, subject, event) in &rows {
         let (event, hidden) = shadow_input(event, &scrub, &reads);
-        let b = run_one(&current, &event);
-        let a = run_one(&candidate, &event);
-        let ch = b != a;
-        if ch {
-            changed += 1;
+        let b = shadow_emits(&current, &event, root, &pkg);
+        let a = shadow_emits(&candidate, &event, root, &pkg);
+        let ch = compared(&b, &a);
+        match ch {
+            Some(true) => changed += 1,
+            None => not_recorded += 1,
+            Some(false) => {}
         }
         let result = json!({
             "seq": seq, "subject": subject, "preview": preview_of(&event),
-            "before": b, "after": a, "changed": ch,
+            "before": b, "after": a, "changed": ch == Some(true),
         });
         results.push(with_hidden(result, hidden));
     }
     Ok(json!({
         "file": file, "flow": unit, "candidate_hash": versions::hash_content(candidate_src),
-        "events": results.len(), "changed": changed, "results": results,
+        "events": results.len(), "changed": changed, "not_recorded": not_recorded, "results": results,
     }))
 }
 
@@ -540,6 +524,8 @@ struct Canary {
     running: Arc<AtomicBool>,
     total: Arc<AtomicU64>,
     changed: Arc<AtomicU64>,
+    /// Events left out: a run made a call whose answer is not recorded.
+    not_recorded: Arc<AtomicU64>,
     ring: Arc<Mutex<VecDeque<Value>>>,
     // set when the canary auto-stops (the live version changed under it, so the
     // accumulated diff would compare against a stale baseline) — never a silently
@@ -553,14 +539,35 @@ fn canaries() -> &'static Mutex<HashMap<String, Canary>> {
 
 /// Run one event through a parsed version in shadow, returning its emits (never
 /// published — vjs::run only collects them).
+/// What a shown run of `prog` gives for one event: its emits, or its error. A
+/// run that made a call whose answer is not recorded names it as
+/// `not_recorded`: what it gave says nothing of the flow's outputs.
 fn shadow_emits(prog: &vjs::Program, ev: &Value, root: &Path, pkg: &str) -> Value {
     let mut engine = vjs::Engine::shadow(root.to_path_buf(), pkg.to_string());
-    match vjs::run(prog, ev, &mut engine) {
+    let mut out = match vjs::run(prog, ev, &mut engine) {
         Ok(ctx) => json!({
             "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>(),
             "error": Value::Null,
         }),
         Err(e) => json!({ "emits": [], "error": e }),
+    };
+    if let Some(call) = engine.take_unrecorded() {
+        out["not_recorded"] = Value::String(call);
+    }
+    out
+}
+
+/// Whether one event's two outputs differ. None when both runs reached the
+/// same call, whose answer is not recorded (ADR-0032, point 4): what follows
+/// depends on that answer, so the event is left out of the comparison and
+/// counted apart, and two refusals do not read as "unchanged". A run that
+/// calls with other arguments, calls another service, or fails before its
+/// call does something else with the event: that is a change.
+fn compared(before: &Value, after: &Value) -> Option<bool> {
+    match (before.get("not_recorded"), after.get("not_recorded")) {
+        (None, None) => Some(before != after),
+        (Some(b), Some(a)) if b == a => None,
+        _ => Some(true),
     }
 }
 
@@ -587,6 +594,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
     let running = Arc::new(AtomicBool::new(true));
     let total = Arc::new(AtomicU64::new(0));
     let changed = Arc::new(AtomicU64::new(0));
+    let not_recorded = Arc::new(AtomicU64::new(0));
     let ring = Arc::new(Mutex::new(VecDeque::new()));
     let stop_reason = Arc::new(Mutex::new(None::<String>));
     {
@@ -606,6 +614,7 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 running: running.clone(),
                 total: total.clone(),
                 changed: changed.clone(),
+                not_recorded: not_recorded.clone(),
                 ring: ring.clone(),
                 stop_reason: stop_reason.clone(),
             },
@@ -649,13 +658,15 @@ fn canary_start(root: &Path, file: &str, candidate_src: &str) -> Result<Value, S
                 let seq = m.delivery().map(|i| i.stream_seq).unwrap_or(0);
                 let b = shadow_emits(&current, &event, &root, &pkg);
                 let a = shadow_emits(&candidate, &event, &root, &pkg);
-                let ch = b != a;
+                let ch = compared(&b, &a);
                 total.fetch_add(1, Ordering::SeqCst);
-                if ch {
-                    changed.fetch_add(1, Ordering::SeqCst);
+                match ch {
+                    Some(true) => _ = changed.fetch_add(1, Ordering::SeqCst),
+                    None => _ = not_recorded.fetch_add(1, Ordering::SeqCst),
+                    Some(false) => {}
                 }
                 let mut r = ring.lock().unwrap();
-                r.push_back(with_hidden(json!({"seq": seq, "changed": ch, "before": b, "after": a}), hidden));
+                r.push_back(with_hidden(json!({"seq": seq, "changed": ch == Some(true), "before": b, "after": a}), hidden));
                 while r.len() > 500 {
                     r.pop_front();
                 }
@@ -684,6 +695,7 @@ fn canary_read(root: &Path, file: &str) -> Result<Value, String> {
         "started_at": c.started_at,
         "events": c.total.load(Ordering::SeqCst),
         "changed": c.changed.load(Ordering::SeqCst),
+        "not_recorded": c.not_recorded.load(Ordering::SeqCst),
         "stop_reason": *c.stop_reason.lock().unwrap(),
         "results": results,
     }))
@@ -1312,6 +1324,11 @@ fn set_state(handle: &Handle, f: impl FnOnce(&mut ProcState)) {
     f(&mut st);
 }
 
+/// How soon a flow picks up an edit of a service it invokes, or of a secret a
+/// declaration reads: its engine loads them again at most this often, and a
+/// declaration's secrets are resolved at most once in that time.
+const SERVICES_FRESH: Duration = Duration::from_secs(1);
+
 /// Native VejasScript flow: NATS pull consumer + in-process interpreter.
 fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
@@ -1414,8 +1431,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // The flow's file as the record names it: a trace joins each
             // statement it ran with this file's code (ADR-0034, point 8).
             let code_file: Arc<str> = relative_to(&root, &handle.spec.path).into();
-            // One pull request is always in flight ahead of the round being
-            // processed. Without it every round began with ~2 ms of waiting for
+            // A flow that only computes keeps one pull request in flight ahead
+            // of the round being processed. Without it every round began with ~2 ms of waiting for
             // its first message — request, round-trip, server delivery — while
             // this thread sat idle at ~50 % CPU; a Go client on the same
             // server pulls 72 k msgs/s with the same batch precisely because it
@@ -1426,15 +1443,30 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
             // (`PULL_EXPIRES_MS`) and its round comes back empty. A stop
             // leaves at most one request outstanding, whose messages redeliver
             // un-acked after `ack_wait` — the same as stopping mid-batch.
-            let mut round = sub.round()?;
+            //
+            // A flow that calls a system takes its messages one by one, and asks
+            // for the next one once it is done with this one (ADR-0032). Rounds
+            // of 64, and the next asked for ahead, would hold up to 128 messages
+            // in the client while each one's calls run, and ack a round only at
+            // its end: past `ack_wait`, the server delivers them again, here or
+            // to another instance. A service edited live to call a system turns
+            // this on from the round after its first call.
+            //
+            // A message whose run outlived `ack_wait` can still come back here,
+            // when the server takes the next pull before the late ack: it takes
+            // acks and pull requests on queues of their own. The loop knows the
+            // messages it settled, and acks such a copy without running it.
+            let mut one_by_one = engine.reaches_system(&prog);
+            let mut settled = Settled::default();
+            let mut round = sub.round_of(if one_by_one { 1 } else { bus::PULL_BATCH })?;
             let mut batch = nc.batch();
             loop {
                 if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                engine.invalidate(); // pick up live service edits
+                engine.refresh(SERVICES_FRESH); // pick up live service edits
                 let round_t0 = Instant::now();
-                let next = sub.round()?;
+                let next = if one_by_one { None } else { Some(sub.round()?) };
                 // Messages are processed as they arrive, not once the whole batch
                 // has landed, so reading and working overlap instead of taking
                 // turns.
@@ -1457,6 +1489,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     }
                     // the replay of another unit's dead letter (ADR-0015 Amendment C)
                     if msg.replay_elsewhere(&handle.spec.name) {
+                        let _ = msg.ack();
+                        continue;
+                    }
+                    // a message this loop settled, delivered again (`Settled`)
+                    if msg.delivery().is_some_and(|d| settled.holds(d.stream_seq)) {
                         let _ = msg.ack();
                         continue;
                     }
@@ -1489,6 +1526,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                     record_trace(&handle.spec.name, &msg.subject, false,
                                         Some(format!("{err} — dead-lettered")), vec![], prev, None, Some(&hop), msg.delivery());
                                     let _ = msg.ack();
+                                    settled.add(&msg);
                                 }
                                 Err(de) => {
                                     record_trace(&handle.spec.name, &msg.subject, false,
@@ -1509,6 +1547,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let t0 = Instant::now();
                     // Each `invoke` leaves a span under the hop, while spans are exported.
                     engine.trace_under(traced.then_some(&hop));
+                    // A system the run calls continues the message's trace (ADR-0032).
+                    engine.carry(Some(carried.clone()));
                     // The record says which statements the event went through.
                     engine.record_steps(record::on());
                     // Holding an emit is local, so a refusal is final for this message:
@@ -1572,8 +1612,14 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             // before ack, nak if the DLQ write fails.
                             let delivered =
                                 msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                            // A call that got no answer (ADR-0032): the message tries
+                            // again at its next delivery, after the service's delay,
+                            // while the service allows it; a call no later try can
+                            // change, or whose attempts are spent, is a dead letter now.
+                            let failure = engine.take_failure();
+                            let spent = failure.as_ref().is_some_and(|f| !f.retry || delivered >= f.attempts);
                             let mut dead_lettered = false;
-                            if delivered >= MAX_DELIVERIES {
+                            if delivered >= MAX_DELIVERIES || spent {
                                 match connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &e, &msg.data, &flow_version, Some(&carried), msg.delivery().map(|d| d.message()), &durable) {
                                     Ok(()) => {
                                         dead_lettered = true;
@@ -1582,6 +1628,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                             Some(format!("{e} — dead-lettered after {delivered} deliveries")),
                                             vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
                                         let _ = msg.ack();
+                                        settled.add(&msg);
                                     }
                                     Err(de) => {
                                         record_trace(&handle.spec.name, &msg.subject, false,
@@ -1593,7 +1640,11 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             } else {
                                 record_trace(&handle.spec.name, &msg.subject, false, Some(e.clone()),
                                     vec![], String::new(), Some(event.clone()), Some(&hop), msg.delivery());
-                                // no ack -> redelivery after ack_wait
+                                // no ack -> redelivery after ack_wait; after a call,
+                                // after the service's delay
+                                if let Some(failure) = &failure {
+                                    let _ = msg.nak_after(failure.delay);
+                                }
                             }
                             if observing {
                                 let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &flow_version, overlay_of.as_ref(), start_nanos);
@@ -1613,6 +1664,10 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 let confirmed = batch.confirm();
                 match &confirmed {
                     Ok(()) => {
+                        // done, whether or not the acks get through
+                        for msg in &to_ack {
+                            settled.add(msg);
+                        }
                         if let Err(e) = nc.ack_all(&to_ack) {
                             eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                         }
@@ -1623,7 +1678,13 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     ),
                 }
                 end_confirmed(done, &confirmed);
-                round = next;
+                if !one_by_one && engine.made_a_call() {
+                    one_by_one = true;
+                }
+                round = match next {
+                    Some(next) => next,
+                    None => sub.round_of(1)?,
+                };
                 let first = first_at.unwrap_or(processed_at);
                 metrics::observe_round(
                     &handle.spec.name,
@@ -1650,6 +1711,39 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
     set_state(&handle, |st| {
         st.status = "stopped".into();
     });
+}
+
+/// The messages a flow loop settled last, acked after a run or a dead letter,
+/// by stream sequence. A message whose `ack_wait` ran out before its ack was
+/// taken is delivered again although its run is done; the loop acks that copy
+/// instead of running it a second time. The copy comes in the next round or
+/// the one after: the last [`Settled::KEPT`] are remembered.
+#[derive(Default)]
+struct Settled {
+    seqs: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl Settled {
+    const KEPT: usize = 4 * bus::PULL_BATCH;
+
+    fn add(&mut self, msg: &bus::Message) {
+        let Some(seq) = msg.delivery().map(|d| d.stream_seq) else {
+            return;
+        };
+        if self.seqs.insert(seq) {
+            self.order.push_back(seq);
+        }
+        if self.order.len() > Self::KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seqs.remove(&oldest);
+            }
+        }
+    }
+
+    fn holds(&self, seq: u64) -> bool {
+        self.seqs.contains(&seq)
+    }
 }
 
 /// End the successful hops of a batch once its barrier has answered: a hop
@@ -2243,6 +2337,26 @@ fn snapshot_unit(
     Ok(())
 }
 
+/// The project a script is in: the folder that holds its `flows/` or
+/// `services/`, or the `packages/` its package is in; else VEJAS_ROOT, else
+/// the current folder.
+fn project_of(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let scripts = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| matches!(dir.file_name().and_then(|n| n.to_str()), Some("flows" | "services")));
+    match scripts.and_then(Path::parent) {
+        Some(holder) => match holder.parent() {
+            Some(packages) if packages.file_name().is_some_and(|n| n == "packages") => {
+                packages.parent().unwrap_or(holder).to_path_buf()
+            }
+            _ => holder.to_path_buf(),
+        },
+        None => PathBuf::from(env::var("VEJAS_ROOT").unwrap_or_else(|_| ".".into())),
+    }
+}
+
 fn pkg_of_path(path: &Path) -> String {
     let s = path.display().to_string();
     if let Some(rest) = s.split("packages/").nth(1) {
@@ -2350,7 +2464,7 @@ fn supervise_connector(handle: Arc<Handle>, root: PathBuf) {
             let prog = vjs::parse(&src)?;
             let driver_name = prog.driver.clone().ok_or("no `driver` declaration")?;
             let driver = connectors::driver_for(&driver_name)
-                .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+                .ok_or_else(|| unknown_driver(&driver_name))?;
             // Resolve config by EVALUATING the manifest (so secret("…") in a
             // config value resolves to the real value, fail-closed). The
             // manifest's UPPERCASE variables are the driver's config.
@@ -3035,6 +3149,7 @@ Rules:
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
+- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 
 const CONTRACT_VJS: &str = r#"You write ONE VejasScript file for the Vejas integration platform. Reply with ONLY the file content (no markdown fences, no commentary).
@@ -3353,6 +3468,16 @@ fn provision(
     }))
 }
 
+/// Why a manifest's driver runs no connector: a driver a service declares
+/// answers a flow's invoke from `services/` (ADR-0032).
+fn unknown_driver(driver: &str) -> String {
+    if connectors::answer::DRIVERS.contains(&driver) {
+        format!("driver {driver:?} answers a flow's invoke: declare it in services/, and invoke the service")
+    } else {
+        format!("unknown driver {driver:?}")
+    }
+}
+
 /// One synchronous test of a connector instance: evaluate its manifest with
 /// the REAL secrets (a missing one fails here, in words), then run the
 /// driver's probe — reach the remote side, touch nothing.
@@ -3363,7 +3488,7 @@ fn probe_connector(root: &Path, file: &str) -> Value {
         let prog = vjs::parse(&src)?;
         let driver_name = prog.driver.clone().ok_or("not a connector manifest (no `driver`)")?;
         let driver = connectors::driver_for(&driver_name)
-            .ok_or_else(|| format!("unknown driver {driver_name:?}"))?;
+            .ok_or_else(|| unknown_driver(&driver_name))?;
         let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(&path));
         let cfg_ctx = vjs::run(&prog, &Value::Object(serde_json::Map::new()), &mut engine)
             .map_err(|e| connectors::humanize(&e))?;
@@ -4145,6 +4270,7 @@ fn run_api_flow(
     let mut route = String::new();
     let mut invoked = Vec::new();
     let mut steps = None;
+    let mut failure = None;
     let result = (|| -> Result<vjs::Ctx, String> {
         let path = path.as_deref().ok_or("path not allowed")?;
         let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -4158,10 +4284,12 @@ fn run_api_flow(
             .to_string();
         let mut engine = vjs::Engine::live(root.to_path_buf(), pkg_of_path(path));
         engine.trace_under(traced.then_some(&hop));
+        engine.carry(Some(hop.context()));
         engine.record_steps(record::on());
         let run = vjs::run(&prog, input, &mut engine);
         invoked = engine.take_spans();
         steps = engine.take_steps();
+        failure = engine.take_failure();
         run
     })();
     // The emits leave before the answer: a caller told 2xx can count on them.
@@ -4189,7 +4317,12 @@ fn run_api_flow(
                 json!({"ok": true, "emits": ctx.emits.iter().map(|(s, p)| json!({"subject": s, "payload": p})).collect::<Vec<_>>()}).to_string(),
             ),
         },
-        (Err(e), _) => (500, json!({"error": e}).to_string()),
+        // A service that answered nothing (ADR-0032): the caller may try again.
+        (Err(e), _) => match &failure {
+            Some(f) if f.timed_out => (504, json!({"error": e}).to_string()),
+            Some(_) => (502, json!({"error": e}).to_string()),
+            None => (500, json!({"error": e}).to_string()),
+        },
     };
     if traced || (metrics::tracing() && failed) {
         for span in invoked {
@@ -4334,13 +4467,13 @@ fn mcp_tools(root: &Path) -> Value {
         json!({"name": "vejas_write_flow", "description": "Create or overwrite a .vjs script (parse-validated, hot-reloaded) or a .json fixture. path under flows/, connectors/, or packages/<pkg>/flows|services|fixtures.", "inputSchema": obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), vec!["path", "content"])}),
         json!({"name": "vejas_set_literal", "description": "Rewrite one literal of the business surface in place (constant, or a table/mapping entry via key).", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_rollback_literal", "description": "Roll a business-surface literal back to the value it held before its most recent promote (from the VEJAS_AUDIT trail). Rollback is itself an audited promote to the recorded previous value — forward-only, hot-reloaded, previewable first with vejas_replay_literal. Returns {restored, was, rolled_back_promote_ts}.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}}), vec!["file", "name"])}),
-        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
+        json!({"name": "vejas_time_travel", "description": "Time-travel (ADR-0021): replay a window of REAL persisted traffic through a whole CANDIDATE version of a flow and diff its emissions against the current effective version, joined by stream sequence. Read-only, the bus untouched, a candidate's emits never reach a real subject. Use to preview an arbitrary rewrite (not just one literal) before promoting it. Returns {events, changed, not_recorded, results:[{seq, before, after, changed, hidden?}]}: `not_recorded` counts the events left out of the comparison because a run called a system whose answer is not recorded, named in that run's `not_recorded`. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "candidate"])}),
         json!({"name": "vejas_canary_start", "description": "Start a canary (ADR-0021): shadow-follow a flow's LIVE traffic and diff a candidate version against the current effective version as events arrive, accumulating a diff. Read-only (shadow — no real emit). Refuses if a canary is already running for the flow. Auto-stops if the live version changes under it (reason in status).", "inputSchema": obj(json!({"file": {"type": "string"}, "candidate": {"type": "string", "description": "the whole candidate VejasScript source"}}), vec!["file", "candidate"])}),
-        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, stop_reason, results:[{seq, before, after, changed, hidden?}]}. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
+        json!({"name": "vejas_canary_status", "description": "Read a canary's accumulating diff: {running, events, changed, not_recorded, stop_reason, results:[{seq, before, after, changed, hidden?}]}. `not_recorded` counts the events left out of the comparison because a run called a system whose answer is not recorded. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_canary_stop", "description": "Stop a running canary for a flow (its shadow consumer exits; the last diff stays readable).", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_propose", "description": "Submit a governed change PROPOSAL for a human to approve in the panel (ADR-0024) — you can propose but never approve. kind='set_literal' (payload {file, name, key, value}) or kind='version' (payload {file, candidate: whole source}). Attach `evidence` you gathered (vejas_time_travel results, vejas_canary stats) — the panel shows it next to Approve, and flags 'no evidence' loudly. The proposal is pinned to the current baseline and auto-expires if a deploy/promote moves it. Returns the stored proposal (id, status:pending).", "inputSchema": obj(json!({"kind": {"type": "string"}, "payload": {"type": "object"}, "evidence": {"type": "object"}}), vec!["kind", "payload"])}),
         json!({"name": "vejas_proposals", "description": "List the proposal queue with status (pending/approved/rejected/expired) and evidence. Read-only. Approve/reject are human panel actions, not tools.", "inputSchema": obj(json!({}), vec![])}),
-        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live. Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
+        json!({"name": "vejas_replay_literal", "description": "Shadow-replay a proposed literal change against REAL persisted traffic: hydrate the flow's recent events from JetStream (read-only, the bus untouched — falls back to the in-memory trace ring when the stream is empty or the flow has no bus source), rerun them against the current AND the patched script, and return the before/after emit diff (with `source`: jetstream|trace-ring). `not_recorded` counts the events left out of the comparison because a run called a system whose answer is not recorded. The replayed events are masked as the record masks them, flags and nulls kept: `hidden` names a field the code reads that the run did not see, and a rule on it may go another way live. Nothing is written — promote with vejas_set_literal.", "inputSchema": obj(json!({"file": {"type": "string"}, "name": {"type": "string"}, "key": {"type": "string", "description": "entry key, or '-' for a whole constant"}, "value": {}, "n": {"type": "integer", "description": "how many recent events to replay (default 20)"}}), vec!["file", "name", "value"])}),
         json!({"name": "vejas_preview", "description": "Run a flow on its fixture and return the emitted messages plus the final pipeline.", "inputSchema": obj(json!({"file": {"type": "string"}}), vec!["file"])}),
         json!({"name": "vejas_run_flow", "description": "Run any flow on a supplied input event and return its emits (does not touch the bus).", "inputSchema": obj(json!({"file": {"type": "string"}, "input": {"type": "object"}}), vec!["file", "input"])}),
         json!({"name": "vejas_events", "description": "The most recent events processed by the flows — subject, ok/error, emitted subjects, payload preview — newest first. Optional filter: flow (e.g. \"flow:stripe_alerts\").", "inputSchema": obj(json!({"flow": {"type": "string"}}), vec![])}),
@@ -5357,7 +5490,16 @@ fn main() {
         return;
     }
     if args.len() >= 3 && args[1] == "vjs-check" {
-        match fs::read_to_string(&args[2]).map_err(|e| e.to_string()).and_then(|s| vjs::parse(&s).map(|_| ())) {
+        let path = PathBuf::from(&args[2]);
+        let checked = fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| vjs::parse(&s)).and_then(|prog| {
+            // the arguments of its calls, against the services of its project
+            let mut engine = vjs::Engine::shadow(project_of(&path), pkg_of_path(&path));
+            match engine.check_invokes(&prog) {
+                problems if problems.is_empty() => Ok(()),
+                problems => Err(problems.join("\n")),
+            }
+        });
+        match checked {
             Ok(()) => {
                 println!("ok");
                 return;
@@ -5701,6 +5843,63 @@ mod tests {
         // nothing was written: the file still holds the original threshold
         let src = std::fs::read_to_string(root.join("flows").join("replay_probe.vjs")).unwrap();
         assert!(src.contains("TH = 500"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replay_leaves_out_the_events_whose_calls_are_not_recorded() {
+        let root = std::env::temp_dir().join(format!("vejas-replay-calls-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::create_dir_all(root.join("services")).unwrap();
+        std::fs::write(
+            root.join("services").join("get_limit.vjs"),
+            "driver \"http-rpc\"\nURL = \"http://127.0.0.1:9/limits/{id}\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("flows").join("replay_calls.vjs"),
+            "source \"vx.rc.test\"\nLIMIT = 100\no = invoke get_limit(id: event.id)\nif o.body.n > LIMIT:\n  emit \"vx.out\", {n: o.body.n}\nend\n",
+        )
+        .unwrap();
+        record_trace("flow:replay_calls", "vx.rc.test", true, None, vec![], "{}".into(), Some(json!({"id": "A"})), None, None);
+        record_trace("flow:replay_calls", "vx.rc.test", true, None, vec![], "{}".into(), Some(json!({"id": "B"})), None, None);
+        let diff = replay_literal(&root, "flows/replay_calls.vjs", "LIMIT", "-", &json!(10), 20).unwrap();
+        // two refusals of the same call do not read as "unchanged"
+        assert_eq!((&diff["events"], &diff["changed"], &diff["not_recorded"]), (&json!(2), &json!(0), &json!(2)), "{diff}");
+        assert_eq!(diff["results"][0]["before"]["not_recorded"], "get_limit(id: \"B\")");
+        // a candidate that calls with other arguments changes what the event does
+        std::fs::write(
+            root.join("flows").join("replay_args.vjs"),
+            "source \"vx.ra.test\"\nPREFIX = \"\"\no = invoke get_limit(id: f\"{PREFIX}{event.id}\")\nemit \"vx.out\", {n: o.body.n}\n",
+        )
+        .unwrap();
+        record_trace("flow:replay_args", "vx.ra.test", true, None, vec![], "{}".into(), Some(json!({"id": "A"})), None, None);
+        let diff = replay_literal(&root, "flows/replay_args.vjs", "PREFIX", "-", &json!("X-"), 20).unwrap();
+        assert_eq!((&diff["events"], &diff["changed"], &diff["not_recorded"]), (&json!(1), &json!(1), &json!(0)), "{diff}");
+        // and one that fails before its call, or calls another service
+        let call = |c: &str| json!({"emits": [], "error": "e", "not_recorded": c});
+        let failed = json!({"emits": [], "error": "get_limit: the argument idd appears nowhere in its URL"});
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &call("get_limit(id: \"A\")")), None);
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &failed), Some(true));
+        assert_eq!(compared(&failed, &call("get_limit(id: \"A\")")), Some(true));
+        assert_eq!(compared(&call("get_limit(id: \"A\")"), &call("get_cap(id: \"A\")")), Some(true));
+        // runs that call nothing are compared as before
+        assert_eq!(compared(&json!({"emits": []}), &json!({"emits": [1]})), Some(true));
+        assert_eq!(compared(&json!({"emits": []}), &json!({"emits": []})), Some(false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_script_belongs_to_the_project_that_holds_its_folder() {
+        let root = std::env::temp_dir().join(format!("vejas-project-{}", std::process::id()));
+        for dir in ["flows", "services", "packages/billing/flows"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        for script in ["flows/a.vjs", "services/b.vjs", "packages/billing/flows/c.vjs"] {
+            std::fs::write(root.join(script), "").unwrap();
+            assert_eq!(project_of(&root.join(script)), root, "{script}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

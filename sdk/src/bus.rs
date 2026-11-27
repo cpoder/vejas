@@ -599,6 +599,12 @@ impl Message {
         self.answer(Bytes::from_static(b"-NAK"))
     }
 
+    /// Ask for this message again after `delay`, not at once: a call that got
+    /// no answer gives its system that long (ADR-0032).
+    pub fn nak_after(&self, delay: Duration) -> Result<(), String> {
+        self.answer(Bytes::from(format!("-NAK {{\"delay\":{}}}", delay.as_nanos())))
+    }
+
     /// Answer a request. A message that expects no answer is left alone.
     pub fn respond(&self, payload: impl AsRef<[u8]>) -> Result<(), String> {
         self.answer(Bytes::copy_from_slice(payload.as_ref()))
@@ -686,7 +692,7 @@ fn parse_ack_subject(reply: &str) -> Option<Delivery> {
 // ───────────────────────── pull rounds ─────────────────────────
 
 /// Messages asked for in one pull request.
-const PULL_BATCH: usize = 64;
+pub const PULL_BATCH: usize = 64;
 
 /// The idle poll window (`expires`). One outstanding pull covers this whole span,
 /// so a message arriving any time inside it is delivered at once: there is NO gap
@@ -708,6 +714,12 @@ const PULL_EXPIRES_MS: u64 = 500;
 /// one more message before dying, the zombie-consumer trap caught while
 /// rehearsing the demo.)
 const PULL_REQUEST: &[u8] = b"{\"batch\":64,\"expires\":500000000,\"no_wait\":true}";
+
+/// The pull request for `batch` messages, the window and the wait of
+/// [`PULL_REQUEST`].
+fn pull_request(batch: usize) -> String {
+    format!("{{\"batch\":{batch},\"expires\":{},\"no_wait\":true}}", PULL_EXPIRES_MS * 1_000_000)
+}
 
 /// Client-side backstop, comfortably past the server's `expires`, so that the
 /// server's own status ends a round and not this timeout.
@@ -737,20 +749,33 @@ impl Puller {
     /// and the caller's loop keeps its pace and its stop flag until the
     /// connection is back, when it picks up where it was.
     pub fn round(&self) -> Result<Round<'_>, String> {
+        self.round_of(PULL_BATCH)
+    }
+
+    /// A round of at most `batch` messages (1 to [`PULL_BATCH`]), as
+    /// [`Puller::round`]. A loop whose messages each take long asks for one at
+    /// a time, so that a message does not wait in the client while its
+    /// `ack_wait` runs out. The server takes acks and pull requests on queues
+    /// of their own, so an ack may still be taken after the pull that follows
+    /// it, and a message whose `ack_wait` ran out comes back into that pull:
+    /// the caller knows it by its sequence.
+    pub fn round_of(&self, batch: usize) -> Result<Round<'_>, String> {
         if let Some(fault) = self.fault.borrow_mut().take() {
             return Err(fault);
         }
+        let batch = batch.clamp(1, PULL_BATCH);
         if self.link.up() {
-            let request = self.link.client.publish_with_reply(
-                self.next.clone(),
-                self.inbox.clone(),
-                Bytes::from_static(PULL_REQUEST),
-            );
+            let body = match batch {
+                PULL_BATCH => Bytes::from_static(PULL_REQUEST),
+                n => Bytes::from(pull_request(n)),
+            };
+            let request = self.link.client.publish_with_reply(self.next.clone(), self.inbox.clone(), body);
             wait(sent(request))?;
         }
         Ok(Round {
             puller: self,
             taken: 0,
+            batch,
         })
     }
 
@@ -779,6 +804,7 @@ impl Drop for Puller {
 pub struct Round<'a> {
     puller: &'a Puller,
     taken: usize,
+    batch: usize,
 }
 
 impl Iterator for Round<'_> {
@@ -786,7 +812,7 @@ impl Iterator for Round<'_> {
 
     fn next(&mut self) -> Option<Message> {
         let deadline = Instant::now() + PULL_WAIT;
-        while self.taken < PULL_BATCH {
+        while self.taken < self.batch {
             let message = self.puller.receive(deadline)?;
             match classify(&message) {
                 Pulled::Message => {
@@ -1439,6 +1465,10 @@ mod tests {
         assert_eq!(request["batch"], PULL_BATCH);
         assert_eq!(request["expires"], PULL_EXPIRES_MS * 1_000_000);
         assert_eq!(request["no_wait"], true);
+        // a smaller round asks for less, with the same window
+        let one: Value = serde_json::from_str(&pull_request(1)).unwrap();
+        assert_eq!((&one["batch"], &one["expires"], &one["no_wait"]), (&json!(1), &request["expires"], &json!(true)));
+        assert_eq!(pull_request(PULL_BATCH).as_bytes(), PULL_REQUEST);
     }
 
     #[test]

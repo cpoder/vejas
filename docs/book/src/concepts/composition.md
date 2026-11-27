@@ -1,9 +1,11 @@
 # Composing services
 
-A flow does one job end to end. When several flows need the *same* piece of
-logic — format an alert, classify a ticket, shape a payload — you factor it
-into a **service** and `invoke` it. Same language, same purity, no
-duplication.
+A flow does one job end to end. When it needs something it does not hold, it
+calls a **service** with `invoke`: a piece of logic several flows share
+(format an alert, classify a ticket, shape a payload), or a system that
+answers (the current state of an order, from an API). The flow writes the
+call the same way in both cases, and a service can move from one to the
+other without touching the flows that call it.
 
 ## A service is a flow without a trigger
 
@@ -17,9 +19,91 @@ example (`services/format_alert.vjs`):
 alert_text = f"[{sev}] {subj} - {lower(email)}"
 ```
 
-Because a service is pure VejasScript, everything true of a flow holds: its
-literals are part of the [business surface](business-surface.md), it is
-statically analyzable, and it has no I/O of its own.
+A service written in VejasScript is pure, and everything true of a flow
+holds: its literals are part of the [business surface](business-surface.md),
+it is statically analyzable, and it has no I/O of its own.
+
+## A service that answers from a system
+
+A service can declare a connector instead of holding code (ADR-0032).
+`services/get_order.vjs`:
+
+```
+driver "http-rpc"
+BASE_URL = "https://orders.example"
+URL = "{BASE_URL}/orders/{id}"
+HEADERS = {Authorization: f"Bearer {secret("orders/token")}"}
+TIMEOUT_MS = 5000
+ATTEMPTS = 3
+DELAY_MS = 500
+```
+
+A flow invokes it as it invokes any service, and reads what came back:
+
+```
+o = invoke get_order(id: data.orderId)
+emit "vx.orders.ready", {id: data.orderId, state: o.body.status}
+```
+
+- `{name}` in `URL` takes the argument `name`, percent-encoded, or the
+  setting `name` as written. Every argument must appear in the URL, except
+  `body`, which is sent as the JSON body. `METHOD` is `GET` unless set.
+- The settings are the service's own. An argument may not have the name of
+  one, so a flow cannot choose the host its credentials go to. An argument
+  may not make a segment of the path empty, `.` or `..`, which would reach
+  another resource; in the query, any value goes. A setting goes in as written, so
+  a secret placed in the query must hold only characters a URL takes as
+  they are.
+- `vejas-runtime vjs-check` reports an argument the service does not take,
+  when the declaration writes its `URL` as a literal. So does a preview.
+- The answer is `{status, body, headers}`, with the arguments the flow
+  passed, as a service of code gives them back. `body` is parsed when it is
+  JSON and is text otherwise; header names are in lower case.
+- A status listed in `ANSWERS` is an answer; by default, any 2xx.
+  `ANSWERS = [200, 404]` lets the flow decide what a 404 means. A call
+  follows no redirect, which would take the service's headers elsewhere: a
+  3xx is an answer only if `ANSWERS` lists it, and the flow reads
+  `location`.
+- Any other status, a timeout (`TIMEOUT_MS`, 10 s by default) or a network
+  error fails the run, with an error that names the service and the cause:
+  `get_order: HTTP 503`. A failure that may change later (429, a 5xx, a
+  timeout, the network; `RETRY_ON` lists other statuses) brings the message
+  back after `DELAY_MS` (1 s, at most an hour), until it has been delivered
+  `ATTEMPTS` times (3), and never past the five deliveries of any message. A
+  secret store that does not answer when the declaration is read is such a
+  failure too. Any other failure, or the last attempt, is a
+  [dead letter](../guides/dlq-replay.md) at once, replayed once the cause is
+  fixed. A run's emits leave only when it succeeds, so a message tried again
+  emits once.
+- The error names no URL and no header, and is masked as the trace record
+  masks one, so a credential reaches no log, span, answer or dead letter.
+- A flow that calls a system takes its messages one by one: it asks for the
+  next once it has acked the last. Its messages then wait in no queue while
+  calls run. Keep a run's calls, `TIMEOUT_MS` each, under the consumer's
+  `ack_wait` (30 s): a message whose run outlives it is delivered again. Its
+  own loop acks that copy without running it; another instance runs it. A
+  flow that only computes takes them 64 at a time.
+- A flow on the bus reads the declaration again at most once a second: an
+  edit of it, or a rotated secret, is picked up within that time. An `api`
+  flow reads it at each request.
+- `TIMEOUT_MS` bounds the connection, TLS and the answer. The name lookup is
+  outside it.
+- In an `api` flow, a failed call answers the caller 502, or 504 after a
+  timeout.
+- The call carries the message's trace (`traceparent`): a system that reads
+  it continues the trace.
+- A call is made at least once. When a later step of the run fails, the
+  message's next delivery calls again. A service that changes something must
+  be idempotent, with a key the flow passes, such as the event's id.
+- A run that is shown (a preview, `vejas_run_flow`, a replay, time travel,
+  the canary, a golden capture) calls no system: such an invoke fails there
+  and says why. A replay, time travel and the canary leave out an event whose
+  two runs reach the same call, and count it as `not_recorded`. A candidate
+  that calls with other arguments, calls another service or fails before
+  its call has changed what the event does, and counts as changed. Reading the answers
+  recorded with the event instead is the next step of ADR-0032.
+- The credentials stay in the declaration, through `secret()`; the flow
+  never sees them.
 
 ## `invoke` — merge, or capture
 
@@ -60,7 +144,8 @@ invoke notifications:notify_slack(channel: "#ops", text: alert_text)
 ## When to compose, and when to use the bus
 
 - **`invoke`** when it's *synchronous shared logic* inside one processing
-  step — formatting, classification, a lookup shape. It runs in the caller's
+  step — formatting, classification, a lookup shape — or a question the step
+  needs a system to answer: enrichment, a lookup. It runs in the caller's
   pipeline, same event, no persistence boundary.
 - **The bus** (`emit` to a subject another flow `source`s) when it's a
   *separate stage* that deserves its own delivery guarantee, retry/replay, or

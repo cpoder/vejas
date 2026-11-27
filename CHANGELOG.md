@@ -8,6 +8,34 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **`invoke` calls a service that answers from a system** (ADR-0032). A file in
+  `services/` may declare `driver "http-rpc"` instead of holding code: `URL`
+  with `{arg}` placeholders, `METHOD`, `HEADERS` (with `secret()`),
+  `TIMEOUT_MS`, `ATTEMPTS`, `DELAY_MS`, `ANSWERS`, `RETRY_ON`. A flow writes
+  `o = invoke get_order(id: x)` and reads `o.status`, `o.body`, `o.headers`.
+  A call that gets no answer fails the run with the service's name and the
+  cause; when a later try may change it, the message comes back after the
+  service's delay, up to its attempts (a delayed nak, not `ack_wait`), and
+  otherwise it is a dead letter at once. An `api` flow answers 502, or 504
+  after a timeout. The call carries the message's `traceparent`. A run that
+  is shown (preview, replay, time travel, canary, golden) calls no system and
+  says so; replay, time travel and the canary count an event whose two runs
+  reach the same call as `not_recorded` instead of comparing it, and the
+  panel says which events it could not check. A candidate that calls with
+  other arguments, calls another service or fails before its call counts as
+  changed. Replaying recorded answers comes next. An argument fills a
+  `{name}` of the URL, may not take a setting's name, and may not make a
+  segment of the path empty, `.` or `..`; `vjs-check` and a preview report
+  one the service does not take. A call follows no redirect. Its error names no URL and no
+  header and is masked as the record masks one. A flow that calls a system
+  takes its messages one by one, so none waits in the client past
+  `ack_wait` and runs twice. A message whose run outlived `ack_wait` and
+  comes back to its loop is acked without running again. A declaration holds settings only (an `invoke`
+  there is refused), is read again at most once a second, and a secret store
+  that does not answer while reading it is a failure a later delivery may
+  get past. No new crate: the call uses the runtime's HTTP client. e2e
+  `invoke-http.sh` checks it in CI.
+
 - **Signed webhooks on `http-in`** (ADR-0037, the first driver it calls for).
   A manifest names its sender's scheme in `SIGNATURE` (`github`, `stripe`,
   `slack`, `shopify`, `standard-webhooks`, `gitlab`, or `hmac-sha256` and
@@ -133,6 +161,11 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   reason instead of "Replayed.".
 
 ### Security
+- **A request of `http-out`, `http-poll` or `oauth-poll` that does not get
+  through names its host in its error, not its URL.** The HTTP client's text
+  starts with the whole URL, its query and user info included, and quotes a
+  header it cannot send, value included. A credential placed in either
+  reached the unit's last error and the log.
 - **The runtime masks what it shows of the bus, as the trace record does**
   (ADR-0034). The events ring (`/events`, `vejas_events`: a hop's preview, a
   sink's answer, an error), dead letters (`/dlq`, `vejas_dlq`: the payload and
