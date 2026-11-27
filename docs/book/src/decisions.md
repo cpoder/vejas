@@ -42,3 +42,4 @@ to "why is it built this way", and the moat a rewrite would have to re-earn.
 - [ADR-0037 — 0037 — How the connector catalog grows: vendors as certified recipes on protocol drivers](https://github.com/cpoder/vejas/blob/master/docs/adr/0037-how-the-connector-catalog-grows.md)
 - [ADR-0038 — 0038 — One connector contract, two packagings](https://github.com/cpoder/vejas/blob/master/docs/adr/0038-one-connector-contract-two-packagings.md)
 - [ADR-0039 — 0039 — A flow sees its message as it came, and owns its failures](https://github.com/cpoder/vejas/blob/master/docs/adr/0039-a-flow-sees-its-message-and-owns-its-failures.md)
+- [ADR-0040 — 0040 — A flow holds its source while a system it calls is down](https://github.com/cpoder/vejas/blob/master/docs/adr/0040-a-flow-holds-its-source-while-a-system-is-down.md)
