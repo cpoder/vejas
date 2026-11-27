@@ -11,15 +11,84 @@ use crate::trace;
 
 /// A pooled, blocking HTTP(S) agent shared by http-out / http-poll / oauth-poll,
 /// so connections stay alive across requests (no process-per-request). Pure-Rust
-/// TLS (rustls); credentials ride in the headers, in memory, never argv.
+/// TLS (rustls); credentials ride in the headers, in memory, never argv. It
+/// follows no redirect, as the calls of a flow do not: ureq would take every
+/// header but `Authorization` to wherever the answer points, an `X-Api-Key`
+/// among them. A redirect is an error that says so (see [`refused`]).
 static HTTP_AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
 fn http_agent() -> &'static ureq::Agent {
     HTTP_AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(30))
+            .redirects(0)
             .user_agent("vejas")
             .build()
     })
+}
+
+/// The host a URL names, `host[:port]`, for a log line or an error: never its
+/// user info, its path or its query, where credentials ride.
+pub(crate) fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+}
+
+/// A URL as an event names it: its scheme, host and path, without its user
+/// info and its query, and with any value a secret store handed out masked.
+pub(crate) fn url_shown(url: &str) -> String {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path_at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let path = &rest[path_at..];
+    let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
+    let shown = match scheme {
+        Some(scheme) => format!("{scheme}://{}{path}", host_of(url)),
+        None => format!("{}{path}", host_of(url)),
+    };
+    crate::record::shown().error(&shown)
+}
+
+/// The start of what a system answered, for an error: a system may echo the
+/// request, so the URL's query and user info are taken out, and the record's
+/// mask applies (ADR-0017): the values the secret stores handed out, and
+/// credential-named pairs. The error reaches the log, the unit's last error
+/// and the dead letter at rest.
+fn excerpt(url: &str, body: &[u8], most: usize) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let mut echoed: Vec<&str> = Vec::new();
+    if let Some((user_info, _)) = authority.rsplit_once('@') {
+        echoed.push(user_info);
+    }
+    if let Some((_, query)) = url.split_once('?') {
+        echoed.push(&query[..query.find('#').unwrap_or(query.len())]);
+    }
+    echoed.retain(|v| !v.is_empty());
+    // read past `most` by the longest of them, so that one the cut would
+    // split is still found whole
+    let longest = echoed.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut text = String::from_utf8_lossy(&body[..body.len().min(most + longest)]).into_owned();
+    for value in echoed {
+        text = text.replace(value, "<masked>");
+    }
+    if text.len() > most {
+        let cut = (0..=most).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        text.truncate(cut);
+    }
+    crate::record::shown().error(text.trim())
+}
+
+/// The error of an answer outside 2xx: a redirect, which is not followed, or
+/// the status and the start of the answer.
+pub(super) fn refused(code: u16, url: &str, body: &[u8], most: usize) -> String {
+    if (300..400).contains(&code) {
+        return format!(
+            "HTTP {code} from {}: a redirect, not followed, since the request's headers would go along: set the URL to the address it points to",
+            host_of(url)
+        );
+    }
+    format!("HTTP {code}: {}", excerpt(url, body, most))
 }
 
 /// The agent of the calls a flow makes (ADR-0032). It follows no redirect: a
@@ -88,10 +157,7 @@ pub fn http_request(
 pub(super) fn http_get(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
     match http_request("GET", url, headers, None)? {
         (code, body) if (200..300).contains(&code) => Ok(body),
-        (code, body) => Err(format!(
-            "HTTP {code}: {}",
-            String::from_utf8_lossy(&body[..body.len().min(300)]).trim()
-        )),
+        (code, body) => Err(refused(code, url, &body, 300)),
     }
 }
 
@@ -197,10 +263,7 @@ pub(super) fn http_post(
 ) -> Result<Vec<u8>, String> {
     match http_request("POST", url, &traced(headers, trace), Some(body))? {
         (code, out) if (200..300).contains(&code) => Ok(out),
-        (code, out) => Err(format!(
-            "HTTP {code}: {}",
-            String::from_utf8_lossy(&out[..out.len().min(300)]).trim()
-        )),
+        (code, out) => Err(refused(code, url, &out, 300)),
     }
 }
 
@@ -282,5 +345,61 @@ mod tests {
             panic!("the header was sent")
         };
         assert!(e.contains("Bad Header") && !e.contains("SECRET"), "{e}");
+    }
+
+    #[test]
+    fn a_url_is_named_without_its_user_info_and_its_query() {
+        let url = "https://svc:pw-SECRET-1@api.x:8443/v1/orders?api_key=SECRET-2#top";
+        assert_eq!(host_of(url), "api.x:8443");
+        assert_eq!(url_shown(url), "https://api.x:8443/v1/orders");
+        assert_eq!((host_of("http://h"), url_shown("http://h").as_str()), ("h", "http://h"));
+        assert_eq!((host_of("https://h?x=1"), url_shown("https://h?x=1").as_str()), ("h", "https://h"));
+        assert_eq!((host_of("h/p?q=1"), url_shown("h/p?q=1").as_str()), ("h", "h/p"));
+    }
+
+    #[test]
+    fn an_answer_that_echoes_the_request_keeps_its_credentials_out() {
+        let url = "http://svc:pw-SECRET-1@h:1/orders?api_key=SECRET-2&page=1";
+        let e = refused(400, url, b"no route for GET /orders?api_key=SECRET-2&page=1 (svc:pw-SECRET-1)", 300);
+        assert_eq!(e, "HTTP 400: no route for GET /orders?<masked> (<masked>)");
+        // where the excerpt's cut would split the echo, it is still found whole
+        let body = format!("{}/orders?api_key=SECRET-2&page=1", "x".repeat(290));
+        let e = refused(400, url, body.as_bytes(), 300);
+        assert!(!e.contains("SECRET") && !e.contains("api_key") && e.contains("/orders?<m"), "{e}");
+        // a credential-named pair, under the record's mask (ADR-0017)
+        let e = refused(401, "http://h/x", br#"{"error":"bad","client_secret":"K3Y"}"#, 300);
+        assert!(!e.contains("K3Y"), "{e}");
+        // a redirect is not followed, and says where to look
+        let e = refused(302, url, b"<a href=/elsewhere?api_key=SECRET-2>", 300);
+        assert!(e.starts_with("HTTP 302 from h:1: a redirect, not followed") && !e.contains("SECRET"), "{e}");
+    }
+
+    #[test]
+    fn a_redirect_takes_no_header_elsewhere() {
+        use std::io::{Read as _, Write as _};
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let there = elsewhere.local_addr().unwrap().port();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let here = server.local_addr().unwrap().port();
+        // two requests, a GET and a POST, each answered with a redirect
+        let answering = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = server.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = conn.read(&mut request);
+                let answer = format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{there}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                conn.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        let headers = [("X-Api-Key".to_string(), "SECRET-4".to_string())];
+        let url = format!("http://127.0.0.1:{here}/orders");
+        let get = http_get(&url, &headers).unwrap_err();
+        let post = http_post(&url, &headers, b"{}", None).unwrap_err();
+        answering.join().unwrap();
+        for e in [get, post] {
+            assert!(e.starts_with(&format!("HTTP 302 from 127.0.0.1:{here}: a redirect, not followed")), "{e}");
+        }
+        assert!(elsewhere.accept().is_err(), "the redirect's target got a connection");
     }
 }

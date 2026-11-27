@@ -10,7 +10,7 @@ hot-addable). No subprocess, no Python. Drivers today:
 - **http-in** (source:webhook) — `POST /ingest/<suffix>` → `vx.<suffix>`. Config: PORT, MAX_CONNECTIONS.
 - **timer** (source:interval) — emits PAYLOAD on SUBJECT every INTERVAL_SECS
   (an object payload gains a `ts` field, ISO 8601 UTC, when absent).
-- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS; optional `ENVELOPE = true` publishes `{endpoint, fetched_at, body}` (like oauth-poll) so a stateless flow gets a `collected_at`.
+- **http-poll** (source:poll) — GETs URL every INTERVAL_SECS → SUBJECT. Optional HEADERS; optional `ENVELOPE = true` publishes `{endpoint, fetched_at, body}` (like oauth-poll) so a stateless flow gets a `collected_at`; `endpoint` is the URL without its user info and its query. Like http-out and oauth-poll, it follows no redirect: a 3xx is an error.
 - **oauth-poll** (source:poll) — OAuth2 client-credentials REST poller: token from
   TOKEN_URL (CLIENT_SECRET via `secret()`), GETs each of ENDPOINTS with the Bearer,
   pagination via NEXT_LINK_FIELD (default `@odata.nextLink`, absolute links followed

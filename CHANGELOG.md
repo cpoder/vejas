@@ -202,6 +202,21 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   reason instead of "Replayed.".
 
 ### Security
+- **`http-out`, `http-poll` and `oauth-poll` keep a credential that rides in
+  a URL or that a system echoes out of the log and the dead letters.** An
+  answer outside 2xx is quoted in the error with the URL's query and user
+  info taken out, and under the record's mask (ADR-0017): a system that
+  echoes the request, as a 400 page often does, carried an `api_key` from the
+  query into the log, the unit's last error and the dead letter stored in
+  the stream. The same for a token endpoint that echoes the client secret.
+  `http-poll` logs its host instead of its URL, and the `endpoint` of its
+  envelope (`ENVELOPE = true`) is the URL without its user info and its
+  query. The `http-out` test names the host it was refused by.
+- **`http-out`, `http-poll` and `oauth-poll` follow no redirect**, as the
+  calls of a flow do not (ADR-0032). The HTTP client dropped `Authorization`
+  on a redirect and took the other headers along, an `X-Api-Key` among them,
+  to wherever the answer pointed. A 3xx is now an error that names the host
+  and says to set the URL to the address it points to.
 - **A request of `http-out`, `http-poll` or `oauth-poll` that does not get
   through names its host in its error, not its URL.** The HTTP client's text
   starts with the whole URL, its query and user info included, and quotes a

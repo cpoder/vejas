@@ -2,7 +2,7 @@
 
 use vejas_connector::{answer_text, summarize};
 
-use crate::connectors::http_client::{http_post, http_request};
+use crate::connectors::http_client::{host_of, http_post, http_request, refused};
 use crate::connectors::{Ctx, Driver, humanize};
 
 pub(super) struct HttpOut;
@@ -11,7 +11,7 @@ impl Driver for HttpOut {
         "sink"
     }
     fn about(&self) -> &'static str {
-        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL, HEADERS (optional doc — put credentials there via secret(), e.g. {\"Authorization\": …}), TEST_BODY (optional harmless payload enabling the test probe)."
+        "Consumes a subject and POSTs each message body to a URL. Config: SUBJECT, URL, HEADERS (optional doc — put credentials there via secret(), e.g. {\"Authorization\": …}), TEST_BODY (optional harmless payload enabling the test probe). A redirect is not followed."
     }
     fn probe(&self, ctx: &Ctx) -> Result<String, String> {
         let url = ctx.config.str("URL").ok_or("URL required")?;
@@ -24,16 +24,17 @@ impl Driver for HttpOut {
         }
         let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         match http_request("POST", &url, &headers, Some(&bytes)) {
-            Ok((code, resp)) if (200..300).contains(&code) => Ok(format!(
+            Ok((code, resp)) if (200..300).contains(&code) => Ok(crate::record::shown().error(&format!(
                 "POST OK · answered: {}",
                 summarize(&resp).unwrap_or_else(|| "(empty)".into())
-            )),
-            Ok((401 | 403, _)) => Err(humanize(&format!("HTTP 401: authentication rejected by {url}"))),
+            ))),
+            Ok((401 | 403, _)) => Err(humanize(&format!("HTTP 401: authentication rejected by {}", host_of(&url)))),
+            Ok((code, resp)) if (300..400).contains(&code) => Err(refused(code, &url, &resp, 300)),
             // any other answer past auth still proves network + credentials;
             // only the probe payload was refused
             Ok((code, resp)) => Ok(format!(
-                "reachable and authenticated · but TEST_BODY was refused (HTTP {code}: {})",
-                summarize(&resp).unwrap_or_default()
+                "reachable and authenticated · but TEST_BODY was refused ({})",
+                refused(code, &url, &resp, 300)
             )),
             Err(e) => Err(humanize(&e)),
         }

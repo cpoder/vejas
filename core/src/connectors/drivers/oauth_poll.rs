@@ -7,7 +7,7 @@ use serde_json::Value;
 use vejas_connector::clock::iso8601_utc;
 
 use crate::bus;
-use crate::connectors::http_client::{http_request, join_url, next_url, urlencode};
+use crate::connectors::http_client::{host_of, http_request, join_url, next_url, refused, urlencode};
 use crate::connectors::{Config, Ctx, Driver, humanize};
 use crate::metrics::Kind;
 
@@ -129,10 +129,12 @@ impl OAuthPoll {
         )];
         let (code, body) = http_request("POST", token_url, &headers, Some(form.as_bytes()))?;
         if !(200..300).contains(&code) {
-            return Err(format!(
-                "token endpoint HTTP {code}: {}",
-                String::from_utf8_lossy(&body[..body.len().min(300)]).trim()
-            ));
+            // an endpoint may echo the form, the client secret in it
+            let mut refusal = refused(code, token_url, &body, 300);
+            if !client_secret.is_empty() {
+                refusal = refusal.replace(&urlencode(client_secret), "<masked>").replace(client_secret, "<masked>");
+            }
+            return Err(format!("token endpoint {refusal}"));
         }
         let v: Value =
             serde_json::from_slice(&body).map_err(|e| format!("token endpoint: bad JSON: {e}"))?;
@@ -214,10 +216,11 @@ impl Driver for OAuthPoll {
         let next_field = ctx.config.str_or("NEXT_LINK_FIELD", "@odata.nextLink");
         let js = ctx.jetstream()?;
         eprintln!(
-            "[{}] oauth-poll {} endpoint(s) + {} expand(s) on {base} every {interval}s -> {subject}",
+            "[{}] oauth-poll {} endpoint(s) + {} expand(s) on {} every {interval}s -> {subject}",
             ctx.name,
             endpoints.len(),
-            expands.len()
+            expands.len(),
+            host_of(&base)
         );
         let mut tc = TokenCache {
             token_url,
@@ -280,10 +283,7 @@ impl Driver for OAuthPoll {
                             }
                         }
                         Ok((code, body)) => {
-                            let msg = format!(
-                                "{ep}: HTTP {code}: {}",
-                                String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
-                            );
+                            let msg = format!("{ep}: {}", refused(code, &url, &body, 200));
                             eprintln!("[{}] {msg} — endpoint skipped this tick", ctx.name);
                             ctx.failed(&subject, msg);
                             break;
@@ -376,11 +376,7 @@ impl Driver for OAuthPoll {
                             }
                         }
                         Ok((code, body)) => {
-                            let msg = format!(
-                                "{}: HTTP {code}: {}",
-                                spec.name,
-                                String::from_utf8_lossy(&body[..body.len().min(200)]).trim()
-                            );
+                            let msg = format!("{}: {}", spec.name, refused(code, &url, &body, 200));
                             eprintln!("[{}] {msg} — expand skipped this tick", ctx.name);
                             ctx.failed(&subject, msg);
                             break;
