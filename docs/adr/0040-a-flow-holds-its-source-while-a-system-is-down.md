@@ -7,9 +7,11 @@
   (`POST /hold/release`, `POST /hold/probe`, write-gated, human acts in
   governed mode, audited); one message at a time on the consumer of a flow
   that holds; the state in `/topology` and `vejas_topology`; `held`,
-  `resumed` and `released` on `vx.flow.events`; the trace record and the
-  metrics; e2e/flow-holds.sh. Not built: the panel's badge and buttons, MCP
-  tools for the two acts.
+  `resumed` and `released` (and `failed`, `stopped`) on `vx.flow.events`;
+  the trace record and the metrics; e2e/flow-holds.sh. Not built: the panel's badge and buttons, MCP
+  tools for the two acts. A release runs the message once more with the
+  held service answering its failure, not called: the calls before it in
+  the flow are made again.
 - Date: 2026-11-27
 
 ## Context

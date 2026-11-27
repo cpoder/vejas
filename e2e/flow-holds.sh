@@ -18,8 +18,8 @@ cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/core/target/release/vejas-runtime}"
 [ -x "$BIN" ] || { echo "build first" >&2; exit 1; }
 S=$(mktemp -d); R=$(mktemp -d)
-RT=""; NP=""; SUB=""; SYS=""
-trap 'kill $RT $NP $SUB $SYS 2>/dev/null; wait $RT $NP $SUB $SYS 2>/dev/null; rm -rf "$S" "$R"' EXIT
+RT=""; RT2=""; NP=""; SUB=""; SYS=""
+trap 'kill $RT $RT2 $NP $SUB $SYS 2>/dev/null; wait $RT $RT2 $NP $SUB $SYS 2>/dev/null; rm -rf "$S" "$R"' EXIT
 fail=0
 ok(){ echo "  ✓ $1"; }
 ko(){ echo "  ✗ $1"; fail=1; }
@@ -28,9 +28,11 @@ PORT=4306; URL=nats://127.0.0.1:$PORT; HP=8790; H="http://127.0.0.1:$HP"; SP=879
 TOK="e2e-holds-$$"
 
 # A system that is down (503) until the file up exists, answers 404 for an id
-# with GONE in it, and has a health URL. It writes down each path asked.
+# with GONE in it, and has a health URL, and one that never answers 2xx. Down,
+# an id with SLOW in it answers after 6 s; b1, b2, b4 and b5 answer anyway.
+# /dl/ is another system, up once dl.up exists. It writes down each path asked.
 cat > "$S/system.py" <<'PY'
-import http.server, json, os, sys
+import http.server, json, os, sys, time
 calls, up = sys.argv[2], sys.argv[2] + ".up"
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -39,7 +41,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         live = os.path.exists(up)
         if self.path == "/health":
             status = 200 if live else 503
+        elif self.path == "/never":
+            status = 503
+        elif self.path.startswith("/dl/"):
+            status = 200 if os.path.exists(calls + ".dl.up") else 503
+        elif self.path.rsplit("/", 1)[-1] in ("b1", "b2", "b4", "b5"):
+            status = 200
         else:
+            if "SLOW" in self.path and not live:
+                time.sleep(6)
             status = 404 if "GONE" in self.path else 200 if live else 503
         body = json.dumps({"ok": status == 200}).encode()
         self.send_response(status)
@@ -83,6 +93,68 @@ WHEN_DOWN = "dead-letter"
 ATTEMPTS = 2
 DELAY_MS = 200
 V
+# its health never answers: only a person ends its hold
+cat > "$R/services/pay_rel.vjs" <<V
+driver "http-rpc"
+URL = "http://127.0.0.1:$SP/pay/{id}"
+HEALTH_URL = "http://127.0.0.1:$SP/never"
+ATTEMPTS = 1
+DELAY_MS = 200
+PROBE_MAX_MS = 500
+V
+# calls that outlast the ack wait of 4 s while the system is down
+cat > "$R/services/pay_slow.vjs" <<V
+driver "http-rpc"
+URL = "http://127.0.0.1:$SP/pay/{id}"
+TIMEOUT_MS = 5000
+ATTEMPTS = 2
+DELAY_MS = 200
+PROBE_MAX_MS = 500
+V
+cat > "$R/services/dl3.vjs" <<V
+driver "http-rpc"
+URL = "http://127.0.0.1:$SP/dl/{id}"
+WHEN_DOWN = "dead-letter"
+ATTEMPTS = 3
+DELAY_MS = 200
+V
+# code for now: the flow takes its messages in rounds, until it is edited
+cat > "$R/services/quote.vjs" <<'V'
+status = 200
+V
+cat > "$R/flows/rel.vjs" <<'V'
+# flow: rel
+source "vx.fh.rel"
+try:
+    o = invoke pay_rel(id: event.id)
+    emit "vx.fh.rel_paid", {id: event.id}
+catch e:
+    emit "vx.fh.rel_rejected", {id: event.id, status: e.status}
+end
+V
+cat > "$R/flows/slow.vjs" <<'V'
+# flow: slow
+source "vx.fh.slow"
+o = invoke pay_slow(id: event.id)
+emit "vx.fh.paids", {id: event.id}
+V
+cat > "$R/flows/mix.vjs" <<'V'
+# flow: mix
+source "vx.fh.mix"
+a = invoke pay(id: event.id)
+try:
+    b = invoke dl3(id: event.id)
+    emit "vx.fh.mixed", {id: event.id}
+catch e:
+    emit "vx.fh.mix_rejected", {id: event.id, attempts: e.attempts}
+end
+V
+cat > "$R/flows/batchy.vjs" <<'V'
+# flow: batchy
+source "vx.fh.batch"
+o = invoke quote(id: event.id)
+emit "vx.fh.batched", {id: event.id}
+V
 cat > "$R/flows/pay.vjs" <<'V'
 # flow: pay
 source "vx.fh.pay"
@@ -105,12 +177,13 @@ V
 nats-server -js -sd "$S/n" -a 127.0.0.1 -p $PORT > /dev/null 2>&1 & NP=$!
 for _ in $(seq 1 50); do nats -s $URL server check connection > /dev/null 2>&1 && break; sleep 0.1; done
 start(){
-  NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:$HP VEJAS_TOKEN="$TOK" VEJAS_ACK_WAIT_SECS=4 \
-    VEJAS_DLQ_EVENT_SECS=0 "$BIN" >> "$S/rt.log" 2>&1 & RT=$!
-  until curl -sf -o /dev/null "$H/healthz"; do sleep 0.1; done
-  for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.fh' "$S/rt.log")" -ge "$1" ] && break; sleep 0.1; done
+  NATS_URL=$URL VEJAS_ROOT="$R" VEJAS_HTTP_ADDR=127.0.0.1:${2:-$HP} VEJAS_TOKEN="$TOK" VEJAS_ACK_WAIT_SECS=4 \
+    VEJAS_DLQ_EVENT_SECS=0 "$BIN" > "$S/rt${2:-}.log" 2>&1 &
+  [ -n "${2:-}" ] && RT2=$! || RT=$!
+  until curl -sf -o /dev/null "http://127.0.0.1:${2:-$HP}/healthz"; do sleep 0.1; done
+  for _ in $(seq 1 100); do [ "$(grep -c 'consuming vx.fh' "$S/rt${2:-}.log")" -ge "$1" ] && break; sleep 0.1; done
 }
-start 3
+start 7
 nats -s $URL sub 'vx.>' > "$S/bus" 2>/dev/null & SUB=$!
 sleep 0.5
 
@@ -210,17 +283,84 @@ for _ in $(seq 1 60); do letters | grep -q d1 && break; sleep 0.1; done
   && ok "WHEN_DOWN = \"dead-letter\": today's path, two deliveries then a dead letter" \
   || ko "dead-letter service: $(calls /pay/d1) calls, held $(event held flow:payd), letters $(letters)"
 
+echo "── a release does not call the held system again"
+down
+nats -s $URL pub vx.fh.rel '{"id":"rel1"}' > /dev/null 2>&1
+held_until flow:rel
+C=$(calls /pay/rel1)
+up
+sleep 1   # its health still says down: it stays held
+A=$(act -H "Authorization: Bearer $TOK" -d '{"flow":"flow:rel"}' "$H/hold/release")
+until_sent vx.fh.rel_rejected rel1
+R1=$(msgs vx.fh.rel_rejected | grep rel1)
+echo "$A" | grep -q ' 200$' && [ "$(calls /pay/rel1)" = "$C" ] && [ "$(count vx.fh.rel_paid rel1)" = 0 ] \
+  && echo "$R1" | grep -q '"status":503' \
+  && ok "the system back, a release still sends the message to its catch, with no call: $R1" \
+  || ko "release: $A, calls $C then $(calls /pay/rel1), paid $(count vx.fh.rel_paid rel1), rejected $R1"
+
+echo "── a flow that took its messages in rounds holds one: the round before is settled, the rest go back"
+cat > "$R/services/quote.vjs" <<V
+driver "http-rpc"
+URL = "http://127.0.0.1:$SP/pay/{id}"
+ATTEMPTS = 1
+DELAY_MS = 200
+PROBE_MAX_MS = 500
+V
+sleep 1.5   # the flow reads its services again at most once a second
+down
+nats -s $URL pub vx.fh.batch '{"id":"b{{Count}}"}' --count 5 > /dev/null 2>&1
+held_until flow:batchy
+sleep 0.5
+PEND=$(nats -s $URL consumer info VEJAS flow_batchy -j 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["num_ack_pending"])')
+[ "$(ids vx.fh.batched)" = "b1 b2" ] && [ "$PEND" = 1 ] \
+  && ok "held on b3: b1 and b2 are out and acked, b4 and b5 went back ($PEND pending)" \
+  || ko "batch held: out $(ids vx.fh.batched), $PEND pending"
+up
+until_sent vx.fh.batched b5
+[ "$(ids vx.fh.batched)" = "b1 b2 b3 b4 b5" ] && ok "back: b3, b4, b5 in order" || ko "batch after: $(ids vx.fh.batched)"
+
+echo "── a rerun is no delivery: a service that says dead-letter keeps its attempts after a hold"
+down
+rm -f "$S/calls.dl.up"
+nats -s $URL pub vx.fh.mix '{"id":"m1"}' > /dev/null 2>&1
+held_until flow:mix
+sleep 1.5
+up
+until_sent vx.fh.mix_rejected m1
+A=$(msgs vx.fh.mix_rejected | grep m1)
+[ "$(calls /dl/m1)" = 3 ] && echo "$A" | grep -q '"attempts":3' \
+  && ok "held on pay, then dl3 down: its catch on the third delivery, three calls: $A" \
+  || ko "mix: $(calls /dl/m1) calls to dl3, $A"
+
+echo "── held through calls that outlast the ack wait, with another instance reading"
+down
+start 7 8792
+nats -s $URL pub vx.fh.slow '{"id":"SLOW-1"}' > /dev/null 2>&1
+sleep 14   # two runs of 5 s in hand, then held, probes of 5 s
+up
+until_sent vx.fh.paids SLOW-1
+sleep 0.5
+RED=$(nats -s $URL consumer info VEJAS flow_slow -j 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["num_redelivered"])')
+[ "$RED" = 0 ] && [ "$(count vx.fh.paids SLOW-1)" = 1 ] \
+  && ok "kept in progress through every run: never delivered again, out once" \
+  || ko "slow: $RED redelivered, $(count vx.fh.paids SLOW-1) out"
+kill $RT2; wait $RT2 2>/dev/null; RT2=""
+
 echo "── a stop gives the held message back at once, and the next start runs it first"
+down
 nats -s $URL pub vx.fh.pay '{"id":"s1"}' > /dev/null 2>&1
 nats -s $URL pub vx.fh.pay '{"id":"s2"}' > /dev/null 2>&1
 held_until flow:pay
+STOPPED=$(event stopped flow:pay)
 kill -TERM $RT; wait $RT 2>/dev/null; RT=""
 # Well within its ack wait, the held message is there for the next reader at
 # once (read here and not acked: it comes back after the ack wait).
 NEXT=$(nats -s $URL consumer next VEJAS flow_pay --no-ack --timeout 1s 2>/dev/null | tr '\n' ' ')
-echo "$NEXT" | grep -q '"id":"s1"' && ok "stopped: the held message went back at once" || ko "after the stop: $NEXT"
+sleep 0.3
+echo "$NEXT" | grep -q '"id":"s1"' && [ "$(event stopped flow:pay)" = $((STOPPED + 1)) ] \
+  && ok "stopped: the held message went back at once, and the hold says it stopped" || ko "after the stop: $NEXT, stopped events $(event stopped flow:pay)"
 up
-start 3
+start 7
 until_sent vx.fh.paid s2
 [ "$(ids vx.fh.paid | tr ' ' '\n' | grep '^s' | tr '\n' ' ')" = "s1 s2 " ] \
   && ok "the next start ran s1, then s2" || ko "after the restart: $(ids vx.fh.paid)"

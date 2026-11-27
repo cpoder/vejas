@@ -2128,9 +2128,10 @@ pub struct Engine {
     delivery: Option<i64>,
     /// What `seen` reads: the keys the flow's runs remembered (ADR-0039).
     memory: Option<Arc<dyn Memory>>,
-    /// A person released the held message (ADR-0040): its catch takes the
-    /// failure now, whatever its deliveries.
-    releasing: bool,
+    /// A person released the held message (ADR-0040): the failure its
+    /// service gave, which a call to it answers with, and which its catch
+    /// takes now, whatever its deliveries.
+    releasing: Option<crate::connectors::answer::Failure>,
 }
 
 /// The keys a flow's runs remembered (ADR-0039, point 4), which `seen` reads.
@@ -2529,7 +2530,7 @@ impl Engine {
             called: false,
             delivery: None,
             memory: None,
-            releasing: false,
+            releasing: None,
         }
     }
     /// Call a service that answers (ADR-0032), carrying the trace of `hop`, the
@@ -2560,6 +2561,13 @@ impl Engine {
             self.unrecorded.get_or_insert(call);
             return Err(error);
         }
+        if let Some(held) = self.releasing.as_ref().filter(|held| held.service == name) {
+            // released: the system is not called again (ADR-0040)
+            let failure = held.clone();
+            let error = failure.error.clone();
+            self.failure = Some(failure);
+            return Err(error);
+        }
         self.called = true;
         let trace = hop.map(|hop| hop.context()).or_else(|| self.carried.clone());
         let config = &declared.config;
@@ -2585,10 +2593,12 @@ impl Engine {
     pub fn delivered(&mut self, delivery: Option<i64>) {
         self.delivery = delivery;
     }
-    /// Whether the runs that follow are the release of a held message
-    /// (ADR-0040): a catch then takes any failure, as on a last delivery.
-    pub fn releasing(&mut self, releasing: bool) {
-        self.releasing = releasing;
+    /// The runs that follow are the release of a held message (ADR-0040),
+    /// whose service gave `held`: a call to that service answers with that
+    /// failure and is not made, and a catch takes any failure, as on a last
+    /// delivery. None ends the release.
+    pub fn releasing(&mut self, held: Option<crate::connectors::answer::Failure>) {
+        self.releasing = held;
     }
     /// What `seen` reads in the runs that follow.
     pub fn remember_in(&mut self, memory: Option<Arc<dyn Memory>>) {
@@ -2620,7 +2630,7 @@ impl Engine {
             return None;
         }
         let attempt = self.delivery.unwrap_or(1);
-        if let Some(f) = self.failure.as_ref().filter(|_| !self.releasing && self.delivery.is_some()) {
+        if let Some(f) = self.failure.as_ref().filter(|_| self.releasing.is_none() && self.delivery.is_some()) {
             // A flow on the bus holds its message while the system is down
             // (ADR-0040): no delivery is its last, until a person releases it.
             if f.holds() {
@@ -4835,7 +4845,7 @@ end
 
     #[test]
     fn a_catch_waits_while_its_flow_holds_the_message_until_a_release() {
-        let (url, _calls) = system(|path| match path {
+        let (url, calls) = system(|path| match path {
             p if p.ends_with("/down") => (503, r#"{"error":"down"}"#, 0),
             p if p.ends_with("/gone") => (404, "", 0),
             _ => (200, "{}", 0),
@@ -4861,11 +4871,16 @@ end
             let f = engine.take_failure().expect("the failure the hold reads");
             assert!(f.holds(), "{f:?}");
         }
-        // released, its catch takes it now
-        engine.releasing(true);
+        // released, its catch takes it now, and the system is not called again
+        let made = calls.lock().unwrap().len();
+        engine.delivered(Some(1));
+        failed(run(&prog, &json!({"id": "down"}), &mut engine));
+        let held = engine.take_failure().unwrap();
+        engine.releasing(Some(held));
         let ctx = run(&prog, &json!({"id": "down"}), &mut engine).unwrap();
-        assert_eq!(ctx.emits[0].0, "vx.rejected");
-        engine.releasing(false);
+        assert_eq!(ctx.emits[0], ("vx.rejected".to_string(), json!({"status": 503})));
+        assert_eq!(calls.lock().unwrap().len(), made + 1, "the release made no call");
+        engine.releasing(None);
         // a failure no later try changes is caught at once
         engine.delivered(Some(1));
         let ctx = run(&prog, &json!({"id": "gone"}), &mut engine).unwrap();

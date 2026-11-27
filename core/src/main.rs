@@ -1092,34 +1092,46 @@ fn hold_http_gate(request: &tiny_http::Request) -> Result<(), (u16, String)> {
 }
 
 /// Release the message a flow holds, or have it probe now (ADR-0040, point 5),
-/// recorded in the audit with who asked. The flow takes it at its next
-/// tenth of a second; a flow that holds nothing here answers 409, since in a
-/// cluster another instance may hold it.
+/// recorded in the audit with who asked. The act is answered once the flow
+/// took it: a hold that ended meanwhile, or a flow that holds nothing here,
+/// answers 409 (in a cluster another instance may hold it), and nothing is
+/// recorded. An act the audit could not record is answered 500, as taken.
 fn hold_act(registry: &Registry, flow: Option<&str>, release: bool, actor: &str) -> Result<Value, (u16, String)> {
     let flow = flow.ok_or((400, "give the flow: {\"flow\": \"name\"}".to_string()))?;
     let handle = registry.lock().unwrap().get(flow).cloned().ok_or((404, format!("no flow {flow}")))?;
-    let hold = handle.state.lock().unwrap().hold.clone();
-    let Some(hold) = hold else {
-        return Err((409, format!("{flow} holds no message on this instance")));
+    let holds_nothing = || (409, format!("{flow} holds no message on this instance"));
+    let Some(hold) = handle.state.lock().unwrap().hold.clone() else {
+        return Err(holds_nothing());
     };
     let kind = if release { "hold-release" } else { "hold-probe" };
-    if release {
-        handle.release.store(true, Ordering::SeqCst);
-    } else {
-        handle.probe_now.store(true, Ordering::SeqCst);
+    let flag = if release { &handle.release } else { &handle.probe_now };
+    flag.store(true, Ordering::SeqCst);
+    // The flow takes it between two probes: a run or a probe under way
+    // finishes first, a call each within its TIMEOUT_MS.
+    let until = Instant::now() + Duration::from_secs(60);
+    while flag.load(Ordering::SeqCst) {
+        let ended = handle.state.lock().unwrap().hold.is_none();
+        if ended || Instant::now() >= until {
+            if flag.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Err(if ended {
+                    holds_nothing()
+                } else {
+                    (503, format!("{flow} did not take the {kind} within a minute; ask again"))
+                });
+            }
+            break; // taken as we gave up
+        }
+        thread::sleep(Duration::from_millis(20));
     }
     let record = json!({
         "ts": now_secs(), "actor": actor, "kind": kind, "unit": flow,
         "service": hold["service"], "subject": hold["subject"],
     });
     let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
-    match bus::connect(&url).map(|nc| nc.jetstream()) {
-        Ok(js) => {
-            if let Err(e) = connectors::to_audit(&js, flow, &record) {
-                eprintln!("[vejas] {kind}: audit not written: {e}");
-            }
-        }
-        Err(e) => eprintln!("[vejas] {kind}: audit not written: {e}"),
+    let audited = bus::connect(&url).and_then(|nc| connectors::to_audit(&nc.jetstream(), flow, &record));
+    if let Err(e) = audited {
+        eprintln!("[vejas] {kind}: audit not written: {e}");
+        return Err((500, format!("{kind} of {flow} taken, but the audit did not record it: {e}")));
     }
     Ok(json!({"ok": true, "flow": flow, "action": if release { "release" } else { "probe" }, "hold": hold}))
 }
@@ -1597,7 +1609,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 }
                 engine.refresh(SERVICES_FRESH); // pick up live service edits
                 let round_t0 = Instant::now();
-                let next = if one_by_one { None } else { Some(sub.round()?) };
+                let mut next = if one_by_one { None } else { Some(sub.round()?) };
                 // Messages are processed as they arrive, not once the whole batch
                 // has landed, so reading and working overlap instead of taking
                 // turns.
@@ -1610,7 +1622,9 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 // then: acked and recorded, or failed if the stream refused one
                 // of its emits.
                 let mut ran: Vec<Ran> = Vec::new();
-                for msg in fetch {
+                // A held message is kept in progress until it is settled (ADR-0040).
+                let mut in_hand: Option<InHand> = None;
+                while let Some(msg) = fetch.next() {
                     fetched += 1;
                     first_at.get_or_insert_with(Instant::now);
                     if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
@@ -1690,7 +1704,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     // a failed run, capped by MAX_DELIVERIES and dead-lettered, and
                     // the emits it held before the refusal go back out of the batch:
                     // a run's emits leave all together or not at all (ADR-0032).
-                    let held = batch.held();
+                    let mut held = batch.held();
                     let mut outcome = run_into(&prog, &event, &mut engine, &mut batch, &carried);
                     if traced {
                         for invoked in engine.take_spans() {
@@ -1707,6 +1721,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                     let mut hold_ended = false;
                     let mut held_note = None;
                     if let (Err(error), Some(first)) = (&outcome, failure.as_ref().filter(|f| f.holds())) {
+                        in_hand = Some(InHand::keep(&msg));
                         if !one_at_a_time {
                             one_at_a_time = true;
                             let _ = js.create_pull_consumer_with(
@@ -1717,6 +1732,43 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                                 None,
                                 Some(1),
                             );
+                        }
+                        // A flow that took its messages in rounds (a service
+                        // edited to call a system): the messages after this one
+                        // go back, those of the round asked for ahead too, and
+                        // what already ran in the round is settled now, so that
+                        // none waits on the hold unkept (ADR-0040).
+                        if !one_by_one {
+                            one_by_one = true;
+                            for rest in fetch.by_ref() {
+                                let _ = rest.nak();
+                            }
+                            if let Some(ahead) = next.take() {
+                                for rest in ahead {
+                                    let _ = rest.nak();
+                                }
+                            }
+                            let confirmed = batch.confirm_each();
+                            if let Err(e) = &confirmed {
+                                eprintln!("[vejas] {}: flush before ack failed: {e} (batch redelivers)", handle.spec.name);
+                            }
+                            let unit = Unit {
+                                handle: &handle,
+                                file: &code_file,
+                                version: &flow_version,
+                                overlay_of: overlay_of.as_ref(),
+                                js: &js,
+                                durable: &durable,
+                                memory: &memory,
+                            };
+                            let acked = settle(std::mem::take(&mut ran), &confirmed, &unit);
+                            for done in &acked {
+                                settled.add(done);
+                            }
+                            if let Err(e) = nc.ack_all(&acked) {
+                                eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
+                            }
+                            held = batch.held();
                         }
                         let (first, error) = (first.clone(), error.clone());
                         let mut holding = Holding {
@@ -1743,6 +1795,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             }
                             Held::Stopped => {
                                 // first in line for the next holder (ADR-0040)
+                                drop(in_hand.take());
                                 let _ = msg.nak();
                                 return Ok(());
                             }
@@ -1767,6 +1820,8 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                             msg,
                         }),
                         Err(e) => {
+                            // settled here: no longer kept in progress
+                            drop(in_hand.take());
                             eprintln!("[vejas] {}: {e}", handle.spec.name);
                             metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
                             // poison guard: past MAX_DELIVERIES the message is
@@ -1851,6 +1906,7 @@ fn supervise_vjs(handle: Arc<Handle>, root: PathBuf) {
                 if let Err(e) = nc.ack_all(&acked) {
                     eprintln!("[vejas] {}: ack: {e} (redelivers)", handle.spec.name);
                 }
+                drop(in_hand);
                 if !one_by_one && engine.made_a_call() {
                     one_by_one = true;
                 }
@@ -2079,14 +2135,52 @@ enum Woken {
     ProbeNow,
 }
 
-/// Wait `pause` with the message in hand, telling the bus it is still in
-/// progress often enough that its `ack_wait` does not run out. A stop ends
-/// the wait at once; once the flow is held, so do a release and a probe a
-/// person asked for.
-fn hold_wait(h: &Holding, pause: Duration, wip: &mut Instant, held: bool) -> Woken {
-    let wait = connectors::ack_wait();
-    let wait = if wait.is_zero() { Duration::from_secs(30) } else { wait };
-    let every = (wait / 3).max(Duration::from_millis(200));
+/// Keeps a message in progress for as long as the flow holds it in hand
+/// (ADR-0040): from its first failure until it is settled, through its runs,
+/// its probes and their calls, each up to `TIMEOUT_MS`. A thread of its own
+/// tells the bus every third of the `ack_wait`, so that no other instance is
+/// given the message meanwhile. Dropped, it stops, before the message is
+/// acked or given back.
+struct InHand {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl InHand {
+    fn keep(msg: &bus::Message) -> InHand {
+        let keeper = msg.keeper();
+        let wait = connectors::ack_wait();
+        let wait = if wait.is_zero() { Duration::from_secs(30) } else { wait };
+        let every = (wait / 3).max(Duration::from_millis(200));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut last: Option<Instant> = None;
+            while !stopped.load(Ordering::SeqCst) {
+                if last.is_none_or(|at| at.elapsed() >= every) {
+                    let _ = keeper.in_progress();
+                    last = Some(Instant::now());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        InHand { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for InHand {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Wait `pause` with the message in hand (`InHand` keeps it in progress). A
+/// stop ends the wait at once; once the flow is held, so do a release and a
+/// probe a person asked for.
+fn hold_wait(h: &Holding, pause: Duration, held: bool) -> Woken {
     let until = Instant::now() + pause;
     loop {
         if !RUNNING.load(Ordering::SeqCst) || h.handle.stop.load(Ordering::SeqCst) {
@@ -2102,22 +2196,19 @@ fn hold_wait(h: &Holding, pause: Duration, wip: &mut Instant, held: bool) -> Wok
         if now >= until {
             return Woken::Due;
         }
-        if now.duration_since(*wip) >= every {
-            let _ = h.msg.in_progress();
-            *wip = now;
-        }
         thread::sleep((until - now).min(Duration::from_millis(100)));
     }
 }
 
 /// Run the held message again: its outcome, its steps, and the failure it
-/// took, if it failed.
+/// took, if it failed. A rerun is no delivery: a failure the hold does not
+/// take (a service that says dead-letter, a secret store that did not
+/// answer) counts the message's real deliveries for its catch.
 fn run_again(
     h: &mut Holding,
-    tries: i64,
 ) -> (Result<vjs::Ctx, String>, Option<vjs::Steps>, Option<connectors::answer::Failure>) {
     h.engine.record_steps(record::on());
-    h.engine.delivered(Some(tries));
+    h.engine.delivered(Some(h.msg.delivery().map(|d| d.delivered).unwrap_or(1)));
     let outcome = run_into(h.prog, h.event, h.engine, h.batch, h.carried);
     if h.traced {
         for invoked in h.engine.take_spans() {
@@ -2180,69 +2271,79 @@ fn hold_over(h: &Holding, service: &str) {
 /// did not answer (ADR-0040, point 2). The run is tried again in hand,
 /// `DELAY_MS` apart, up to `ATTEMPTS` runs, with nothing announced. Then the
 /// flow is held: it says so, and probes, after `DELAY_MS` and twice as long
-/// each time up to `PROBE_MAX_MS`, with `HEALTH_URL` when the service has one,
-/// with the run itself otherwise. Probes are not deliveries. The hold ends with
-/// the run that passes, a failure no later try changes, a release, or a stop.
+/// each time up to `PROBE_MAX_MS`, the service that failed last: its
+/// `HEALTH_URL` when it has one, the run itself otherwise. Probes are not
+/// deliveries. The hold ends with the run that passes, a failure no later try
+/// changes, a release, or a stop.
 fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> Held {
-    let connectors::answer::WhenDown::Hold(probe) = first.down.clone() else {
+    let connectors::answer::WhenDown::Hold(mut probe) = first.down.clone() else {
         // only a holding service's failure comes here
         return Held::Ran { outcome: Err(error), steps: None, failure: Some(first), ended: false, note: HoldNote { service: String::new(), millis: 0, tries: 1, probes: 0 } };
     };
-    let service = first.service.clone();
+    let mut service = first.service.clone();
     let delay = first.delay.max(Duration::from_millis(1));
+    let attempts = first.attempts.max(1);
     let started = Instant::now();
     let since = now_secs();
-    let mut wip = Instant::now();
     let mut tries: i64 = 1;
     let mut probes: u64 = 0;
-    let mut last = (error, first.status);
-    let note = |tries: i64, probes: u64| HoldNote {
-        service: service.clone(),
+    let mut last = (error, first);
+    let note = |service: &str, tries: i64, probes: u64| HoldNote {
+        service: service.to_string(),
         millis: started.elapsed().as_millis() as u64,
         tries,
         probes,
     };
     // 1. In hand: a blip costs a delay and nothing else.
-    while tries < first.attempts.max(1) {
-        if let Woken::Stop = hold_wait(h, delay, &mut wip, false) {
+    while tries < attempts {
+        if let Woken::Stop = hold_wait(h, delay, false) {
             return Held::Stopped;
         }
         tries += 1;
-        let (outcome, steps, failure) = run_again(h, tries);
-        match &failure {
-            Some(f) if outcome.is_err() && f.holds() => last = (outcome.err().unwrap_or_default(), f.status),
-            _ => {
+        let (outcome, steps, failure) = run_again(h);
+        match failure {
+            Some(f) if outcome.is_err() && f.holds() => {
+                service = f.service.clone();
+                last = (outcome.err().unwrap_or_default(), f);
+            }
+            failure => {
                 let ended = failure.as_ref().is_none_or(|f| !f.retry);
-                return Held::Ran { outcome, steps, failure, ended, note: note(tries, probes) };
+                return Held::Ran { outcome, steps, failure, ended, note: note(&service, tries, probes) };
             }
         }
     }
     // 2. Held: said, and probed until the system answers.
+    if let connectors::answer::WhenDown::Hold(p) = &last.1.down {
+        probe = p.clone();
+    }
     h.handle.release.store(false, Ordering::SeqCst);
     h.handle.probe_now.store(false, Ordering::SeqCst);
     eprintln!("[vejas] {}: held while {service} is down: {}", h.handle.spec.name, last.0);
     metrics::set_held(&h.handle.spec.name, &service, true);
-    hold_event(h, "held", &service, since, probes, last.1);
+    hold_event(h, "held", &service, since, probes, last.1.status);
     record_trace(&h.handle.spec.name, &h.msg.subject, false,
         Some(format!("{}, held while {service} is down", last.0)),
         vec![], String::new(), Some(h.event.clone()), None, h.msg.delivery());
     let mut pause = delay.min(probe.max);
     loop {
-        hold_state(h, &service, since, &last.0, last.1, tries, probes, pause);
-        match hold_wait(h, pause, &mut wip, true) {
+        hold_state(h, &service, since, &last.0, last.1.status, tries, probes, pause);
+        match hold_wait(h, pause, true) {
             Woken::Stop => {
+                hold_event(h, "stopped", &service, since, probes, last.1.status);
                 hold_over(h, &service);
                 return Held::Stopped;
             }
             Woken::Release => {
-                // Its catch takes the failure now, or it is a dead letter.
-                h.engine.releasing(true);
+                // The held service answers with the failure it gave, and no
+                // call is made to it: the catch takes it now, or the message
+                // is a dead letter. Calls before it in the flow are made again.
+                h.engine.releasing(Some(last.1.clone()));
                 tries += 1;
-                let (outcome, steps, failure) = run_again(h, tries);
-                h.engine.releasing(false);
-                hold_event(h, "released", &service, since, probes, last.1);
+                let (outcome, steps, failure) = run_again(h);
+                h.engine.releasing(None);
+                hold_event(h, "released", &service, since, probes, last.1.status);
                 hold_over(h, &service);
-                return Held::Ran { outcome, steps, failure, ended: true, note: note(tries, probes) };
+                return Held::Ran { outcome, steps, failure, ended: true, note: note(&service, tries, probes) };
             }
             Woken::Due | Woken::ProbeNow => {}
         }
@@ -2250,24 +2351,39 @@ fn hold(h: &mut Holding, first: connectors::answer::Failure, error: String) -> H
         metrics::inc_probe(&h.handle.spec.name);
         if probe.has_health() {
             if let Err(e) = probe.ask() {
-                last = (format!("{service}: {e}"), last.1);
+                last.0 = format!("{service}: {e}");
                 pause = (pause * 2).min(probe.max);
                 continue;
             }
         }
         tries += 1;
-        let (outcome, steps, failure) = run_again(h, tries);
-        match &failure {
+        let (outcome, steps, failure) = run_again(h);
+        match failure {
             Some(f) if outcome.is_err() && f.holds() => {
-                last = (outcome.err().unwrap_or_default(), f.status);
+                if f.service != service {
+                    // another system it calls is down now: probe that one
+                    metrics::set_held(&h.handle.spec.name, &service, false);
+                    service = f.service.clone();
+                    metrics::set_held(&h.handle.spec.name, &service, true);
+                }
+                if let connectors::answer::WhenDown::Hold(p) = &f.down {
+                    probe = p.clone();
+                }
+                last = (outcome.err().unwrap_or_default(), f);
                 pause = (pause * 2).min(probe.max);
             }
-            _ => {
-                hold_event(h, "resumed", &service, since, probes, None);
-                hold_over(h, &service);
-                eprintln!("[vejas] {}: {service} answers again, resumed", h.handle.spec.name);
+            failure => {
                 let ended = failure.as_ref().is_none_or(|f| !f.retry);
-                return Held::Ran { outcome, steps, failure, ended, note: note(tries, probes) };
+                // A failure no later try changes ends the hold too: its catch
+                // has run, or the message is a dead letter, not resumed.
+                let (transition, status) = match &failure {
+                    Some(f) if ended && outcome.is_err() => ("failed", f.status),
+                    _ => ("resumed", None),
+                };
+                hold_event(h, transition, &service, since, probes, status);
+                hold_over(h, &service);
+                eprintln!("[vejas] {}: {service} answers again, {transition}", h.handle.spec.name);
+                return Held::Ran { outcome, steps, failure, ended, note: note(&service, tries, probes) };
             }
         }
     }
@@ -3950,8 +4066,8 @@ Rules:
 - A string is in double quotes and reads JSON's escapes: `\n`, `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, and `\u` with four hex digits. In an f-string, `\{` and `\}` give a brace, as `{{` and `}}` do. Any other escape is an error.
 - An `emit` subject must be a valid subject: no whitespace, no control character. A subject built from an event field is checked when the flow runs, and a value that breaks the rule fails the run, so the message reaches the DLQ after its deliveries. Map such a field through a table rather than trusting it.
 - `secret()` never yields the value where a run is SHOWN instead of performed (preview, vejas_run_flow, flow-as-tool, shadow-replay, time-travel, canary, golden capture): it stays fail-closed and evaluates to the placeholder `<secret:path/key>`, so a branch comparing with a secret takes the not-equal path there.
-- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
-- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. A `secret()` or a `seen()` whose store does not answer is a failure a later delivery may change: the catch takes it on the fifth delivery. A secret the store says it does not have is an error in the code. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
+- A service in `services/` is VejasScript, or the declaration of a system that answers: `driver "http-rpc"`, `URL = "{BASE_URL}/orders/{id}"` and its settings (see Composing services). `o = invoke get_order(id: x)` then gives `{status, body, headers}` with the arguments, and a call that gets no answer fails the run with the service's name and the cause. A flow on the bus holds its message while the system is down (`WHEN_DOWN = "hold"`, the default; `HEALTH_URL`, `PROBE_MAX_MS`), or sends it back until it is a dead letter (`WHEN_DOWN = "dead-letter"`) (ADR-0040). Every argument but `body` fills a `{name}` of the URL, and none takes the name of a setting.
+- `try:` ... `catch e:` ... `end`: the catch takes a failure no later delivery may change: an error in the code, a call the service does not try again, or, for a service that says `WHEN_DOWN = "dead-letter"`, a call on the delivery that spends the service's `ATTEMPTS` (5 deliveries at most). Before that the run fails and the message comes back after the service's delay, as without `try`. A service that holds (the default) keeps the message in hand while its system is down, and the catch takes the failure when a person releases it (ADR-0040): the run is made again, the held service answers with the failure it gave and is not called, and the calls before it in the flow are made again. A `secret()` or a `seen()` whose store does not answer is a failure a later delivery may change: the catch takes it on the fifth delivery. A secret the store says it does not have is an error in the code. An `api` flow's request has no later delivery: its catch takes the failure at once. In `e`, `service` is null for an error in the code, `status` is null when the system gave no answer, and `attempts` is the delivery's number (1 for a request). What the `try` emitted, remembered or responded before the failure is dropped; the variables it set stay. A failure in the catch fails the run, or goes to the `try` around it. A run that is SHOWN makes no call, so its catch takes no call's failure.
 - `seen(key)` is true when a run of this flow said `remember key for "<window>"` and the window has not passed. The mark is written once the run's emits are stored: a run that fails marks nothing, so a message that comes back is processed again, and a catch marks only what it remembers. The window is a number and s, m, h or d, up to 3650d, written in the statement or in an UPPERCASE constant that the flow sets once. A key is any value but null; a number or a document is read as its JSON text. A copy of a message finds the mark of a run before it, also in the same batch, but two copies that run at the same instant, on two instances or as two requests, can both pass. Where a run is SHOWN, `seen` is false for every key. `remember` is a write: a read-method `api` flow that remembers needs the token, as one that emits. A flow whose memory does not answer fails its run, as a call that may answer later does (an `api` flow answers 503).
 - A connector manifest's first line is `# connector: <name>`, then `driver "<name>"` (catalog: vejas_drivers) and UPPERCASE literal config; any credential uses secret("path/key"), never a literal."#;
 

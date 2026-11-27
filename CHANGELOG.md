@@ -27,13 +27,16 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   with the service's `HEALTH_URL` when it has one. The messages behind it
   wait; none becomes a dead letter, and the held one runs first once the
   system answers. Probes are not deliveries; the message is told to the bus
-  as still in progress. A flow that calls a service that holds takes one
+  as still in progress (`+WPI`) from its first failure until it is settled,
+  through its runs and probes. A flow that calls a service that holds takes one
   message at a time across instances (`max_ack_pending = 1`). A stop gives
   the held message back at once. The flow's `hold` is in `/topology` and
-  `vejas_topology`; `held`, `resumed` and `released` go to `vx.flow.events`;
+  `vejas_topology`; `held`, `resumed`, `failed`, `released` and `stopped`
+  go to `vx.flow.events`;
   `/metrics` has `vejas_flow_held` and `vejas_hold_probes_total`; the trace
-  record carries `vejas.hold.*`. `POST /hold/release` (the catch runs, or a
-  dead letter) and `POST /hold/probe` take `{"flow": ...}`, the write token,
+  record carries `vejas.hold.*`. `POST /hold/release` (the held service
+  answers with its failure and is not called again: the catch runs, or a
+  dead letter; calls before it in the flow are made again) and `POST /hold/probe` take `{"flow": ...}`, the write token,
   the approval token in governed mode, and are audited. The sdk gains
   `Message::in_progress()` and a consumer's `max_ack_pending`.
   **Behaviour change**: hold is the default for every declared service

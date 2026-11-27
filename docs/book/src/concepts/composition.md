@@ -157,16 +157,30 @@ PROBE_MAX_MS = 60000
 - What is seen: the flow's `status` is `held` and its `hold` in
   `GET /topology` and `vejas_topology` gives the service, since when, the
   last error, the runs, the probes, the next probe and the messages behind.
-  `held`, `resumed` and `released` are published on `vx.flow.events`, an
+  `held`, `resumed`, `failed`, `released` and `stopped` are published on `vx.flow.events`, an
   ordinary subject, as dead letters are on `vx.dlq.events`. `/metrics` has
   `vejas_flow_held{unit,service}` and `vejas_hold_probes_total{unit}`. The
   trace record of the run that ends the hold carries `vejas.hold.ms`, its
   runs and its probes.
 - A person can `POST /hold/release` with `{"flow": "flow:pay"}`: the held
-  message's catch runs now, or it is a dead letter. `POST /hold/probe` has
+  message runs once more, the held service answers it with the failure it
+  gave and is not called, so its catch runs now, or it is a dead letter.
+  Calls the flow makes before that one are made again: a service that
+  changes something must take the same call twice. `POST /hold/probe` has
   the flow probe now. Both take the write token, are human acts in governed
   mode (the approval token, as a DLQ replay), and are written to the audit
-  with who asked. A flow that holds nothing on this instance answers 409.
+  with who asked. They are answered once the flow took them, between two
+  probes; a flow that holds nothing on this instance, or whose hold ended
+  meanwhile, answers 409, and an act the audit could not record answers 500.
+- A probe that ends in a failure no later try changes (a 404) ends the hold:
+  `failed` on `vx.flow.events`, and its catch runs or it is a dead letter. A
+  stop announces `stopped`. While held, the flow probes the service that
+  failed last.
+- The message stays in progress for the bus (`+WPI`, every third of the
+  `ack_wait`) from its first failure until it is settled, through the runs
+  and the probes. A flow that took its messages in rounds and holds for the
+  first time settles the runs of the round before and gives the others
+  back.
 - An `api` flow is never held: it answers at once, 502 or 504, or its catch
   runs. A run that is shown makes no call.
 ## `invoke` — merge, or capture
