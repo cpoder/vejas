@@ -799,9 +799,56 @@ fn escape_at(bytes: &[u8], i: usize) -> Escape {
 }
 
 /// An entity of XML or HTML, from right after its `&`: a named one XML
-/// defines, or a character's number.
+/// defines, one HTML5 names for a sign of ASCII (`&sol;`, `&plus;`, as PHP's
+/// `htmlentities` writes them), or a character's number.
 fn entity(rest: &[u8]) -> Escape {
-    const NAMED: [(&[u8], u8); 5] = [(b"amp;", b'&'), (b"lt;", b'<'), (b"gt;", b'>'), (b"quot;", b'"'), (b"apos;", b'\'')];
+    const NAMED: [(&[u8], u8); 45] = [
+        (b"amp;", b'&'),
+        (b"lt;", b'<'),
+        (b"gt;", b'>'),
+        (b"quot;", b'"'),
+        (b"apos;", b'\''),
+        (b"AMP;", b'&'),
+        (b"LT;", b'<'),
+        (b"GT;", b'>'),
+        (b"QUOT;", b'"'),
+        (b"Tab;", b'\t'),
+        (b"NewLine;", b'\n'),
+        (b"excl;", b'!'),
+        (b"num;", b'#'),
+        (b"dollar;", b'$'),
+        (b"percnt;", b'%'),
+        (b"lpar;", b'('),
+        (b"rpar;", b')'),
+        (b"ast;", b'*'),
+        (b"midast;", b'*'),
+        (b"plus;", b'+'),
+        (b"comma;", b','),
+        (b"period;", b'.'),
+        (b"sol;", b'/'),
+        (b"colon;", b':'),
+        (b"semi;", b';'),
+        (b"equals;", b'='),
+        (b"quest;", b'?'),
+        (b"commat;", b'@'),
+        (b"lsqb;", b'['),
+        (b"lbrack;", b'['),
+        (b"bsol;", b'\\'),
+        (b"rsqb;", b']'),
+        (b"rbrack;", b']'),
+        (b"Hat;", b'^'),
+        (b"lowbar;", b'_'),
+        (b"UnderBar;", b'_'),
+        (b"grave;", b'`'),
+        (b"DiacriticalGrave;", b'`'),
+        (b"lcub;", b'{'),
+        (b"lbrace;", b'{'),
+        (b"verbar;", b'|'),
+        (b"vert;", b'|'),
+        (b"VerticalLine;", b'|'),
+        (b"rcub;", b'}'),
+        (b"rbrace;", b'}'),
+    ];
     for (name, b) in NAMED {
         if rest.starts_with(name) {
             return Escape::byte(1 + name.len(), b);

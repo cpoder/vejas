@@ -62,9 +62,10 @@ pub(crate) fn path_shown(endpoint: &str) -> std::borrow::Cow<'_, str> {
 /// The shortest user info or query value taken for a credential: shorter
 /// ones, `page=1`, would mask the answer's text everywhere they occur.
 const SHORTEST_SECRET: usize = 6;
-/// The shortest path segment taken for a token, which has a digit in it: a
-/// webhook's address carries its credential in the path, where a resource is
-/// named shorter, or in words (`deviceManagement`).
+/// The shortest path segment taken for a token, which has a digit in it or
+/// reads as random: a webhook's address carries its credential in the path,
+/// where a resource is named shorter, or in words (`deviceManagement`). A
+/// shorter token is not found.
 const SHORTEST_TOKEN: usize = 16;
 /// The shortest reading of a value looked for in an answer.
 const SHORTEST_READING: usize = 4;
@@ -79,10 +80,12 @@ const ANSWER_KEPT: usize = 16 * 1024;
 /// token, each as it is and decoded. An echo in any other form reads as one
 /// of them once its escapes are read (`record::Values::found_in`).
 fn credentials(url: &str, also: &[&str]) -> crate::record::Values {
+    // a URL a secret store handed out is a credential whole, each of its parts
+    credentials_in(url, also, crate::secrets::is_handed_out(url))
+}
+
+fn credentials_in(url: &str, also: &[&str], stored: bool) -> crate::record::Values {
     let mut values: Vec<String> = also.iter().filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
-    // a date, a time, a version or a number is no credential:
-    // `api-version=2024-02-01` would mask each such date in the answer
-    let data = |value: &str| percent_decoded(value).bytes().all(|b| b.is_ascii_digit() || b"-.:_/+ TZ".contains(&b));
     if let Ok(parsed) = url::Url::parse(url) {
         let mut secret = |value: &str, shortest: usize| {
             if value.len() >= shortest {
@@ -94,12 +97,19 @@ fn credentials(url: &str, also: &[&str]) -> crate::record::Values {
         for pair in parsed.query().unwrap_or_default().split('&') {
             // a pair with no `=` is a value alone, `?<token>`
             let value = pair.split_once('=').map_or(pair, |(_, value)| value);
-            if !data(value) {
+            // a `+` of a query is a space to a form: `2024-02-01+10:00:00`
+            let data = is_date_or_version(&percent_decoded(value))
+                || is_date_or_version(&percent_decoded(&value.replace('+', " ")));
+            if stored || !data {
                 secret(value, SHORTEST_SECRET);
             }
         }
         for segment in parsed.path_segments().into_iter().flatten() {
-            if segment.bytes().any(|b| b.is_ascii_digit()) && !data(segment) {
+            let token = (segment.bytes().any(|b| b.is_ascii_digit())
+                && !is_date_or_version(&percent_decoded(segment))
+                && !is_uuid(segment))
+                || reads_as_random(segment);
+            if stored || token {
                 secret(segment, SHORTEST_TOKEN);
             }
         }
@@ -163,8 +173,47 @@ fn floor_char(text: &str, at: usize) -> usize {
 pub(crate) fn excerpt(url: &str, body: &[u8], most: usize, also: &[&str]) -> String {
     let values = credentials(url, also);
     let window = most.saturating_add(values.longest().saturating_mul(ESCAPED_MOST));
-    let text = crate::record::shown().error(&String::from_utf8_lossy(&body[..body.len().min(window)]));
+    // the record's mask, without the cut of an error: a value of the URL that
+    // ran past that cut would show its start
+    let read = String::from_utf8_lossy(&body[..body.len().min(window)]);
+    let text = crate::record::shown().text(&read, body.len() > window);
     masked_start(&text, &values, most).0.trim().to_string()
+}
+
+/// A date, a time or a version, which no credential is: `api-version=2024-02-01`
+/// would mask each such date in the answer. A number may be one, a PIN or a
+/// key of digits.
+fn is_date_or_version(value: &str) -> bool {
+    static DATA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    DATA.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"^(\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?(-[a-z]+)?|v?\d+(\.\d+)+(-[a-z0-9.]+)?)$",
+        )
+        .case_insensitive(true)
+        .build()
+        .expect("a valid pattern")
+    })
+    .is_match(value)
+}
+
+/// Letters alone that read as random, as a token without a digit does: as
+/// many capitals as small letters, give or take, and a change of case at
+/// least every third letter. A word in camel case has few capitals
+/// (`CustomerOrderItems`), an acronym few changes (`HTTPServerConfig`).
+fn reads_as_random(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let capitals = bytes.iter().filter(|b| b.is_ascii_uppercase()).count();
+    let changes = bytes.windows(2).filter(|w| w[0].is_ascii_uppercase() != w[1].is_ascii_uppercase()).count();
+    bytes.iter().all(u8::is_ascii_alphabetic)
+        && (bytes.len() * 3..=bytes.len() * 7).contains(&(capitals * 10))
+        && changes * 3 >= bytes.len()
+}
+
+/// A UUID, which in a path names a resource (`/devices/3f2b8c1e-…`).
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { *b == b'-' } else { b.is_ascii_hexdigit() })
 }
 
 /// What of a sink's URL could carry a credential, to mask in what its system
@@ -633,6 +682,8 @@ mod tests {
             "bad pyq=AB/CD%2BEF-PYQ01",
             "<p>AB&#x2F;CD&#43;EF-HTM01</p>",
             "til=AB%7ECD-TIL01",
+            // PHP's htmlentities(…, ENT_HTML5)
+            "<p>AB&sol;CD&plus;EF-HTM01</p>",
         ] {
             let e = excerpt(url, body.as_bytes(), 300, &[]);
             assert!(!["PHP01", "NET01", "PYQ01", "HTM01", "TIL01"].iter().any(|tail| e.contains(tail)), "{body} → {e}");
@@ -649,9 +700,77 @@ mod tests {
 
     #[test]
     fn a_date_or_a_version_in_the_url_is_no_credential() {
-        let url = "http://h/v1/reports/2024-02-01T00:00:00?api-version=2024-02-01&key=K3Y-DATE-01";
-        let e = excerpt(url, b"created 2024-02-01 for 2024-02-01T00:00:00 with K3Y-DATE-01", 300, &[]);
-        assert_eq!(e, "created 2024-02-01 for 2024-02-01T00:00:00 with <masked>");
+        let url = "http://h/v1/reports/2024-02-01T00:00:00?api-version=2024-02-01-preview&v=1.2.3&key=K3Y-DATE-01";
+        let e = excerpt(url, b"created 2024-02-01-preview for 2024-02-01T00:00:00 in 1.2.3 with K3Y-DATE-01", 300, &[]);
+        assert_eq!(e, "created 2024-02-01-preview for 2024-02-01T00:00:00 in 1.2.3 with <masked>");
+        // a number may be a key, a PIN
+        let e = excerpt("http://h/x?key=73950264817", b"key 73950264817 is unknown", 300, &[]);
+        assert_eq!(e, "key <masked> is unknown");
+        // a UUID in a path names a resource
+        let url = "http://h/sap/devices/3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f";
+        let e = excerpt(url, b"Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'", 300, &[]);
+        assert_eq!(e, "Resource not found for segment '3f2b8c1e-9a4d-4e6b-8c2f-1a2b3c4d5e6f'");
+    }
+
+    #[test]
+    fn a_token_of_letters_alone_reads_as_random() {
+        assert!(reads_as_random("hTqWzKeLmPbXcVnRaYsDfGuJ"));
+        for words in ["deviceManagement", "CustomerOrderItemsCollection", "HTTPServerConfig", "abcdefghijklmnopqrstuvwx", "A_BusinessPartnerX"] {
+            assert!(!reads_as_random(words), "{words}");
+        }
+        let e = excerpt("http://h/hook/T0001/B0001/hTqWzKeLmPbXcVnRaYsDfGuJ", b"no webhook hTqWzKeLmPbXcVnRaYsDfGuJ", 300, &[]);
+        assert_eq!(e, "no webhook <masked>");
+        let e = excerpt("http://h/odata/CustomerOrderItemsCollection", b"no CustomerOrderItemsCollection", 300, &[]);
+        assert_eq!(e, "no CustomerOrderItemsCollection");
+        // a time sent as a form writes it, its space a `+`
+        let e = excerpt("http://h/x?since=2024-02-01+10:00:00", b"nothing since 2024-02-01+10:00:00", 300, &[]);
+        assert_eq!(e, "nothing since 2024-02-01+10:00:00");
+    }
+
+    #[test]
+    fn of_an_answer_outside_2xx_only_64_kib_are_read() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for code in [500, 200] {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = vec![b'x'; 200 * 1024];
+                let head = format!("HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/big");
+        let (code, body) = http_request("GET", &url, &[], None).unwrap();
+        assert_eq!((code, body.len()), (500, ERROR_BODY_MOST as usize));
+        let (code, body) = http_request("GET", &url, &[], None).unwrap();
+        assert_eq!((code, body.len()), (200, 200 * 1024));
+    }
+
+    #[test]
+    fn a_url_a_store_handed_out_is_a_credential_whole() {
+        // a webhook's token with no digit, and a date, in a URL a store holds
+        let url = "https://h/services/T0001/B0001/abcdefghijklmnopqrstuvwx?since=2024-02-01";
+        let text = "no webhook /services/T0001/B0001/abcdefghijklmnopqrstuvwx since 2024-02-01";
+        let (e, _) = masked_start(text, &credentials_in(url, &[], true), 300);
+        assert_eq!(e, "no webhook /services/T0001/B0001/<masked> since <masked>");
+        let (e, _) = masked_start(text, &credentials_in(url, &[], false), 300);
+        assert_eq!(e, text);
+    }
+
+    #[test]
+    fn a_long_value_of_the_url_is_masked_past_the_cut_of_an_error() {
+        // past the 2048 bytes the record keeps of an error
+        let sts = "Zq9".repeat(700);
+        let url = format!("http://h/x?sts={sts}");
+        let body = format!("{}{sts} is expired", "x".repeat(100));
+        let e = excerpt(&url, body.as_bytes(), 300, &[]);
+        assert!(!e.contains("Zq9Zq9"), "{e}");
+        // the cut falls inside it: what follows is past the excerpt
+        assert!(e.ends_with("<masked>"), "{e}");
     }
 
     #[test]

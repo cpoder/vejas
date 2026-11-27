@@ -531,9 +531,7 @@ pub fn otlp_init() {
         let (tx, rx) = sync_channel::<Span>(config.queue);
         eprintln!("[vejas] OTLP traces -> {}", shown(&config.url));
         let spawned = std::thread::Builder::new().name("otlp-export".into()).spawn(move || {
-            // no redirect: ureq would take OTEL_EXPORTER_OTLP_HEADERS, an API
-            // key among them, to wherever the collector's answer points
-            let agent = ureq::AgentBuilder::new().timeout(config.timeout).redirects(0).build();
+            let agent = export_agent(&config);
             let mut batch: Vec<Span> = Vec::with_capacity(config.batch);
             let mut oldest: Option<Instant> = None;
             let mut last_report: Option<Instant> = None;
@@ -637,6 +635,13 @@ fn ship(agent: &ureq::Agent, config: &ExportConfig, batch: &mut Vec<Span>, last_
             *last_report = Some(Instant::now());
         }
     }
+}
+
+/// The exporter's client. It follows no redirect: ureq would take
+/// OTEL_EXPORTER_OTLP_HEADERS, an API key among them, to wherever the
+/// collector's answer points.
+fn export_agent(config: &ExportConfig) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(config.timeout).redirects(0).build()
 }
 
 /// One POST, retried with backoff on what the OTLP specification calls
@@ -968,6 +973,33 @@ mod tests {
         assert_eq!(shown("https://user:tok@collector:4318/v1/traces?key=abc"), "https://collector:4318/v1/traces");
         assert_eq!(shown("http://c:4318/v1/traces"), "http://c:4318/v1/traces");
         assert_eq!(shown("c:4318"), "c:4318");
+    }
+
+    #[test]
+    fn a_collector_that_redirects_gets_no_header_elsewhere_and_no_span_counted() {
+        use std::io::{Read as _, Write as _};
+        let far = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        far.set_nonblocking(true).unwrap();
+        let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (to, at) = (far.local_addr().unwrap().port(), collector.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = collector.accept() else { return };
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let head = format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{to}/v1/traces\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes());
+        });
+        let endpoint = format!("http://127.0.0.1:{at}");
+        let config = export_config(|k| match k {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some(endpoint.clone()),
+            "OTEL_EXPORTER_OTLP_HEADERS" => Some("x-api-key=OTLP-K3Y".into()),
+            _ => None,
+        })
+        .unwrap();
+        let error = export(&export_agent(&config), &config, "{}").unwrap_err();
+        assert!(error.starts_with("HTTP 302 from 127.0.0.1:"), "{error}");
+        assert!(error.contains("a redirect, not followed, since the headers would go along"), "{error}");
+        assert!(far.accept().is_err(), "the far host was called");
     }
 
     #[test]

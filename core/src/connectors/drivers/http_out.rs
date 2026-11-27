@@ -24,9 +24,13 @@ impl Driver for HttpOut {
         }
         let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         match http_request("POST", &url, &headers, Some(&bytes)) {
+            // the URL's values masked in the whole answer, then its start: one
+            // that the summary's cut would split is found all the same
             Ok((code, resp)) if (200..300).contains(&code) => Ok(crate::record::shown().error(&format!(
                 "POST OK · answered: {}",
-                summarize(&resp).map_or_else(|| "(empty)".into(), |answer| Echoes::of(&url).masked(answer))
+                answer_text(resp)
+                    .and_then(|answer| summarize(Echoes::of(&url).masked(answer).as_bytes()))
+                    .unwrap_or_else(|| "(empty)".into())
             ))),
             Ok((401 | 403, _)) => Err(humanize(&format!("HTTP 401: authentication rejected by {}", host_of(&url)))),
             Ok((code, resp)) if (300..400).contains(&code) => Err(refused(code, &url, &resp, 300, &[])),

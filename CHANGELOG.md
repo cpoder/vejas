@@ -228,17 +228,27 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   carry a credential masked wherever the answer echoes it: the user info and
   each value of the query, of 6 bytes or more, and a segment of the path of
   16 bytes or more with a digit in it, as a webhook's address carries its
-  token, but no date, version or number (`api-version=2024-02-01`). Each is found as it is, decoded, and through the escapes the answer
-  wraps it in, JSON's, a URL's or HTML's, as the record finds the values the
-  stores handed out; one the excerpt's cut would split is masked whole. The
-  same for a token endpoint that echoes the client secret, and for what the
-  system of an `http-out` sink answers with a 2xx, which the trace record and
-  the events keep. The access token `oauth-poll` fetches is masked wherever
-  the values the stores handed out are. `http-out`, `http-poll` and
-  `oauth-poll` read 64 KiB at most of an answer outside 2xx. `http-poll` logs
-  its host instead of its URL, `oauth-poll` names its endpoints without their
-  query and their user info in its errors and its test, and the `http-out`
-  test names the host it was refused by.
+  token, or of letters that read as random. A date, a time or a version is
+  no credential (`api-version=2024-02-01`), nor is a UUID in the path, which
+  names a resource; a number is one, since a PIN or a key may be. Each part
+  of a URL a secret store handed out is one. A shorter token in the path, or
+  one in words, is not found. Each is found as it is, decoded, and through
+  the escapes the answer wraps it in, JSON's, a URL's or HTML's, the named
+  signs of HTML5 among them (`&sol;`), as the record finds the values the
+  stores handed out; one that starts before the excerpt's cut is masked
+  whole, however long. The same for a token endpoint that echoes the client
+  secret, and for what the system of an `http-out` sink answers with a 2xx,
+  which the trace record, the events and the sink's test keep. The access
+  token `oauth-poll` fetches is masked wherever the values the stores handed
+  out are: each connector's last two, apart from those values, so that
+  however many tokens come, none pushes a store's value out of the masks. A
+  401 to a token fetched less than 30 s before is no longer tried again with
+  a new one, which a client the endpoint refuses got once per endpoint and
+  per tick. `http-out`, `http-poll` and `oauth-poll` read 64 KiB at most of
+  an answer outside 2xx. `http-poll` logs its host instead of its URL,
+  `oauth-poll` names its endpoints and an item's link without their query
+  and their user info in its errors and its test, and the `http-out` test
+  names the host it was refused by.
 - **`http-out`, `http-poll`, `oauth-poll`, the Vault store and the OTLP
   exporter follow no redirect**, as the calls of a flow do not (ADR-0032).
   The HTTP client dropped `Authorization` on a redirect and took the other

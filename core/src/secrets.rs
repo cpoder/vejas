@@ -190,20 +190,27 @@ fn remember(value: &str) {
     }
 }
 
-/// Every value handed out and still remembered, longest first.
+/// Every value handed out and still remembered, and every value held
+/// (`hold`), longest first.
 pub fn handed_out() -> Vec<String> {
-    let Some(handed) = HANDED_OUT.get() else {
-        return Vec::new();
-    };
-    let mut values: Vec<String> = handed
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .last_use
-        .keys()
-        .cloned()
-        .collect();
+    let mut values: Vec<String> = HANDED_OUT
+        .get()
+        .map(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(held) = HELD.get() {
+        values.extend(held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned());
+    }
     values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
     values
+}
+
+/// Whether a store handed this value out: a URL a store holds is a
+/// credential whole.
+pub(crate) fn is_handed_out(value: &str) -> bool {
+    HANDED_OUT
+        .get()
+        .is_some_and(|handed| handed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last_use.contains_key(value))
 }
 
 /// A value as if a store had handed it out, for the tests of what reads them.
@@ -212,10 +219,54 @@ pub(crate) fn hand_out(value: &str) {
     remember(value);
 }
 
+/// The credentials the runtime holds that no store handed out, a token a
+/// connector fetched, by their holder: its last two, the one in use and the
+/// one before, which a request under way may still carry. Apart from the
+/// values handed out, so that however many tokens come, none pushes a
+/// store's value out of the masks: there are as many holders as connectors.
+static HELD: OnceLock<Mutex<Held>> = OnceLock::new();
+
+#[derive(Default)]
+struct Held(HashMap<String, [Option<String>; 2]>);
+
+impl Held {
+    /// A holder's new value, its last but one let go; true when it is new.
+    /// The one before, given again, is the one in use again.
+    fn note(&mut self, holder: &str, value: &str) -> bool {
+        let slot = self.0.entry(holder.to_string()).or_default();
+        match slot.iter().position(|held| held.as_deref() == Some(value)) {
+            Some(0) => false,
+            Some(_) => {
+                slot.swap(0, 1);
+                false
+            }
+            None => {
+                slot[1] = slot[0].replace(value.to_string());
+                true
+            }
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &String> {
+        self.0.values().flat_map(|slot| slot.iter().flatten())
+    }
+}
+
 /// A credential the runtime holds that no store handed out, a token a
-/// connector fetched: masked wherever the values handed out are.
-pub(crate) fn hold(value: &str) {
-    remember(value);
+/// connector fetched: masked wherever the values handed out are, as long as
+/// it is its holder's last or last but one.
+pub(crate) fn hold(holder: &str, value: &str) {
+    if value.len() < HANDED_OUT_MIN {
+        return;
+    }
+    let new = HELD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .note(holder, value);
+    if new {
+        HANDED_OUT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Changes when a value joins `handed_out()`: the trace record rebuilds its
@@ -602,6 +653,34 @@ mod tests {
         let mut kept: Vec<&str> = handed.last_use.keys().map(String::as_str).collect();
         kept.sort();
         assert_eq!(kept, ["read-at-start", "token-2", "token-3"]);
+    }
+
+    #[test]
+    fn a_holder_keeps_its_last_two_values_and_pushes_no_store_value_out() {
+        let mut held = Held::default();
+        assert!(held.note("connector:a", "tok-a-1"));
+        assert!(held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:b", "tok-b-1"));
+        assert!(!held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:a", "tok-a-3"));
+        let mut kept: Vec<&str> = held.values().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["tok-a-2", "tok-a-3", "tok-b-1"]);
+        // a token server that gives the one before again: it is the one in use
+        assert!(!held.note("connector:a", "tok-a-2"));
+        assert!(held.note("connector:a", "tok-a-4"));
+        let mut kept: Vec<&str> = held.values().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["tok-a-2", "tok-a-4", "tok-b-1"]);
+        // however many tokens a connector fetches, a store's value stays
+        hand_out("Hv7-stored-once-0001");
+        for i in 0..HANDED_OUT_MAX + 10 {
+            hold("connector:many", &format!("Tk9-many-{i:05}"));
+        }
+        let all = handed_out();
+        assert!(all.iter().any(|v| v == "Hv7-stored-once-0001"));
+        assert_eq!(all.iter().filter(|v| v.starts_with("Tk9-many-")).count(), 2);
+        assert!(is_handed_out("Hv7-stored-once-0001") && !is_handed_out("Tk9-many-00000"));
     }
 
     #[test]

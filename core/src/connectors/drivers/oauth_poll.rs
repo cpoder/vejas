@@ -26,42 +26,54 @@ pub(super) struct OAuthPoll;
 
 /// Client-credentials token cache: refresh a minute early, invalidate on 401.
 struct TokenCache {
+    /// The connector: its tokens are masked as its own (`secrets::hold`).
+    holder: String,
     token_url: String,
     client_id: String,
     client_secret: String,
     scope: String,
-    cached: Option<(String, Instant)>,
+    /// The token, when it runs out, and when it was fetched.
+    cached: Option<(String, Instant, Instant)>,
 }
+
+/// A token this young is not fetched again for a 401: the client may not read
+/// that endpoint (a scope, a consent), which a new token does not change.
+const TOKEN_FRESH: Duration = Duration::from_secs(30);
 
 impl TokenCache {
     fn bearer(&mut self) -> Result<String, String> {
-        if let Some((t, deadline)) = &self.cached {
+        if let Some((t, deadline, _)) = &self.cached {
             if Instant::now() < *deadline {
                 return Ok(t.clone());
             }
         }
-        let (t, ttl) =
-            OAuthPoll::token(&self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
-        self.cached = Some((t.clone(), Instant::now() + ttl));
+        let (t, ttl) = OAuthPoll::token(&self.holder, &self.token_url, &self.client_id, &self.client_secret, &self.scope)?;
+        let now = Instant::now();
+        self.cached = Some((t.clone(), now + ttl, now));
         Ok(t)
     }
     fn invalidate(&mut self) {
         self.cached = None;
     }
+    fn fresh(&self) -> bool {
+        self.cached.as_ref().is_some_and(|(_, _, fetched)| fetched.elapsed() < TOKEN_FRESH)
+    }
 }
 
-/// GET with the cached bearer; ONE fresh-token retry on 401.
+/// GET with the cached bearer; on a 401, ONE retry with a new token, unless
+/// the token is fresh: one per endpoint and per tick would hammer the token
+/// endpoint, and each new token is one more value for the masks.
 fn authed_get(tc: &mut TokenCache, url: &str) -> Result<(u16, Vec<u8>), String> {
     let tok = tc.bearer()?;
     let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
     match http_request("GET", url, &headers, None)? {
-        (401, _) => {
+        (401, _) if !tc.fresh() => {
             tc.invalidate();
             let tok = tc.bearer()?;
             let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
             http_request("GET", url, &headers, None)
         }
-        ok => Ok(ok),
+        answer => Ok(answer),
     }
 }
 
@@ -110,6 +122,7 @@ fn parse_expands(cfg: &Config) -> Result<Vec<Expand>, String> {
 
 impl OAuthPoll {
     fn token(
+        holder: &str,
         token_url: &str,
         client_id: &str,
         client_secret: &str,
@@ -142,7 +155,7 @@ impl OAuthPoll {
             .to_string();
         // a credential no store handed out: masked wherever theirs are, in an
         // answer that quotes it as in the record (ADR-0017)
-        crate::secrets::hold(&tok);
+        crate::secrets::hold(holder, &tok);
         // refresh a minute early; floor for endpoints that answer tiny lifetimes
         let ttl = v["expires_in"].as_u64().unwrap_or(300).saturating_sub(60).max(30);
         Ok((tok, Duration::from_secs(ttl)))
@@ -170,7 +183,9 @@ impl Driver for OAuthPoll {
                 parse_expands(&ctx.config).ok().and_then(|ex| ex.first().map(|s| s.list.clone()))
             })
             .ok_or("ENDPOINTS or EXPAND required")?;
-        let (tok, _) = Self::token(&token_url, &client_id, &client_secret, &scope)
+        // a holder of its own, so that a test never lets go of the token the
+        // running connector still sends
+        let (tok, _) = Self::token(&format!("{}:test", ctx.name), &token_url, &client_id, &client_secret, &scope)
             .map_err(|e| humanize(&e))?;
         let url = join_url(&base, &ep);
         let headers = [("Authorization".to_string(), format!("Bearer {tok}"))];
@@ -225,6 +240,7 @@ impl Driver for OAuthPoll {
             host_of(&base)
         );
         let mut tc = TokenCache {
+            holder: ctx.name.clone(),
             token_url,
             client_id,
             client_secret,
@@ -367,15 +383,19 @@ impl Driver for OAuthPoll {
                                         }
                                         Ok((c, _)) => {
                                             eprintln!(
-                                                "[{}] {}: detail for {id} -> HTTP {c}",
-                                                ctx.name, spec.name
+                                                "[{}] {}: detail for {} -> HTTP {c}",
+                                                ctx.name,
+                                                spec.name,
+                                                path_shown(&id)
                                             );
                                             Value::Null
                                         }
                                         Err(e) => {
                                             eprintln!(
-                                                "[{}] {}: detail for {id}: {e}",
-                                                ctx.name, spec.name
+                                                "[{}] {}: detail for {}: {e}",
+                                                ctx.name,
+                                                spec.name,
+                                                path_shown(&id)
                                             );
                                             Value::Null
                                         }
