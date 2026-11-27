@@ -1121,7 +1121,7 @@ function routeHtml(f, shape, ctx, preview) {
   if (topCalls || !checks) parts.push(calls, checks); else parts.push(checks, calls);
   parts.push(stopSends(f, shape, ctx, preview));
   return `<div class="route">${parts.join('')}</div>
-    <div class="legend"><span><i class="sw" style="background:var(--in)"></i>What comes in</span><span><i class="sw" style="background:var(--out)"></i>What goes out</span><span><i class="sw" style="background:var(--edit);border:1.5px solid var(--edit-line)"></i>A business value you can change</span></div>`;
+    <div class="legend"><span><i class="sw" style="background:var(--in)"></i>What comes in</span><span><i class="sw" style="background:var(--out)"></i>What goes out</span>${PUBLIC ? '<span><i class="sw" style="background:var(--sunk);border:1.5px solid var(--line2)"></i>A business value</span>' : '<span><i class="sw" style="background:var(--edit);border:1.5px solid var(--edit-line)"></i>A business value you can change</span>'}</div>`;
 }
 
 function stopReceives(f, shape, ctx, preview) {
@@ -1142,7 +1142,7 @@ function stopReceives(f, shape, ctx, preview) {
   } else {
     body += `<div class="names">${reads.map(p => `<span>${esc(p)}</span>`).join('')}</div>`;
   }
-  body += `<div class="more-line">${ctx.input !== undefined ? 'The values come from the sample event.' : 'No sample event yet. Write one to see what each step makes of it.'}
+  if (!PUBLIC) body += `<div class="more-line">${ctx.input !== undefined ? 'The values come from the sample event.' : 'No sample event yet. Write one to see what each step makes of it.'}
     <button class="btn small" type="button" data-act="edit-sample">${icon('sample')}${ctx.input !== undefined ? 'Edit the sample' : 'Write a sample'}</button></div><div id="sample-slot"></div>`;
   return stop('in', 'in', 'Receives', `an event on ${orList(subjects)}`, body);
 }
