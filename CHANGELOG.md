@@ -27,6 +27,19 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   them on the bus.
 
 ### Changed
+- **The Varpulis engine moves from 0d1c7b0 to b09ff7e** (varpulis #306).
+  A partitioned detect (`.partition_by`) now gets the index the
+  non-partitioned ones got in 6d40466, one per partition: a partition with
+  8 sequences waiting or more looks up the ones an event can advance
+  instead of visiting each, and goes back to visiting them under 4. A
+  partition of one or two sequences, the usual `partition_by id` shape,
+  never builds one. Behaviour change: the matches one event completes in a
+  partition now come out in the order their sequences opened, and so do
+  those a deadline confirms (a negated step). They used to come out in the
+  order of the partition's run list, which removals reshuffled. When one
+  event completes several sequences, a `.limit()`, `.distinct()` or count
+  window after the pattern can keep different matches than before. Nothing
+  in the suites depended on the old order.
 - **The Varpulis engine moves from 6d40466 to 0d1c7b0.** Besides `and` and
   `or`: a pattern that one event completes emits its match at once, where
   it used to wait for the unit's next event. A named pattern the engine
