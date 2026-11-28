@@ -18,8 +18,23 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `<root>.flow.events`. `e2e/detect-losses.sh` checks it.
 - **`VEJAS_DETECT_MAX_RUNS`**: how many sequences a detect pattern keeps
   open at once (10 000 by default, per partition).
+- **`and` and `or` between the steps of a detect pattern** (engine
+  0d1c7b0). `A and B` waits for both events in either order within the
+  pattern's `within`, `A or B` for either; `and` binds tighter than `or`,
+  which binds tighter than `->`. See the detects page for the two traps
+  (`A -> B or C` is `A -> (B or C)`; a `where` takes a following `and`
+  unless its step ends with its alias). `e2e/detect/run.sh` D10 checks
+  them on the bus.
 
 ### Changed
+- **The Varpulis engine moves from 6d40466 to 0d1c7b0.** Besides `and` and
+  `or`: a pattern that one event completes emits its match at once, where
+  it used to wait for the unit's next event. A named pattern the engine
+  cannot compile is a load error, where it used to be dropped with a log
+  line. `A -> all B -> NOT C` and `A -> all B -> all C` now emit; they used
+  to emit nothing. An event whose type none of a waiting sequence's next
+  steps takes now passes that sequence by without advancing it, which is
+  cheaper when many are open (under `.strict()` it still ends it).
 - **The Varpulis engine moves from 1cb201b to 6d40466.** It refuses at load,
   with codes E100 to E104, what it used to ignore with a warning or in
   silence: `import`, `context`, a `timer()` source, `.enrich()` and

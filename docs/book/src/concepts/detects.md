@@ -89,6 +89,47 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
 - **The connector declaration.** VPL binds sources and sinks to a named
   connector; Vejas ignores its `url` — the bus is `NATS_URL`, there is one.
 
+## Both, either: `and` and `or`
+
+Since engine 0d1c7b0, the steps of a `pattern` declaration can be joined by
+`and` (both events, in either order, within the pattern's `within`) and `or`
+(either one). Between steps `and` binds tightest, then `or`, then `->`;
+parentheses group.
+
+```vpl
+pattern ReadyToClose =
+    Order as o
+    -> (Shipment where id == o.id as s
+        and Invoice where id == o.id as i)
+    within 1h
+    partition by id
+
+pattern Paid =
+    Order as o
+    -> (CardPayment where id == o.id as p
+        or Transfer where id == o.id as p)
+    within 1h
+    partition by id
+```
+
+An order shipped then invoiced, or invoiced then shipped, closes; one paid by
+card or by transfer is paid, and `p` names whichever came. A run gives at
+most one match through an `or`; when one event completes several
+alternatives, the leftmost wins. Two traps:
+
+- **`->` is looser than `or`.** `A -> B or C` is `A -> (B or C)`, not
+  `(A -> B) or C`. Write the parentheses you mean.
+- **A `where` takes a following `and`.** In `A where x > 1 and B`, the
+  filter is `x > 1 and B` and there is no B step. End the step with its
+  alias, `A where x > 1 as a and B`, or put it in parentheses. The engine
+  warns when `B` is a declared event type (W038).
+
+A pattern that one event completes (`pattern Failed = CardDeclined as f or
+TransferBounced as f`) emits at once. Before 0d1c7b0 it emitted when the
+unit's next event arrived. A named pattern the engine cannot compile is now
+refused at load; it used to be dropped with a log line.
+`e2e/detect/run.sh` (D10) runs these patterns on the bus.
+
 ## Snapshot and resume
 
 The engine's state — open sequences, window contents, join buffers — lives
