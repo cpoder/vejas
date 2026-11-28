@@ -35,6 +35,8 @@
 #   D12 timer replay  an order acked after the last snapshot and before kill -9
 #                     replays ahead of the beats that came due while the runtime
 #                     was down: it takes the catch-up beat, and alerts once
+#   D13 NOT mid-pattern  `A -> NOT B -> C`: the C that comes next raises the
+#                     orders no B followed, and only those, once each
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -321,6 +323,37 @@ stream Stale = Waited
     .to(Bus, topic: "vxt.rp.stale")
 VPL
 
+# A NOT between two steps: the next beat raises the orders not shipped before it.
+cat > "$ROOT/detects/midnot.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Order:
+    id: str
+event Shipment:
+    id: str
+event Beat:
+    n: int
+
+stream Orders = Order
+    .from(Bus, topic: "vxt.mn.order")
+stream Shipments = Shipment
+    .from(Bus, topic: "vxt.mn.ship")
+stream Beats = Beat
+    .from(Bus, topic: "vxt.mn.beat")
+
+pattern Unshipped =
+    Order as o
+    -> NOT Shipment where id == o.id
+    -> Beat as b
+    within 1m
+
+stream Stale = Unshipped
+    .emit(rule: "unshipped", order: o.id, beat: b.n)
+    .to(Bus, topic: "vxt.mn.stale")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
@@ -356,6 +389,9 @@ out=$(NATS_URL=nats://127.0.0.1:1 VEJAS_ROOT="$WORK/none" timeout -k 2 5 "$BIN" 
 out=$("$BIN" vpl-check "$ROOT/detects/threshold.vpl" 2>&1); [ "$out" = "ok" ] && ok "threshold.vpl: ok" || bad "threshold.vpl: $out"
 out=$("$BIN" vpl-check "$ROOT/detects/lateral.vpl" 2>&1); [ "$out" = "ok" ] && ok "lateral.vpl: ok" || bad "lateral.vpl: $out"
 out=$("$BIN" vpl-check "$ROOT/detects/heartbeat.vpl" 2>&1); [ "$out" = "ok" ] && ok "heartbeat.vpl: ok (a timer validates as it runs)" || bad "heartbeat.vpl: $out"
+out=$("$BIN" vpl-check "$ROOT/detects/midnot.vpl" 2>&1); [ "$out" = "ok" ] && ok "midnot.vpl: ok (a NOT between two steps)" || bad "midnot.vpl: $out"
+printf 'event A:\n    id: int\nevent B:\n    id: int\n\npattern P = NOT A -> B within 1m\n\nstream S = P\n    .emit(x: 1)\n' > "$WORK/leadnot.vpl"
+if "$BIN" vpl-check "$WORK/leadnot.vpl" > /dev/null 2>&1; then bad "a pattern that starts with NOT was accepted"; else ok "a pattern that starts with NOT is refused"; fi
 printf 'event Order:\n    id: int\n\nstream Bad = Order\n    .filter(id == 1)\n    .emit(x: 1)\n' > "$WORK/bad.vpl"
 if "$BIN" vpl-check "$WORK/bad.vpl" > /dev/null 2>&1; then bad "a program the engine refuses was accepted"; else ok "a refused program exits non-zero"; fi
 
@@ -366,14 +402,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 9 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 10 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "nine detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "ten detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:andor","detect:bruteforce","detect:heartbeat","detect:lateral","detect:quiet","detect:replayed","detect:threshold","detect:unacked","detect:waited"], names
+assert names==["detect:andor","detect:bruteforce","detect:heartbeat","detect:lateral","detect:midnot","detect:quiet","detect:replayed","detect:threshold","detect:unacked","detect:waited"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -663,6 +699,29 @@ assert [a["order"] for a in alerts]==["r-1"], alerts
 # the catch-up beat is stamped at a deadline that passed while the runtime was down
 assert alerts[0]["first"] < int(sys.argv[2]), alerts
 assert alerts[0]["second"] - alerts[0]["first"] == 2000, alerts
+PY
+
+echo "── D13 NOT between two steps: the next step closes the absence"
+( timeout 30 "$NATS" -s "$URL" sub vxt.mn.stale --raw > "$WORK/midnot.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+mn() { # <subject> <type> <time> <json fields>
+  "$NATS" -s "$URL" pub "vxt.mn.$1" "{\"event_type\":\"$2\",\"@timestamp\":\"2026-09-23T09:$3Z\",$4}" > /dev/null 2>&1
+}
+mn order Order 00:00 '"id":"m1"'      # m1: never shipped
+mn order Order 00:01 '"id":"m2"'      # m2: shipped before the beat
+mn ship Shipment 00:02 '"id":"m2"'
+mn beat Beat 00:03 '"n":1'            # raises m1, not m2
+mn beat Beat 00:04 '"n":2'            # beat 1 closed m1: nothing
+mn order Order 00:05 '"id":"m3"'      # m3: shipped only after the beat
+mn beat Beat 00:06 '"n":3'            # raises m3
+mn ship Shipment 00:07 '"id":"m3"'
+deadline=$((SECONDS+10)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(grep -c '^{' "$WORK/midnot.txt")" -ge 2 ] && break; sleep 0.2; done
+sleep 1.5
+kill "$SUB_PID" 2>/dev/null
+python3 - "$WORK/midnot.txt" <<'PY' && ok "a beat raises the orders not shipped before it (m1, m3), not the one shipped (m2), each once" || bad "NOT mid-pattern: $(cat "$WORK/midnot.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert [(a["rule"], a["order"], a["beat"]) for a in alerts]==[("unshipped","m1",1),("unshipped","m3",3)], alerts
 PY
 
 if [ "$fail" -eq 0 ]; then echo "detect: all invariants hold ✓"; else echo "detect: FAILED"; tail -30 "$WORK/rt.log"; fi
