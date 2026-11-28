@@ -49,7 +49,8 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
   `ts` or `timestamp` (epoch milliseconds), is the event's time. Every
   `.within()` and window is judged against it, never against the clock, so
   a replay of the same events gives the same alerts. A payload without any
-  of them is stamped on arrival.
+  of them is stamped on arrival. A `timer()` is the one thing that runs on
+  the wall clock (see [Timers](#timers)).
 - **A window closes when the event time of the types feeding it passes its
   end**: on any event of those types, not only one of the window's own. A
   brute force counted per address on Security events is raised by the next
@@ -130,6 +131,70 @@ unit's next event arrived. A named pattern the engine cannot compile is now
 refused at load; it used to be dropped with a log line.
 `e2e/detect/run.sh` (D10) runs these patterns on the bus.
 
+## Timers
+
+A `timer(period)` source fires on the runtime's wall clock: Vejas owns the
+time and asks the engine for its next deadline. The unit waits for its next
+message or that deadline, whichever comes first, and a unit without a timer
+waits as it always did. What a timer emits goes out like any other emit: to
+its stream's `.to()` subject or `<root>.detect.<unit>.<stream>`, with a
+trace of its own, since no message stands behind it. A unit made of timers
+alone has no `.from()` and no consumer; a unit that drops its last
+`.from()` deletes the consumer it had.
+
+**Beats follow the wall clock, not the data.** The unit fires a timer
+after the batch it has read, but when its consumer lags, the beats are
+still ahead of the events it has yet to process: an event published before
+a beat can reach the engine after it. The exception is the backlog the
+consumer holds when the unit starts: the timers wait until it is replayed,
+so an event acked after the last snapshot comes back before the beats that
+came due while the unit was down.
+
+```vpl
+stream Beat = timer(1s)
+    .emit(kind: "beat", at: timestamp)
+    .to(Bus, topic: "vx.ops.beat")
+
+pattern Waited =
+    Order as o
+    -> Beat
+    -> Beat
+    within 1m
+
+stream Stale = Waited
+    .emit(rule: "two_beats", order: o.id)
+    .to(Bus, topic: "vx.alerts.stale")
+```
+
+The fired event carries its deadline as `timestamp` (epoch milliseconds),
+and a pattern takes the timer's stream as a step. The first deadline is one
+period after the unit starts, plus `initial_delay` when the timer has one
+(`timer(1m, initial_delay: 10s)`).
+
+**Late.** When the unit reaches a deadline late by more than a period (a
+pause, a stopped runtime), the timer fires once, at the latest deadline
+passed, and the periods in between are counted as `timer_periods_skipped`
+(see below). A unit back from an hour away emits one beat, not 3 600. The
+schedule does not drift: the next deadline stays on the grid of the first.
+
+**Restart.** A unit with a timer keeps a snapshot, and the timers' schedule
+is in it. After a restart the schedule goes on where it was, not from the
+restart: what came due while the unit was down fires once, and the periods
+missed are counted, those since the last snapshot included. A new version
+of the program starts a new schedule.
+
+**Clock stepped back.** A timer never fires before its deadline on the
+timers' own clock, which only moves forward. When the wall clock steps
+back (a manual set, a VM restored), no timer fires until the wall clock
+has caught up again, by the size of the step. The unit says it once per
+start, on the log with the step in milliseconds and as a `clock_back`
+event on `<root>.flow.events` (at most one a minute).
+
+`vpl-check` and `vejas_vpl_check` accept a `timer()` as the unit runs it;
+the engine alone, with no clock to drive it, refuses it (E102).
+`e2e/detect/run.sh` runs the example above and the restart (D11), and the
+replay of an event ahead of the catch-up beat (D12).
+
 ## Snapshot and resume
 
 The engine's state — open sequences, window contents, join buffers — lives
@@ -141,7 +206,8 @@ for**. It is taken at a batch boundary every `VEJAS_SNAPSHOT_SECS` (5) or
 `VEJAS_SNAPSHOT_ACKS` (10 000), whichever comes first, never while a
 message is waiting for redelivery, once more on a clean stop, and once at
 start, so that a crash before the first cadence still has a sequence to
-resume from.
+resume from. A unit with a timer also takes one after its timers fire, on the
+same cadence, so that a quiet unit keeps its schedule current.
 
 On restart the unit restores its snapshot and re-creates its consumer at
 the sequence after it. Everything acked since the snapshot replays from
@@ -175,7 +241,7 @@ it would have found is lost. `VEJAS_DETECT_MAX_RUNS` sets the cap for every
 detect unit of the runtime; size it from the formula below, and partition
 before you raise it.
 
-Three counters say what was lost without an error, per unit, on `/metrics`
+Four counters say what was lost without an error, per unit, on `/metrics`
 as `vejas_detect_losses_total{unit, kind}` and under `losses` in
 `/topology`:
 
@@ -184,17 +250,22 @@ as `vejas_detect_losses_total{unit, kind}` and under `losses` in
   eviction strategy, not the default);
 - `filters_without_value`: events a `.where()` could not judge, a field
   missing or of another type, and took as not matching. On a source that
-  mixes event shapes this is the normal course; it says how often.
+  mixes event shapes this is the normal course; it says how often;
+- `timer_periods_skipped`: timer periods that came due while the unit was
+  late or down, and did not fire on their own (see [Timers](#timers)).
 
 The totals count since the runtime started and do not go back when a unit
-restarts or reloads. A loss of runs is also said: the first, then at most
-one a minute (a loss held back is said once the minute has passed), as a
-line on the log and a `losses` event on `<root>.flow.events` with the three
-totals. `filters_without_value` is counted, not said.
+restarts or reloads. A loss of runs or of timer periods is also said: the
+first, then at most one a minute (a loss held back is said once the minute
+has passed), as a line on the log and a `losses` event on
+`<root>.flow.events` with the four totals. A skipped period means the unit
+was late, which is worth a warning. `filters_without_value` is counted, not
+said.
 
 The engine refuses at load what it would not run: `import`, `context`,
-a `timer()` source, `.enrich()` and `.alert(webhook: ...)` are errors
-(E100 to E104), not warnings.
+`.enrich()` and `.alert(webhook: ...)` are errors (E100, E101, E103, E104),
+not warnings, and so is a `timer()` whose period or `initial_delay` is not a
+duration literal, or whose period is zero (E102).
 
 ## What it costs
 

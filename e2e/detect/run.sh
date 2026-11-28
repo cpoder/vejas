@@ -27,6 +27,14 @@
 #                     still raised after the restart (from the snapshot)
 #   D10 and / or      `and` waits for two steps in either order, `or` for either
 #                     of two, and a pattern one event completes emits at once
+#   D11 timers        a detect of `timer(1s)` alone publishes beats on the bus, on
+#                     the wall clock; a timer feeds a pattern (an order raised on
+#                     its second beat); after kill -9 the beats resume on the
+#                     schedule the snapshot kept, and the periods missed while
+#                     the runtime was down are a loss (/topology, flow.events)
+#   D12 timer replay  an order acked after the last snapshot and before kill -9
+#                     replays ahead of the beats that came due while the runtime
+#                     was down: it takes the catch-up beat, and alerts once
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -249,6 +257,70 @@ stream Failures = PaymentFailed
     .to(Bus, topic: "vxt.ao.out")
 VPL
 
+# A detect of timers alone: no consumer, a beat a second on the bus.
+cat > "$ROOT/detects/heartbeat.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+stream Beat = timer(1s)
+    .emit(kind: "beat", at: timestamp)
+    .to(Bus, topic: "vxt.beat")
+VPL
+
+# A timer feeding a pattern: an order is raised on its second beat.
+cat > "$ROOT/detects/waited.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Order:
+    id: str
+
+stream Orders = Order
+    .from(Bus, topic: "vxt.tm.order")
+
+stream Beat = timer(1s)
+    .emit(kind: "beat")
+
+pattern Waited =
+    Order as o
+    -> Beat
+    -> Beat
+    within 1m
+
+stream Stale = Waited
+    .emit(rule: "two_beats", order: o.id)
+    .to(Bus, topic: "vxt.tm.stale")
+VPL
+
+# The same with a 2 s timer, for D12: the replayed order and the catch-up beat.
+cat > "$ROOT/detects/replayed.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Order:
+    id: str
+
+stream Orders = Order
+    .from(Bus, topic: "vxt.rp.order")
+
+stream Beat = timer(2s)
+    .emit(at: timestamp)
+    .to(Bus, topic: "vxt.rp.beat")
+
+pattern Waited =
+    Order as o
+    -> Beat as b1
+    -> Beat as b2
+    within 1m
+
+stream Stale = Waited
+    .emit(rule: "two_beats", order: o.id, first: b1.at, second: b2.at)
+    .to(Bus, topic: "vxt.rp.stale")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
@@ -283,6 +355,7 @@ out=$(NATS_URL=nats://127.0.0.1:1 VEJAS_ROOT="$WORK/none" timeout -k 2 5 "$BIN" 
 [ "$out" = "$want" ] && ok "--version answers and exits: $out" || bad "--version: expected '$want', got: $(printf '%s' "$out" | head -c 200)"
 out=$("$BIN" vpl-check "$ROOT/detects/threshold.vpl" 2>&1); [ "$out" = "ok" ] && ok "threshold.vpl: ok" || bad "threshold.vpl: $out"
 out=$("$BIN" vpl-check "$ROOT/detects/lateral.vpl" 2>&1); [ "$out" = "ok" ] && ok "lateral.vpl: ok" || bad "lateral.vpl: $out"
+out=$("$BIN" vpl-check "$ROOT/detects/heartbeat.vpl" 2>&1); [ "$out" = "ok" ] && ok "heartbeat.vpl: ok (a timer validates as it runs)" || bad "heartbeat.vpl: $out"
 printf 'event Order:\n    id: int\n\nstream Bad = Order\n    .filter(id == 1)\n    .emit(x: 1)\n' > "$WORK/bad.vpl"
 if "$BIN" vpl-check "$WORK/bad.vpl" > /dev/null 2>&1; then bad "a program the engine refuses was accepted"; else ok "a refused program exits non-zero"; fi
 
@@ -293,14 +366,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 6 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 9 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "six detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "nine detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:andor","detect:bruteforce","detect:lateral","detect:quiet","detect:threshold","detect:unacked"], names
+assert names==["detect:andor","detect:bruteforce","detect:heartbeat","detect:lateral","detect:quiet","detect:replayed","detect:threshold","detect:unacked","detect:waited"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -505,6 +578,92 @@ assert by("payment_failed")==[("o3",None,None)], alerts
 assert len(alerts)==5, alerts
 PY
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.ao.out" 2>/dev/null
+
+echo "── D11 timers: beats on the wall clock, a timer in a pattern, resumed after kill -9"
+( timeout 30 "$NATS" -s "$URL" sub vxt.beat --raw > "$WORK/beats.txt" 2>/dev/null ) & SUB_PID=$!
+( timeout 30 "$NATS" -s "$URL" sub vxt.tm.stale --raw > "$WORK/stale.txt" 2>/dev/null ) & SUB2_PID=$!
+( timeout 30 "$NATS" -s "$URL" sub vxt.flow.events --raw > "$WORK/events11.txt" 2>/dev/null ) & SUB3_PID=$!
+sleep 0.5
+"$NATS" -s "$URL" pub vxt.tm.order "{\"event_type\":\"Order\",\"@timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\",\"id\":\"t-1\"}" > /dev/null 2>&1
+sleep 0.8
+[ "$(grep -c '^{' "$WORK/stale.txt")" -eq 0 ] && ok "the order is not raised before its second beat" || bad "raised too soon: $(cat "$WORK/stale.txt")"
+deadline=$((SECONDS+5)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '"t-1"' "$WORK/stale.txt" && break; sleep 0.2; done
+sleep 1.2
+python3 - "$WORK/stale.txt" <<'PY' && ok "a timer fed the pattern: the order is raised on its second beat, once" || bad "timer pattern: $(cat "$WORK/stale.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert [(a["rule"], a["order"]) for a in alerts]==[("two_beats","t-1")], alerts
+PY
+killed_ms=$(date +%s%3N)
+kill -9 "$RT_PID"; wait "$RT_PID" 2>/dev/null; RT_PID=""
+log_at=$(wc -l < "$WORK/rt.log")
+sleep 2.5
+start_rt
+after_beats() { python3 -c 'import json,sys; print(sum(1 for l in open(sys.argv[1]) if l.startswith("{") and json.loads(l)["at"] > int(sys.argv[2])))' "$WORK/beats.txt" "$killed_ms"; }
+deadline=$((SECONDS+6)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(after_beats)" -ge 3 ] && break; sleep 0.2; done
+kill "$SUB_PID" "$SUB2_PID" 2>/dev/null; pkill -f "[s]ub vxt.beat" 2>/dev/null; pkill -f "[s]ub vxt.tm.stale" 2>/dev/null
+python3 - "$WORK/beats.txt" "$killed_ms" <<'PY' && ok "beats a second apart on the wall clock, and on the same schedule after kill -9" || bad "beats: $(tr '\n' ' ' < "$WORK/beats.txt" | head -c 600)"
+import json, sys, time
+beats=[json.loads(l)["at"] for l in open(sys.argv[1]) if l.startswith("{")]
+# split on the beat's own deadline: a beat fired before the kill is due before it
+killed=int(sys.argv[2])
+pre, post = [b for b in beats if b <= killed], [b for b in beats if b > killed]
+assert len(pre) >= 3 and len(post) >= 3, (pre, post)
+# a second apart; a machine that stalled past a period skips some, on the grid
+assert all(b - a >= 1000 and (b - a) % 1000 == 0 for a, b in zip(pre, pre[1:])), ("a second apart before the crash", pre)
+# after a restart a fresh schedule would start at the restart's own instant
+assert all((b - pre[0]) % 1000 == 0 for b in post), ("on the snapshot's schedule", pre[0], post)
+assert post[0] - pre[-1] >= 2000, ("the missed periods fired once, not one by one", pre[-1], post[0])
+assert abs(post[-1] - time.time() * 1000) < 5000, ("wall clock", post[-1])
+PY
+tail -n +"$((log_at+1))" "$WORK/rt.log" | grep -q 'detect:heartbeat: restored its snapshot' && ok "the heartbeat restored its snapshot" || bad "no 'detect:heartbeat: restored its snapshot' after the restart"
+topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
+python3 - "$topo" <<'PY' && ok "the periods missed while down are counted: /topology losses.timer_periods_skipped" || bad "topology losses: $(printf '%s' "$topo" | head -c 600)"
+import json, sys
+d={x["name"]: x for x in json.loads(sys.argv[1])["detects"]}
+assert d["detect:heartbeat"]["losses"]["timer_periods_skipped"] >= 1, d["detect:heartbeat"]
+PY
+curl -s "http://127.0.0.1:$HTTP_P/metrics" | grep -qE '^vejas_detect_losses_total\{unit="detect:heartbeat",kind="timer_periods_skipped"\} [1-9]' \
+  && ok "and on /metrics" || bad "no timer_periods_skipped on /metrics"
+deadline=$((SECONDS+3)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '"detect:heartbeat"' "$WORK/events11.txt" && break; sleep 0.2; done
+kill "$SUB3_PID" 2>/dev/null; pkill -f "[s]ub vxt.flow.events" 2>/dev/null
+python3 - "$WORK/events11.txt" <<'PY' && ok "a losses event on flow.events says the skipped periods" || bad "losses event: $(cat "$WORK/events11.txt" | head -c 600)"
+import json, sys
+ev=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+ev=[e for e in ev if e.get("transition")=="losses" and e.get("unit")=="detect:heartbeat"]
+assert ev and ev[0]["timer_periods_skipped"] >= 1, ev
+PY
+
+echo "── D12 an order replayed after kill -9 comes before the beats that came due while down"
+( timeout 40 "$NATS" -s "$URL" sub vxt.rp.beat --raw > "$WORK/rpbeats.txt" 2>/dev/null ) & SUB_PID=$!
+( timeout 40 "$NATS" -s "$URL" sub vxt.rp.stale --raw > "$WORK/rpstale.txt" 2>/dev/null ) & SUB2_PID=$!
+# A runtime whose snapshots wait an hour: the order is acked after the last one.
+crash_and_restart 3600
+sleep 0.5
+# Just after a beat, so that the order is acked and the runtime killed well
+# before the next one (2 s).
+n0=$(grep -c '^{' "$WORK/rpbeats.txt")
+deadline=$((SECONDS+5)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(grep -c '^{' "$WORK/rpbeats.txt")" -gt "$n0" ] && break; sleep 0.02; done
+before=$(processed detect:replayed); before=${before:-0}
+"$NATS" -s "$URL" pub vxt.rp.order "{\"event_type\":\"Order\",\"@timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\",\"id\":\"r-1\"}" > /dev/null 2>&1
+deadline=$((SECONDS+2)); while [ "$SECONDS" -lt "$deadline" ]; do now=$(processed detect:replayed); [ "${now:-0}" -gt "$before" ] && break; sleep 0.05; done
+sleep 0.2
+kill -9 "$RT_PID"; wait "$RT_PID" 2>/dev/null; RT_PID=""
+[ "$(grep -c '^{' "$WORK/rpstale.txt")" -eq 0 ] && ok "r-1 acked and still open when the runtime is killed" || bad "r-1 alerted before the kill: the check proves nothing"
+sleep 2.5   # a beat comes due while the runtime is down
+restarted_ms=$(date +%s%3N)
+SNAP_SECS=1 start_rt
+deadline=$((SECONDS+8)); while [ "$SECONDS" -lt "$deadline" ]; do grep -q '"r-1"' "$WORK/rpstale.txt" && break; sleep 0.2; done
+sleep 2.5
+kill "$SUB_PID" "$SUB2_PID" 2>/dev/null; pkill -f "[s]ub vxt.rp." 2>/dev/null
+python3 - "$WORK/rpstale.txt" "$restarted_ms" <<'PY' && ok "the replayed order took the catch-up beat as its first, and alerted once" || bad "replay before beats: $(cat "$WORK/rpstale.txt") (restart at $restarted_ms)"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+assert [a["order"] for a in alerts]==["r-1"], alerts
+# the catch-up beat is stamped at a deadline that passed while the runtime was down
+assert alerts[0]["first"] < int(sys.argv[2]), alerts
+assert alerts[0]["second"] - alerts[0]["first"] == 2000, alerts
+PY
 
 if [ "$fail" -eq 0 ]; then echo "detect: all invariants hold ✓"; else echo "detect: FAILED"; tail -30 "$WORK/rt.log"; fi
 exit $fail

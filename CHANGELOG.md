@@ -8,6 +8,27 @@ is `0`, minor versions may carry breaking changes — they are called out here.
 ## [Unreleased]
 
 ### Added
+- **Detect units run `timer()` sources**, on the runtime's wall clock. The
+  unit waits for its next message or the next deadline, whichever comes
+  first, and publishes what a timer emits as it publishes any emit (same
+  subjects, a trace of its own, the same dead letters). A timer can feed a
+  pattern, and a unit of timers alone needs no `.from()`. A timer late by
+  more than a period fires once, and the periods it skipped are a loss,
+  `timer_periods_skipped`, on `/metrics`, in `/topology` and said on
+  `<root>.flow.events` within the once-a-minute limit. The schedule is in
+  the unit's snapshot, so a restart resumes it rather than starting over.
+  `vpl-check` and `vejas_vpl_check` accept a `timer()` as the unit runs it.
+  Timers fire after the batch the unit has read, and wait while the unit
+  replays the backlog it found at start, so an event acked after the last
+  snapshot replays before the beats that came due while it was down. Beats
+  still follow the wall clock: a consumer that lags sees them ahead of its
+  data. A wall clock that steps back stalls the timers by the size of the
+  step; the unit says it once per start, on the log and as a `clock_back`
+  event on `<root>.flow.events`. Timer emits are also counted apart, as
+  `vejas_detect_timer_emits_total`. A unit that drops its last `.from()`
+  deletes its old consumer. `e2e/detect/run.sh` D11 checks the beats, a
+  timer in a pattern, and the restart; D12 the replay before the catch-up
+  beat.
 - **What a detect unit's engine loses is counted.**
   `vejas_detect_losses_total{unit, kind}` on `/metrics` and `losses` under
   each detect in `/topology`: sequences never opened at the cap
@@ -27,6 +48,12 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   them on the bus.
 
 ### Changed
+- **The Varpulis engine moves from b09ff7e to 9f11a92** (varpulis #307):
+  `timer()` runs in the embedded engine when the host names a clock. Without
+  one it is still refused (E102), and so is a period or `initial_delay` that
+  is not a duration literal, or a zero period, whatever the clock. A
+  snapshot carries the timers' schedule; one taken before has none, and the
+  timers start fresh.
 - **The Varpulis engine moves from 0d1c7b0 to b09ff7e** (varpulis #306).
   A partitioned detect (`.partition_by`) now gets the index the
   non-partitioned ones got in 6d40466, one per partition: a partition with
