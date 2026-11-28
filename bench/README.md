@@ -389,6 +389,14 @@ without it the engine has to consider every open run for every event, and at
 1 000 open that is 26 000/s against 4 300. Partition every correlation, on
 the field the pair shares.
 
+That was engine 1cb201b. The engine has since indexed the runs waiting in a
+sequence (6d40466 without `.partition_by`, b09ff7e per partition), and on
+2026-11-28, engines 0d1c7b0 and b09ff7e alternating on this box, the
+unpartitioned run at 1 000 open measured 20 200 – 20 900/s against
+19 600 – 20 400/s partitioned: the gap is gone on this bench. The rates of
+that session, all lower than the table above with either engine, are on the
+detects page of the book. Partitioning still bounds the run cap per key.
+
 **What bounds a unit is memory, not a cliff.** An open correlation costs
 about 2 KB at ten thousand and 4.5 KB at a hundred thousand; the rate falls
 gently with the runs each partition carries (here 500 hosts, so 200 runs a
@@ -438,7 +446,8 @@ one unit handles that at around 25 000 events/s in 18 MB.
 - **At 1 000 open:** 26 000 events/s, 16 MB. **At 10 000:** 22 000 events/s,
   33 MB. **At 100 000:** 11 000 events/s, 450 MB: plan on memory, about 4 KB
   an open run.
-- **Always partition a correlation** — about six times the throughput.
+- **Always partition a correlation**: the cap counts per key. It was also six
+  times the throughput before the engine's index; on 0d1c7b0 and b09ff7e it is not.
 - **One instance saturates near 44 000 events/s** whatever the unit count.
   Beyond it, add instances: they share the durable consumers and the work
   (see *Clustering*).

@@ -198,29 +198,62 @@ a `timer()` source, `.enrich()` and `.alert(webhook: ...)` are errors
 
 ## What it costs
 
-Since engine 6d40466, a pattern with 8 sequences waiting or more looks up
-the sequences an event can advance instead of visiting each one: equality,
-order and range conditions between the event and what a sequence captured
-are indexed. It applies without `.partition_by`, without a negation that
-spans the pattern, and to those conditions only; other sequences are
-visited as before. Matches that one event completes are emitted in the
-order their sequences opened. The figures below were measured before the
-index (engine 1cb201b) and are kept until the bench is run again; the
-engine itself measures about 1.4 to 1.6 KB a waiting sequence.
+A pattern with 8 sequences waiting or more looks up the sequences an event
+can advance instead of visiting each one: equality, order and range
+conditions between the event and what a sequence captured are indexed.
+Without `.partition_by` the index covers the pattern's sequences (since
+engine 6d40466). With it, each partition gets its own index (since engine
+b09ff7e): a partition builds one once it holds 8 sequences, drops it under
+4, and a partition of one or two sequences, the usual `partition_by id`
+shape, never builds one. The index stays off under a negation that spans
+the pattern, and covers those conditions only; other sequences are visited
+as before. The engine itself measures about 1.4 to 1.6 KB a waiting
+sequence.
 
-A stateless rule runs at about 30 000 events/s in 10 MB. A correlation is
-sized by how many of its sequences are **open at once** — first steps still
-waiting for their second:
+**Order of matches.** The matches one event completes come out in the
+order their sequences opened, within a partition as without one, and so do
+those a deadline confirms (a negated step). Before b09ff7e a partition
+emitted them in the order of its run list, which removals reshuffled. When
+one event completes several sequences, a `.limit()`, `.distinct()` or count
+window after the pattern can keep different matches than it did then.
+
+A stateless rule runs at about 30 000 events/s in 10 MB (measured on
+engine 1cb201b). A correlation is sized by how many of its sequences are
+**open at once**, first steps still waiting for their second:
 
 ```
 open at once  =  first steps per second  x  how long a first step waits
 ```
 
-Under a hundred open, a unit keeps 28 000 events/s; at a thousand, 26 000;
-at ten thousand, 22 000 in about 33 MB; at a hundred thousand, 11 000 in
-450 MB. What bounds a unit is memory, about 4 KB an open sequence.
-`.partition_by` on the field a pair shares is worth about six times the
-throughput as soon as anything is open — partition every correlation.
+Measured on 2026-11-28 with `PROGRAM=sequence bench/detect.sh` (a two-step
+correlation over 500 hosts, partitioned on the host), engines 0d1c7b0 and
+b09ff7e alternating on the same box, two runs each:
+
+| Open at once | 0d1c7b0 | b09ff7e | RSS |
+|---:|---:|---:|---:|
+| up to 100 | 20 300 – 21 200/s | 20 300 – 21 200/s | 22 – 23 MB |
+| 1 000 | 20 300 – 20 400/s | 19 600/s | 24 – 25 MB |
+| 10 000 | 18 900 – 19 100/s | 18 800 – 18 900/s | 44 – 62 MB |
+| 30 000 | 15 700 – 16 200/s | 15 000 – 15 100/s | 87 – 107 MB |
+| 100 000 | 11 500 – 11 800/s | 11 800 – 13 300/s | 307 – 424 MB |
+| 1 000, unpartitioned | 20 200 – 20 500/s | 20 300 – 20 900/s | 23 – 24 MB |
+
+The two engines are within the noise here. The bench's pairs share the
+partition key, so every sequence of a partition passes the condition and
+the index has nothing to narrow. It pays when a partition holds many
+sequences an event cannot advance (a key of low cardinality, or many orders
+waiting under one key). For that shape the engine's own bench gives one
+event completing a sequence plus one reopening it at 179 µs with 1 000
+sequences in one partition before b09ff7e, and about 2 µs after. What
+bounds a unit is memory, about 3 to 4 KB an open sequence.
+
+Before any index (engine 1cb201b, an earlier session on the same box, when
+a unit kept 28 600/s with one sequence open), `.partition_by` was worth
+about six times the throughput at 1 000 open: 26 000/s against 4 300. The
+table shows that gap is gone. Partition a correlation on the field its
+steps share all the same: the cap of 10 000 sequences counts per
+partition, and the sequences the index cannot file stay within their own
+key.
 
 One process saturates near 44 000 events/s whatever the unit count; beyond
 it, add instances. The measurements and the method are in
