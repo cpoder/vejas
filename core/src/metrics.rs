@@ -62,7 +62,7 @@ struct Unit {
     /// summed over every program the unit ran since the process started.
     /// When runs were last said lost, and whether a later loss waits to be.
     detect: bool,
-    loss: [u64; 3],
+    loss: Losses,
     loss_said: Option<Instant>,
     loss_pending: bool,
 }
@@ -139,7 +139,15 @@ pub fn observe_restore(unit: &str, seq: u64) {
 
 /// What a detect unit's engine can lose without an error, in the order of
 /// `vejas_detect_losses_total{kind=...}` and `/topology`.
-pub const LOSS_KINDS: [&str; 3] = ["runs_dropped", "runs_evicted", "filters_without_value"];
+pub const LOSS_KINDS: [&str; 4] = ["runs_dropped", "runs_evicted", "filters_without_value", "timer_periods_skipped"];
+
+/// A count per `LOSS_KINDS`.
+pub type Losses = [u64; 4];
+
+/// The kinds that are news, said on the log and the bus: lost runs, and timer
+/// periods skipped because the unit was late to fire them. A filter that could
+/// not judge an event is only counted.
+const SAID_KINDS: [usize; 3] = [0, 1, 3];
 
 /// How often a unit that keeps losing is reported again.
 const LOSS_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -155,7 +163,7 @@ pub enum LossNews {
     /// Nothing to say.
     Quiet,
     /// Say these totals now, on the log and the bus.
-    Say([u64; 3]),
+    Say(Losses),
     /// Runs were lost but were said less than `LOSS_WARN_EVERY` ago: ask
     /// again with `flush_losses` from this instant.
     Later(Instant),
@@ -177,17 +185,17 @@ fn loss_news(u: &mut Unit) -> LossNews {
 
 /// Add what one program lost since its last report. Several programs of a
 /// unit may report at once (a reload overlaps the old and the new): each
-/// adds its own delta, so the total only grows. A loss of runs is news; a
-/// filter that could not judge an event is counted, not said, since mixed
-/// traffic does that in the normal course.
-pub fn add_losses(unit: &str, delta: [u64; 3]) -> LossNews {
+/// adds its own delta, so the total only grows. A loss of runs or a skipped
+/// timer period is news; a filter that could not judge an event is counted,
+/// not said, since mixed traffic does that in the normal course.
+pub fn add_losses(unit: &str, delta: Losses) -> LossNews {
     let mut map = units().lock().unwrap();
     let u = map.entry(unit.to_string()).or_default();
     u.detect = true;
-    for i in 0..3 {
-        u.loss[i] += delta[i];
+    for (total, d) in u.loss.iter_mut().zip(delta) {
+        *total += d;
     }
-    if delta[0] == 0 && delta[1] == 0 {
+    if SAID_KINDS.iter().all(|&i| delta[i] == 0) {
         return LossNews::Quiet;
     }
     loss_news(u)
@@ -203,7 +211,7 @@ pub fn flush_losses(unit: &str) -> LossNews {
 }
 
 /// A detect unit's loss totals since the process started, if it is one.
-pub fn losses(unit: &str) -> Option<[u64; 3]> {
+pub fn losses(unit: &str) -> Option<Losses> {
     let map = units().lock().unwrap();
     let u = map.get(unit).filter(|u| u.detect)?;
     Some(u.loss)
@@ -346,7 +354,7 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
     for (unit, u) in map.iter() {
         out.push_str(&format!("vejas_restore_seq{{unit=\"{}\"}} {}\n", esc(unit), u.restore_seq));
     }
-    out.push_str("# HELP vejas_detect_losses_total What a detect unit's engine lost without an error: runs never opened at the max_runs cap, runs evicted, events a filter discarded for want of a true/false value.\n");
+    out.push_str("# HELP vejas_detect_losses_total What a detect unit's engine lost without an error: runs never opened at the max_runs cap, runs evicted, events a filter discarded for want of a true/false value, timer periods skipped because the unit fired late.\n");
     out.push_str("# TYPE vejas_detect_losses_total counter\n");
     for (unit, u) in map.iter().filter(|(_, u)| u.detect) {
         for (i, kind) in LOSS_KINDS.iter().enumerate() {
@@ -985,23 +993,29 @@ mod tests {
         let unit = "detect:losses_t";
         assert_eq!(losses(unit), None, "not a detect unit before it says so");
         declare_detect(unit);
-        assert_eq!(losses(unit), Some([0, 0, 0]));
-        assert_eq!(add_losses(unit, [0, 0, 2]), LossNews::Quiet, "a filter that could not judge is not news");
-        assert_eq!(add_losses(unit, [3, 0, 0]), LossNews::Say([3, 0, 2]), "the first lost run is said");
-        assert!(matches!(add_losses(unit, [2, 0, 0]), LossNews::Later(_)), "then held back");
+        assert_eq!(losses(unit), Some([0, 0, 0, 0]));
+        assert_eq!(add_losses(unit, [0, 0, 2, 0]), LossNews::Quiet, "a filter that could not judge is not news");
+        assert_eq!(add_losses(unit, [3, 0, 0, 0]), LossNews::Say([3, 0, 2, 0]), "the first lost run is said");
+        assert!(matches!(add_losses(unit, [2, 0, 0, 0]), LossNews::Later(_)), "then held back");
         assert!(matches!(flush_losses(unit), LossNews::Later(_)), "still within the minute");
         // two programs of the unit report deltas at once, as across a reload:
         // the total is their sum and never goes back
-        add_losses(unit, [1, 0, 0]);
-        add_losses(unit, [1, 0, 1]);
-        assert_eq!(losses(unit), Some([7, 0, 3]));
+        add_losses(unit, [1, 0, 0, 0]);
+        add_losses(unit, [1, 0, 1, 0]);
+        assert_eq!(losses(unit), Some([7, 0, 3, 0]));
         units().lock().unwrap().get_mut(unit).unwrap().loss_said =
             Some(Instant::now() - LOSS_WARN_EVERY);
-        assert_eq!(flush_losses(unit), LossNews::Say([7, 0, 3]), "the held-back loss is said after the minute");
+        assert_eq!(flush_losses(unit), LossNews::Say([7, 0, 3, 0]), "the held-back loss is said after the minute");
         assert_eq!(flush_losses(unit), LossNews::Quiet, "and only once");
+        // a timer period skipped is news too, within the same once-a-minute limit
+        assert!(matches!(add_losses(unit, [0, 0, 0, 4]), LossNews::Later(_)), "held back: said a moment ago");
+        units().lock().unwrap().get_mut(unit).unwrap().loss_said =
+            Some(Instant::now() - LOSS_WARN_EVERY);
+        assert_eq!(flush_losses(unit), LossNews::Say([7, 0, 3, 4]), "a skipped timer period is said");
         let text = render(&[]);
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"runs_dropped\"} 7"));
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 3"));
+        assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"timer_periods_skipped\"} 4"));
         assert!(!text.contains("vejas_detect_losses_total{unit=\"flow:"), "only detect units carry it");
     }
 

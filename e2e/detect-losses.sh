@@ -134,7 +134,7 @@ t = json.load(open(sys.argv[1]))
 d = {u["name"]: u for u in t["detects"]}
 l = d["detect:capped"]["losses"]
 assert l["runs_dropped"] == int(sys.argv[2]), l
-assert set(l) == {"runs_dropped", "runs_evicted", "filters_without_value"}, l
+assert set(l) == {"runs_dropped", "runs_evicted", "filters_without_value", "timer_periods_skipped"}, l
 assert d["detect:filtered"]["losses"]["filters_without_value"] >= 1, d["detect:filtered"]
 PY
 then ok "/topology carries the totals"; else bad "/topology losses wrong: $(cat "$WORK/topo.json")"; fi
@@ -146,7 +146,7 @@ if grep -q '"transition":"losses"' "$WORK/events.txt" && grep -q '"unit":"detect
 else
   bad "no losses event: $(cat "$WORK/events.txt")"
 fi
-grep -q 'detect:capped: the engine lost runs without an error' "$WORK/rt.log" && ok "a line on the log" || bad "no log line"
+grep -q 'detect:capped: the engine lost runs or timer periods without an error' "$WORK/rt.log" && ok "a line on the log" || bad "no log line"
 grep -q '"unit":"detect:filtered"' "$WORK/events.txt" && bad "a filter loss was said on the bus" || ok "a filter that could not judge is not said"
 n=$(grep -c '"unit":"detect:capped"' "$WORK/events.txt")
 [ "$n" -le 1 ] && ok "said once, not per event ($n)" || bad "said $n times in a minute"

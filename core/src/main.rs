@@ -2714,6 +2714,69 @@ fn emit_subject(emit: &varpulis_engine::Emit, subj_root: &str, stem: &str) -> St
         .unwrap_or_else(|| format!("{subj_root}.detect.{stem}.{}", emit.stream))
 }
 
+/// Publish what a detect unit's engine emitted with no message behind it:
+/// windows that time closed on quiet sources (a tick), or the timers that came
+/// due (`timer`). Each such run starts a trace of its own, and its alerts take
+/// the path of an event's: held, confirmed, a dead letter when refused. There
+/// is no message to ack, so a crash before the next snapshot replays and emits
+/// them again.
+#[allow(clippy::too_many_arguments)]
+fn publish_unprompted(
+    outbox: &mut bus::Batch,
+    js: &bus::JetStream,
+    unit: &str,
+    emits: &[varpulis_engine::Emit],
+    subj_root: &str,
+    stem: &str,
+    version: &Arc<str>,
+    timer: bool,
+) -> Result<(), String> {
+    let hop = trace::Hop::begin(None);
+    let carried = hop.context();
+    let start_nanos = metrics::now_nanos();
+    let (subjects, mut lost) = match hold_alerts(outbox, emits, subj_root, stem, &carried) {
+        Ok(subjects) => (subjects, None),
+        Err(error) => {
+            park_run(js, unit, emits, subj_root, stem, &error, version, &carried)?;
+            (Vec::new(), Some(error))
+        }
+    };
+    // No message to deliver again stands behind them: see `confirm_alerts`.
+    let confirmed = confirm_alerts(outbox, js, unit, version, |_| Some(carried.clone()));
+    let dead = lost.is_some() || confirmed.as_ref().is_ok_and(|parked| !parked.is_empty());
+    match &confirmed {
+        Ok(parked) => {
+            if let Some((_, e)) = parked.first() {
+                lost.get_or_insert(e.clone());
+            }
+        }
+        Err(e) => lost = Some(e.clone()),
+    }
+    metrics::observe_tick_emits(unit, emits.len() as u64);
+    if metrics::wants(hop.sampled, lost.is_some()) {
+        let span = metrics::Span::hop(&hop, metrics::Kind::Producer, unit, start_nanos)
+            .attr("vejas.flow.version", metrics::Attr::Computed(version.clone()))
+            .attr("vejas.emits", emits.len() as u64);
+        let span = if timer { span.attr("vejas.timer", true) } else { span };
+        let span = if dead { span.attr("vejas.dlq", true) } else { span };
+        record::end(
+            match lost {
+                Some(e) => span.failed(e),
+                None => span,
+            },
+            record::Extras::new().emits(subjects),
+        );
+    }
+    confirmed.map(|_| ())
+}
+
+/// Whether a detect unit takes its snapshot now: something moved since the
+/// last one (a message acked, a timer fired), nothing waits for redelivery,
+/// and the cadence is reached.
+fn snapshot_due(moved: bool, acks: u64, retrying: bool, since: Duration, every_acks: u64, every: Duration) -> bool {
+    moved && !retrying && (acks >= every_acks || since >= every)
+}
+
 /// A detect unit (ADR-0031): a VPL program run by the embedded Varpulis engine.
 ///
 /// One durable pull consumer per `.from()` subject, each on a thread of its
@@ -2761,8 +2824,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
         let began = Instant::now();
         let attempt = contained(|| -> Result<(), String> {
             let src = fs::read_to_string(&handle.spec.path).map_err(|e| e.to_string())?;
-            let mut program =
-                varpulis_engine::Program::compile(&src).map_err(|e| e.to_string())?;
+            let mut program = compile_detect(&src)?;
             if let Some(max) = detect_max_runs() {
                 program.set_max_runs(max);
             }
@@ -2780,8 +2842,11 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                 };
                 sources.push((subject, b.event_type.clone()));
             }
-            if sources.is_empty() {
-                return Err("no `.from(<connector>, topic: \"...\")` declaration: nothing to consume".into());
+            // A program of timers alone consumes nothing: it has no consumer.
+            let timed = program.has_timers();
+            let consumes = !sources.is_empty();
+            if !consumes && !timed {
+                return Err("no `.from(<connector>, topic: \"...\")` declaration and no `timer()`: nothing to run".into());
             }
             let stem = handle
                 .spec
@@ -2816,7 +2881,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // A snapshot of another version of the program is ignored: the state
             // of one program is not the state of another. A stateless program
             // keeps no snapshot and resumes at its ack floor, as a flow does.
-            let stateful = program_is_stateful(&program);
+            // A timer's schedule is state too: a restart resumes it where it
+            // was rather than from the restart.
+            let stateful = timed || program_is_stateful(&program);
             let store = if stateful { connectors::open_state_store(&js) } else { None };
             if stateful && store.is_none() {
                 eprintln!(
@@ -2825,6 +2892,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                 );
             }
             let mut resume_seq: Option<u64> = None;
+            let mut restored = false;
             if let Some(store) = &store {
                 match connectors::snapshot_get(store, &handle.spec.name)? {
                     Some(snap) if *snap.version == *version => {
@@ -2839,6 +2907,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                             now_secs().saturating_sub(snap.taken_at)
                         );
                         resume_seq = Some(snap.seq + 1);
+                        restored = true;
                     }
                     Some(snap) => eprintln!(
                         "[vejas] {}: its snapshot is of another version of the program ({} ≠ {}): ignored",
@@ -2850,6 +2919,17 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // After the restore: a restored window's sources start counting
             // their silence from now.
             program.set_idle_grace(idle_grace);
+            // Timers run on the wall clock, which the host owns (TimerClock::Host).
+            // The first `fire_due` starts their schedules and fires nothing; a
+            // restored schedule needs none, and the loop fires what came due
+            // while the unit was down: once, the periods it missed counted.
+            if timed && program.next_deadline().is_none() {
+                program.fire_due(varpulis_engine::Utc::now()).map_err(|e| format!("start the timers: {e}"))?;
+            }
+            // A program without a consumer has no stream position to stand for.
+            if !consumes {
+                resume_seq = None;
+            }
             // A program with state has its consumer made again at each start,
             // after what its engine holds: the snapshot's sequence, else the
             // ack floor. A message the consumer delivers a second time is then
@@ -2858,10 +2938,15 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // instances may share: a message delivered again alerts again.
             let start = match resume_seq {
                 Some(seq) => Some(seq),
-                None if stateful => js.ack_floor(&stream, &durable).ok().map(|floor| floor + 1),
+                None if stateful && consumes => js.ack_floor(&stream, &durable).ok().map(|floor| floor + 1),
                 None => None,
             };
             match start {
+                _ if !consumes => {
+                    if restored {
+                        metrics::observe_restore(&handle.spec.name, 0);
+                    }
+                }
                 Some(seq) => {
                     // The server cannot move an existing consumer: re-create it.
                     let _ = js.delete_consumer(&stream, &durable);
@@ -2875,16 +2960,21 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // A first snapshot at the consumer's position, so a crash before the
             // first cadence still replays from here rather than resuming past
             // events the state never saw.
-            if let (Some(store), None) = (&store, resume_seq) {
-                let floor = js.ack_floor(&stream, &durable).unwrap_or(0);
+            if let (Some(store), false) = (&store, restored) {
+                let floor = if consumes { js.ack_floor(&stream, &durable).unwrap_or(0) } else { 0 };
                 if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, floor) {
                     eprintln!("[vejas] {}: first snapshot: {e}", handle.spec.name);
                 }
             }
-            let sub = js
-                .pull_durable(&stream, &durable, None)
-                .map_err(|e| format!("{durable}: {e}"))?;
-            {
+            // Without a consumer, the channel stays open and empty: the loop
+            // only waits for its timers.
+            let mut _no_reader = None;
+            if !consumes {
+                _no_reader = Some(tx);
+            } else {
+                let sub = js
+                    .pull_durable(&stream, &durable, None)
+                    .map_err(|e| format!("{durable}: {e}"))?;
                 let stop = attempt_stop.clone();
                 let unit = handle.clone();
                 let name = handle.spec.name.clone();
@@ -2923,18 +3013,28 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                 st.started_at = Some(now_secs());
                 st.last_error = None;
             });
-            eprintln!(
-                "[vejas] {} (vpl, embedded engine) consuming {}",
-                handle.spec.name,
-                sources.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")
-            );
+            if consumes {
+                eprintln!(
+                    "[vejas] {} (vpl, embedded engine) consuming {}",
+                    handle.spec.name,
+                    sources.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            } else {
+                eprintln!("[vejas] {} (vpl, embedded engine) running its timers", handle.spec.name);
+            }
             // Snapshot bookkeeping: the highest acked stream sequence, the
             // sequences left for redelivery (a snapshot must not stand for a
             // sequence with an unprocessed message below it), acks since the
             // last snapshot and when it was taken.
-            let mut acked_max: u64 = 0;
+            // A snapshot stands for what is below the consumer's start, until
+            // a message is acked; one taken after a timer fired, with no ack
+            // since the start, stands for that.
+            let mut acked_max: u64 = start.map_or(0, |seq| seq.saturating_sub(1));
+            let position_known = start.is_some() || !consumes;
             let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut acks_since_snapshot: u64 = 0;
+            // A timer fired since the last snapshot: its schedule moved.
+            let mut timers_moved = false;
             let mut last_snapshot = Instant::now();
             // A message the engine has taken in is not fed to it again, where
             // it would count twice: a batch the bus does not confirm starts
@@ -2946,7 +3046,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         // A clean stop: what is acked is in the snapshot, so a
                         // restart replays nothing.
                         if let Some(store) = &store {
-                            if acks_since_snapshot > 0 && retrying.is_empty() {
+                            if (acks_since_snapshot > 0 || (timers_moved && position_known)) && retrying.is_empty() {
                                 if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
                                     eprintln!("[vejas] {}: snapshot on stop: {e}", handle.spec.name);
                                 }
@@ -2954,9 +3054,56 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         }
                         return Ok(());
                     }
+                    // The timers that came due fire before the next batch, and
+                    // their alerts go out as a tick's do. Late, a timer fires
+                    // once and the periods it skipped are a loss.
+                    let mut wait = Duration::from_millis(500);
+                    if timed {
+                        let now = varpulis_engine::Utc::now();
+                        if program.next_deadline().is_some_and(|due| due <= now) {
+                            match program.fire_due(now) {
+                                Ok(emits) if !emits.is_empty() => {
+                                    publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, true)?;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("[vejas] {}: timers: {e}", handle.spec.name);
+                                    set_state(&handle, |st| st.last_error = Some(format!("timers: {e}")));
+                                }
+                            }
+                            timers_moved = true;
+                            losses.report(&handle.spec.name, &program, &js, &subj_root);
+                            if let Some(store) = &store {
+                                if snapshot_due(
+                                    position_known,
+                                    acks_since_snapshot,
+                                    !retrying.is_empty(),
+                                    last_snapshot.elapsed(),
+                                    snapshot_every_acks,
+                                    snapshot_every,
+                                ) {
+                                    match snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
+                                        Ok(()) => {
+                                            acks_since_snapshot = 0;
+                                            timers_moved = false;
+                                            last_snapshot = Instant::now();
+                                        }
+                                        Err(e) => eprintln!("[vejas] {}: snapshot: {e} (the next timer tries again)", handle.spec.name),
+                                    }
+                                }
+                            }
+                        }
+                        // Wait for a message or the next deadline, whichever
+                        // comes first: a deadline never passes unseen, and the
+                        // loop never spins (the deadline is past the clock).
+                        if let Some(due) = program.next_deadline() {
+                            let left = (due - varpulis_engine::Utc::now()).to_std().unwrap_or(Duration::ZERO);
+                            wait = wait.min(left);
+                        }
+                    }
                     // A batch is whatever has arrived: wait for one message, take
                     // the rest without waiting, bounded.
-                    let first = match rx.recv_timeout(Duration::from_millis(500)) {
+                    let first = match rx.recv_timeout(wait) {
                         Ok(m) => m,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // a quiet unit still says the losses it held back
@@ -2968,45 +3115,7 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                             if idle_grace.is_some() {
                                 match program.tick() {
                                     Ok(emits) if !emits.is_empty() => {
-                                        // No message stands behind a window that time
-                                        // closed: each tick that emits starts a trace.
-                                        let hop = trace::Hop::begin(None);
-                                        let carried = hop.context();
-                                        let start_nanos = metrics::now_nanos();
-                                        let (subjects, mut lost) = match hold_alerts(&mut outbox, &emits, &subj_root, &stem, &carried) {
-                                            Ok(subjects) => (subjects, None),
-                                            Err(error) => {
-                                                park_run(&js, &handle.spec.name, &emits, &subj_root, &stem, &error, &version, &carried)?;
-                                                (Vec::new(), Some(error))
-                                            }
-                                        };
-                                        // No message to deliver again stands behind what time
-                                        // closed: see `confirm_alerts`.
-                                        let confirmed = confirm_alerts(&mut outbox, &js, &handle.spec.name, &version, |_| Some(carried.clone()));
-                                        let dead = lost.is_some() || confirmed.as_ref().is_ok_and(|parked| !parked.is_empty());
-                                        match &confirmed {
-                                            Ok(parked) => {
-                                                if let Some((_, e)) = parked.first() {
-                                                    lost.get_or_insert(e.clone());
-                                                }
-                                            }
-                                            Err(e) => lost = Some(e.clone()),
-                                        }
-                                        metrics::observe_tick_emits(&handle.spec.name, emits.len() as u64);
-                                        if metrics::wants(hop.sampled, lost.is_some()) {
-                                            let span = metrics::Span::hop(&hop, metrics::Kind::Producer, &handle.spec.name, start_nanos)
-                                                .attr("vejas.flow.version", metrics::Attr::Computed(version.clone()))
-                                                .attr("vejas.emits", emits.len() as u64);
-                                            let span = if dead { span.attr("vejas.dlq", true) } else { span };
-                                            record::end(
-                                                match lost {
-                                                    Some(e) => span.failed(e),
-                                                    None => span,
-                                                },
-                                                record::Extras::new().emits(subjects),
-                                            );
-                                        }
-                                        confirmed?;
+                                        publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, false)?;
                                     }
                                     Ok(_) => {}
                                     Err(e) => eprintln!("[vejas] {}: tick: {e}", handle.spec.name),
@@ -3199,14 +3308,18 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         processed_at.elapsed().as_secs_f64(),
                     );
                     if let Some(store) = &store {
-                        if acks_since_snapshot > 0
-                            && retrying.is_empty()
-                            && (acks_since_snapshot >= snapshot_every_acks
-                                || last_snapshot.elapsed() >= snapshot_every)
-                        {
+                        if snapshot_due(
+                            acks_since_snapshot > 0 || (timers_moved && position_known),
+                            acks_since_snapshot,
+                            !retrying.is_empty(),
+                            last_snapshot.elapsed(),
+                            snapshot_every_acks,
+                            snapshot_every,
+                        ) {
                             match snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
                                 Ok(()) => {
                                     acks_since_snapshot = 0;
+                                    timers_moved = false;
                                     last_snapshot = Instant::now();
                                 }
                                 Err(e) => eprintln!(
@@ -3245,29 +3358,30 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
 }
 
 /// What one program of a detect unit has lost without an error (a run never
-/// opened at the cap, a run evicted, an event a filter could not judge),
+/// opened at the cap, a run evicted, an event a filter could not judge, a
+/// timer period skipped because the unit fired late),
 /// handed to `/metrics` and `/topology` as deltas: two programs of the same
 /// unit may overlap for a moment across a reload, and each adds only what it
-/// lost itself. A loss of runs is also said on the log and as a `losses`
+/// lost itself. A loss of runs or of timer periods is also said on the log and as a `losses`
 /// event on `<root>.flow.events`: the first, then at most one a minute, and
 /// the last one held back is said once the minute has passed.
 struct LossWatch {
-    last: [u64; 3],
+    last: metrics::Losses,
     flush_at: Option<Instant>,
 }
 
 impl LossWatch {
     fn new(unit: &str) -> Self {
         metrics::declare_detect(unit);
-        LossWatch { last: [0; 3], flush_at: None }
+        LossWatch { last: [0; metrics::LOSS_KINDS.len()], flush_at: None }
     }
 
-    /// Cheap when nothing moved: three compares, no lock.
+    /// Cheap when nothing moved: four compares, no lock.
     fn report(&mut self, unit: &str, program: &varpulis_engine::Program, js: &bus::JetStream, subj_root: &str) {
         let l = program.losses();
-        let cur = [l.runs_dropped, l.runs_evicted, l.filters_without_value];
+        let cur = [l.runs_dropped, l.runs_evicted, l.filters_without_value, l.timer_periods_skipped];
         let said = if cur != self.last {
-            let delta: [u64; 3] = std::array::from_fn(|i| cur[i].saturating_sub(self.last[i]));
+            let delta: metrics::Losses = std::array::from_fn(|i| cur[i].saturating_sub(self.last[i]));
             self.last = cur;
             metrics::add_losses(unit, delta)
         } else if self.flush_at.is_some_and(|t| Instant::now() >= t) {
@@ -3286,11 +3400,11 @@ impl LossWatch {
     }
 }
 
-fn say_losses(unit: &str, total: [u64; 3], js: &bus::JetStream, subj_root: &str) {
+fn say_losses(unit: &str, total: metrics::Losses, js: &bus::JetStream, subj_root: &str) {
     eprintln!(
-        "[vejas] {unit}: the engine lost runs without an error: runs_dropped={} runs_evicted={} \
-         (since start; filters_without_value={}; see vejas_detect_losses_total)",
-        total[0], total[1], total[2]
+        "[vejas] {unit}: the engine lost runs or timer periods without an error: runs_dropped={} runs_evicted={} \
+         timer_periods_skipped={} (since start; filters_without_value={}; see vejas_detect_losses_total)",
+        total[0], total[1], total[3], total[2]
     );
     let mut event = json!({ "transition": "losses", "ts": now_secs(), "unit": unit });
     for (kind, n) in metrics::LOSS_KINDS.iter().zip(total) {
@@ -3319,6 +3433,23 @@ fn detect_max_runs() -> Option<usize> {
             None
         }
     }
+}
+
+/// How a detect unit's VPL is compiled: its `timer()`s run on the wall clock,
+/// which the host owns and drives with `fire_due` (see `supervise_detect`).
+fn detect_options() -> varpulis_engine::CompileOptions {
+    varpulis_engine::CompileOptions::new().timer_clock(varpulis_engine::TimerClock::Host)
+}
+
+/// Compile a detect unit's VPL as the unit runs it.
+fn compile_detect(src: &str) -> Result<varpulis_engine::Program, String> {
+    varpulis_engine::Program::compile_with(src, &detect_options()).map_err(|e| e.to_string())
+}
+
+/// The verdict a detect unit would give its VPL at load (`vpl-check`, the MCP
+/// `vejas_vpl_check`): the same options, so a `timer()` validates as it runs.
+fn check_detect(src: &str) -> Result<(), String> {
+    varpulis_engine::Program::check_with(src, &detect_options()).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Whether the program has state worth a snapshot: a sequence, a window or a
@@ -5817,9 +5948,9 @@ fn mcp_call(root: &Path, registry: &Registry, name: &str, args: &Value) -> Resul
             let src = fs::read_to_string(root.join(file))
                 .or_else(|_| fs::read_to_string(file))
                 .map_err(|e| e.to_string())?;
-            match varpulis_engine::Program::check(&src) {
+            match check_detect(&src) {
                 Ok(()) => text(json!({"ok": true, "file": file}).to_string()),
-                Err(e) => text(json!({"ok": false, "file": file, "error": e.to_string()}).to_string()),
+                Err(e) => text(json!({"ok": false, "file": file, "error": e}).to_string()),
             }
         }
         "vejas_events" => text(events_json(args["flow"].as_str())),
@@ -7107,7 +7238,7 @@ fn main() {
         // refusal a running detect unit would give.
         match fs::read_to_string(&args[2])
             .map_err(|e| e.to_string())
-            .and_then(|s| varpulis_engine::Program::check(&s).map_err(|e| e.to_string()))
+            .and_then(|s| check_detect(&s))
         {
             Ok(()) => {
                 println!("ok");
@@ -7397,6 +7528,69 @@ mod tests {
         let lateral = "event SmbConnect:\n    host: str\n    target: str\n\nevent ServiceStart:\n    host: str\n\nstream Lateral = SmbConnect as smb\n    -> ServiceStart where host == smb.target as svc\n    .within(2m)\n    .emit(to: svc.host)\n";
         let program = varpulis_engine::Program::compile(lateral).unwrap();
         assert!(program_is_stateful(&program), "an open sequence is state");
+    }
+
+    const TIMED: &str = "connector Bus = nats (\n    url: \"x\"\n)\n\n\
+        event Order:\n    id: str\n\n\
+        stream Orders = Order\n    .from(Bus, topic: \"vx.tm.order\")\n\n\
+        stream Beat = timer(1s)\n    .emit(kind: \"beat\", at: timestamp)\n\n\
+        pattern Waited =\n    Order as o\n    -> Beat\n    -> Beat\n    within 1m\n\n\
+        stream Stale = Waited\n    .emit(rule: \"two_beats\", order: o.id)\n";
+
+    fn at(ms: i64) -> varpulis_engine::DateTime<varpulis_engine::Utc> {
+        varpulis_engine::DateTime::from_timestamp_millis(1_790_000_000_000 + ms).unwrap()
+    }
+
+    fn feed(program: &mut varpulis_engine::Program, event_type: &str, id: &str, ms: i64) -> Vec<varpulis_engine::Emit> {
+        let json = format!(r#"{{"id": "{id}", "@timestamp": "{}"}}"#, at(ms).to_rfc3339());
+        program.feed_json(event_type, json.as_bytes()).unwrap()
+    }
+
+    fn streams(emits: &[varpulis_engine::Emit]) -> Vec<String> {
+        emits.iter().map(|e| match e.to_json().get("order").and_then(|o| o.as_str()) {
+            Some(order) => format!("{}:{order}", e.stream),
+            None => e.stream.clone(),
+        }).collect()
+    }
+
+    #[test]
+    fn a_detect_runs_its_timers_on_the_hosts_clock() {
+        // a timer validates as it runs: the engine alone, without a clock, refuses it
+        assert!(varpulis_engine::Program::check(TIMED).is_err(), "no clock: E102");
+        check_detect(TIMED).unwrap();
+        let mut program = compile_detect(TIMED).unwrap();
+        assert!(program.has_timers());
+        assert!(program_is_stateful(&program));
+        assert_eq!(program.next_deadline(), None, "not started");
+        assert!(program.fire_due(at(0)).unwrap().is_empty(), "the first call starts the schedule");
+        assert_eq!(program.next_deadline(), Some(at(1000)));
+        assert!(feed(&mut program, "Order", "o1", 100).is_empty());
+        assert_eq!(streams(&program.fire_due(at(1000)).unwrap()), ["Beat"]);
+        assert!(feed(&mut program, "Order", "o2", 1100).is_empty());
+        let second = program.fire_due(at(2000)).unwrap();
+        assert_eq!(streams(&second), ["Beat", "Stale:o1"], "o1 has seen two beats, o2 one");
+        assert_eq!(second[0].to_json()["at"], json!(at(2000).timestamp_millis()), "a beat carries its deadline");
+        assert_eq!(program.losses().timer_periods_skipped, 0);
+
+        // a restart mid-period resumes on the schedule the snapshot holds
+        let snap = program.snapshot().unwrap();
+        let mut again = compile_detect(TIMED).unwrap();
+        again.restore(&snap).unwrap();
+        assert_eq!(again.next_deadline(), Some(at(3000)), "on schedule, not from the restart");
+        // late by several periods: one beat, the others counted; o2's second
+        // beat, kept in the snapshot with its open sequence
+        let late = again.fire_due(at(6500)).unwrap();
+        assert_eq!(streams(&late), ["Beat", "Stale:o2"]);
+        assert_eq!(late[0].to_json()["at"], json!(at(6000).timestamp_millis()));
+        assert_eq!(again.losses().timer_periods_skipped, 3, "3, 4 and 5 s were skipped");
+        assert_eq!(again.next_deadline(), Some(at(7000)));
+    }
+
+    #[test]
+    fn a_detect_of_timers_alone_compiles() {
+        let beat = "stream Beat = timer(1s)\n    .emit(kind: \"beat\")\n";
+        let program = compile_detect(beat).unwrap();
+        assert!(program.has_timers() && program.sources().is_empty());
     }
 
     use super::*;
