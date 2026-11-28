@@ -48,6 +48,17 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   them on the bus.
 
 ### Changed
+- **The Varpulis engine moves from 9f11a92 to edee746** (varpulis #309,
+  #310). A `NOT` between two steps now works: in `A -> NOT B -> C` the C
+  that comes next closes the absence, and a B before it ends the sequence
+  without a match. A pattern that starts with `NOT` is refused (E038).
+  `e2e/detect/run.sh` D13 checks it on the bus. When one event takes two
+  alternatives of an `or` at once, the one that loses the tie no longer
+  survives through the engine's index and matches too
+  (`A -> ((C -> D) or D) -> E`: one match, not two). A snapshot keeps when
+  each sequence started to the nanosecond, so a run cap evicts the same
+  sequence before and after a restart; a snapshot taken by 9f11a92 has no
+  such field and restores as before (a unit test restores one).
 - **The Varpulis engine moves from b09ff7e to 9f11a92** (varpulis #307):
   `timer()` runs in the embedded engine when the host names a clock. Without
   one it is still refused (E102), and so is a period or `initial_delay` that

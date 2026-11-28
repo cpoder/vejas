@@ -7690,6 +7690,36 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_an_older_engine_took_restores() {
+        // Taken by engine 9f11a92 from this program after two orders, o1 and
+        // o2, both still waiting for their shipment. That engine wrote each
+        // run's start to the millisecond only; the next one adds the
+        // nanoseconds, and a snapshot without them must still restore.
+        const SHIPPED: &str = "event Order:\n    id: str\nevent Shipment:\n    id: str\n    carrier: str\n\n\
+            pattern Shipped =\n    Order as o\n    -> Shipment where id == o.id as s\n    within 1h\n\n\
+            stream Out = Shipped\n    .emit(order: o.id, carrier: s.carrier)\n";
+        let old = include_bytes!("testdata/detect-snapshot-9f11a92.json");
+        assert!(!old.windows(13).any(|w| w == b"started_at_ns"), "the fixture is the older format");
+        let ship = |program: &mut varpulis_engine::Program, id: &str, ts: &str| {
+            let json = format!(r#"{{"id": "{id}", "carrier": "rail", "@timestamp": "{ts}"}}"#);
+            program.feed_json("Shipment", json.as_bytes()).unwrap()
+        };
+        let mut program = compile_detect(SHIPPED).unwrap();
+        program.restore(old).unwrap();
+        assert_eq!(streams(&ship(&mut program, "o2", "2026-09-23T09:10:00Z")), ["Out:o2"]);
+        assert_eq!(streams(&ship(&mut program, "o1", "2026-09-23T09:11:00Z")), ["Out:o1"]);
+        assert!(ship(&mut program, "o1", "2026-09-23T09:12:00Z").is_empty(), "o1 closed once");
+        // what this engine writes back carries the nanoseconds, and restores too
+        let mut again = compile_detect(SHIPPED).unwrap();
+        again.restore(old).unwrap();
+        let snap = again.snapshot().unwrap();
+        assert!(snap.windows(13).any(|w| w == b"started_at_ns"));
+        let mut third = compile_detect(SHIPPED).unwrap();
+        third.restore(&snap).unwrap();
+        assert_eq!(streams(&ship(&mut third, "o1", "2026-09-23T09:11:00Z")), ["Out:o1"]);
+    }
+
+    #[test]
     fn a_first_snapshot_is_a_position_timer_snapshots_can_stand_for() {
         // first deployment: no consumer yet, so no start, but the first
         // snapshot recorded the floor of the consumer just made

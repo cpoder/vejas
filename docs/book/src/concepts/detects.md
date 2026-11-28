@@ -68,6 +68,12 @@ machine it connected to: one alert, on `vx.alerts.lateral`.
   the four hours or, when nothing more comes at all, about a grace after
   them. An absence the unit was waiting out when it stopped is in its
   snapshot, and is still raised after the restart.
+- **A `NOT` can sit between two steps** (engine edee746). In
+  `Order as o -> NOT Shipment where id == o.id -> Beat as b within 1m`, the
+  next `Beat` closes the absence: it raises the orders no matching
+  `Shipment` followed, and a shipment that comes first ends that order's
+  sequence without a match. A pattern cannot start with `NOT` (E038).
+  `e2e/detect/run.sh` (D13) runs it on the bus.
 - **Types.** A string `event_type` in the payload names the event type;
   without it, the type is the one the `.from()` binding declares for that
   subject. The engine's own decoder does this, the same one every Varpulis
