@@ -65,6 +65,10 @@ struct Unit {
     loss: Losses,
     loss_said: Option<Instant>,
     loss_pending: bool,
+    /// Emits of a detect unit's timers, also counted in `emits`.
+    timer_emits: u64,
+    /// When a wall clock that stepped back was last said on the bus.
+    clock_said: Option<Instant>,
 }
 
 static UNITS: OnceLock<Mutex<HashMap<String, Unit>>> = OnceLock::new();
@@ -99,6 +103,27 @@ pub fn observe(unit: &str, ok: bool, emits: u64, secs: f64) {
 pub fn observe_tick_emits(unit: &str, emits: u64) {
     let mut map = units().lock().unwrap();
     map.entry(unit.to_string()).or_default().emits += emits;
+}
+
+/// Emits published by a detect unit's timers. They count as emits, and
+/// apart as `vejas_detect_timer_emits_total`.
+pub fn observe_timer_emits(unit: &str, emits: u64) {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    u.emits += emits;
+    u.timer_emits += emits;
+}
+
+/// Whether a wall clock that stepped back behind a unit's timers is said on
+/// the bus now: at most once a minute, like a loss.
+pub fn clock_step_news(unit: &str) -> bool {
+    let mut map = units().lock().unwrap();
+    let u = map.entry(unit.to_string()).or_default();
+    if u.clock_said.is_some_and(|t| t.elapsed() < LOSS_WARN_EVERY) {
+        return false;
+    }
+    u.clock_said = Some(Instant::now());
+    true
 }
 
 /// One pull round of the consumer loop and how many messages it returned.
@@ -392,6 +417,11 @@ pub fn render(gauges: &[(String, String, u64)]) -> String {
             esc(unit),
             u.emits
         ));
+    }
+    out.push_str("# HELP vejas_detect_timer_emits_total Messages a detect unit's timers published, included in vejas_emits_published_total.\n");
+    out.push_str("# TYPE vejas_detect_timer_emits_total counter\n");
+    for (unit, u) in map.iter().filter(|(_, u)| u.detect) {
+        out.push_str(&format!("vejas_detect_timer_emits_total{{unit=\"{}\"}} {}\n", esc(unit), u.timer_emits));
     }
 
     out.push_str("# HELP vejas_http_rejected_total Connections or requests refused past a bound, or for want of a thread.\n");
@@ -1016,6 +1046,13 @@ mod tests {
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"runs_dropped\"} 7"));
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"filters_without_value\"} 3"));
         assert!(text.contains("vejas_detect_losses_total{unit=\"detect:losses_t\",kind=\"timer_periods_skipped\"} 4"));
+        observe_timer_emits(unit, 2);
+        observe_tick_emits(unit, 1);
+        let text = render(&[]);
+        assert!(text.contains("vejas_detect_timer_emits_total{unit=\"detect:losses_t\"} 2"), "a tick's emits are not a timer's");
+        assert!(text.contains("vejas_emits_published_total{unit=\"detect:losses_t\"} 3"));
+        assert!(clock_step_news(unit), "the first step back is said");
+        assert!(!clock_step_news(unit), "then at most once a minute");
         assert!(!text.contains("vejas_detect_losses_total{unit=\"flow:"), "only detect units carry it");
     }
 

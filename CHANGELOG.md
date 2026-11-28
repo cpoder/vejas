@@ -18,8 +18,17 @@ is `0`, minor versions may carry breaking changes — they are called out here.
   `<root>.flow.events` within the once-a-minute limit. The schedule is in
   the unit's snapshot, so a restart resumes it rather than starting over.
   `vpl-check` and `vejas_vpl_check` accept a `timer()` as the unit runs it.
-  `e2e/detect/run.sh` D11 checks the beats, a timer in a pattern, and the
-  restart.
+  Timers fire after the batch the unit has read, and wait while the unit
+  replays the backlog it found at start, so an event acked after the last
+  snapshot replays before the beats that came due while it was down. Beats
+  still follow the wall clock: a consumer that lags sees them ahead of its
+  data. A wall clock that steps back stalls the timers by the size of the
+  step; the unit says it once per start, on the log and as a `clock_back`
+  event on `<root>.flow.events`. Timer emits are also counted apart, as
+  `vejas_detect_timer_emits_total`. A unit that drops its last `.from()`
+  deletes its old consumer. `e2e/detect/run.sh` D11 checks the beats, a
+  timer in a pattern, and the restart; D12 the replay before the catch-up
+  beat.
 - **What a detect unit's engine loses is counted.**
   `vejas_detect_losses_total{unit, kind}` on `/metrics` and `losses` under
   each detect in `/topology`: sequences never opened at the cap

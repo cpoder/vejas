@@ -139,7 +139,16 @@ message or that deadline, whichever comes first, and a unit without a timer
 waits as it always did. What a timer emits goes out like any other emit: to
 its stream's `.to()` subject or `<root>.detect.<unit>.<stream>`, with a
 trace of its own, since no message stands behind it. A unit made of timers
-alone has no `.from()` and no consumer.
+alone has no `.from()` and no consumer; a unit that drops its last
+`.from()` deletes the consumer it had.
+
+**Beats follow the wall clock, not the data.** The unit fires a timer
+after the batch it has read, but when its consumer lags, the beats are
+still ahead of the events it has yet to process: an event published before
+a beat can reach the engine after it. The exception is the backlog the
+consumer holds when the unit starts: the timers wait until it is replayed,
+so an event acked after the last snapshot comes back before the beats that
+came due while the unit was down.
 
 ```vpl
 stream Beat = timer(1s)
@@ -172,10 +181,19 @@ schedule does not drift: the next deadline stays on the grid of the first.
 is in it. After a restart the schedule goes on where it was, not from the
 restart: what came due while the unit was down fires once, and the periods
 missed are counted, those since the last snapshot included. A new version
-of the program starts a new schedule. `vpl-check` and `vejas_vpl_check`
-accept a `timer()` as the unit runs it; the engine alone, with no clock to
-drive it, refuses it (E102). `e2e/detect/run.sh` (D11) runs the example
-above and the restart.
+of the program starts a new schedule.
+
+**Clock stepped back.** A timer never fires before its deadline on the
+timers' own clock, which only moves forward. When the wall clock steps
+back (a manual set, a VM restored), no timer fires until the wall clock
+has caught up again, by the size of the step. The unit says it once per
+start, on the log with the step in milliseconds and as a `clock_back`
+event on `<root>.flow.events` (at most one a minute).
+
+`vpl-check` and `vejas_vpl_check` accept a `timer()` as the unit runs it;
+the engine alone, with no clock to drive it, refuses it (E102).
+`e2e/detect/run.sh` runs the example above and the restart (D11), and the
+replay of an event ahead of the catch-up beat (D12).
 
 ## Snapshot and resume
 

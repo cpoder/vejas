@@ -2752,7 +2752,11 @@ fn publish_unprompted(
         }
         Err(e) => lost = Some(e.clone()),
     }
-    metrics::observe_tick_emits(unit, emits.len() as u64);
+    if timer {
+        metrics::observe_timer_emits(unit, emits.len() as u64);
+    } else {
+        metrics::observe_tick_emits(unit, emits.len() as u64);
+    }
     if metrics::wants(hop.sampled, lost.is_some()) {
         let span = metrics::Span::hop(&hop, metrics::Kind::Producer, unit, start_nanos)
             .attr("vejas.flow.version", metrics::Attr::Computed(version.clone()))
@@ -2775,6 +2779,60 @@ fn publish_unprompted(
 /// and the cadence is reached.
 fn snapshot_due(moved: bool, acks: u64, retrying: bool, since: Duration, every_acks: u64, every: Duration) -> bool {
     moved && !retrying && (acks >= every_acks || since >= every)
+}
+
+/// Where a detect unit's snapshots start from: the stream sequence below the
+/// consumer's start, raised to the floor its first snapshot recorded, and
+/// whether that is a position a snapshot taken after a timer can stand for.
+/// A unit without a consumer has no position to keep, so any will do.
+fn snapshot_base(start: Option<u64>, first_floor: Option<u64>, consumes: bool) -> (u64, bool) {
+    let below_start = start.map(|seq| seq.saturating_sub(1));
+    let base = below_start.into_iter().chain(first_floor).max();
+    (base.unwrap_or(0), base.is_some() || !consumes)
+}
+
+/// The timers' clock in an engine snapshot, if their schedules had started.
+fn timer_clock_of(snapshot: &[u8]) -> Option<varpulis_engine::DateTime<varpulis_engine::Utc>> {
+    let v: Value = serde_json::from_slice(snapshot).ok()?;
+    let ns = v.get("timers")?.get("clock_ns")?.as_i64()?;
+    Some(varpulis_engine::DateTime::from_timestamp_nanos(ns))
+}
+
+/// A wall clock that stepped back behind the timers' clock: nothing fires
+/// until it catches up, by the size of the step. Said once an attempt, on the
+/// log and, within the losses' once-a-minute limit, on `<root>.flow.events`.
+#[derive(Default)]
+struct ClockWatch {
+    said: bool,
+}
+
+impl ClockWatch {
+    fn check(
+        &mut self,
+        unit: &str,
+        clock: Option<varpulis_engine::DateTime<varpulis_engine::Utc>>,
+        now: varpulis_engine::DateTime<varpulis_engine::Utc>,
+        js: &bus::JetStream,
+        subj_root: &str,
+    ) {
+        let Some(step) = clock.filter(|c| now < *c).map(|c| (c - now).num_milliseconds()) else {
+            return;
+        };
+        if self.said {
+            return;
+        }
+        self.said = true;
+        eprintln!(
+            "[vejas] {unit}: the wall clock is {step} ms behind the timers' clock: \
+             no timer fires until it catches up"
+        );
+        if metrics::clock_step_news(unit) {
+            let event = json!({ "transition": "clock_back", "ts": now_secs(), "unit": unit, "step_ms": step });
+            if let Err(e) = js.publish(&format!("{subj_root}.flow.events"), serde_json::to_vec(&event).unwrap_or_default()) {
+                eprintln!("[vejas] {unit}: clock_back event not published: {e}");
+            }
+        }
+    }
 }
 
 /// A detect unit (ADR-0031): a VPL program run by the embedded Varpulis engine.
@@ -2893,6 +2951,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             }
             let mut resume_seq: Option<u64> = None;
             let mut restored = false;
+            // The timers' clock: never earlier than this, or they stall (see
+            // `ClockWatch`). Read off the snapshot restored, else the start.
+            let mut timers_clock: Option<varpulis_engine::DateTime<varpulis_engine::Utc>> = None;
             if let Some(store) = &store {
                 match connectors::snapshot_get(store, &handle.spec.name)? {
                     Some(snap) if *snap.version == *version => {
@@ -2908,6 +2969,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         );
                         resume_seq = Some(snap.seq + 1);
                         restored = true;
+                        if timed {
+                            timers_clock = timer_clock_of(&snap.state);
+                        }
                     }
                     Some(snap) => eprintln!(
                         "[vejas] {}: its snapshot is of another version of the program ({} ≠ {}): ignored",
@@ -2924,7 +2988,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // restored schedule needs none, and the loop fires what came due
             // while the unit was down: once, the periods it missed counted.
             if timed && program.next_deadline().is_none() {
-                program.fire_due(varpulis_engine::Utc::now()).map_err(|e| format!("start the timers: {e}"))?;
+                let now = varpulis_engine::Utc::now();
+                program.fire_due(now).map_err(|e| format!("start the timers: {e}"))?;
+                timers_clock = Some(now);
             }
             // A program without a consumer has no stream position to stand for.
             if !consumes {
@@ -2943,6 +3009,9 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             };
             match start {
                 _ if !consumes => {
+                    // A unit that dropped its `.from()`s leaves no consumer
+                    // behind to hold the stream's messages for it.
+                    let _ = js.delete_consumer(&stream, &durable);
                     if restored {
                         metrics::observe_restore(&handle.spec.name, 0);
                     }
@@ -2960,12 +3029,22 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // A first snapshot at the consumer's position, so a crash before the
             // first cadence still replays from here rather than resuming past
             // events the state never saw.
+            let mut first_floor: Option<u64> = None;
             if let (Some(store), false) = (&store, restored) {
-                let floor = if consumes { js.ack_floor(&stream, &durable).unwrap_or(0) } else { 0 };
-                if let Err(e) = snapshot_unit(store, &handle.spec.name, &version, &program, floor) {
-                    eprintln!("[vejas] {}: first snapshot: {e}", handle.spec.name);
+                let floor = if consumes { js.ack_floor(&stream, &durable).ok() } else { Some(0) };
+                match snapshot_unit(store, &handle.spec.name, &version, &program, floor.unwrap_or(0)) {
+                    Ok(()) => first_floor = floor,
+                    Err(e) => eprintln!("[vejas] {}: first snapshot: {e}", handle.spec.name),
                 }
             }
+            // The backlog the consumer holds at the start: a timer waits until
+            // it is replayed, so a replayed event comes before the beats that
+            // came due while the unit was down (see the loop).
+            let mut replaying: u64 = if timed && consumes {
+                js.consumer_info(&stream, &durable).ok().and_then(|i| i["num_pending"].as_u64()).unwrap_or(0)
+            } else {
+                0
+            };
             // Without a consumer, the channel stays open and empty: the loop
             // only waits for its timers.
             let mut _no_reader = None;
@@ -3029,12 +3108,14 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
             // A snapshot stands for what is below the consumer's start, until
             // a message is acked; one taken after a timer fired, with no ack
             // since the start, stands for that.
-            let mut acked_max: u64 = start.map_or(0, |seq| seq.saturating_sub(1));
-            let position_known = start.is_some() || !consumes;
+            let (mut acked_max, mut position_known) = snapshot_base(start, first_floor, consumes);
             let mut retrying: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut acks_since_snapshot: u64 = 0;
             // A timer fired since the last snapshot: its schedule moved.
             let mut timers_moved = false;
+            // The last `fire_due` failed and said so in `last_error`.
+            let mut timers_failed = false;
+            let mut clock_watch = ClockWatch::default();
             let mut last_snapshot = Instant::now();
             // A message the engine has taken in is not fed to it again, where
             // it would count twice: a batch the bus does not confirm starts
@@ -3054,23 +3135,280 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                         }
                         return Ok(());
                     }
-                    // The timers that came due fire before the next batch, and
-                    // their alerts go out as a tick's do. Late, a timer fires
-                    // once and the periods it skipped are a loss.
+                    // Wait for a message or the next deadline, whichever comes
+                    // first: a deadline never passes unseen, and the loop never
+                    // spins (a deadline is always past the timers' clock). While
+                    // the backlog of the start replays, the timers wait for it.
                     let mut wait = Duration::from_millis(500);
-                    if timed {
-                        let now = varpulis_engine::Utc::now();
-                        if program.next_deadline().is_some_and(|due| due <= now) {
-                            match program.fire_due(now) {
-                                Ok(emits) if !emits.is_empty() => {
-                                    publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, true)?;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("[vejas] {}: timers: {e}", handle.spec.name);
-                                    set_state(&handle, |st| st.last_error = Some(format!("timers: {e}")));
+                    if timed && replaying == 0 {
+                        if let Some(due) = program.next_deadline() {
+                            let left = (due - varpulis_engine::Utc::now()).to_std().unwrap_or(Duration::ZERO);
+                            wait = wait.min(left);
+                        }
+                    }
+                    // A batch is whatever has arrived: wait for one message, take
+                    // the rest without waiting, bounded.
+                    let got = match rx.recv_timeout(wait) {
+                        Ok(m) => Some(m),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // nothing more to read: the start's backlog is replayed
+                            replaying = 0;
+                            // a quiet unit still says the losses it held back
+                            losses.report(&handle.spec.name, &program, &js, &subj_root);
+                            // Nothing to feed: close what time has closed on
+                            // quiet sources. Those emits stand for no message,
+                            // so there is nothing to ack; a crash before the
+                            // next snapshot replays and closes them again.
+                            if idle_grace.is_some() {
+                                match program.tick() {
+                                    Ok(emits) if !emits.is_empty() => {
+                                        publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, false)?;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => eprintln!("[vejas] {}: tick: {e}", handle.spec.name),
                                 }
                             }
+                            None
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("the consumer reader stopped".into())
+                        }
+                    };
+                    if let Some(first) = got {
+                        let round_t0 = Instant::now();
+                        let mut batch = vec![first];
+                        while batch.len() < 256 {
+                            match rx.try_recv() {
+                                Ok(m) => batch.push(m),
+                                Err(_) => break,
+                            }
+                        }
+                        replaying = replaying.saturating_sub(batch.len() as u64);
+                        let mut to_ack: Vec<(bus::Message, u64)> = Vec::new();
+                        // The runs that alerted, recorded once their alerts are confirmed.
+                        let mut alerted: Vec<Alerted> = Vec::new();
+                        for msg in batch {
+                            if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
+                                return Ok(()); // un-acked: redelivers to whoever holds the durable next
+                            }
+                            let seq = msg.delivery().map(|i| i.stream_seq).unwrap_or(0);
+                            // A second delivery, of an ack lost or late: the engine of
+                            // a program with state took the message in, its consumer
+                            // being made at this start, so it is acked and not fed.
+                            // One nak'd when its dead letter failed was never taken in.
+                            if stateful
+                                && msg.delivery().is_some_and(|d| d.delivered > 1)
+                                && !retrying.contains(&seq)
+                            {
+                                to_ack.push((msg, seq));
+                                continue;
+                            }
+                            // The consumer's filters are the `.from()` subjects, so one
+                            // matches; the first declared wins when two overlap.
+                            let Some(event_type) = sources
+                                .iter()
+                                .find(|(topic, _)| connectors::subject_matches(topic, &msg.subject))
+                                .map(|(_, event_type)| event_type.as_str())
+                            else {
+                                return Err(format!(
+                                    "received {} which no `.from()` subject matches: consumer `{durable}` \
+                                     is not the one this unit created",
+                                    msg.subject
+                                ));
+                            };
+                            let t0 = Instant::now();
+                            // The hop continues the trace of the message that closed
+                            // or fed a window; what it emits carries it on (ADR-0034).
+                            let hop = trace::Hop::begin(trace::of(&msg));
+                            let carried = hop.context();
+                            let observing = metrics::observing();
+                            let start_nanos = metrics::now_nanos();
+                            // The program decodes the payload itself: its decoder
+                            // interns field names and event types once per program,
+                            // not once per message (21.6 → 5.4 µs an event).
+                            let fed = program.feed_json(event_type, &msg.data);
+                            losses.report(&handle.spec.name, &program, &js, &subj_root);
+                            match fed {
+                                Err(varpulis_engine::Error::Event(e)) => {
+                                    // Not an event: permanent poison. Dead-letter it
+                                    // (ADR-0015), publish before ack, nak if the DLQ
+                                    // write fails.
+                                    let err = format!("bad payload: {e}");
+                                    eprintln!("[vejas] {}: {err}", handle.spec.name);
+                                    let delivered =
+                                        msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                                    metrics::observe(&handle.spec.name, false, 0, 0.0);
+                                    let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable);
+                                    match &dead {
+                                        Ok(()) => {
+                                            metrics::inc_dead_letter(&handle.spec.name);
+                                            let _ = msg.ack();
+                                            retrying.remove(&seq);
+                                        }
+                                        Err(_) => {
+                                            let _ = msg.nak();
+                                            retrying.insert(seq);
+                                        }
+                                    }
+                                    if observing {
+                                        let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
+                                        record::end(
+                                            if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
+                                            record::Extras::new().input(&msg.data),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    // The engine took the event in before it failed:
+                                    // delivered again, it would count twice. It is a
+                                    // dead letter at once, and a replay of it is the
+                                    // operator's choice.
+                                    let err = e.to_string();
+                                    eprintln!("[vejas] {}: {err}", handle.spec.name);
+                                    metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
+                                    let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
+                                    connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable)
+                                        .map_err(|de| format!("{err}, and its dead letter failed: {de}"))?;
+                                    metrics::inc_dead_letter(&handle.spec.name);
+                                    if observing {
+                                        let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
+                                        record::end(span.attr("vejas.dlq", true).failed(err.clone()), record::Extras::new().input(&msg.data));
+                                    }
+                                    record_trace(&handle.spec.name, &msg.subject, false, Some(format!("{err} — dead-lettered at once: the engine has taken it in")),
+                                        vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
+                                    set_state(&handle, |st| st.last_error = Some(err));
+                                    to_ack.push((msg, seq));
+                                }
+                                Ok(emits) => {
+                                    let first = outbox.held();
+                                    let (subjects, parked) = match hold_alerts(&mut outbox, &emits, &subj_root, &stem, &carried) {
+                                        Ok(subjects) => (subjects, Vec::new()),
+                                        Err(error) => {
+                                            park_run(&js, &handle.spec.name, &emits, &subj_root, &stem, &error, &version, &carried)?;
+                                            (Vec::new(), vec![error])
+                                        }
+                                    };
+                                    alerted.push(Alerted {
+                                        emits: first..outbox.held(),
+                                        msg,
+                                        seq,
+                                        subjects,
+                                        parked,
+                                        hop,
+                                        start_nanos,
+                                        secs: t0.elapsed().as_secs_f64(),
+                                        observing,
+                                    });
+                                }
+                            }
+                        }
+                        let processed_at = Instant::now();
+                        // Publish before ack, one round-trip per batch (ADR-0002).
+                        let confirmed = confirm_alerts(&mut outbox, &js, &handle.spec.name, &version, |index| {
+                            alerted.iter().find(|a| a.emits.contains(&index)).map(|a| a.hop.context())
+                        });
+                        let refused = match confirmed {
+                            Ok(refused) => refused,
+                            Err(e) => {
+                                for a in &alerted {
+                                    if a.observing {
+                                        let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos);
+                                        record::end(span.failed(e.clone()), record::Extras::new().input(&a.msg.data));
+                                    }
+                                    record_trace(&handle.spec.name, &a.msg.subject, false, Some(e.clone()), vec![],
+                                        connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
+                                }
+                                return Err(e);
+                            }
+                        };
+                        for a in alerted {
+                            let mut lost = a.parked;
+                            let held_back = lost.len();
+                            lost.extend(refused.iter().filter(|(index, _)| a.emits.contains(index)).map(|(_, e)| e.clone()));
+                            let stored = (a.subjects.len() - (lost.len() - held_back)) as u64;
+                            metrics::observe(&handle.spec.name, lost.is_empty(), stored, a.secs);
+                            let said = lost.first().map(|e| format!("{e} — the alert is a dead letter"));
+                            if a.observing && (a.hop.sampled || said.is_some()) {
+                                let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos)
+                                    .attr("vejas.emits", stored);
+                                let extras = record::Extras::new().emits(a.subjects.clone()).input(&a.msg.data);
+                                match &said {
+                                    None => record::end(span, extras),
+                                    Some(e) => record::end(span.attr("vejas.dlq", true).failed(e.clone()), extras),
+                                }
+                            }
+                            if let Some(e) = &said {
+                                set_state(&handle, |st| st.last_error = Some(e.clone()));
+                            }
+                            record_trace(&handle.spec.name, &a.msg.subject, said.is_none(), said, a.subjects,
+                                connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
+                            to_ack.push((a.msg, a.seq));
+                        }
+                        let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
+                        for (_, seq) in &to_ack {
+                            retrying.remove(seq);
+                            acked_max = acked_max.max(*seq);
+                            // a sequence acked is a position a snapshot can stand for
+                            position_known = true;
+                        }
+                        acks_since_snapshot += to_ack.len() as u64;
+                        metrics::observe_round(
+                            &handle.spec.name,
+                            0.0,
+                            (processed_at - round_t0).as_secs_f64(),
+                            processed_at.elapsed().as_secs_f64(),
+                        );
+                        if let Some(store) = &store {
+                            if snapshot_due(
+                                acks_since_snapshot > 0 || (timers_moved && position_known),
+                                acks_since_snapshot,
+                                !retrying.is_empty(),
+                                last_snapshot.elapsed(),
+                                snapshot_every_acks,
+                                snapshot_every,
+                            ) {
+                                match snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
+                                    Ok(()) => {
+                                        acks_since_snapshot = 0;
+                                        timers_moved = false;
+                                        last_snapshot = Instant::now();
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[vejas] {}: snapshot: {e} (the next batch tries again)",
+                                        handle.spec.name
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    // The timers that came due fire after what has arrived is
+                    // processed, and their alerts go out as a tick's do. Late, a
+                    // timer fires once and the periods it skipped are a loss.
+                    if timed && replaying == 0 {
+                        let now = varpulis_engine::Utc::now();
+                        clock_watch.check(&handle.spec.name, timers_clock, now, &js, &subj_root);
+                        if program.next_deadline().is_some_and(|due| due <= now) {
+                            match program.fire_due(now) {
+                                Ok(emits) => {
+                                    if !emits.is_empty() {
+                                        publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, true)?;
+                                    }
+                                    if timers_failed {
+                                        timers_failed = false;
+                                        set_state(&handle, |st| {
+                                            if st.last_error.as_deref().is_some_and(|e| e.starts_with("timers: ")) {
+                                                st.last_error = None;
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[vejas] {}: timers at {}: {e}", handle.spec.name, now.to_rfc3339());
+                                    set_state(&handle, |st| st.last_error = Some(format!("timers: {e}")));
+                                    timers_failed = true;
+                                }
+                            }
+                            timers_clock = Some(now);
                             timers_moved = true;
                             losses.report(&handle.spec.name, &program, &js, &subj_root);
                             if let Some(store) = &store {
@@ -3091,241 +3429,6 @@ fn supervise_detect(handle: Arc<Handle>, root: PathBuf) {
                                         Err(e) => eprintln!("[vejas] {}: snapshot: {e} (the next timer tries again)", handle.spec.name),
                                     }
                                 }
-                            }
-                        }
-                        // Wait for a message or the next deadline, whichever
-                        // comes first: a deadline never passes unseen, and the
-                        // loop never spins (the deadline is past the clock).
-                        if let Some(due) = program.next_deadline() {
-                            let left = (due - varpulis_engine::Utc::now()).to_std().unwrap_or(Duration::ZERO);
-                            wait = wait.min(left);
-                        }
-                    }
-                    // A batch is whatever has arrived: wait for one message, take
-                    // the rest without waiting, bounded.
-                    let first = match rx.recv_timeout(wait) {
-                        Ok(m) => m,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // a quiet unit still says the losses it held back
-                            losses.report(&handle.spec.name, &program, &js, &subj_root);
-                            // Nothing to feed: close what time has closed on
-                            // quiet sources. Those emits stand for no message,
-                            // so there is nothing to ack; a crash before the
-                            // next snapshot replays and closes them again.
-                            if idle_grace.is_some() {
-                                match program.tick() {
-                                    Ok(emits) if !emits.is_empty() => {
-                                        publish_unprompted(&mut outbox, &js, &handle.spec.name, &emits, &subj_root, &stem, &version, false)?;
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => eprintln!("[vejas] {}: tick: {e}", handle.spec.name),
-                                }
-                            }
-                            continue;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err("the consumer reader stopped".into())
-                        }
-                    };
-                    let round_t0 = Instant::now();
-                    let mut batch = vec![first];
-                    while batch.len() < 256 {
-                        match rx.try_recv() {
-                            Ok(m) => batch.push(m),
-                            Err(_) => break,
-                        }
-                    }
-                    let mut to_ack: Vec<(bus::Message, u64)> = Vec::new();
-                    // The runs that alerted, recorded once their alerts are confirmed.
-                    let mut alerted: Vec<Alerted> = Vec::new();
-                    for msg in batch {
-                        if !RUNNING.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
-                            return Ok(()); // un-acked: redelivers to whoever holds the durable next
-                        }
-                        let seq = msg.delivery().map(|i| i.stream_seq).unwrap_or(0);
-                        // A second delivery, of an ack lost or late: the engine of
-                        // a program with state took the message in, its consumer
-                        // being made at this start, so it is acked and not fed.
-                        // One nak'd when its dead letter failed was never taken in.
-                        if stateful
-                            && msg.delivery().is_some_and(|d| d.delivered > 1)
-                            && !retrying.contains(&seq)
-                        {
-                            to_ack.push((msg, seq));
-                            continue;
-                        }
-                        // The consumer's filters are the `.from()` subjects, so one
-                        // matches; the first declared wins when two overlap.
-                        let Some(event_type) = sources
-                            .iter()
-                            .find(|(topic, _)| connectors::subject_matches(topic, &msg.subject))
-                            .map(|(_, event_type)| event_type.as_str())
-                        else {
-                            return Err(format!(
-                                "received {} which no `.from()` subject matches: consumer `{durable}` \
-                                 is not the one this unit created",
-                                msg.subject
-                            ));
-                        };
-                        let t0 = Instant::now();
-                        // The hop continues the trace of the message that closed
-                        // or fed a window; what it emits carries it on (ADR-0034).
-                        let hop = trace::Hop::begin(trace::of(&msg));
-                        let carried = hop.context();
-                        let observing = metrics::observing();
-                        let start_nanos = metrics::now_nanos();
-                        // The program decodes the payload itself: its decoder
-                        // interns field names and event types once per program,
-                        // not once per message (21.6 → 5.4 µs an event).
-                        let fed = program.feed_json(event_type, &msg.data);
-                        losses.report(&handle.spec.name, &program, &js, &subj_root);
-                        match fed {
-                            Err(varpulis_engine::Error::Event(e)) => {
-                                // Not an event: permanent poison. Dead-letter it
-                                // (ADR-0015), publish before ack, nak if the DLQ
-                                // write fails.
-                                let err = format!("bad payload: {e}");
-                                eprintln!("[vejas] {}: {err}", handle.spec.name);
-                                let delivered =
-                                    msg.delivery().map(|i| i.delivered).unwrap_or(1);
-                                metrics::observe(&handle.spec.name, false, 0, 0.0);
-                                let dead = connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable);
-                                match &dead {
-                                    Ok(()) => {
-                                        metrics::inc_dead_letter(&handle.spec.name);
-                                        let _ = msg.ack();
-                                        retrying.remove(&seq);
-                                    }
-                                    Err(_) => {
-                                        let _ = msg.nak();
-                                        retrying.insert(seq);
-                                    }
-                                }
-                                if observing {
-                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
-                                    record::end(
-                                        if dead.is_ok() { span.attr("vejas.dlq", true) } else { span }.failed(err),
-                                        record::Extras::new().input(&msg.data),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                // The engine took the event in before it failed:
-                                // delivered again, it would count twice. It is a
-                                // dead letter at once, and a replay of it is the
-                                // operator's choice.
-                                let err = e.to_string();
-                                eprintln!("[vejas] {}: {err}", handle.spec.name);
-                                metrics::observe(&handle.spec.name, false, 0, t0.elapsed().as_secs_f64());
-                                let delivered = msg.delivery().map(|i| i.delivered).unwrap_or(1);
-                                connectors::to_dlq(&js, &handle.spec.name, &msg.subject, delivered, &err, &msg.data, &version, Some(&carried), msg.delivery().map(|d| d.message()), &durable)
-                                    .map_err(|de| format!("{err}, and its dead letter failed: {de}"))?;
-                                metrics::inc_dead_letter(&handle.spec.name);
-                                if observing {
-                                    let span = hop_span(&hop, &handle.spec.name, &code_file, &msg, &version, None, start_nanos);
-                                    record::end(span.attr("vejas.dlq", true).failed(err.clone()), record::Extras::new().input(&msg.data));
-                                }
-                                record_trace(&handle.spec.name, &msg.subject, false, Some(format!("{err} — dead-lettered at once: the engine has taken it in")),
-                                    vec![], connectors::trace_preview(&msg.data), None, Some(&hop), msg.delivery());
-                                set_state(&handle, |st| st.last_error = Some(err));
-                                to_ack.push((msg, seq));
-                            }
-                            Ok(emits) => {
-                                let first = outbox.held();
-                                let (subjects, parked) = match hold_alerts(&mut outbox, &emits, &subj_root, &stem, &carried) {
-                                    Ok(subjects) => (subjects, Vec::new()),
-                                    Err(error) => {
-                                        park_run(&js, &handle.spec.name, &emits, &subj_root, &stem, &error, &version, &carried)?;
-                                        (Vec::new(), vec![error])
-                                    }
-                                };
-                                alerted.push(Alerted {
-                                    emits: first..outbox.held(),
-                                    msg,
-                                    seq,
-                                    subjects,
-                                    parked,
-                                    hop,
-                                    start_nanos,
-                                    secs: t0.elapsed().as_secs_f64(),
-                                    observing,
-                                });
-                            }
-                        }
-                    }
-                    let processed_at = Instant::now();
-                    // Publish before ack, one round-trip per batch (ADR-0002).
-                    let confirmed = confirm_alerts(&mut outbox, &js, &handle.spec.name, &version, |index| {
-                        alerted.iter().find(|a| a.emits.contains(&index)).map(|a| a.hop.context())
-                    });
-                    let refused = match confirmed {
-                        Ok(refused) => refused,
-                        Err(e) => {
-                            for a in &alerted {
-                                if a.observing {
-                                    let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos);
-                                    record::end(span.failed(e.clone()), record::Extras::new().input(&a.msg.data));
-                                }
-                                record_trace(&handle.spec.name, &a.msg.subject, false, Some(e.clone()), vec![],
-                                    connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
-                            }
-                            return Err(e);
-                        }
-                    };
-                    for a in alerted {
-                        let mut lost = a.parked;
-                        let held_back = lost.len();
-                        lost.extend(refused.iter().filter(|(index, _)| a.emits.contains(index)).map(|(_, e)| e.clone()));
-                        let stored = (a.subjects.len() - (lost.len() - held_back)) as u64;
-                        metrics::observe(&handle.spec.name, lost.is_empty(), stored, a.secs);
-                        let said = lost.first().map(|e| format!("{e} — the alert is a dead letter"));
-                        if a.observing && (a.hop.sampled || said.is_some()) {
-                            let span = hop_span(&a.hop, &handle.spec.name, &code_file, &a.msg, &version, None, a.start_nanos)
-                                .attr("vejas.emits", stored);
-                            let extras = record::Extras::new().emits(a.subjects.clone()).input(&a.msg.data);
-                            match &said {
-                                None => record::end(span, extras),
-                                Some(e) => record::end(span.attr("vejas.dlq", true).failed(e.clone()), extras),
-                            }
-                        }
-                        if let Some(e) = &said {
-                            set_state(&handle, |st| st.last_error = Some(e.clone()));
-                        }
-                        record_trace(&handle.spec.name, &a.msg.subject, said.is_none(), said, a.subjects,
-                            connectors::trace_preview(&a.msg.data), None, Some(&a.hop), a.msg.delivery());
-                        to_ack.push((a.msg, a.seq));
-                    }
-                    let _ = nc.ack_all(to_ack.iter().map(|(m, _)| m));
-                    for (_, seq) in &to_ack {
-                        retrying.remove(seq);
-                        acked_max = acked_max.max(*seq);
-                    }
-                    acks_since_snapshot += to_ack.len() as u64;
-                    metrics::observe_round(
-                        &handle.spec.name,
-                        0.0,
-                        (processed_at - round_t0).as_secs_f64(),
-                        processed_at.elapsed().as_secs_f64(),
-                    );
-                    if let Some(store) = &store {
-                        if snapshot_due(
-                            acks_since_snapshot > 0 || (timers_moved && position_known),
-                            acks_since_snapshot,
-                            !retrying.is_empty(),
-                            last_snapshot.elapsed(),
-                            snapshot_every_acks,
-                            snapshot_every,
-                        ) {
-                            match snapshot_unit(store, &handle.spec.name, &version, &program, acked_max) {
-                                Ok(()) => {
-                                    acks_since_snapshot = 0;
-                                    timers_moved = false;
-                                    last_snapshot = Instant::now();
-                                }
-                                Err(e) => eprintln!(
-                                    "[vejas] {}: snapshot: {e} (the next batch tries again)",
-                                    handle.spec.name
-                                ),
                             }
                         }
                     }
@@ -7584,6 +7687,31 @@ mod tests {
         assert_eq!(late[0].to_json()["at"], json!(at(6000).timestamp_millis()));
         assert_eq!(again.losses().timer_periods_skipped, 3, "3, 4 and 5 s were skipped");
         assert_eq!(again.next_deadline(), Some(at(7000)));
+    }
+
+    #[test]
+    fn a_first_snapshot_is_a_position_timer_snapshots_can_stand_for() {
+        // first deployment: no consumer yet, so no start, but the first
+        // snapshot recorded the floor of the consumer just made
+        assert_eq!(snapshot_base(None, Some(0), true), (0, true));
+        assert_eq!(snapshot_base(None, Some(41), true), (41, true));
+        // neither: unknown until a message is acked
+        assert_eq!(snapshot_base(None, None, true), (0, false));
+        // a restart at a snapshot's sequence: what is below it
+        assert_eq!(snapshot_base(Some(10), None, true), (9, true));
+        assert_eq!(snapshot_base(Some(10), Some(12), true), (12, true));
+        // timers alone: no position to keep
+        assert_eq!(snapshot_base(None, None, false), (0, true));
+    }
+
+    #[test]
+    fn the_timers_clock_is_read_off_a_snapshot() {
+        let mut program = compile_detect(TIMED).unwrap();
+        assert_eq!(timer_clock_of(&program.snapshot().unwrap()), None, "not started");
+        program.fire_due(at(0)).unwrap();
+        program.fire_due(at(1500)).unwrap();
+        assert_eq!(timer_clock_of(&program.snapshot().unwrap()), Some(at(1500)));
+        assert_eq!(timer_clock_of(b"not json"), None);
     }
 
     #[test]
