@@ -25,6 +25,8 @@
 #                     go silent after the order, and not for an order acked
 #   D9 absence, kill  an absence the unit was waiting out when killed -9 is
 #                     still raised after the restart (from the snapshot)
+#   D10 and / or      `and` waits for two steps in either order, `or` for either
+#                     of two, and a pattern one event completes emits at once
 #   D3 vpl-check      the engine's verdict on the CLI: ok / refused, with exit codes
 #   D4 topology       /topology lists the units under "detects", lang vpl, running
 #
@@ -176,6 +178,77 @@ stream Late = Unacked
     .to(Bus, topic: "vxt.unacked")
 VPL
 
+cat > "$ROOT/detects/andor.vpl" <<'VPL'
+connector Bus = nats (
+    url: "ignored-by-vejas: the bus is NATS_URL"
+)
+
+event Order:
+    id: str
+event Shipment:
+    id: str
+    carrier: str
+event Invoice:
+    id: str
+    amount: float
+event CardPayment:
+    id: str
+    amount: float
+event Transfer:
+    id: str
+    amount: float
+event CardDeclined:
+    id: str
+event TransferBounced:
+    id: str
+
+stream Orders = Order
+    .from(Bus, topic: "vxt.ao.order")
+stream Shipments = Shipment
+    .from(Bus, topic: "vxt.ao.ship")
+stream Invoices = Invoice
+    .from(Bus, topic: "vxt.ao.invoice")
+stream Cards = CardPayment
+    .from(Bus, topic: "vxt.ao.card")
+stream Transfers = Transfer
+    .from(Bus, topic: "vxt.ao.transfer")
+stream Declines = CardDeclined
+    .from(Bus, topic: "vxt.ao.declined")
+stream Bounces = TransferBounced
+    .from(Bus, topic: "vxt.ao.bounced")
+
+# shipped and invoiced, in either order
+pattern ReadyToClose =
+    Order as o
+    -> (Shipment where id == o.id as s
+        and Invoice where id == o.id as i)
+    within 1h
+    partition by id
+
+stream Closable = ReadyToClose
+    .emit(rule: "closable", order: o.id, carrier: s.carrier, amount: i.amount)
+    .to(Bus, topic: "vxt.ao.out")
+
+# paid by card or by transfer: both alternatives bind p
+pattern Paid =
+    Order as o
+    -> (CardPayment where id == o.id as p
+        or Transfer where id == o.id as p)
+    within 1h
+    partition by id
+
+stream Payments = Paid
+    .emit(rule: "paid", order: o.id, amount: p.amount)
+    .to(Bus, topic: "vxt.ao.out")
+
+# one event completes it: emitted at once, not on the next event
+pattern PaymentFailed = CardDeclined as f or TransferBounced as f
+
+stream Failures = PaymentFailed
+    .emit(rule: "payment_failed", order: f.id)
+    .to(Bus, topic: "vxt.ao.out")
+VPL
+
 start_nats() { "$NATSD" -js -sd "$WORK/js" -a 127.0.0.1 -p "$NATS_P" > /dev/null 2>&1 & NATS_PID=$!; sleep 0.5; }
 start_rt() {
   VEJAS_ROOT="$ROOT" NATS_URL="$URL" VEJAS_STREAM=TTEST VEJAS_SUBJECT_ROOT=vxt \
@@ -220,14 +293,14 @@ echo "── D4 topology"
 deadline=$((SECONDS+10))
 while [ "$SECONDS" -lt "$deadline" ]; do
   topo=$(curl -s "http://127.0.0.1:$HTTP_P/topology")
-  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 5 ] && break
+  [ "$(printf '%s' "$topo" | grep -o '"status":"running"' | wc -l)" -ge 6 ] && break
   sleep 0.2
 done
-python3 - "$topo" <<'PY' && ok "five detects listed, lang vpl, running" || bad "topology: $topo"
+python3 - "$topo" <<'PY' && ok "six detects listed, lang vpl, running" || bad "topology: $topo"
 import json, sys
 t=json.loads(sys.argv[1]); d=t.get("detects", [])
 names=sorted(x["name"] for x in d)
-assert names==["detect:bruteforce","detect:lateral","detect:quiet","detect:threshold","detect:unacked"], names
+assert names==["detect:andor","detect:bruteforce","detect:lateral","detect:quiet","detect:threshold","detect:unacked"], names
 assert all(x["lang"]=="vpl" for x in d), d
 assert all(x["status"]=="running" for x in d), [x["status"] for x in d]
 PY
@@ -402,6 +475,36 @@ close_sequences replay 16
 restores=$(curl -s "http://127.0.0.1:$HTTP_P/metrics" | grep 'vejas_restores_total{unit="detect:lateral"}' | awk '{print $2}')
 [ "${restores:-0}" -ge 1 ] && ok "restores are counted (vejas_restores_total=$restores)" || bad "vejas_restores_total is ${restores:-missing}"
 kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.lateral" 2>/dev/null
+
+echo "── D10 and / or between the steps of a pattern"
+( timeout 40 "$NATS" -s "$URL" sub vxt.ao.out --raw > "$WORK/andor.txt" 2>/dev/null ) & SUB_PID=$!
+sleep 0.5
+ao() { # <subject> <type> <time> <json fields>
+  "$NATS" -s "$URL" pub "vxt.ao.$1" "{\"event_type\":\"$2\",\"@timestamp\":\"2026-09-22T08:$3Z\",$4}" > /dev/null 2>&1
+}
+ao order Order 00:00 '"id":"o1"'
+ao order Order 00:01 '"id":"o2"'
+ao order Order 00:02 '"id":"o3"'
+ao invoice Invoice 00:03 '"id":"o1","amount":100.0'   # o1: invoiced, then shipped
+ao card CardPayment 00:04 '"id":"o1","amount":100.0'
+ao ship Shipment 00:05 '"id":"o1","carrier":"rail"'
+ao ship Shipment 00:06 '"id":"o2","carrier":"road"'   # o2: shipped, then invoiced
+ao transfer Transfer 00:07 '"id":"o2","amount":50.0'
+ao invoice Invoice 00:08 '"id":"o2","amount":50.0'
+ao invoice Invoice 00:09 '"id":"o3","amount":75.0'    # o3: invoiced, never shipped, never paid
+ao bounced TransferBounced 00:10 '"id":"o3"'          # and nothing comes after it
+deadline=$((SECONDS+10)); while [ "$SECONDS" -lt "$deadline" ]; do [ "$(grep -c '^{' "$WORK/andor.txt")" -ge 5 ] && break; sleep 0.2; done
+sleep 1.5
+python3 - "$WORK/andor.txt" <<'PY' && ok "and: o1 and o2 close, each in its order, o3 does not; or: a card and a transfer each pay; a one-event pattern emits with nothing after it" || bad "and/or: $(cat "$WORK/andor.txt")"
+import json, sys
+alerts=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+by=lambda r: sorted((a["order"], a.get("carrier"), a.get("amount")) for a in alerts if a["rule"]==r)
+assert by("closable")==[("o1","rail",100.0),("o2","road",50.0)], alerts
+assert by("paid")==[("o1",None,100.0),("o2",None,50.0)], alerts
+assert by("payment_failed")==[("o3",None,None)], alerts
+assert len(alerts)==5, alerts
+PY
+kill "$SUB_PID" 2>/dev/null; pkill -f "[s]ub vxt.ao.out" 2>/dev/null
 
 if [ "$fail" -eq 0 ]; then echo "detect: all invariants hold ✓"; else echo "detect: FAILED"; tail -30 "$WORK/rt.log"; fi
 exit $fail
